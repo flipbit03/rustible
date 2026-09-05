@@ -152,10 +152,13 @@ Consequences accepted with remote-brain:
 
 `rustible run playbook <file>` does:
 
-1. **Read metadata** from the playbook's `#[rustible::playbook(...)]` attribute by
-   parsing the source with `syn`. No compilation is needed to learn the target
-   hosts. (Alternative considered: compile a host build and run it with a
-   `--describe` flag. Rejected as slower and unnecessary.)
+1. **Read metadata** by doing a host-native build of the playbook (cheap, cached,
+   incremental) and running it with `--describe`, which the `#[playbook]` macro
+   generates. This yields the target hosts, `become`, and a JSON schema of the
+   playbook's typed vars struct (section 13). (Alternative considered: parse the
+   attribute with `syn` and skip compilation. Rejected on 2026-09-05 because
+   validating inventory vars against the typed struct needs real type knowledge,
+   and one mechanism beats two.)
 2. **Resolve hosts** from the inventory and **open SSH** to each, in parallel.
 3. **Probe** each host with one tiny shell command (`uname -sm`, `/etc/os-release`)
    to learn its target triple. This bootstrap probe is the only shell-dependent
@@ -687,7 +690,7 @@ Networking and anything async are also off `System` for now.
   `rustible run playbook ./playbooks/x.rs` becomes `cargo build --bin x --target
   <triple>` under the hood. (Alternatives noted: `src/bin/` auto-discovery, a
   `build.rs`, or a generated shadow workspace. Syncing `[[bin]]` is the simplest.)
-- **Inventory is data**, in a file (`hosts.yml` or `hosts.toml`, format OPEN).
+- **Inventory is data**, in a file next to `rustible.toml`. See section 13.
   Dynamic inventories become a trait later.
 - **Crates:**
   - `rustible`: the CLI and orchestrator (init, create, run, SSH, compile, render).
@@ -721,12 +724,12 @@ Networking and anything async are also off `System` for now.
 
 In the suggested order of attack:
 
-1. **Inventory**: file format, groups, host vars, group vars, how
-   `hosts = "web"` resolves, connection settings per host (user, port, become
-   method).
-2. **`Ctx` beyond `step`**: `log`, `vars` (typed? how?), `facts`, `local_file`,
-   `local_secret`, and the future coordination calls (`barrier`, `run_once`,
-   peer facts).
+1. **Inventory**: file format (TOML recommended, pending Cadu's pick) and the
+   sibling-group conflict rule. Structure, precedence, and typed vars are decided
+   in section 13.
+2. **`Ctx` beyond `step`**: `log`, `facts`, `local_file`, `local_secret`, and the
+   future coordination calls (`barrier`, `run_once`, peer facts). Vars are
+   decided in section 13.
 3. **Protocol serialization format** (postcard vs msgpack vs JSON) and framing
    details; check-mode semantics for the step driver when a `Change` is planned
    (skip and continue vs stop).
@@ -756,3 +759,122 @@ In the suggested order of attack:
    (`file::Line` is a good first), a playbook file with the macro, run locally.
    Turns the sketches above into a compiling crate and surfaces what they hide.
    **Not blocked**; can start any time.
+
+## 13. Inventory, typed vars, and the workspace (DECIDED 2026-09-05, format pending)
+
+### 13.1 Structure
+
+The inventory stores single hosts and host groups. Groups can contain groups
+(`members = [..]`); a host's group set is the transitive closure, and vars merge
+from outermost group to innermost.
+
+**Connection settings are not vars.** `addr`, `port`, `ssh_user`, `connection`
+(`ssh` | `local`), and the become method are orchestrator configuration and live
+directly on the host or group. Playbook vars live under a separate `vars` table.
+Ansible mixes these (`ansible_host`, `ansible_user`) and that is a source of its
+precedence confusion.
+
+### 13.2 Format
+
+Criteria: human editing, **machine editing that preserves comments and layout**
+(a future `rustible host add`, and agents editing the file), silent coercion
+traps, Rust library quality, familiarity.
+
+| | YAML | TOML | KDL | JSON |
+|---|---|---|---|---|
+| Human editing | Good, pretty nesting | Good, flatter nesting | Good, unfamiliar | Poor |
+| Machine edit preserving comments | Bad in Rust (`serde_yaml` deprecated, no format-preserving editor) | Excellent (`toml_edit`, used by `cargo add`) | Good (`kdl` crate) | Poor |
+| Silent coercion traps | Yes (`no`, `NO`, `1.10`, `022`) | None | None | None |
+| Familiarity for Rust users | High | Highest (`Cargo.toml`) | Low | High |
+| Nested groups | Natural | Workable, noisier | Natural | Ugly |
+
+**Recommendation: TOML**, tiebreaker being machine editing and consistency with
+`rustible.toml` and `Cargo.toml`. YAML is acceptable if preferred; Cadu said he
+has fewer reservations about YAML for non-programmable data. **Pick pending.**
+
+```toml
+# hosts.toml
+[vars]
+fruit = "banana"
+
+[hosts.laptop]
+connection = "local"
+
+[groups.myservers]
+vars = { ssh_user = "deploy" }
+
+[groups.myservers.hosts.a]
+addr = "10.0.0.1"
+vars = { user = "cadu", fruit = "mango" }
+
+[groups.myservers.hosts.b]
+addr = "10.0.0.2"
+
+[groups.myservers.hosts.c]
+addr = "10.0.0.3"
+port = 2222
+```
+
+### 13.3 Typed vars: bridging the untyped bag and the typed playbook
+
+- The inventory holds a **bag of scalars** per host/group: `HashMap<String,
+  Scalar>` where `Scalar` is string, int, float, bool, or a list of one of those.
+  (Not `HashMap<String, String>`: the file format already has typed scalars;
+  flattening to strings and re-parsing is lossy.)
+- A playbook declares a **flat (single-level) typed struct** of the vars it
+  needs, in the same `.rs` file, with `Option<T>` for optional fields and
+  defaults via attribute or `impl Default`. The `#[rustible::vars]` macro
+  enforces flatness and derives `Deserialize` plus a JSON schema.
+- Coercion from the bag into the struct goes through `serde`, giving `Option`,
+  defaults, and precise error messages for free. No hand-written coercion.
+- **Validation happens on the orchestrator, before any cross-compile or upload,
+  for every resolved host.** If any host fails, nothing runs and the error names
+  each host and each missing or mistyped var. This is why metadata is obtained
+  via `--describe` on a host-native build (section 5.2).
+
+```rust
+#[rustible::vars]
+struct Vars {
+    user: String,          // required
+    fruit: String,         // required
+    port: Option<u16>,     // optional
+    #[default = 3]
+    retries: u32,          // defaulted
+}
+
+#[rustible::playbook(hosts = "myservers", vars = Vars, become = true)]
+fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { .. }
+```
+
+```
+error: 2 of 3 hosts in group `myservers` do not satisfy the vars of playbooks/thing.rs
+
+  host `a`   ok
+  host `b`   missing required var `user`
+  host `c`   missing required var `user`
+
+  Vars are resolved from hosts.toml as: [vars] -> group vars -> host vars.
+  Add `user` to hosts b and c, or to `[groups.myservers.vars]` if it is shared.
+```
+
+**Precedence** (four levels, versus Ansible's twenty-two): `[vars]` (all), then
+group vars outermost to innermost, then host vars, then `--var key=value` on the
+command line. **OPEN:** when a host belongs to two sibling groups that define the
+same var, error (leaning) or last-declared wins.
+
+### 13.4 Workspace
+
+- A **rustible workspace** is a Cargo package whose root also contains
+  `rustible.toml`. (`rustible.toml`, not `rustible.cfg`: same format as
+  everything else, sits next to `Cargo.toml`.)
+- `rustible.toml` points at the inventory file (default `hosts.toml`) and holds
+  workspace-level settings defined later.
+- The CLI finds the workspace root by **walking up from the current directory**
+  looking for `rustible.toml`, as Cargo does with `Cargo.toml`. `--workspace
+  <dir>` overrides this, for monorepos where the workspace lives in a subfolder.
+- Everything is resolved relative to the workspace root: playbook paths,
+  inventory, files to embed or stream.
+- `rustible init` ensures a `.gitignore` exists (creating or appending if inside
+  a git repository) containing `target/` and `.rustible/` (the local cache for
+  per-triple artifacts and describe output), so playbook runs never produce git
+  noise.
