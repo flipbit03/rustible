@@ -731,11 +731,10 @@ Networking and anything async are also off `System` for now.
 
 In the suggested order of attack:
 
-1. **Inventory**: the sibling-group var conflict rule (error vs last wins).
-   Everything else is decided in section 13.
-2. **`Ctx` beyond `step`**: `log`, `facts`, `local_file`, `local_secret`, and the
-   future coordination calls (`barrier`, `run_once`, peer facts). Vars are
-   decided in section 13.
+1. ~~Inventory~~: fully decided in section 13. Sibling-group var conflicts are
+   an error naming both groups and the host (fix: set it on the host or a common
+   parent).
+2. ~~`Ctx` beyond `step`~~: decided in section 14.
 3. **Protocol serialization format** (postcard vs msgpack vs JSON) and framing
    details; check-mode semantics for the step driver when a `Change` is planned
    (skip and continue vs stop).
@@ -744,8 +743,8 @@ In the suggested order of attack:
 5. **Facts**: the exact `Facts` struct, which probes gather it, and how ops
    extend it.
 6. **Diff representation** and rendering.
-7. **Privilege escalation details**: `become` method (sudo/doas), password
-   handling, per-op `as_user` semantics for file ops (write then chown).
+7. ~~Privilege escalation~~: decided in section 14.3 (helper-process backend).
+   Remaining: `doas` specifics.
 8. **Error model**: error types, what a failed step reports, retries.
 9. **Output rendering**: the terminal UI, verbosity levels, machine-readable
    output.
@@ -984,3 +983,131 @@ same var, error (leaning) or last-declared wins.
   a git repository) containing `target/` and `.rustible/` (the local cache for
   per-triple artifacts and describe output), so playbook runs never produce git
   noise.
+
+## 14. `Ctx` (DECIDED 2026-09-06)
+
+`Ctx` is what `main` receives. Three tiers: MVP, cheap extras, and reserved
+shapes whose signatures and protocol frames exist now so adding them later
+changes no playbook.
+
+```rust
+pub struct Ctx {
+    sys: System,            // Local backend, facts, identity, check_mode
+    host: HostInfo,         // from the Start frame
+    channel: Channel,       // framed up/down link to the orchestrator
+    step_counter: u32,
+    section_depth: u8,
+}
+
+impl Ctx {
+    // ---- tier 1: MVP ----
+    pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>>;
+    pub fn host(&self) -> &HostInfo;          // name, groups, target-relevant params
+    pub fn facts(&self) -> &Facts;
+    pub fn check_mode(&self) -> bool;
+    pub fn log(&self, msg);   pub fn warn(&self, msg);   pub fn debug(&self, msg);  // Log frames
+    pub fn local_file(&mut self, path) -> Result<PathBuf>;   // streamed; temp path; deleted at exit
+    pub fn local_secret(&mut self, name) -> Result<Secret>;  // bytes in memory; zeroized on drop
+    pub fn sys(&self) -> &System;             // reads fine; mutations should be steps
+
+    // ---- tier 2 ----
+    pub fn skip(&mut self, name, reason);     // record a deliberately-not-run step
+    pub fn section<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T>; // output grouping
+    pub fn as_user(&self, name: &str) -> Ctx; // same channel/host, different identity
+    pub fn as_root(&self) -> Ctx;             // sugar for as_user("root")
+    pub fn fetch(&mut self, remote, local_dest) -> Result<()>;  // reverse transfer
+
+    // ---- tier 3: reserved, not MVP ----
+    pub fn barrier(&mut self, name: &str) -> Result<()>;                       // blocks until all hosts arrive
+    pub fn run_once<T>(&mut self, name: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Option<T>>;
+    pub fn peer_facts(&mut self, host: &str) -> Result<Facts>;
+}
+```
+
+### 14.1 Decisions embedded
+
+- **`vars` is a parameter of `main`** (`fn main(ctx: &mut Ctx, vars: Vars)`), not
+  a method on `Ctx`. The macro deserializes it from the `Start` frame before
+  `main` runs; failure is a clean per-host message. `Ctx` is untyped w.r.t. vars.
+- **`sys()` is exposed.** Playbooks are programs; authors are responsible. Reads
+  are unreported. Mutations outside a step still go through the backend (logged
+  at `-v`) but do not appear as steps; if it should be in the report, make it a
+  step (`shell::Command` exists for that).
+- **`skip` is explicit and optional.** An `if` that does not run a step makes it
+  vanish from the output; `skip` records it with a reason and the summary counts
+  it, for the "twelve steps, three did not apply, here is why" report.
+- **`section` is output-only** grouping (indented block under a heading), so a
+  collection helper emitting several steps reads as one unit. Sections nest.
+- **`bail!`** (re-exported) is Ansible's `fail` module.
+- **Tier 3 calls are blocking calls over the channel** (remote-brain): `barrier`
+  sends a frame up and waits for `BarrierRelease`; `run_once` is a barrier plus
+  an election by the orchestrator. Reserved, not implemented in the MVP.
+
+### 14.2 Example
+
+```rust
+#[rustible::vars]
+struct Vars { domain: String, #[default = 4] workers: u32 }
+
+#[rustible::playbook(hosts = "web", vars = Vars, become = true)]
+fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
+    if ctx.facts().package_manager != Pm::Apt {
+        bail!("this playbook only knows Debian-likes, got {:?}", ctx.facts().distro);
+    }
+    ctx.step("nginx present", apt::Present::new(["nginx"]))?;
+
+    let cfg = ctx.section("Configure nginx", |ctx| {
+        let conf = ctx.step("Render site config",
+            file::Template::render(Site { domain: &vars.domain, workers: vars.workers })
+                .to("/etc/nginx/sites-available/app"))?;
+        ctx.step("Enable site",
+            file::Symlink::at("/etc/nginx/sites-enabled/app").pointing_to("/etc/nginx/sites-available/app"))?;
+        Ok(conf)
+    })?;
+
+    if cfg.changed { ctx.step("nginx restarted", systemd::Restart::new("nginx"))?; }
+    else { ctx.skip("nginx restarted", "config unchanged"); }
+
+    if ctx.facts().cpus < 2 { ctx.warn("single-CPU host, workers setting will be ignored"); }
+
+    let cert = ctx.local_secret("tls/app.pem")?;
+    ctx.step("Install TLS cert", file::Copy::from_bytes(cert.as_bytes()).to("/etc/ssl/app.pem").mode(0o600))?;
+    Ok(())
+}
+```
+
+### 14.3 Per-step privilege escalation (DECIDED 2026-09-06)
+
+Escalation is a property of how a step runs, not of the op, so it lives on
+`Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
+steps, or `ctx.as_user("postgres").step(..)` to step down. Playbook-level
+`become = true` remains for the common case and means the binary is launched
+under sudo (default identity root). Output marks steps whose identity differs
+from the binary's own (`as root`, `as postgres`).
+
+**Mechanism.** A running process cannot change identity per call, and
+`sys.write_atomic("/etc/...")` from an unprivileged process gets EACCES.
+Ansible's answer is shell tricks (`sudo tee`, chmod dances). Ours: `as_user`
+creates a `System` whose backend is `Elevated { user }`. On first use it spawns
+**the same binary** under sudo in helper mode:
+
+```
+sudo -n -u <user> /tmp/.rustible/<hash> --helper
+```
+
+and speaks the `Backend` primitives (`read`, `write`, `stat`, `spawn`) to it over
+its stdin/stdout, framed like the main channel. The helper is `Local` wrapped in
+a request loop. One helper per identity, spawned lazily, kept alive for the run,
+killed at exit. Properties:
+
+- No extra upload: the helper is the binary already on the target.
+- Ops know nothing: this is the payoff of routing all I/O through `sys`.
+- Stepping down (`as_user("postgres")`) is the same mechanism.
+- The check-mode mutation guard holds in the helper (same code).
+- Helper commands are reported back and forwarded up as `CmdRan` tagged with
+  the identity.
+- Cost: one spawn per identity, then a pipe round trip per file primitive.
+
+Sudo passwords: `-n` fails rather than prompts. If the inventory's `become`
+needs a password, the orchestrator sends it in the `Start` frame as a secret
+and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
