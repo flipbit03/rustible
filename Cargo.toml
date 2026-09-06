@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustible-sdk",
+    "crates/rustible-std",
+    "crates/spike-playbook",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rustible-sdk = { path = "crates/rustible-sdk" }
+rustible-std = { path = "crates/rustible-std" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+similar = "2"
+regex = "1"
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }

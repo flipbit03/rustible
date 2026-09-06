@@ -371,16 +371,22 @@ pub trait Op {
     type Output;
     /// Inspect the system. Never mutates. Returns what would need to happen.
     fn check(&self, sys: &System) -> Result<Plan<Self::Output>>;
-    /// Perform the change described by the plan. Only called if the plan says so.
-    fn apply(&self, sys: &System, plan: Plan<Self::Output>) -> Result<Self::Output>;
+    /// Perform the change described by the plan. Only called when `check`
+    /// returned `Change` and we are not in check mode.
+    fn apply(&self, sys: &System, change: Change<Self::Output>) -> Result<Self::Output>;
 }
 
 pub enum Plan<T> {
     /// Already in desired state. Carries the output so `step` can return it without applying.
     Satisfied(T),
-    /// Something must change. `diff` is what the report shows.
-    Change { diff: Diff },
+    /// Something must change.
+    Change(Change<T>),
 }
+
+/// `diff` is what the report shows; `predicted` (opt-in, section 15) is what
+/// the output would be after apply, so chained steps continue in check mode.
+pub struct Change<T> { pub diff: Diff, pub predicted: Option<T> }
+// (Spike 3 finding: `apply` takes `Change<T>` rather than `Plan<T>`; see docs/02_SPIKE_SDK_CORE.md.)
 
 pub struct Applied<T> { pub value: T, pub changed: bool, pub diff: Option<Diff>, /* timing */ }
 // Applied<T> derefs to T, so `account.home` works and `account.changed` is there too.
@@ -758,10 +764,8 @@ In the suggested order of attack:
 2. **Protocol over SSH**: framed bidirectional exchange over the `openssh` crate,
    spawn an uploaded binary, exchange messages, measure round trip. Also pick the
    serialization format.
-3. **SDK core**: the `Op` trait, `System` with `Local` and `Fake`, one real op
-   (`file::Line` is a good first), a playbook file with the macro, run locally.
-   Turns the sketches above into a compiling crate and surfaces what they hide.
-   **Not blocked**; can start any time.
+3. ~~**SDK core**~~: **done 2026-09-06**, see `docs/02_SPIKE_SDK_CORE.md`. The
+   sketches hold; `apply` takes `Change<T>`; prediction is nearly free.
 
 ## 13. Inventory, typed vars, and the workspace (DECIDED 2026-09-05, format pending)
 

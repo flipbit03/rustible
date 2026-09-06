@@ -1,0 +1,11 @@
+[package]
+name = "spike-playbook"
+publish = false
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rustible-sdk.workspace = true
+rustible-std.workspace = true
+tempfile.workspace = true
+regex.workspace = true
