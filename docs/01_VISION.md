@@ -739,8 +739,7 @@ In the suggested order of attack:
    details. Check-mode semantics are decided in section 15.
 4. **`rustible init` layout in detail**: exact files, config file (if any),
    `.gitignore`, how the `[[bin]]` sync works, how the CLI finds the project root.
-5. **Facts**: the exact `Facts` struct, which probes gather it, and how ops
-   extend it.
+5. ~~Facts~~: decided in section 16.
 6. **Diff representation** and rendering.
 7. ~~Privilege escalation~~: decided in section 14.3 (helper-process backend).
    Remaining: `doas` specifics.
@@ -1137,3 +1136,59 @@ Options considered:
   (`user::Present` can predict name, home, shell; not uid). Chained steps then
   continue, and the report marks the step's output as predicted.
 - Ansible effectively does option 2 with silent garbage instead of a loud error.
+
+## 16. Facts (DECIDED 2026-09-06)
+
+**How Ansible does it.** The `setup` module eagerly returns a dict of well over
+a hundred keys, taking one to five seconds per host (hence `gather_facts: no`
+and `gather_subset`). Extension: "local facts" JSON files in
+`/etc/ansible/facts.d/` on the target, and "fact modules" (`package_facts`,
+`service_facts`, `docker_host_info`) whose `ansible_facts` result is merged into
+the global untyped namespace.
+
+**Insight.** A fact module is a task that reads the system and returns data. In
+Rustible that is just an op with typed output run through `ctx.step`. No
+registry, no merge, no extension mechanism. `rustible-docker` needs no facts:
+`docker::Container::Running` fails with "docker not found" at the step where it
+is used.
+
+**Decision: `Facts` is a fixed core struct.** Rule for membership: data that
+many *ops* need for their internal decisions, cheap to gather, stable for the
+run. Gathered eagerly at startup (about ten reads: `/etc/os-release`, `uname`,
+`/proc/cpuinfo`, `/proc/meminfo`, `/proc/1/comm`, PATH checks), milliseconds,
+sent up once in the `Facts` frame. No lazy facts, no dynamic facts.
+
+```rust
+pub struct Facts {
+    pub os: Os,                  // Linux for now
+    pub distro: Distro,          // Debian, Ubuntu, Alpine, Fedora, Rhel, Arch, Other(String)
+    pub distro_version: String,  // "12", "24.04", "3.20"
+    pub arch: Arch,              // X86_64, Aarch64, Other(String)
+    pub kernel: String,
+    pub hostname: String,
+    pub package_manager: Pm,     // Apt, Dnf, Apk, Pacman, Zypper, Other(String)
+    pub init: Init,              // Systemd, OpenRc, Other(String)
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub user: String,            // who the binary runs as
+    pub is_root: bool,
+}
+```
+
+Enums carry an `Other(String)` variant so unknown values degrade to strings.
+Deliberately excluded from the core: mounts, network interfaces, users and
+groups, installed packages, environment. Each is an op when a playbook needs
+it. No versioning needed: binary and orchestrator share one dependency set.
+
+### 16.1 Desired-state ops are the lookups
+
+There is no generic `::lookup()`. The desired-state op's typed output already
+says what was found: `pkg::Present::new(["python3"])` returns
+`already_present` and `installed`, and `.changed` is false when nothing was
+done (reported as `ok`, never `skipped`; `skipped` means deliberately not run).
+
+A small minority of **read-only ops** exists for *observe without changing*:
+"if docker is installed, configure it" (where `pkg::Present` would install it)
+and "this user must already exist, fail otherwise" (`user::Existing`, where
+`user::Present` would create it). They appear as named steps with typed
+output, never report `changed`, and most resources do not need one.
