@@ -697,7 +697,7 @@ Networking and anything async are also off `System` for now.
   `rustible run playbook ./playbooks/x.rs` becomes `cargo build --bin x --target
   <triple>` under the hood. (Alternatives noted: `src/bin/` auto-discovery, a
   `build.rs`, or a generated shadow workspace. Syncing `[[bin]]` is the simplest.)
-- **Inventory is data**, in a file next to `rustible.toml`. See section 13.
+- **Inventory is data**, in `hosts.kdl` next to `rustible.toml`. See section 13.
   Dynamic inventories become a trait later.
 - **Crates:**
   - `rustible`: the CLI and orchestrator (init, create, run, SSH, compile, render).
@@ -780,46 +780,132 @@ directly on the host or group. Playbook vars live under a separate `vars` table.
 Ansible mixes these (`ansible_host`, `ansible_user`) and that is a source of its
 precedence confusion.
 
-### 13.2 Format
+### 13.2 Format: KDL for the inventory, TOML for `rustible.toml` (DECIDED 2026-09-06)
 
-Criteria: human editing, **machine editing that preserves comments and layout**
-(a future `rustible host add`, and agents editing the file), silent coercion
-traps, Rust library quality, familiarity.
+Candidates were YAML, TOML, RON, KDL, JSON, and a Rust-file inventory.
 
-| | YAML | TOML | KDL | JSON |
+| | TOML | RON | KDL |
+|---|---|---|---|
+| Reads well for nested groups | No (every nested map needs a `[a.b.c]` header; inline tables are single-line) | Okay | Best |
+| Machine edit preserving comments | `toml_edit`, excellent | Nothing; rewrite loses comments | `kdl` crate round-trips documents |
+| Typed scalars, no coercion traps | Yes | Yes | Yes |
+| Familiarity | Everyone | Rust people, loosely | Few, learnable in minutes |
+
+- YAML rejected: silent coercion (`no`, `NO`, `1.10`, `022`) and no
+  format-preserving editor in Rust.
+- TOML was chosen first, then rejected for the inventory because Cadu dislikes
+  its nested-table syntax and an inventory is mostly nesting. It stays for
+  `rustible.toml`, which is flat.
+- RON considered: "typed" is mostly cosmetic since serde validates any format
+  into our `Inventory` struct; its only visible gain is unquoted enum variants,
+  and it has no comment-preserving editor.
+- Rust-file inventory rejected even though a compile is now paid anyway
+  (section 5.2): inventories get edited by scripts, agents, and non-Rust
+  colleagues.
+- **KDL chosen**: node-based, which is the shape of an inventory; braces nest
+  without repeating paths; lists are positional arguments; comments survive
+  machine edits; slash-dash (`/-node`) disables a whole node with children,
+  which is the "take web3 out of tonight's run" move. Use KDL 2.0 syntax
+  (`#true`/`#false`).
+
+### 13.2.1 Parameters versus vars
+
+Two kinds of data with two syntactic homes so they cannot be confused:
+
+- **Parameters** are the fixed, typed, closed set `rustible` itself understands
+  (how to connect). They are **properties on the node** (`key=value` after the
+  name). Misspelling one is a load-time error with a suggestion.
+- **Vars** are the open bag the playbook consumes. They live **only inside a
+  `vars` child block**. `rustible` never interprets them; it merges them and
+  hands them to the playbook's typed struct. A var named `port` is unrelated to
+  the `port` parameter: the block boundary is the namespace. (Ansible needs the
+  reserved `ansible_*` prefix for the same separation.)
+
+| Parameter | Type | Required | Default | Settable on |
 |---|---|---|---|---|
-| Human editing | Good, pretty nesting | Good, flatter nesting | Good, unfamiliar | Poor |
-| Machine edit preserving comments | Bad in Rust (`serde_yaml` deprecated, no format-preserving editor) | Excellent (`toml_edit`, used by `cargo add`) | Good (`kdl` crate) | Poor |
-| Silent coercion traps | Yes (`no`, `NO`, `1.10`, `022`) | None | None | None |
-| Familiarity for Rust users | High | Highest (`Cargo.toml`) | Low | High |
-| Nested groups | Natural | Workable, noisier | Natural | Ugly |
+| `addr` | string (IP or hostname) | yes unless `connection="local"` | none | host only |
+| `connection` | `"ssh"` \| `"local"` | no | `"ssh"` | host, group, defaults |
+| `ssh_user` | string | no | local username | host, group, defaults |
+| `port` | u16 | no | 22 | host, group, defaults |
+| `become` | `"sudo"` \| `"doas"` \| `"none"` | no | `"sudo"` | host, group, defaults |
+| `become_user` | string | no | `"root"` | host, group, defaults |
+| `ssh_args` | list of strings | no | empty | host, group, defaults |
 
-**Decision (2026-09-06): TOML for all Rustible files** (`rustible.toml`,
-`hosts.toml`). Tiebreakers: machine editing via `toml_edit` and consistency with
-`Cargo.toml`. YAML was acceptable to Cadu for non-programmable data but lost.
+Parameter resolution: host, then nearest group outward, then `defaults`, then
+the built-in default. Parameters never come from `vars` and vars never from
+properties. On the orchestrator side parameters deserialize into a `HostParams`
+struct via serde.
 
-```toml
-# hosts.toml
-[vars]
-fruit = "banana"
+### 13.2.2 Full example
 
-[hosts.laptop]
-connection = "local"
+```kdl
+// hosts.kdl  (KDL 2.0)
+// Nodes: vars, defaults, host, group.
 
-[groups.myservers]
-vars = { ssh_user = "deploy" }
+vars {                                  // workspace-wide vars: the "all" level
+    fruit "banana"
+    timezone "America/Sao_Paulo"
+}
 
-[groups.myservers.hosts.a]
-addr = "10.0.0.1"
-vars = { user = "cadu", fruit = "mango" }
+defaults ssh_user="cadu" port=22 become="sudo"   // workspace-wide parameters
 
-[groups.myservers.hosts.b]
-addr = "10.0.0.2"
+host "laptop" connection="local"
 
-[groups.myservers.hosts.c]
-addr = "10.0.0.3"
-port = 2222
+group "web" ssh_user="deploy" {         // group-level parameter
+    vars {
+        nginx_workers 4
+        allowed_ports 22 80 443         // list: positional arguments -> Vec<u16>
+        tls #true
+    }
+    host "web1" addr="10.0.1.11"
+    host "web2" addr="10.0.1.12" {
+        vars { nginx_workers 8 }        // host-level override
+    }
+}
+
+group "db" {
+    vars { pg_version 16 }
+    host "db1" addr="10.0.2.11" ssh_user="pgadmin" port=2222 {
+        vars { role "primary" }
+    }
+    host "db2" addr="10.0.2.12" {
+        vars {
+            role "replica"
+            replica_of "db1"
+        }
+    }
+}
+
+group "production" {                    // group of groups
+    members "web" "db"
+    vars { env "production" }
+}
+
+group "monitored" {
+    members "web1" "db1"                // cherry-pick hosts by name
+    vars { alerts #true }
+}
+
+/-host "web3" addr="10.0.1.13" {        // slash-dash: disabled, children included
+    vars { nginx_workers 2 }
+}
 ```
+
+`rustible inventory show web2` prints the resolved parameters and vars with the
+source of each (all / group X / host / defaults), including what was overridden.
+
+### 13.2.3 Structural rules
+
+- Names are unique across hosts and groups, so `members` can reference either.
+- A host is defined exactly once (inside at most one group by nesting) and
+  referenced from other groups by name. Defining it twice is an error.
+- Group membership is the transitive closure through `members`.
+- `vars { a 1 }` (children form) and `vars a=1` (property form) are equivalent;
+  use children form for lists and many vars.
+- Var names use underscores and match the Rust field names one to one. No case
+  mapping.
+- Load-time errors name the file and line, e.g. missing `addr` on an ssh host,
+  unknown parameter with a did-you-mean, `addr` on a group.
 
 ### 13.3 Typed vars: bridging the untyped bag and the typed playbook
 
@@ -873,11 +959,11 @@ error: 2 of 3 hosts in group `myservers` do not satisfy the vars of playbooks/th
   host `b`   missing required var `user`
   host `c`   missing required var `user`
 
-  Vars are resolved from hosts.toml as: [vars] -> group vars -> host vars.
-  Add `user` to hosts b and c, or to `[groups.myservers.vars]` if it is shared.
+  Vars are resolved from hosts.kdl as: vars -> group vars -> host vars.
+  Add `user` to hosts b and c, or to group "myservers" vars if it is shared.
 ```
 
-**Precedence** (four levels, versus Ansible's twenty-two): `[vars]` (all), then
+**Precedence** (four levels, versus Ansible's twenty-two): top-level `vars` (all), then
 group vars outermost to innermost, then host vars, then `--var key=value` on the
 command line. **OPEN:** when a host belongs to two sibling groups that define the
 same var, error (leaning) or last-declared wins.
@@ -887,8 +973,8 @@ same var, error (leaning) or last-declared wins.
 - A **rustible workspace** is a Cargo package whose root also contains
   `rustible.toml`. (`rustible.toml`, not `rustible.cfg`: same format as
   everything else, sits next to `Cargo.toml`.)
-- `rustible.toml` points at the inventory file (default `hosts.toml`) and holds
-  workspace-level settings defined later.
+- `rustible.toml` (TOML; flat config) points at the inventory file (default
+  `hosts.kdl`) and holds workspace-level settings defined later.
 - The CLI finds the workspace root by **walking up from the current directory**
   looking for `rustible.toml`, as Cargo does with `Cargo.toml`. `--workspace
   <dir>` overrides this, for monorepos where the workspace lives in a subfolder.
