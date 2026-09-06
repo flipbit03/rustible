@@ -24,7 +24,9 @@ fn playbook(ctx: &mut Ctx) -> Result<()> {
     // Scratch area, set up outside the step model on purpose: it's test rigging.
     let scratch = std::env::var_os("RUSTIBLE_SPIKE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("rustible-spike-{}", std::process::id())));
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("rustible-spike-{}", std::process::id()))
+        });
     std::fs::create_dir_all(&scratch).map_err(|e| Error::msg(e.to_string()))?;
     let sshd = scratch.join("sshd_config");
     if !sshd.exists() {

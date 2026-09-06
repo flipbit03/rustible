@@ -183,19 +183,24 @@ Consequences accepted with remote-brain:
 - **Linux only, `*-unknown-linux-musl` targets only**, for the MVP. Static musl
   binaries run on any Linux regardless of libc version.
 - **Op crates must be pure Rust by convention.** Pure-Rust crates targeting musl
-  link with the bundled `rust-lld` after `rustup target add`. Any C dependency
-  (openssl, libgit2, sqlite) turns cross-compilation into "install a C toolchain per
-  triple". Use `rustls`, `rustix`, and pure-Rust alternatives.
+  link with the bundled `rust-lld` after `rustup target add`, with
+  `linker = "rust-lld"` and `-C link-self-contained=yes` set per target in
+  `.cargo/config.toml` (validated in spike 1, `docs/03_SPIKE_CROSS_COMPILE.md`:
+  3.5 s link, no zig, no distro toolchain). Any C dependency (openssl, libgit2,
+  sqlite) turns cross-compilation into "install a C toolchain per triple". Use
+  `rustls`, `rustix`, and pure-Rust alternatives.
+- **Shipped binaries use the `dist` profile** (strip, fat LTO, `opt-level = "z"`):
+  1.4 MB for the spike playbook on aarch64 versus 3.1 MB for plain release.
 - **`cargo-zigbuild`** (zig as a universal C cross-linker with bundled sysroots) is
   the escape hatch when a C dependency is unavoidable.
 - macOS and Windows targets are deferred. They have their own toolchain and SDK
   requirements.
 
 Environment facts recorded 2026-09-05 on the primary dev box: rustc 1.97.1,
-targets installed: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`. No zig,
-no `cross`, no sccache. Docker present. An ARM Linux VM (`cadu-cogram-vm-arm`,
-reachable via Tailscale when online) is the intended aarch64 test target. The
-cross-compile spike is blocked until it is online.
+targets installed: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and
+since 2026-09-06 `aarch64-unknown-linux-musl`. No zig, no `cross`, no sccache.
+Docker present. The ARM Linux VM (`cadu-cogram-vm-arm`, Ubuntu 24.04 aarch64,
+reachable via Tailscale, passwordless SSH as `cadu`) is the aarch64 test target.
 
 ### 5.4 Transport (DECIDED for MVP)
 
@@ -757,10 +762,10 @@ In the suggested order of attack:
 
 ## 12. Planned spikes
 
-1. **Cross-compile**: pure-Rust hello binary to `aarch64-unknown-linux-musl`
-   from the x86 dev box, first with plain rustup targets and `rust-lld`, then with
-   `cargo-zigbuild` if that fails; run it on the ARM VM. Validates or kills the
-   compile story. **Blocked**: ARM VM offline as of 2026-09-05.
+1. ~~**Cross-compile**~~: **done 2026-09-06**, see `docs/03_SPIKE_CROSS_COMPILE.md`.
+   The spike-3 playbook cross-linked to aarch64 musl with stock rustup plus
+   `rust-lld`, ran on the ARM VM with identical behaviour. Cold SSH connection
+   (20 s) dominates upload cost, not binary size (0.4 s warm).
 2. **Protocol over SSH**: framed bidirectional exchange over the `openssh` crate,
    spawn an uploaded binary, exchange messages, measure round trip. Also pick the
    serialization format.

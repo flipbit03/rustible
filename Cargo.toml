@@ -21,3 +21,12 @@ similar = "2"
 regex = "1"
 tempfile = "3"
 rustix = { version = "1", features = ["process"] }
+
+# Profile for binaries shipped to targets: small over fast-to-build.
+[profile.dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "unwind"
