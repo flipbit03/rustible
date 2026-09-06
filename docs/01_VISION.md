@@ -152,14 +152,20 @@ Consequences accepted with remote-brain:
 
 `rustible run playbook <file>` does:
 
-1. **Read metadata** by parsing the playbook source with `syn`: the
-   `#[rustible::playbook(...)]` attribute gives hosts and `become`, and the
-   `#[rustible::vars]` struct gives the vars schema. No compilation. This is
-   sound because the vars struct is flat with a closed set of allowed types
-   (section 13.3). (Alternative considered on 2026-09-05: a host-native build run
-   with `--describe`. Rejected on 2026-09-06 as slow and wasteful for a pre-check
-   that should be instant; `--describe` may remain as a debug command but is not
-   in the run path.)
+1. **Read metadata** by doing a host-native debug build of the playbook and
+   running it with `--describe`, which the `#[playbook]` macro generates. This
+   yields the target hosts, `become`, and a JSON schema of the typed vars struct
+   (section 13.3). **Accepted trade-off (final, 2026-09-06):** the pre-check costs
+   a cold build the first time (about a minute) and seconds afterwards. In
+   exchange the schema comes from the real compiled types, so there is no
+   source parser of our own to maintain and no restriction on var field types.
+   (Alternative considered twice: parse the source with `syn`. It is instant but
+   only sound for a closed set of canonically spelled types, cannot see through
+   aliases or imports, and needs a second parser kept in sync with the proc
+   macro. Rejected.) Mitigations: cache describe output by hash of the playbook
+   source plus `Cargo.lock`; dev profile with a shared target dir; the describe
+   build shares dependency compilation with the target build for same-arch
+   hosts; `rustible inventory check` runs only this step.
 2. **Resolve hosts** from the inventory and **open SSH** to each, in parallel.
 3. **Probe** each host with one tiny shell command (`uname -sm`, `/etc/os-release`)
    to learn its target triple. This bootstrap probe is the only shell-dependent
@@ -830,22 +836,21 @@ port = 2222
 - **Validation happens on the orchestrator, before any cross-compile or upload,
   for every resolved host.** If any host fails, nothing runs and the error names
   each host and each missing or mistyped var.
-- **The schema is extracted from source with `syn`, no compile** (decided
-  2026-09-06). This works because the struct is flat and its types come from a
-  closed set: `String`, `bool`, integer types, `f64`, `PathBuf`, and `Option<T>`
-  / `Vec<T>` of those, spelled with canonical names (no aliases, no renamed
-  imports). A field is *required* iff it is not `Option<T>` and has no default
-  marker; default *values* need not be evaluated for validation. One shared
-  crate (`rustible-schema`) implements the parsing for both the CLI and the proc
-  macro so they cannot drift.
-- **Three safety nets**, so a `syn` misread can never produce a wrong run: the
-  CLI pre-check (fast, may be wrong only in its message), the proc macro at
-  compile time (rejects non-flat structs and unsupported types with a clear
-  error), and the binary deserializing vars at `Start` on the target.
-- Options rejected: proc macro writing the schema to disk during compilation
-  (still needs a compile); `--describe` on a host build (slow first time);
-  schema in a separate `x.vars.toml` with the struct generated from it (splits
-  the playbook across two files); rustdoc JSON / rust-analyzer (heavyweight).
+- **The schema comes from `--describe` on a host-native build** (section 5.2),
+  generated from the compiled types. Consequence: **any field type that
+  implements `Deserialize` and the schema derive is allowed**, including
+  user-defined enums, newtypes, and types from other crates. The only rule is
+  that the struct is flat (one level), which is an inventory design choice, not
+  a parser limitation.
+- A field is *required* iff it is not `Option<T>` and has no default.
+- Last line of defense: the binary deserializes its vars again at `Start` on the
+  target, so nothing runs with bad vars even if the pre-check were bypassed.
+- Options rejected: `syn` on the source (instant, but only sound for a closed
+  canonically spelled type set, and needs a second parser kept in sync with the
+  proc macro); proc macro writing the schema to disk during compilation (still
+  needs a compile, and is hacky); schema in a separate `x.vars.toml` with the
+  struct generated from it (splits the playbook across two files); rustdoc JSON
+  / rust-analyzer (heavyweight).
 
 ```rust
 #[rustible::vars]
