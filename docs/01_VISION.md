@@ -736,8 +736,7 @@ In the suggested order of attack:
    parent).
 2. ~~`Ctx` beyond `step`~~: decided in section 14.
 3. **Protocol serialization format** (postcard vs msgpack vs JSON) and framing
-   details; check-mode semantics for the step driver when a `Change` is planned
-   (skip and continue vs stop).
+   details. Check-mode semantics are decided in section 15.
 4. **`rustible init` layout in detail**: exact files, config file (if any),
    `.gitignore`, how the `[[bin]]` sync works, how the CLI finds the project root.
 5. **Facts**: the exact `Facts` struct, which probes gather it, and how ops
@@ -1111,3 +1110,30 @@ killed at exit. Properties:
 Sudo passwords: `-n` fails rather than prompts. If the inventory's `become`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
+
+## 15. Check-mode semantics (DECIDED 2026-09-06)
+
+Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change { diff }` does
+not, so in a dry run a step that *would* change has nothing to return, and a
+later step that chains from it has no value.
+
+Options considered:
+1. Stop the host at the first would-change step. Honest but shows only the
+   first change; useless for "what would this playbook do". Rejected.
+2. Continue; the output is unavailable; fail loudly only when a later step
+   actually reads it.
+3. Let ops predict their output (`Plan::Change { diff, predicted: Option<T> }`).
+   Most fidelity, more work per op, and a wrong prediction is a lie in a dry run.
+
+**Decision: 2 as the rule, 3 as opt-in.**
+- In check mode, a would-change step reports `WouldChange` with its diff and
+  the run continues.
+- `Applied<T>` holds `Option<T>` internally in check mode. Reading the output
+  of a would-change step (via `Deref`) fails with: "step `<name>` would have
+  changed; its output is unavailable in check mode". `.changed` and `.diff`
+  remain readable. Playbooks that do not chain get a full dry run; those that
+  chain get as far as the first dependent read, with a clear message.
+- Ops that can predict cheaply may set `predicted` in `Plan::Change`
+  (`user::Present` can predict name, home, shell; not uid). Chained steps then
+  continue, and the report marks the step's output as predicted.
+- Ansible effectively does option 2 with silent garbage instead of a loud error.
