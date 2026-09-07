@@ -240,7 +240,8 @@ Consequences accepted with remote-brain:
    This bootstrap probe is the only shell-dependent step; everything after it
    is the static binary.
 6. **Compile** once for all needed triples in **one cargo invocation**
-   (`cargo build --profile dist -p <pkg> --bin <playbook> --target A --target B`).
+   (`RUSTIBLE_PLAYBOOK=<name> cargo build --profile dist --target A --target B`;
+   the build script includes only that playbook, section 9).
    Cargo accepts several `--target` flags and locks the target directory, so one
    invocation is both simplest and fastest. Per-triple target directories keep
    the caches independent. Use the `dist` profile (section 5.3).
@@ -873,11 +874,77 @@ Networking and anything async are also off `System` for now.
 ## 9. Project layout and ecosystem
 
 - **A Rustible project is one Cargo package.** `rustible init` creates it.
-- **Playbooks are `.rs` files under `playbooks/`**, each mapped to a `[[bin]]`
-  target. `rustible` keeps the `[[bin]]` entries in sync (autobins off), so
-  `rustible playbook run ./playbooks/x.rs` becomes `cargo build --bin x --target
-  <triple>` under the hood. (Alternatives noted: `src/bin/` auto-discovery, a
-  `build.rs`, or a generated shadow workspace. Syncing `[[bin]]` is the simplest.)
+- **A playbook is any `.rs` file under `playbooks/` that carries
+  `#[rustible::playbook]`. A build script finds them. Nothing is ever indexed
+  by hand (DECIDED 2026-09-07).** The requirement, from vetting: the Ansible
+  experience, where a playbook file simply exists and gets used, with no
+  manifest entry to add on create or remove on delete, while keeping full
+  rust-analyzer, clippy, types, and completion in every playbook file.
+
+  **Mechanism.** The workspace package has one bin target, `src/main.rs`,
+  written once by `rustible init` and never edited, and a `build.rs`, also
+  generated once. The build script walks `playbooks/**/*.rs`, parses each
+  file with `syn` (milliseconds per file; immune to the attribute appearing in
+  a comment or string), and for every file containing a function marked
+  `#[rustible::playbook(..)]` writes into `OUT_DIR` a
+  `#[path = "<abs path>"] mod <name>;` line plus a registry entry
+  `("cadu/x", entry)`. `src/main.rs` is essentially
+  `include!(concat!(env!("OUT_DIR"), "/playbooks.rs"))` plus the SDK's
+  dispatcher, which picks the entry by name and speaks the protocol. Files
+  without the marker are not playbooks: they are ignored unless a playbook
+  pulls them in with `mod helpers;` or `#[path]`, so helper code may live
+  next to playbooks. Two marked functions in one file is a build error naming
+  the file. The same scan backs `rustible playbook list`.
+
+  Two Cargo behaviours make this work, both verified in a scratch project on
+  2026-09-07: `cargo:rerun-if-changed=playbooks` on a *directory* makes Cargo
+  rescan the whole tree, so new and deleted files are picked up on the next
+  build with no edits anywhere; and rust-analyzer runs build scripts and
+  resolves `OUT_DIR` includes, so `#[path]` modules get full IDE support.
+
+  **Isolation.** The CLI sets `RUSTIBLE_PLAYBOOK=cadu/x` when building for a
+  run, and the build script (with `rerun-if-env-changed`) includes only that
+  playbook. Verified: a playbook with a type error elsewhere in the tree does
+  not affect `rustible playbook run` of another one. The shipped binary
+  contains exactly one playbook, stays small, and is hashed per playbook for
+  the target-side cache. With the variable unset, as in the IDE, `cargo
+  check`, and CI, every playbook is included, so every broken playbook is
+  visible while editing and fails CI, which is the desired behaviour, not a
+  wart. Switching playbooks between runs re-runs the build script and
+  recompiles the bin crate, the same cost as editing a playbook.
+
+  **Consequences for playbook files.** A playbook file is a module, not a
+  crate root: `use rustible::prelude::*;` works, `#[rustible::vars] struct
+  Vars` is module-local so every playbook may have its own, and the
+  `#[rustible::playbook]` attribute on `fn main` registers an entry rather than
+  defining the process entry point. `mod helpers;` inside `playbooks/cadu/x.rs`
+  resolves to `playbooks/cadu/x/helpers.rs`. Code shared across playbooks
+  lives in the package's `src/lib.rs`. A playbook's name is its path under
+  `playbooks/` without the extension (`cadu/x`); generated module identifiers
+  carry `#[allow(non_snake_case)]`. An unmarked file nobody references is
+  silently ignored (rust-analyzer greys it out); `rustible playbook list` may
+  warn about such orphans.
+
+  **Alternatives considered and rejected:**
+  - Syncing `[[bin]]` entries (the previous plan): a maintenance chore on every
+    create and delete, the opposite of "files simply get used".
+  - `src/bin/` auto-discovery: no manifest edits and full IDE, but the folder
+    must be `src/bin/` and discovery is one level deep, so no `cadu/x.rs`.
+  - Workspace member glob with a folder and a five-line `Cargo.toml` per
+    playbook: full isolation, but the manifest-per-playbook chore returns and
+    adding a collection means editing every playbook's manifest.
+  - Group packages (`playbooks/cadu/` as a package with `src/bin/` inside):
+    isolation even for a bare `cargo build`, but `src/bin/` in the middle of
+    every path and one manifest per group.
+  - A shadow package generated per run: same run isolation as the build
+    script, but the IDE still needs the build-script modules, so two
+    mechanisms and a double compile.
+  - Persistent shadow packages as workspace members: total isolation, but a
+    missing regeneration (fresh clone, manual delete) breaks the whole
+    workspace until `rustible playbook sync` runs.
+  - `cargo script` single-file packages: closest to "just a file", but still
+    nightly-only (`requires -Zscript` on cargo 1.97.1), one dependency cache
+    per playbook, partial rust-analyzer support.
 - **Inventory is data**, in `hosts.kdl` next to `rustible.toml`. See section 10.
   Dynamic inventories become a trait later.
 - **Crates (DECIDED 2026-09-07):**
@@ -1117,7 +1184,8 @@ everything else here failing loudly before a run.
 ### 10.4 Workspace
 
 - A **rustible workspace** is a Cargo package whose root also contains
-  `rustible.toml`. (`rustible.toml`, not `rustible.cfg`: same format as
+  `rustible.toml`, with the generated `src/main.rs` and `build.rs` from
+  section 9 and a `src/lib.rs` for code shared across playbooks. (`rustible.toml`, not `rustible.cfg`: same format as
   everything else, sits next to `Cargo.toml`.)
 - `rustible.toml` (TOML; flat config) points at the inventory file (default
   `hosts.kdl`) and holds workspace-level settings defined later.
@@ -1452,7 +1520,7 @@ The verdict column says whether deciding late has a cost.
 |---|---|---|---|
 | 1 | ~~Crate naming~~ | decided 2026-09-07 | `rustible` is the facade lib, `rustible-cli` the CLI with binary `rustible` (section 9). |
 | 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
-| 3 | **Playbook-to-bin mapping details**: how `rustible` syncs `[[bin]]` entries for `playbooks/**/*.rs`, name collisions across folders (section 9) | M3 | Mostly decided; the code will settle the rest. |
+| 3 | ~~Playbook-to-bin mapping~~ | decided 2026-09-07 | Build-script discovery of files marked `#[rustible::playbook]`, one playbook per shipped binary via `RUSTIBLE_PLAYBOOK` (section 9). |
 | 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
 | 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`; more variants for package sets, permissions, services | M6 | Additive; ops construct variants, nobody matches exhaustively. |
 | 6 | **Output rendering**: per-host buffering vs live interleaving, verbosity levels, machine-readable mode | M3, then iterate | Orchestrator UX, not API. |
