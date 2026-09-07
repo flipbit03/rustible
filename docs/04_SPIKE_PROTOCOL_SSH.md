@@ -80,7 +80,8 @@ profile: it has no regex or similar, so smaller than the sshd spike.
    (attribute args are tokens; `syn` can accept keywords with
    `Ident::parse_any`), but internal code must use another name. Options for
    the attribute: keep `become` for Ansible familiarity and handle it in the
-   macro, or rename to `sudo`/`as_root`. **OPEN.**
+   macro, or rename to `sudo`/`as_root`. **Decided: keep `become`.** Users
+   never need `r#` in the attribute; internal code uses `r#become`.
 2. **Cargo builds all triples in one invocation.** Use it; do not spawn one
    cargo per triple.
 3. **The binary's own name is the hash-suffixed file name**, so `Hello`

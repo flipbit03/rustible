@@ -749,9 +749,10 @@ In the suggested order of attack:
 3. **Protocol serialization format**: JSON with a u32 length prefix, in use
    since spike 2; revisit only if frames get large. Check-mode semantics are
    decided in section 15.
-3b. **The `become` attribute name**: `become` is a reserved Rust keyword
-   (spike 2, finding 1). Keep it in the attribute via `Ident::parse_any`, or
-   rename to `sudo`/`as_root`. OPEN.
+3b. ~~The `become` attribute name~~: decided 2026-09-06. `become` is a
+   reserved Rust keyword, but attribute arguments are raw token trees, so
+   users write `become = true` unchanged; internal code uses the raw
+   identifier `r#become`.
 4. **`rustible init` layout in detail**: exact files, config file (if any),
    `.gitignore`, how the `[[bin]]` sync works, how the CLI finds the project root.
 5. ~~Facts~~: decided in section 16.
