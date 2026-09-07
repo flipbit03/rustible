@@ -414,7 +414,8 @@ coordination feature, not a backend concern.
 ```rust
 //! playbooks/cadu/ensure_rustible_user.rs
 use rustible::prelude::*;
-use rustible_std::{file, ssh, user};
+use rustible_std::ssh::authorized_keys;
+use rustible_std::{file, user};
 
 #[rustible::playbook(hosts = "local", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
@@ -437,7 +438,7 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 
     let authorized = ctx.step(
         "Install authorized keys",
-        ssh::AuthorizedKeys::for_user(&account).keys(keys).exclusive(true),
+        authorized_keys::Present::for_user(&account).keys(keys).exclusive(true),
     )?;
 
     // No Ansible "handlers": reacting to change is just an `if`.
@@ -557,7 +558,7 @@ file mutations during `check` (section 7.3).
 
 **Policies learned in spike 3, now rules for the stdlib:**
 - **Predict by default.** Both ops in the spike already computed their
-  post-apply output while planning, so `Plan::change_predicting(diff, output)`
+  post-apply output while planning, so `Plan::change_predicting(diff, output)` 
   cost nothing. Every stdlib op predicts unless it genuinely cannot (uid
   allocation, versions apt has not resolved yet). `apply` may reuse
   `change.predicted` for what it cannot cheaply recompute.
@@ -584,7 +585,9 @@ translation rule for the standard library.
 | `systemd: state=stopped`   | `systemd::Stopped`                         |
 | `systemd: enabled=yes`     | `systemd::Enabled`                         |
 | `systemd: state=restarted` | `systemd::Restart` (verb: an action)       |
-| `getent`/`register`        | `user::Lookup` (read-only op)              |
+| `authorized_key: state=present` | `ssh::authorized_keys::Present`        |
+| `authorized_key: state=absent`  | `ssh::authorized_keys::Absent`         |
+| `getent`/`register`        | `user::Existing` (read-only op, 13.1)      |
 
 **Alternative considered and rejected:** one struct per resource with a state
 parameter, e.g. `apt::Package::new(..).state(State::Present)`. Rejected because:
@@ -618,7 +621,7 @@ so the orchestrator can mark those steps in the output. This preserves the
 
 ### 6.5 Lookups
 
-Read-only lookups are ops too (`user::Lookup::by_name("rustible")`). They run
+Read-only lookups are ops too (`user::Existing::named("rustible")`, see 13.1). They run
 through `ctx.step`, appear in the step list, are timed, and can never report
 `changed`. They fail the run if the thing is missing. In Ansible this is `getent`
 plus `register` plus `set_fact`; here it is one typed call.
@@ -642,10 +645,10 @@ fn main(ctx: &mut Ctx) -> Result<()> {
     let revoked = ["ssh-ed25519 AAAAC3...OLD1 cadu@laptop-2023", "ssh-ed25519 AAAAC3...OLD2 ci@jenkins"];
     let groups = ["docker", "systemd-journal", "adm"];
 
-    let account = ctx.step("Look up rustible user", user::Lookup::by_name("rustible"))?;
+    let account = ctx.step("Look up rustible user", user::Existing::named("rustible"))?;
 
     let keys = ctx.step("Revoke compromised keys",
-        ssh::AuthorizedKeys::for_user(&account).remove(revoked))?;
+        authorized_keys::Absent::for_user(&account).keys(revoked))?;
     ctx.log(format!("removed {} key(s)", keys.removed.len()));
 
     for name in groups {
@@ -656,9 +659,12 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
-Note `AuthorizedKeys::for_user(x).remove(keys)` versus `.keys(keys).exclusive(true)`:
-one op type covers "ensure these", "ensure exactly these", and "ensure not these",
-because those are options on one resource rather than different states.
+Note the three shapes on one resource, following rule 6.3: `authorized_keys::Present`
+("ensure these"), `authorized_keys::Present ... .exclusive(true)` ("ensure exactly
+these": still the present state, with the option of removing strangers, and the
+output gains a `removed` list), and `authorized_keys::Absent` ("ensure not these").
+An earlier draft had `.remove(keys)` as a method on one type, which was the
+state-as-parameter shape 6.3 rejects; corrected 2026-09-07 during vetting.
 
 ### 6.7 Granularity rule (DECIDED)
 
