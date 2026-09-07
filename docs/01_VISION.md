@@ -896,11 +896,22 @@ Networking and anything async are also off `System` for now.
   next to playbooks. Two marked functions in one file is a build error naming
   the file. The same scan backs `rustible playbook list`.
 
-  Two Cargo behaviours make this work, both verified in a scratch project on
-  2026-09-07: `cargo:rerun-if-changed=playbooks` on a *directory* makes Cargo
-  rescan the whole tree, so new and deleted files are picked up on the next
-  build with no edits anywhere; and rust-analyzer runs build scripts and
-  resolves `OUT_DIR` includes, so `#[path]` modules get full IDE support.
+  Two Cargo behaviours make this work, both verified in scratch projects on
+  2026-09-07 (the second time as a 20-hypothesis spike with positive and
+  negative cases, `docs/05_SPIKE_PLAYBOOK_DISCOVERY.md`): `cargo:rerun-if-changed=playbooks`
+  on a *directory* makes Cargo rescan the whole tree, so new, renamed, and
+  deleted files, including new subdirectories, are picked up on the next build
+  with no edits anywhere; and rust-analyzer runs build scripts and proc macros
+  by default and resolves `OUT_DIR` includes, so `#[path]` modules get full
+  IDE support: they are linked as members of the crate, errors are reported at
+  the playbook file's own path and line, clippy lints and `#[cfg(test)]` tests
+  inside playbook files work, and the prelude resolves. **One dependency to
+  know:** rust-analyzer re-runs the build script only through its check-on-save
+  (`cargo check`), which is on by default. With it on, a newly created playbook
+  is linked within seconds of opening it; with it off, the file shows as
+  unlinked until "Rebuild proc macros and build scripts" or any terminal cargo
+  invocation. `rustible playbook create` prints this hint. Scan cost is about
+  10 ms for 50 playbooks; a no-op build does not re-run the script.
 
   **Isolation.** The CLI sets `RUSTIBLE_PLAYBOOK=cadu/x` when building for a
   run, and the build script (with `rerun-if-env-changed`) includes only that
@@ -917,13 +928,23 @@ Networking and anything async are also off `System` for now.
   crate root: `use rustible::prelude::*;` works, `#[rustible::vars] struct
   Vars` is module-local so every playbook may have its own, and the
   `#[rustible::playbook]` attribute on `fn main` registers an entry rather than
-  defining the process entry point. `mod helpers;` inside `playbooks/cadu/x.rs`
-  resolves to `playbooks/cadu/x/helpers.rs`. Code shared across playbooks
-  lives in the package's `src/lib.rs`. A playbook's name is its path under
-  `playbooks/` without the extension (`cadu/x`); generated module identifiers
-  carry `#[allow(non_snake_case)]`. An unmarked file nobody references is
-  silently ignored (rust-analyzer greys it out); `rustible playbook list` may
-  warn about such orphans.
+  defining the process entry point. **Helper modules are siblings:** because
+  `#[path]`-loaded files get `mod.rs` semantics, `mod helpers;` inside
+  `playbooks/cadu/x.rs` resolves to `playbooks/cadu/helpers.rs` (verified; an
+  earlier draft of this paragraph said `cadu/x/helpers.rs`, which is wrong).
+  A playbook that wants a subfolder layout writes
+  `#[path = "x/helpers.rs"] mod helpers;`. Two playbooks in one directory that
+  both say `mod helpers;` each compile the same file as a private module,
+  which works. Code shared across playbooks lives in the package's
+  `src/lib.rs` and is reached by the **package name**, `myinfra::helper()`,
+  not `crate::helper()`, because playbooks are modules of the bin crate
+  (verified both ways). A playbook's name is its path under `playbooks/`
+  without the extension (`cadu/x`); generated module identifiers carry the
+  needed `#[allow]`s and leak only into test names and backtraces. The scanner
+  matches the attribute path textually (`rustible::playbook` or bare
+  `playbook`), which is acceptable for a marker. An unmarked file nobody
+  references is silently ignored (rust-analyzer greys it out); `rustible
+  playbook list` may warn about such orphans.
 
   **Alternatives considered and rejected:**
   - Syncing `[[bin]]` entries (the previous plan): a maintenance chore on every
