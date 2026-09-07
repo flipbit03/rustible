@@ -767,7 +767,7 @@ In the suggested order of attack:
 6. **Diff representation** and rendering.
 7. ~~Privilege escalation~~: decided in section 14.3 (helper-process backend).
    Remaining: `doas` specifics.
-8. **Error model**: error types, what a failed step reports, retries.
+8. ~~**Error model**~~: decided in section 17.
 9. **Output rendering**: the terminal UI, verbosity levels, machine-readable
    output.
 10. **Binary caching on targets**: cache dir location, cleanup.
@@ -1227,3 +1227,51 @@ A small minority of **read-only ops** exists for *observe without changing*:
 and "this user must already exist, fail otherwise" (`user::Existing`, where
 `user::Present` would create it). They appear as named steps with typed
 output, never report `changed`, and most resources do not need one.
+
+## 17. Error model (DECIDED 2026-09-06)
+
+**Semantics** are Ansible's: a failed step fails that host and the run
+continues on the other hosts. In code that is `?` on `ctx.step`. Ignoring is
+`let _ = ctx.step(..)` or `.ok()`; rescue is `if let Err(e) = ctx.step(..)`;
+retry is a loop. None of these need to know the error's kind, and no playbook
+or op is expected to match on errors.
+
+**Type.** An opaque, `anyhow`-style error with a context chain, wrapping the
+`anyhow` crate. `rustible_sdk::Result<T>` is `Result<T, rustible_sdk::Error>`
+where `Error` converts from any `std::error::Error` via `?`.
+
+Why not the structured enum from spike 3:
+- The drawback is on the *producer* side, not the consumer side. `?` on a
+  foreign error (`serde_yaml::Error`, `regex::Error`, anything from a crate
+  we do not own) does not compile against an enum unless we wrote a `From`
+  for it, so op and playbook authors end up writing `.map_err(..)` on every
+  line. A catch-all variant plus a blanket `From<E: std::error::Error>` is
+  rejected by coherence when the enum itself implements `std::error::Error`;
+  `anyhow`'s design (its `Error` deliberately does not implement that trait)
+  is the one shape that makes the blanket conversion legal.
+- No context chain: a deep failure renders flat, like Ansible's `msg`.
+- The enum would need `#[non_exhaustive]`, which removes exhaustive matching,
+  its only advantage, and nobody was going to match anyway.
+
+**Context is optional.** Bare `?` is the norm. The SDK adds the two most
+useful layers automatically: `ctx.step` wraps any failure with the step name,
+and primitives carry their own detail (`sys.cmd().run()` fails with argv, exit
+code, and stderr; file primitives with the path). `.context("installing
+{pkg}")` is for ops or playbooks that do several similar things where the raw
+error would not say which.
+
+**Typed values inside the chain.** The SDK's own signals remain concrete
+types that the orchestrator can `downcast_ref` for rendering:
+`MutationDuringCheck { path }`, `OutputUnavailable { step }`,
+`CmdFailed { argv, status, stderr }`. Playbooks never need them.
+
+**On the wire.** `Failed { step, error }` carries the rendered chain as text,
+plus the structured fields of a `CmdFailed` when present, so `-v` can show
+the command and its stderr separately.
+
+Rendered example:
+
+```
+[web1]  FAILED at `nginx present`: installing nginx: `apt-get install -y nginx` exited 100
+        E: Unable to locate package nginx
+```
