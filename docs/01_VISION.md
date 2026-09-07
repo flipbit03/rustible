@@ -1037,7 +1037,8 @@ impl Ctx {
     pub fn skip(&mut self, name, reason);     // record a deliberately-not-run step
     pub fn section<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T>; // output grouping
     pub fn as_user(&self, name: &str) -> Ctx; // same channel/host, different identity
-    pub fn as_root(&self) -> Ctx;             // sugar for as_user("root")
+    pub fn as_root(&self) -> Ctx;             // literally as_user("root"), never follows the inventory
+    pub fn as_escalated(&self) -> Ctx;        // as_user(host.escalate_user): the inventory's privileged account
     pub fn fetch(&mut self, remote, local_dest) -> Result<()>;  // reverse transfer
 
     // ---- tier 3: reserved, not MVP ----
@@ -1105,7 +1106,16 @@ Escalation is a property of how a step runs, not of the op, so it lives on
 `Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
 steps, or `ctx.as_user("postgres").step(..)` to step down. Playbook-level
 `escalate = true` remains for the common case and means the binary is launched
-under sudo (default identity root). Output marks steps whose identity differs
+via the inventory's escalation method as `escalate_user` (default root).
+
+**Three identity methods (DECIDED 2026-09-06):**
+- `as_user(name)`: explicit user.
+- `as_root()`: literally `as_user("root")`. It never follows the inventory; a
+  method named `as_root` that might run as `admin` would be hidden indirection.
+- `as_escalated()`: `as_user(host.escalate_user)`, i.e. the privileged account
+  the inventory chose for this host (root by default, or a shared admin
+  account where direct root is not allowed). This is what `escalate = true`
+  uses at launch, exposed per step. Output marks steps whose identity differs
 from the binary's own (`as root`, `as postgres`).
 
 **Mechanism.** A running process cannot change identity per call, and
