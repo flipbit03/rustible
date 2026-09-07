@@ -746,8 +746,12 @@ In the suggested order of attack:
    an error naming both groups and the host (fix: set it on the host or a common
    parent).
 2. ~~`Ctx` beyond `step`~~: decided in section 14.
-3. **Protocol serialization format** (postcard vs msgpack vs JSON) and framing
-   details. Check-mode semantics are decided in section 15.
+3. **Protocol serialization format**: JSON with a u32 length prefix, in use
+   since spike 2; revisit only if frames get large. Check-mode semantics are
+   decided in section 15.
+3b. **The `become` attribute name**: `become` is a reserved Rust keyword
+   (spike 2, finding 1). Keep it in the attribute via `Ident::parse_any`, or
+   rename to `sudo`/`as_root`. OPEN.
 4. **`rustible init` layout in detail**: exact files, config file (if any),
    `.gitignore`, how the `[[bin]]` sync works, how the CLI finds the project root.
 5. ~~Facts~~: decided in section 16.
@@ -766,9 +770,11 @@ In the suggested order of attack:
    The spike-3 playbook cross-linked to aarch64 musl with stock rustup plus
    `rust-lld`, ran on the ARM VM with identical behaviour. Cold SSH connection
    (20 s) dominates upload cost, not binary size (0.4 s warm).
-2. **Protocol over SSH**: framed bidirectional exchange over the `openssh` crate,
-   spawn an uploaded binary, exchange messages, measure round trip. Also pick the
-   serialization format.
+2. ~~**Protocol over SSH**~~: **done 2026-09-06**, see `docs/04_SPIKE_PROTOCOL_SSH.md`.
+   Orchestrator crate with local and SSH transports, hash-cached upload,
+   `Start`/`Hello`/event frames as length-prefixed JSON, `apt::Present` op,
+   two hosts on two architectures in one command, 345 ms warm. JSON framing
+   is kept for now (finding 7).
 3. ~~**SDK core**~~: **done 2026-09-06**, see `docs/02_SPIKE_SDK_CORE.md`. The
    sketches hold; `apply` takes `Change<T>`; prediction is nearly free.
 

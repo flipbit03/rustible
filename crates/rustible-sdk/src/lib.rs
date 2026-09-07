@@ -7,6 +7,7 @@ pub mod error;
 pub mod event;
 pub mod facts;
 pub mod op;
+pub mod protocol;
 pub mod runtime;
 pub mod system;
 

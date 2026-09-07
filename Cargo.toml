@@ -4,6 +4,7 @@ members = [
     "crates/rustible-sdk",
     "crates/rustible-std",
     "crates/spike-playbook",
+    "crates/rustible",
 ]
 
 [workspace.package]

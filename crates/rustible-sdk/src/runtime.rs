@@ -1,30 +1,47 @@
 //! Stand-in for what the `#[rustible::playbook]` macro will generate: parse the
-//! run options, gather facts, build the context, run `main`, report, exit.
+//! run options (from flags locally, or from the `Start` frame when driven by
+//! the orchestrator), gather facts, build the context, run `main`, report, exit.
 
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ctx::{Ctx, HostInfo};
 use crate::error::Result;
 use crate::event::{Event, EventSink, JsonLines, Pretty};
+use crate::protocol::{self, Down, FrameSink, Up};
 use crate::system::System;
 
 pub struct RunOptions {
     pub check_mode: bool,
     pub verbosity: u8,
-    /// Emit JSON lines instead of the pretty renderer.
+    /// Emit JSON lines instead of the pretty renderer (local mode only).
     pub json: bool,
-    pub host_name: String,
+    /// Driven by an orchestrator: read `Start` from stdin, write frames to stdout.
+    pub remote: bool,
+    pub host: HostInfo,
+    pub playbook_name: String,
 }
 
 impl RunOptions {
-    /// Minimal flag parsing for the spike: --check, -v/-vv, --json.
+    /// Minimal flag parsing for the spike: --check, -v/-vv, --json, --remote.
     pub fn from_args() -> Self {
         let mut o = RunOptions {
             check_mode: false,
             verbosity: 0,
             json: false,
-            host_name: "local".into(),
+            remote: false,
+            host: HostInfo {
+                name: "local".into(),
+                groups: vec![],
+            },
+            playbook_name: std::env::args()
+                .next()
+                .and_then(|a| {
+                    std::path::Path::new(&a)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default(),
         };
         for a in std::env::args().skip(1) {
             match a.as_str() {
@@ -32,6 +49,7 @@ impl RunOptions {
                 "-v" => o.verbosity = 1,
                 "-vv" => o.verbosity = 2,
                 "--json" => o.json = true,
+                "--remote" => o.remote = true,
                 _ => {}
             }
         }
@@ -39,13 +57,48 @@ impl RunOptions {
     }
 }
 
-pub fn run(opts: RunOptions, main: impl FnOnce(&mut Ctx) -> Result<()>) -> ExitCode {
-    let sink: Arc<dyn EventSink> = if opts.json {
-        Arc::new(JsonLines(std::sync::Mutex::new(std::io::stdout())))
+pub fn run(mut opts: RunOptions, main: impl FnOnce(&mut Ctx) -> Result<()>) -> ExitCode {
+    let sink: Arc<dyn EventSink> = if opts.remote {
+        // Wait for the orchestrator's Start frame. Everything about this run
+        // comes from it, never from the binary or the target's disk.
+        let start: Option<Down> = match protocol::read_frame(&mut std::io::stdin().lock()) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("rustible: bad Start frame: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        match start {
+            Some(Down::Start {
+                host,
+                check_mode,
+                verbosity,
+                ..
+            }) => {
+                opts.host = host;
+                opts.check_mode = check_mode;
+                opts.verbosity = verbosity;
+            }
+            other => {
+                eprintln!("rustible: expected Start frame, got {other:?}");
+                return ExitCode::from(3);
+            }
+        }
+        let sink = Arc::new(FrameSink(Mutex::new(std::io::stdout())));
+        let _ = protocol::write_frame(
+            &mut *sink.0.lock().unwrap(),
+            &Up::Hello {
+                protocol: protocol::PROTOCOL_VERSION,
+                playbook: opts.playbook_name.clone(),
+            },
+        );
+        sink
+    } else if opts.json {
+        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
     } else {
         Arc::new(Pretty::new(
             std::io::stdout(),
-            opts.host_name.clone(),
+            opts.host.name.clone(),
             opts.verbosity,
         ))
     };
@@ -53,13 +106,7 @@ pub fn run(opts: RunOptions, main: impl FnOnce(&mut Ctx) -> Result<()>) -> ExitC
     let sys = System::local(opts.check_mode, sink.clone());
     sink.emit(Event::Facts(sys.facts().clone()));
 
-    let mut ctx = Ctx::new(
-        sys,
-        HostInfo {
-            name: opts.host_name,
-            groups: vec![],
-        },
-    );
+    let mut ctx = Ctx::new(sys, opts.host);
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| main(&mut ctx)));
     let failed = match outcome {
