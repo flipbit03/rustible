@@ -85,7 +85,7 @@ What Ansible gets right and Rustible keeps:
 
 ## 2. The vision in one paragraph
 
-A Rustible project is a Cargo package. Playbooks are ordinary Rust files. Operations
+A Rustible project (or a "Rustible workspace") is a Cargo package. Playbooks are ordinary Rust files. Operations
 are typed structs with builders and typed outputs, so the compiler catches
 parameter typos, wrong types, and invalid chaining at build time, and the editor
 autocompletes both inputs and outputs. When you run a playbook, Rustible probes the
@@ -108,12 +108,12 @@ file, a `playbooks/` folder (with `.gitkeep`), and any config files that turn ou
 be necessary.
 
 ```
-$ rustible create playbook ./playbooks/cadu/ssh_enable_root_user.rs
+$ rustible playbook create ./playbooks/cadu/ssh_enable_root_user.rs
 ```
 Scaffolds a playbook file with a `main` function and the metadata attribute.
 
 ```
-$ rustible run playbook ./playbooks/cadu/ssh_enable_root_user.rs [--check] [-v|-vv] [--var key=value]
+$ rustible playbook run ./playbooks/cadu/ssh_enable_root_user.rs [--check] [-v|-vv] [--var key=value]
 ```
 Reads the playbook's metadata (target hosts), validates the inventory vars
 against the playbook's typed struct, probes the hosts, compiles per
@@ -125,9 +125,10 @@ $ rustible inventory show web2      # resolved parameters and vars, with their s
 $ rustible inventory check          # validate hosts.kdl, and vars against every playbook
 ```
 
-**OPEN (section 16): verb order.** Both `rustible run playbook <file>` and
-`rustible playbook run <file>` have been used in discussion. Decide at M3 when
-the CLI is built; this document uses the first form until then.
+**Verb order (decided 2026-09-07): noun first, then verb.** `rustible playbook
+run`, `rustible playbook create`, `rustible inventory show`, `rustible
+inventory check`. The subject comes first, like `gh pr create`; the earlier
+`rustible run playbook` form is not used.
 
 ```
 $ cargo add rustible-docker
@@ -207,7 +208,7 @@ Consequences accepted with remote-brain:
 
 ### 5.2 Run pipeline (settled by spikes 1 and 2)
 
-`rustible run playbook <file>` does, in order:
+`rustible playbook run <file>` does, in order:
 
 1. **Locate the workspace** by walking up from the current directory to the
    nearest `rustible.toml` (section 10.4), load `hosts.kdl`.
@@ -864,7 +865,7 @@ Networking and anything async are also off `System` for now.
 - **A Rustible project is one Cargo package.** `rustible init` creates it.
 - **Playbooks are `.rs` files under `playbooks/`**, each mapped to a `[[bin]]`
   target. `rustible` keeps the `[[bin]]` entries in sync (autobins off), so
-  `rustible run playbook ./playbooks/x.rs` becomes `cargo build --bin x --target
+  `rustible playbook run ./playbooks/x.rs` becomes `cargo build --bin x --target
   <triple>` under the hood. (Alternatives noted: `src/bin/` auto-discovery, a
   `build.rs`, or a generated shadow workspace. Syncing `[[bin]]` is the simplest.)
 - **Inventory is data**, in `hosts.kdl` next to `rustible.toml`. See section 10.
@@ -1439,7 +1440,7 @@ The verdict column says whether deciding late has a cost.
 | # | Question | Decide by | Why it can wait (or cannot) |
 |---|---|---|---|
 | 1 | **Crate naming**: `rustible` as facade lib + `rustible-cli`, or the CLI keeps the name (section 9) | M1 | The macro's re-export path depends on it. Recommended: facade. |
-| 2 | **CLI verb order**: `rustible run playbook` vs `rustible playbook run` (section 3) | M3 | Cosmetic, but must be one thing before the CLI ships. |
+| 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
 | 3 | **Playbook-to-bin mapping details**: how `rustible` syncs `[[bin]]` entries for `playbooks/**/*.rs`, name collisions across folders (section 9) | M3 | Mostly decided; the code will settle the rest. |
 | 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
 | 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`; more variants for package sets, permissions, services | M6 | Additive; ops construct variants, nobody matches exhaustively. |
