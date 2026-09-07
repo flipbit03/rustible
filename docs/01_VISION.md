@@ -267,17 +267,21 @@ took 4.5 s).
 
 - **Linux only, `*-unknown-linux-musl` targets only**, for the MVP. Static musl
   binaries run on any Linux regardless of libc version.
-- **Op crates must be pure Rust by convention.** Pure-Rust crates targeting musl
-  link with the bundled `rust-lld` after `rustup target add`, with
-  `linker = "rust-lld"` and `-C link-self-contained=yes` set per target in
+- **Rustible is pure Rust, all the way down the dependency tree (DECIDED
+  2026-09-07).** Playbooks, the SDK, the stdlib, and every collection are Rust
+  crates whose transitive dependencies contain no C code. Pure-Rust crates
+  targeting musl link with the bundled `rust-lld` after `rustup target add`,
+  with `linker = "rust-lld"` and `-C link-self-contained=yes` set per target in
   `.cargo/config.toml` (validated in spike 1, `docs/03_SPIKE_CROSS_COMPILE.md`:
-  3.5 s link, no zig, no distro toolchain). Any C dependency (openssl, libgit2,
-  sqlite) turns cross-compilation into "install a C toolchain per triple". Use
-  `rustls`, `rustix`, and pure-Rust alternatives.
+  3.5 s link, no zig, no distro toolchain). A crate that bundles C under the
+  hood (`openssl-sys`, `libgit2-sys`, `libsqlite3-sys`) is **unsupported**: the
+  link fails, and the fix is the pure-Rust alternative (`rustls`, `gix`,
+  `rustix`). There is no escape hatch and no C cross-toolchain story, on
+  purpose: Ansible never had C modules either, and one rule is simpler than a
+  toolchain matrix. (`cargo-zigbuild` was considered as an escape hatch and
+  dropped.)
 - **Shipped binaries use the `dist` profile** (strip, fat LTO, `opt-level = "z"`):
   1.4 MB for the spike playbook on aarch64 versus 3.1 MB for plain release.
-- **`cargo-zigbuild`** (zig as a universal C cross-linker with bundled sysroots) is
-  the escape hatch when a C dependency is unavoidable.
 - macOS and Windows targets are deferred. They have their own toolchain and SDK
   requirements.
 
@@ -895,7 +899,7 @@ Networking and anything async are also off `System` for now.
   Decide at M1, since the macro's re-export path depends on it.
 - **A playbook binary has four modes** (section 5.5): plain local run,
   `--remote`, `--describe`, `--helper`. The macro generates all of them.
-- Op crates: pure Rust, no C dependencies (section 5.3).
+- Every crate in the tree is pure Rust, transitively (section 5.3).
 
 ## 10. Inventory, typed vars, and the workspace (DECIDED 2026-09-05/06)
 
