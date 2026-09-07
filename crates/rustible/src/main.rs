@@ -30,10 +30,11 @@ struct Cli {
     /// Hosts: `local` or `user@addr`. Repeatable.
     #[arg(long = "host", required = true)]
     hosts: Vec<String>,
-    /// Run the binary under sudo on the target. `become` is a reserved
-    /// keyword in Rust, so it is a raw identifier here.
+    /// Run the binary under sudo on the target. This is Ansible's `become`;
+    /// named `escalate` because `become` is a reserved keyword in Rust and
+    /// `r#become` everywhere is ugly.
     #[arg(long)]
-    r#become: bool,
+    escalate: bool,
     #[arg(long)]
     check: bool,
     #[arg(short, action = clap::ArgAction::Count)]
@@ -109,7 +110,7 @@ async fn main() -> Result<()> {
     for (name, tr, triple) in hosts {
         let artifacts = artifacts.clone();
         let bin = cli.bin.clone();
-        let (r#become, check, verbosity) = (cli.r#become, cli.check, cli.verbose);
+        let (escalate, check, verbosity) = (cli.escalate, cli.check, cli.verbose);
         runs.push(tokio::spawn(async move {
             let (bytes, hash) = &artifacts[&triple];
             let remote_path = format!(".cache/rustible/bin/{bin}-{hash}");
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
             );
 
             let mut argv = vec![];
-            if r#become {
+            if escalate {
                 argv.extend(["sudo".to_string(), "-n".to_string()]);
             }
             argv.push(format!("$HOME/{remote_path}"));

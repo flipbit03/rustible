@@ -154,7 +154,7 @@ Consequences accepted with remote-brain:
 
 1. **Read metadata** by doing a host-native debug build of the playbook and
    running it with `--describe`, which the `#[playbook]` macro generates. This
-   yields the target hosts, `become`, and a JSON schema of the typed vars struct
+   yields the target hosts, `escalate`, and a JSON schema of the typed vars struct
    (section 13.3). **Accepted trade-off (final, 2026-09-06):** the pre-check costs
    a cold build the first time (about a minute) and seconds afterwards. In
    exchange the schema comes from the real compiled types, so there is no
@@ -295,7 +295,7 @@ coordination feature, not a backend concern.
 use rustible::prelude::*;
 use rustible_std::{file, ssh, user};
 
-#[rustible::playbook(hosts = "local", become = true)]
+#[rustible::playbook(hosts = "local", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let keys = [
         "ssh-ed25519 AAAAC3...XYZ cadu@x86",
@@ -340,10 +340,11 @@ local    ok=3  changed=2  skipped=0  failed=0     1.2s
 ```
 
 - The `#[rustible::playbook(...)]` attribute carries metadata: target hosts (a host
-  or group from the inventory), `become`, and later things like `serial`. The
+  or group from the inventory), `escalate`, and later things like `serial`. The
   macro wraps `main` with the runtime that speaks the protocol.
-- `become = true` means the binary is launched under `sudo` on the target. Per-op
-  escalation is a later addition (see `System::as_user` in section 7).
+- `escalate = true` (Ansible's `become`; see open item 3b for the name) means
+  the binary is launched under `sudo` on the target. Per-step escalation is
+  `ctx.as_root()` (section 14.3).
 - `?` on a step means "this host's run fails here". Ansible's `ignore_errors` is
   `.ok()` or a `match`; `failed_when` is an `if` after the step.
 - Loops, conditionals, helper functions, and third-party crates are all just Rust.
@@ -488,7 +489,7 @@ plus `register` plus `set_fact`; here it is one typed call.
 Second example, showing removal and loops:
 
 ```rust
-#[rustible::playbook(hosts = "local", become = true)]
+#[rustible::playbook(hosts = "local", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let revoked = ["ssh-ed25519 AAAAC3...OLD1 cadu@laptop-2023", "ssh-ed25519 AAAAC3...OLD2 ci@jenkins"];
     let groups = ["docker", "systemd-journal", "adm"];
@@ -737,6 +738,9 @@ Networking and anything async are also off `System` for now.
 - **System**: the op's handle to the machine, over a `Backend`.
 - **Facts**: typed data about the target gathered at startup.
 - **Collection**: a crate of ops built on `rustible-sdk`.
+- **Escalate**: Ansible's `become`. Running the binary or a step as another
+  user, root by default. Named `escalate` because `become` is a reserved Rust
+  keyword (open item 3b).
 
 ## 11. What is not yet defined (OPEN)
 
@@ -749,10 +753,14 @@ In the suggested order of attack:
 3. **Protocol serialization format**: JSON with a u32 length prefix, in use
    since spike 2; revisit only if frames get large. Check-mode semantics are
    decided in section 15.
-3b. ~~The `become` attribute name~~: decided 2026-09-06. `become` is a
-   reserved Rust keyword, but attribute arguments are raw token trees, so
-   users write `become = true` unchanged; internal code uses the raw
-   identifier `r#become`.
+3b. ~~The `become` attribute name~~: decided 2026-09-06, revised the same
+   day. **The word `become` is not used anywhere in Rustible; it is
+   `escalate` everywhere**: the playbook attribute (`escalate = true`), the
+   CLI flag (`--escalate`), the inventory parameters (`escalate="sudo"`,
+   `escalate_user`), and all code. Reason: `become` is a reserved Rust
+   keyword; `r#become` all over the code is ugly, and mapping two names is
+   worse. Where `escalate` is defined, a comment says it is Ansible's
+   `become`.
 4. **`rustible init` layout in detail**: exact files, config file (if any),
    `.gitignore`, how the `[[bin]]` sync works, how the CLI finds the project root.
 5. ~~Facts~~: decided in section 16.
@@ -788,8 +796,8 @@ The inventory stores single hosts and host groups. Groups can contain groups
 from outermost group to innermost.
 
 **Connection settings are not vars.** `addr`, `port`, `ssh_user`, `connection`
-(`ssh` | `local`), and the become method are orchestrator configuration and live
-directly on the host or group. Playbook vars live under a separate `vars` table.
+(`ssh` | `local`), and the escalation method are orchestrator configuration and
+live directly on the host or group. Playbook vars live under a separate `vars` table.
 Ansible mixes these (`ansible_host`, `ansible_user`) and that is a source of its
 precedence confusion.
 
@@ -826,8 +834,9 @@ Candidates were YAML, TOML, RON, KDL, JSON, and a Rust-file inventory.
 Two kinds of data with two syntactic homes so they cannot be confused:
 
 - **Parameters** are the fixed, typed, closed set `rustible` itself understands
-  (how to connect). They are **properties on the node** (`key=value` after the
-  name). Misspelling one is a load-time error with a suggestion.
+  (how to connect, how to escalate). They are **properties on the node**
+  (`key=value` after the name). Misspelling one is a load-time error with a
+  suggestion.
 - **Vars** are the open bag the playbook consumes. They live **only inside a
   `vars` child block**. `rustible` never interprets them; it merges them and
   hands them to the playbook's typed struct. A var named `port` is unrelated to
@@ -840,8 +849,8 @@ Two kinds of data with two syntactic homes so they cannot be confused:
 | `connection` | `"ssh"` \| `"local"` | no | `"ssh"` | host, group, defaults |
 | `ssh_user` | string | no | local username | host, group, defaults |
 | `port` | u16 | no | 22 | host, group, defaults |
-| `become` | `"sudo"` \| `"doas"` \| `"none"` | no | `"sudo"` | host, group, defaults |
-| `become_user` | string | no | `"root"` | host, group, defaults |
+| `escalate` | `"sudo"` \| `"doas"` \| `"none"` | no | `"sudo"` | host, group, defaults |
+| `escalate_user` | string | no | `"root"` | host, group, defaults |
 | `ssh_args` | list of strings | no | empty | host, group, defaults |
 
 Parameter resolution: host, then nearest group outward, then `defaults`, then
@@ -860,7 +869,7 @@ vars {                                  // workspace-wide vars: the "all" level
     timezone "America/Sao_Paulo"
 }
 
-defaults ssh_user="cadu" port=22 become="sudo"   // workspace-wide parameters
+defaults ssh_user="cadu" port=22 escalate="sudo"   // workspace-wide parameters
 
 host "laptop" connection="local"
 
@@ -961,7 +970,7 @@ struct Vars {
     retries: u32,          // defaulted
 }
 
-#[rustible::playbook(hosts = "myservers", vars = Vars, become = true)]
+#[rustible::playbook(hosts = "myservers", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { .. }
 ```
 
@@ -1063,7 +1072,7 @@ impl Ctx {
 #[rustible::vars]
 struct Vars { domain: String, #[default = 4] workers: u32 }
 
-#[rustible::playbook(hosts = "web", vars = Vars, become = true)]
+#[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     if ctx.facts().package_manager != Pm::Apt {
         bail!("this playbook only knows Debian-likes, got {:?}", ctx.facts().distro);
@@ -1095,7 +1104,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
 Escalation is a property of how a step runs, not of the op, so it lives on
 `Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
 steps, or `ctx.as_user("postgres").step(..)` to step down. Playbook-level
-`become = true` remains for the common case and means the binary is launched
+`escalate = true` remains for the common case and means the binary is launched
 under sudo (default identity root). Output marks steps whose identity differs
 from the binary's own (`as root`, `as postgres`).
 
@@ -1122,7 +1131,7 @@ killed at exit. Properties:
   the identity.
 - Cost: one spawn per identity, then a pipe round trip per file primitive.
 
-Sudo passwords: `-n` fails rather than prompts. If the inventory's `become`
+Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 

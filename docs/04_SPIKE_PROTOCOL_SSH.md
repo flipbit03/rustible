@@ -21,11 +21,11 @@ command, 345 ms warm.
 - `crates/spike-playbook/src/bin/mc.rs`: refuses without apt or root, one
   step, logs the version.
 - `crates/rustible`: the orchestrator. `--host local` or `--host user@addr`,
-  repeatable; `--become`, `--check`, `-v`. Transports: local process, or SSH
+  repeatable; `--escalate`, `--check`, `-v`. Transports: local process, or SSH
   through the `openssh` crate (system `ssh`, ControlMaster).
 
 ```
-cargo run -p rustible -- --bin mc --host local --host cadu@cadu-cogram-vm-arm --become [--check] [-v]
+cargo run -p rustible -- --bin mc --host local --host cadu@cadu-cogram-vm-arm --escalate [--check] [-v]
 ```
 
 ## The pipeline as run
@@ -80,8 +80,9 @@ profile: it has no regex or similar, so smaller than the sshd spike.
    (attribute args are tokens; `syn` can accept keywords with
    `Ident::parse_any`), but internal code must use another name. Options for
    the attribute: keep `become` for Ansible familiarity and handle it in the
-   macro, or rename to `sudo`/`as_root`. **Decided: keep `become`.** Users
-   never need `r#` in the attribute; internal code uses `r#become`.
+   macro, or rename to `sudo`/`as_root`. **Decided: the word is `escalate`
+   everywhere** (attribute, CLI, inventory, code), documented as Ansible's
+   `become`. No `r#`, no name mapping.
 2. **Cargo builds all triples in one invocation.** Use it; do not spawn one
    cargo per triple.
 3. **The binary's own name is the hash-suffixed file name**, so `Hello`

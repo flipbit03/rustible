@@ -1,6 +1,6 @@
 //! Playbook: on an apt-based host, ensure Midnight Commander is installed.
-//! Needs root (become). Run locally with `sudo target/debug/mc`, or through
-//! the orchestrator with `--become`.
+//! Needs root (escalate). Run locally with `sudo target/debug/mc`, or through
+//! the orchestrator with `--escalate`.
 
 use rustible_sdk::prelude::*;
 use rustible_sdk::runtime::{RunOptions, run};
@@ -16,7 +16,7 @@ fn playbook(ctx: &mut Ctx) -> Result<()> {
         );
     }
     if !f.is_root {
-        bail!("this playbook needs root (run with become)");
+        bail!("this playbook needs root (run with escalate)");
     }
 
     let mc = ctx.step("Midnight Commander present", apt::Present::new(["mc"]))?;
