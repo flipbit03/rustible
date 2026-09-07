@@ -1,7 +1,7 @@
 # Spike 3: SDK core, run locally
 
 **Date:** 2026-09-06. **Status:** done, in-tree. **Verdict:** the sketches in
-`01_VISION.md` sections 6, 7, 14, 15, 16 hold up in code with one small
+`01_VISION.md` sections 6, 7, 11, 12, 13 (numbering after the 2026-09-06 restructure) hold up in code with one small
 deviation. No blockers found.
 
 ## What was built
@@ -33,7 +33,7 @@ RUSTIBLE_SPIKE_DIR=/tmp/x cargo run -p spike-playbook   # fixed scratch dir for 
 - **Mutation guard**: an op that writes inside `check()` fails with
   "op attempted to mutate `/x` during check()" and the fake shows no write
   (test `mutation_during_check_is_refused`).
-- **Check-mode output rule** (section 15): an op that predicts yields an
+- **Check-mode output rule** (section 12): an op that predicts yields an
   available output; one that does not yields `OutputUnavailable` on
   `.output()` and a panic (caught by the runtime) on deref
   (test `check_mode_output_unavailable_unless_predicted`).
@@ -71,7 +71,7 @@ RUSTIBLE_SPIKE_DIR=/tmp/x cargo run -p spike-playbook   # fixed scratch dir for 
    a `check` that runs `apt-get install`. This is a documented limit of the
    guard; file mutations are guarded, processes are the op author's honesty.
 6. **`as_user` in this spike only affects commands** (sudo prefix). The
-   `Elevated` helper-process backend from section 14.3 is not built; file ops
+   `Elevated` helper-process backend from section 11.3 is not built; file ops
    under `as_root()` would still run as the process user. Next spike material.
 7. **`Pretty` renderer lives in the SDK for now** because the spike has no
    orchestrator. It belongs to the `rustible` CLI crate once that exists; the
