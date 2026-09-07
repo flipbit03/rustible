@@ -874,29 +874,30 @@ Networking and anything async are also off `System` for now.
   `build.rs`, or a generated shadow workspace. Syncing `[[bin]]` is the simplest.)
 - **Inventory is data**, in `hosts.kdl` next to `rustible.toml`. See section 10.
   Dynamic inventories become a trait later.
-- **Crates** (naming is OPEN, see below):
+- **Crates (DECIDED 2026-09-07):**
+  - `rustible`: a **thin facade library** that playbook workspaces depend on.
+    Re-exports the SDK, the macros, and the std prelude, so a playbook is
+    `use rustible::prelude::*;` and `#[rustible::playbook(..)]`. No logic of
+    its own. `rustible init` adds this one dependency plus `rustible-std`.
+  - `rustible-cli`: the CLI and orchestrator (init, playbook run/create,
+    inventory show/check, SSH, compile, render), installed with
+    `cargo install rustible-cli`, binary named `rustible`. Never a dependency of
+    a workspace: it would drag tokio and openssh into every cross-compiled
+    playbook. The `Pretty` renderer belongs here, not in the SDK.
   - `rustible-sdk`: `Op`, `Plan`, `Change`, `Applied`, `System`, `Backend`,
     `Local`, `Fake`, `Facts`, `Diff`, `Ctx`, the event and protocol types, the
     runtime that the macro expands into, the test harness. Everything a
-    collection author needs.
-  - `rustible-macros`: the `#[rustible::playbook]` and `#[rustible::vars]` proc
-    macros. Proc macros must live in their own crate; re-exported so users never
-    depend on it directly.
+    collection author needs. Collections depend on this directly.
+  - `rustible-macros`: the `#[playbook]` and `#[vars]` proc macros. Proc macros
+    must live in their own crate; the facade re-exports them so users never
+    name it.
   - `rustible-std`: the base operations mirroring Ansible builtins, itself just a
     consumer of `rustible-sdk`.
-  - The CLI and orchestrator: init, create, run, inventory, SSH, compile, render.
-    The `Pretty` renderer belongs here, not in the SDK.
   - Third-party collections (`rustible-docker`, ...): plain crates on
     `rustible-sdk`, published to crates.io, added with `cargo add`. Because
     playbooks link them directly, no registration mechanism is needed.
-- **OPEN (section 16): the name `rustible`.** Playbooks are written as
-  `use rustible::prelude::*`, and section 3 says `rustible init` adds `rustible`
-  as a dependency, but the CLI crate is also called `rustible` in the tree
-  today. A workspace depending on the CLI crate would pull tokio and openssh
-  into every cross-compiled playbook. Recommended: `rustible` is a thin facade
-  library re-exporting the SDK, macros, and std prelude, and the CLI ships as
-  `rustible-cli` with a binary named `rustible` (`cargo install rustible-cli`).
-  Decide at M1, since the macro's re-export path depends on it.
+  - The spike orchestrator currently at `crates/rustible` is renamed to
+    `crates/rustible-cli` at M1, freeing the name for the facade.
 - **A playbook binary has four modes** (section 5.5): plain local run,
   `--remote`, `--describe`, `--helper`. The macro generates all of them.
 - Every crate in the tree is pure Rust, transitively (section 5.3).
@@ -1443,7 +1444,7 @@ The verdict column says whether deciding late has a cost.
 
 | # | Question | Decide by | Why it can wait (or cannot) |
 |---|---|---|---|
-| 1 | **Crate naming**: `rustible` as facade lib + `rustible-cli`, or the CLI keeps the name (section 9) | M1 | The macro's re-export path depends on it. Recommended: facade. |
+| 1 | ~~Crate naming~~ | decided 2026-09-07 | `rustible` is the facade lib, `rustible-cli` the CLI with binary `rustible` (section 9). |
 | 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
 | 3 | **Playbook-to-bin mapping details**: how `rustible` syncs `[[bin]]` entries for `playbooks/**/*.rs`, name collisions across folders (section 9) | M3 | Mostly decided; the code will settle the rest. |
 | 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
