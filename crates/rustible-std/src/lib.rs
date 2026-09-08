@@ -4,3 +4,4 @@
 pub mod apt;
 pub mod file;
 pub mod shell;
+pub mod ssh;
