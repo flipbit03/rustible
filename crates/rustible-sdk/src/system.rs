@@ -190,6 +190,18 @@ impl System {
         String::from_utf8(bytes).map_err(|e| Error::msg(format!("not utf-8: {e}")))
     }
 
+    /// Where the symbolic link at `p` points. Errors if `p` is not a symlink.
+    pub fn read_link(&self, p: impl AsRef<Path>) -> Result<PathBuf> {
+        let p = p.as_ref();
+        self.backend.read_link(p).map_err(Self::io(p))
+    }
+
+    /// Full paths of the direct children of the directory `p`.
+    pub fn read_dir(&self, p: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+        let p = p.as_ref();
+        self.backend.read_dir(p).map_err(Self::io(p))
+    }
+
     // ---- mutations: guarded and logged ----
 
     pub fn write_atomic(&self, p: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
@@ -206,10 +218,28 @@ impl System {
         self.backend.mkdir_all(p).map_err(Self::io(p))
     }
 
+    /// Remove one entry: a file, a symlink, or an empty directory. A
+    /// populated directory is an error; use `remove_all` for trees.
     pub fn remove(&self, p: impl AsRef<Path>) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
         self.backend.remove(p).map_err(Self::io(p))
+    }
+
+    /// Remove a directory tree. The only recursive delete.
+    pub fn remove_all(&self, p: impl AsRef<Path>) -> Result<()> {
+        let p = p.as_ref();
+        self.guard_mutation(p)?;
+        self.backend.remove_all(p).map_err(Self::io(p))?;
+        self.debug(format!("removed tree {}", p.display()));
+        Ok(())
+    }
+
+    /// Atomically move `from` to `to`, replacing `to` if it exists.
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+        let (from, to) = (from.as_ref(), to.as_ref());
+        self.guard_mutation(to)?;
+        self.backend.rename(from, to).map_err(Self::io(to))
     }
 
     pub fn set_mode(&self, p: impl AsRef<Path>, mode: u32) -> Result<()> {
@@ -222,6 +252,16 @@ impl System {
         let p = p.as_ref();
         self.guard_mutation(p)?;
         self.backend.set_owner(p, uid, gid).map_err(Self::io(p))
+    }
+
+    /// Create the symbolic link `link` pointing at `target`. Fails if `link`
+    /// exists; remove it first to replace it.
+    pub fn symlink(&self, target: impl AsRef<Path>, link: impl AsRef<Path>) -> Result<()> {
+        let (target, link) = (target.as_ref(), link.as_ref());
+        self.guard_mutation(link)?;
+        self.backend.symlink(target, link).map_err(Self::io(link))?;
+        self.debug(format!("linked {} -> {}", link.display(), target.display()));
+        Ok(())
     }
 
     /// Copy `p` to `p.~rustible.<unix-ts>` and return that path.
@@ -355,5 +395,26 @@ impl Cmd {
     pub fn ok(self) -> Result<Option<Output>> {
         let out = self.allow_failure().run()?;
         Ok(out.success().then_some(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Collect;
+
+    #[test]
+    fn symlink_is_refused_during_check() {
+        let fake = Arc::new(Fake::new());
+        let sys = System::fake(fake.clone(), Arc::new(Collect::default()));
+        sys.set_phase(Phase::Checking);
+        let err = sys.symlink("/target", "/link").unwrap_err().to_string();
+        assert!(err.contains("during check()"), "{err}");
+        assert!(fake.file("/link").is_none());
+
+        sys.set_phase(Phase::Applying);
+        sys.symlink("/target", "/link").unwrap();
+        assert_eq!(sys.read_link("/link").unwrap(), PathBuf::from("/target"));
+        assert!(sys.read_dir("/").is_err(), "no such dir in the fake");
     }
 }
