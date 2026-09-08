@@ -100,8 +100,13 @@ Collections of new operations are plain crates built on a public SDK, added with
 ```
 $ rustible init
 ```
-Creates a Cargo package in the current directory (which must be empty) or a chosen
-folder. Adds `rustible` (runtime) and `rustible-std` (the base operations, mirroring
+Creates a Cargo package in the current directory or a chosen folder. It refuses
+only when a file it would itself write is already there, and names the ones that
+clash; a directory holding anything else (a `README.md`, a `LICENSE`, a
+`.gitignore` from a fresh clone) is written into and those files are left alone.
+`--force` adds the missing files anyway and keeps the existing ones, rewriting
+only the two generated shims. This is `cargo init`'s rule.
+Adds `rustible` (runtime) and `rustible-std` (the base operations, mirroring
 Ansible's builtin modules: files, users, groups, packages, services, ssh keys, and
 so on) as dependencies. Creates an opinionated layout: `.gitignore`, an inventory
 file, a `playbooks/` folder (with `.gitkeep`), and any config files that turn out to
@@ -597,6 +602,7 @@ translation rule for the standard library.
 | `systemd: state=stopped`   | `systemd::Stopped`                         |
 | `systemd: enabled=yes`     | `systemd::Enabled`                         |
 | `systemd: state=restarted` | `systemd::Restart` (verb: an action)       |
+| `systemd: daemon_reload=yes` | `systemd::DaemonReload` (an action, no unit) |
 | `authorized_key: state=present` | `ssh::authorized_keys::Present`        |
 | `authorized_key: state=absent`  | `ssh::authorized_keys::Absent`         |
 | `getent`/`register`        | `user::Existing` (read-only op, 13.1)      |
@@ -617,10 +623,16 @@ parameter for this state" errors are what we are escaping.
 
 ### 6.4 Actions and the "always changes" hint
 
-Some things are actions, not states: `systemd::Restart`, `shell::Command`. They
-implement the same `Op` trait; their `check` simply always returns `Plan::Change`,
-because "restarted" is not a state you can already be in. In check mode they
-report "would change", as Ansible does.
+Some things are actions, not states: `systemd::Restart`, `systemd::DaemonReload`,
+`shell::Command`. They implement the same `Op` trait; their `check` simply always
+returns `Plan::Change`, because "restarted" is not a state you can already be in.
+In check mode they report "would change", as Ansible does.
+
+An action need not name a subject, and its output type is whatever it can
+honestly report. `systemd::DaemonReload` makes the manager re-read its unit
+files: it names no unit, so it cannot return the `UnitState` the rest of that
+module returns, and there is nothing else to read back afterwards. Its output is
+`()`. An output that only echoes the op's own inputs is an input, not an output.
 
 `shell::Command` can be promoted toward state-like behavior with Ansible's
 escape hatches as builder methods: `.creates(path)` makes `check` return
@@ -695,10 +707,23 @@ let pkgs = ctx.step("Install nginx and curl",
 ctx.step("Remove apache2", apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
 ctx.step("Keep openssl current", apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
 ```
-`check`: `dpkg-query -W` per name, build the missing set, `Satisfied` if empty.
-`apply`: `apt-get update` if the cache is older than the max age, then
+`Present` `check`: `dpkg-query -W` per name, build the missing set, `Satisfied`
+if empty. `apply`: `apt-get update` if the cache is older than the max age, then
 `apt-get install -y` the missing set. Refuses early on a non-Debian box using
 `facts.package_manager`.
+
+`Latest` compares each installed version against the *candidate* apt would
+install, and candidates come from the package lists, so it refreshes in `check`
+instead: `apt-get update` if the lists are older than the max age, then
+`apt-cache policy` per name, then `apt-get install -y --only-upgrade`. Ansible's
+`apt: state=latest` behaves the same way. The cost is deliberate and is the one
+exception to "check mode changes nothing": with `.update_cache(...)`, a `--check`
+run rewrites `/var/lib/apt/lists` on the target. It is a command rather than a
+mutation through `sys`, so 7.3's guard does not catch it; the op logs a warning
+saying it happened. Without `.update_cache(...)` nothing is refreshed and the
+comparison uses whatever the lists already say. Refreshing in `apply` would be
+worse: a dry run against month-old lists reports every package current, which is
+a wrong answer rather than a stale one.
 
 **`ansible.builtin.lineinfile`**
 ```rust
@@ -726,7 +751,10 @@ if sshd.changed {
 ```
 `Enabled`/`Running`/`Stopped` are states (`systemctl is-enabled` / `is-active` in
 `check`). `Restart` is an action: `check` always returns `Change`; `apply` does
-optional `daemon-reload`, `restart`, then verifies `is-active`.
+optional `daemon-reload`, `restart`, then verifies `is-active`. `DaemonReload` is
+the same reload on its own, for a playbook that writes a unit file and wants
+systemd to notice it without bouncing anything: it names no unit and returns `()`
+(6.4).
 
 ### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED 2026-09-07)
 
@@ -758,7 +786,7 @@ Headscale, two family PCs, and a macOS laptop), was surveyed on 2026-09-07:
 with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,
 `file::{Copy, Directory, Symlink, Absent, Attrs, Line, Block}`,
 `apt::{Present, Absent, Latest}`, `systemd::{Enabled, Disabled, Running,
-Stopped, Restart, Reload}`, `ssh::authorized_keys::{Present, Absent}`,
+Stopped, Restart, Reload, DaemonReload}`, `ssh::authorized_keys::{Present, Absent}`,
 `hostname::Is`, `sysctl::Present`, `http::Download`, `archive::Extracted`,
 `shell::Command`. **Wave two**, the tail: `file::Template` (used once, but
 generally important), `file::Replace`, `acl`, `mount`, `iptables`.
