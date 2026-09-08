@@ -1689,3 +1689,63 @@ $ cargo clippy --workspace --all-targets -- -D warnings
 clean
 
 DONE
+
+# Second merge of main (c514798): the rustible-github collection landed
+# while this branch was finishing. DECISIONS.md conflicted (both sides appended a block);
+# both blocks kept. Gates re-run on the merge:
+
+$ cargo fmt --all --check
+fmt: clean
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+clean
+
+$ cargo test --workspace
+      5 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     12 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+      1 test result: ok. 26 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 281 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.80s
+   Generated /home/cadu/w/cadu/rustible-m6sh/target/doc/rustible/index.html and 6 other files
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # the harness as CI runs it
+test group::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test ssh::authorized_keys::tests::invalid_key_line_is_an_error ... ok
+test ssh::authorized_keys::tests::unknown_user_is_an_error ... ok
+test user::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test absent_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.97s
+test present_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.76s
+test authorized_keys_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+test line_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+test file_family_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+test command_options_against_a_real_shell ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+test present_persist_only_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+test unit_lifecycle_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+test busybox_user_and_group ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+test users_and_groups_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+  wall: 34s
+
+finished 2026-09-08T15:41:44Z  all four gates and all eleven container test binaries green on the second merge
+DONE
