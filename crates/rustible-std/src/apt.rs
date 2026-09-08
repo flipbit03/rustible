@@ -136,6 +136,30 @@ fn installed_version(sys: &System, name: &str) -> Result<Option<String>> {
     })
 }
 
+/// The candidate version apt would install, or `None` when the cache cannot
+/// answer: an unknown name, lists that were never fetched, or an `apt-cache`
+/// that will not run. Used only to decide whether [`Present`] can predict a
+/// version honestly, so a failure here is not an error.
+fn candidate_version(sys: &System, name: &str) -> Option<String> {
+    match sys
+        .cmd("apt-cache")
+        .args(["policy", name])
+        .allow_failure()
+        .run()
+    {
+        Ok(out) if out.success() => parse_policy(&out.stdout_str()).candidate,
+        _ => None,
+    }
+}
+
+/// The package names an attribute diff plans to act on, in order.
+fn planned_names(diff: &Diff) -> Vec<String> {
+    match diff {
+        Diff::Attrs { changes, .. } => changes.iter().map(|c| c.name.clone()).collect(),
+        _ => vec![],
+    }
+}
+
 /// Candidate and installed versions from `apt-cache policy`.
 fn policy(sys: &System, name: &str) -> Result<Policy> {
     let out = sys.cmd("apt-cache").args(["policy", name]).run()?;
@@ -240,6 +264,10 @@ impl Op for Present {
         require_apt_root(sys, "Present")?;
         let mut report = InstallReport::default();
         let mut changes = vec![];
+        // A version we would install is only known when the lists can name a
+        // candidate; without one, the output is not predicted at all rather
+        // than predicted with an empty version (vision 12).
+        let mut versions_known = true;
         for name in &self.names {
             match installed_version(sys, name)? {
                 Some(version) => report.already_present.push(Package {
@@ -252,9 +280,11 @@ impl Op for Present {
                         from: "absent".into(),
                         to: "installed".into(),
                     });
+                    let candidate = candidate_version(sys, name);
+                    versions_known &= candidate.is_some();
                     report.installed.push(Package {
                         name: name.clone(),
-                        version: String::new(),
+                        version: candidate.unwrap_or_default(),
                     });
                 }
             }
@@ -262,19 +292,24 @@ impl Op for Present {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: "apt packages".into(),
-                changes,
-            },
-            report,
-        ))
+        let diff = Diff::Attrs {
+            subject: "apt packages".into(),
+            changes,
+        };
+        if versions_known {
+            Ok(Plan::change_predicting(diff, report))
+        } else {
+            Ok(Plan::change(diff))
+        }
     }
 
     fn apply(&self, sys: &System, change: Change<InstallReport>) -> Result<InstallReport> {
-        let mut report = change.predicted.unwrap_or_default();
-        let missing: Vec<String> = report.installed.iter().map(|p| p.name.clone()).collect();
-
+        // Install what `check` planned, not what dpkg says now (vision 6.2).
+        let missing = planned_names(&change.diff);
+        ensure!(
+            !missing.is_empty(),
+            "apt::Present::apply: the plan names no package to install"
+        );
         if let Some(max_age) = self.update_cache {
             update_cache_if_stale(sys, max_age)?;
         }
@@ -284,8 +319,18 @@ impl Op for Present {
         }
         cmd.args(missing.iter().cloned()).run()?;
 
-        for p in &mut report.installed {
-            p.version = installed_version(sys, &p.name)?.unwrap_or_default();
+        // Report the versions dpkg actually has now, whatever check predicted.
+        let mut report = InstallReport::default();
+        for name in &self.names {
+            let package = Package {
+                name: name.clone(),
+                version: installed_version(sys, name)?.unwrap_or_default(),
+            };
+            if missing.contains(name) {
+                report.installed.push(package);
+            } else {
+                report.already_present.push(package);
+            }
         }
         Ok(report)
     }
@@ -694,6 +739,90 @@ mod tests {
         // No update_cache: neither stat nor apt-get update ran.
         assert!(argv_starting(&argvs, &["stat"]).is_none());
         assert!(argv_starting(&argvs, &["apt-get", "update"]).is_none());
+    }
+
+    #[test]
+    fn present_predicts_the_candidate_version_when_the_lists_know_it() {
+        let fake = Arc::new(policy_of(
+            Fake::new()
+                .with_cmd("dpkg-query", None, 1, "")
+                .with_cmd("apt-get", None, 0, ""),
+            "sl",
+            "(none)",
+            "5.02-1",
+        ));
+        let Plan::Change(c) = Present::new(["sl"]).check(&sys(&fake)).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(c.predicted.unwrap().installed[0].version, "5.02-1");
+    }
+
+    #[test]
+    fn present_does_not_predict_when_the_lists_have_no_candidate() {
+        // A stock image with no package lists: `apt-cache policy` says nothing,
+        // so the version is unknown and check mode must not invent one.
+        for fake in [
+            Arc::new(Fake::new().with_cmd("dpkg-query", None, 1, "").with_cmd(
+                "apt-cache",
+                None,
+                0,
+                "",
+            )),
+            // apt-cache not runnable at all.
+            Arc::new(Fake::new().with_cmd("dpkg-query", None, 1, "")),
+        ] {
+            let Plan::Change(c) = Present::new(["sl"]).check(&sys(&fake)).unwrap() else {
+                panic!("expected change")
+            };
+            assert_eq!(c.diff.short(), "sl=installed");
+            assert!(c.predicted.is_none(), "no candidate, no prediction");
+        }
+    }
+
+    #[test]
+    fn present_apply_installs_what_the_plan_named_and_rereads_versions() {
+        let fake = Arc::new(
+            dpkg(Fake::new().with_cmd("apt-get", None, 0, ""), "mc", 1, "").with_cmd(
+                "dpkg-query",
+                Some(&[DPKG_ARGS[0], DPKG_ARGS[1], "zsh"]),
+                0,
+                "install ok installed\t5.9-4\n",
+            ),
+        );
+        let s = sys(&fake);
+        let op = Present::new(["mc", "zsh"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        // Only the missing one is planned, and only it is installed.
+        assert_eq!(c.diff.short(), "mc=installed");
+        // The prediction is absent (no candidate in this fake), so apply must
+        // work from the diff alone.
+        assert!(c.predicted.is_none());
+        let report = op.apply(&s, c).unwrap();
+        let argvs = fake.argvs();
+        let install = argv_starting(&argvs, &["apt-get", "install"]).unwrap();
+        assert!(install.contains(&"mc".into()) && !install.contains(&"zsh".into()));
+        assert_eq!(report.installed[0].name, "mc");
+        assert_eq!(report.already_present[0].version, "5.9-4");
+    }
+
+    #[test]
+    fn present_apply_refuses_a_plan_with_no_packages() {
+        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
+        let s = sys(&fake);
+        let err = Present::new(["mc"])
+            .apply(
+                &s,
+                Change {
+                    diff: Diff::summary("nothing"),
+                    predicted: None,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names no package"), "{err}");
+        assert!(fake.argvs().is_empty(), "nothing ran");
     }
 
     #[test]

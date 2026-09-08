@@ -212,3 +212,40 @@ Recorded in `docs/plan/DECISIONS.md` under `[M6-so]`:
 ## Self-review
 
 Run by the lead on the PR.
+
+### Self-review (lead, PR #9)
+
+Reviewed by the lead against vision 6.2, 6.8 and 12. Three fixes applied on
+the branch before merge:
+
+- **`apt::Present` no longer predicts an empty version.** `check` asks
+  `apt-cache policy` for the candidate of every missing package and predicts
+  that; when the lists cannot name one (a stock image with no lists, an
+  unknown name, no runnable `apt-cache`) the plan carries no prediction at
+  all, so a check-mode run that chains from the step stops with the vision's
+  message instead of receiving `version: ""`. Tests:
+  `present_predicts_the_candidate_version_when_the_lists_know_it`,
+  `present_does_not_predict_when_the_lists_have_no_candidate`.
+- **`apt::Present::apply` works from the diff, not the prediction.** It used
+  `change.predicted.unwrap_or_default()`, so a change without a prediction
+  would have run `apt-get install -y` with no package arguments and reported
+  success. It now installs exactly the names `check` planned (vision 6.2),
+  refuses a plan that names none, and rebuilds the report from what dpkg has
+  after the install. Tests:
+  `present_apply_installs_what_the_plan_named_and_rereads_versions`,
+  `present_apply_refuses_a_plan_with_no_packages`.
+- **`hostname::Is` rejects names over 64 characters**, the kernel's
+  `HOST_NAME_MAX` and systemd's limit, instead of accepting DNS-legal names up
+  to 253 that `hostnamectl set-hostname` then refuses with its own message.
+
+Verification after the fixes: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace`
+(rustible-std: 168 unit tests), and the three container tests re-run with
+`RUSTIBLE_INTEGRATION=1` on debian:12 and ubuntu:24.04 (apt absent 14.6 s,
+apt present 9.2 s, sysctl 0.9 s, all green).
+
+Left as the agent proposed, for Cadu: `apt::Latest` refreshes the cache in
+`apply` only (vision 6.8 places it there), so a stale list can make a package
+look current in `check` and stay unupgraded. Ansible refreshes during check.
+This is a vision question, not a bug in the branch.
+

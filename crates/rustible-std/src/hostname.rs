@@ -23,7 +23,8 @@ pub struct HostnameReport {
 ///
 /// Refuses names that are not valid hostnames: one or more RFC 1123 labels
 /// (letters, digits, hyphens; no leading or trailing hyphen; at most 63
-/// characters each) joined by dots, at most 253 characters in all. Needs root.
+/// characters each) joined by dots, at most 64 characters in all, which is
+/// the kernel's `HOST_NAME_MAX` and what `hostnamectl` accepts. Needs root.
 #[derive(Debug, Clone)]
 pub struct Is {
     name: String,
@@ -40,9 +41,11 @@ pub fn validate_hostname(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
         return Err("hostname is empty".into());
     }
-    if name.len() > 253 {
+    // The kernel's HOST_NAME_MAX is 64, and systemd refuses anything longer,
+    // so a DNS-legal 253-character name is not a legal hostname.
+    if name.len() > 64 {
         return Err(format!(
-            "hostname is {} characters, the limit is 253",
+            "hostname is {} characters, the limit is 64 (the kernel's HOST_NAME_MAX)",
             name.len()
         ));
     }
@@ -206,7 +209,9 @@ mod tests {
         bad(".a", "empty label");
         bad(&"a".repeat(64), "limit is 63");
         let long = ["a".repeat(63).as_str(); 5].join(".");
-        bad(&long, "limit is 253");
+        bad(&long, "limit is 64");
+        // 63 legal labels, 65 characters in all: DNS says yes, the kernel no.
+        bad(&["a".repeat(32).as_str(); 2].join("."), "HOST_NAME_MAX");
     }
 
     // ---- Fake ----
