@@ -14,7 +14,7 @@ Updated by whoever is working; read first on every resume.
 | M6 rustible-github | todo | |
 | M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
-| M7 release prep | todo | workflow + dry run only; publishing is Cadu's |
+| M7 release prep | partly done | CI and release workflows merged (PR #11), all four CI jobs green on GitHub, seven crates package cleanly, both musl dist builds verified; README rewrite and the rustdoc pass wait for M3; publishing is Cadu's |
 
 ## Log
 (append one line per event: date, milestone, what happened)
@@ -36,3 +36,4 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 14:53 UTC  M6  small ops merged as PR #9 after review (apt::Present predicts only with a known candidate, apply works from the diff, hostname limited to HOST_NAME_MAX; container tests re-run green)
 - 2026-09-08 14:54 UTC  M6  systemd merged as PR #8 after review (no code changes needed; container test re-run green on both jrei images). ARM VM came back up: M3 and M5 agents restarted to run their ARM legs
 - 2026-09-08 14:56 UTC  M6,M3,M5  ARM VM back up: agents `m3-arm` and `m5-arm` running the ARM legs on the existing m3-run and m5-elevated-streaming worktrees. M6 wave two started: `m6-net-archive` and `m6-shell-tests`. Lead is on M7 prep (CI and release workflows).
+- 2026-09-08 15:08 UTC  M7  prep merged as PR #11: .github/workflows/ci.yml (gate, MSRV 1.88, example workspace, Docker harness) and release.yml (version patch, seven crates in dependency order with index-lag retries, musl + macOS binaries). All four CI jobs passed on the PR itself. Two real breakages fixed on the way: examples/workspace had stopped compiling after the apt update_cache signature change, and cargo doc failed on three bad doc links. README rewrite and the full rustdoc pass wait for M3. NOTE for Cadu: pushing .github/workflows over the https remote is rejected (the gh OAuth token has no `workflow` scope); pushed over ssh instead, or run `gh auth refresh -s workflow`.
