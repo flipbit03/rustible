@@ -1,0 +1,15 @@
+// Inventory (KDL 2.0): hosts, groups, connection parameters, and vars.
+// `rustible inventory check` validates it; `rustible inventory show <host>`
+// prints what a host resolves to.
+//
+// A host reached over SSH, and a group that carries parameters and vars:
+//
+//     host "web1" addr="10.0.1.11" ssh_user="deploy"
+//
+//     group "web" ssh_user="deploy" {
+//         vars { nginx_workers 4 }
+//         host "web2" addr="10.0.1.12"
+//     }
+
+// This machine, without SSH. `rustible playbook create` targets it by default.
+host "local" connection="local"
