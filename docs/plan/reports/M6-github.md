@@ -213,3 +213,33 @@ diff has had no second pair of eyes beyond the test suite.
 
 The real-network test was exercised against `github.com` only. GitHub
 Enterprise via `.fetch_with(..)` is designed for but untested.
+
+### Self-review (lead, PR #14)
+
+Reviewed against vision 5.3, 6.2, 6.5, 6.7, 6.9 and 9. No code changes were
+needed. What I checked:
+
+- **The crate is a real collection**: it depends on `rustible-sdk` and
+  `rustible-std` and on nothing else of ours, never on `rustible-cli`. That is
+  the point of the exercise (vision 6.9), and the `Fetch` seam is the shape a
+  third party should copy when it needs something the SDK deliberately lacks.
+- **The judgment calls are the safe ones.** Additive by default, with
+  `exclusive` opt-in; exclusive with an empty key list refuses rather than
+  truncating `authorized_keys`, which is the difference between a no-op and a
+  lockout. A 404 fails naming the user while a 200 with no keys is a
+  successful empty list. An unparseable line fails instead of being skipped,
+  because a dropped key under `exclusive` is also a lockout.
+- **The network boundary is honest**: the login is validated before any
+  request, the body is capped at 1 MiB, connect and read timeouts default to
+  20 seconds, statuses are not errors at the transport layer, and exactly one
+  test crosses the network and is `#[ignore]`d, so the suite is offline and
+  deterministic in CI.
+- **`UserKeys` runs on the target**, like every op, which differs from
+  Ansible's `lookup` running on the controller. That is recorded in the
+  rustdoc, where a reader will meet it.
+
+One thing I escalated rather than settled, recorded as a PROPOSED AMENDMENT in
+DECISIONS: the pure-Rust rule leaves `rustls-rustcrypto 0.0.2-alpha` as the
+only available TLS crypto provider, and it is what fetches the keys that then
+land in `authorized_keys`. That trade-off is Cadu's to make, not an agent's.
+
