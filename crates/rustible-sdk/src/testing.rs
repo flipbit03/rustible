@@ -647,6 +647,15 @@ fn run_in_systemd_image(bin: &Path, image: &str, test_path: &str) -> ImageResult
     finish(image, t0, out)
 }
 
+fn container_running(id: &str) -> bool {
+    Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", id])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
 /// Poll `systemctl is-system-running` until systemd reports a final state.
 /// `degraded` (some unit failed to start) is accepted: the test decides what
 /// it needs. Anything else after [`SYSTEMD_BOOT_TIMEOUT`] is an error naming
@@ -661,9 +670,9 @@ fn wait_for_systemd(id: &str) -> std::result::Result<(), String> {
             .output()
             .map_err(|e| format!("could not run docker exec: {e}"))?;
         last = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        // A dead container answers with empty stdout and a non-zero exit;
-        // fail now instead of polling until the cap.
-        if !out.status.success() && last.is_empty() {
+        // Early in boot `systemctl` may answer non-zero with nothing on
+        // stdout; a dead container answers the same way. Ask docker which.
+        if !out.status.success() && last.is_empty() && !container_running(id) {
             return Err(format!(
                 "container {id} is not running (docker exec: {})",
                 String::from_utf8_lossy(&out.stderr).trim()

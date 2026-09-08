@@ -1,0 +1,41 @@
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6ak/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
+
+running 33 tests
+test ssh::authorized_keys::tests::absent_on_empty_text_is_satisfied ... ok
+test ssh::authorized_keys::tests::absent_of_missing_key_is_satisfied ... ok
+test ssh::authorized_keys::tests::absent_removes_every_duplicate_line_of_a_key ... ok
+test ssh::authorized_keys::tests::absent_on_missing_file_is_satisfied_and_creates_nothing ... ok
+test ssh::authorized_keys::tests::absent_removes_matching_lines_only ... ok
+test ssh::authorized_keys::tests::absent_removes_exactly_one_of_three ... ok
+test ssh::authorized_keys::tests::comment_and_options_do_not_affect_identity ... ok
+test ssh::authorized_keys::tests::check_mode_predicts_and_writes_nothing ... ok
+test ssh::authorized_keys::tests::exclusive_through_ctx_is_changed_then_ok ... ok
+test ssh::authorized_keys::tests::create_path_through_ctx_passes_the_mutation_guard ... ok
+test ssh::authorized_keys::tests::existing_file_and_dir_keep_their_attributes ... ok
+test ssh::authorized_keys::tests::in_file_form_writes_the_given_path_without_owner ... ok
+test ssh::authorized_keys::tests::in_file_form_refuses_missing_parent ... ok
+test ssh::authorized_keys::tests::invalid_key_line_is_an_error ... ok
+test ssh::authorized_keys::tests::parses_cert_and_sk_types ... ok
+test ssh::authorized_keys::tests::non_keys_do_not_parse ... ok
+test ssh::authorized_keys::tests::parses_key_without_comment_and_with_extra_spaces ... ok
+test ssh::authorized_keys::tests::parses_plain_key_with_comment ... ok
+test ssh::authorized_keys::tests::passwd_lookup ... ok
+test ssh::authorized_keys::tests::present_dedupes_requested_keys ... ok
+test ssh::authorized_keys::tests::present_exclusive_removes_strangers_and_keeps_comments ... ok
+test ssh::authorized_keys::tests::present_is_satisfied_when_all_there ... ok
+test ssh::authorized_keys::tests::parses_options_field_with_quoted_spaces ... ok
+test ssh::authorized_keys::tests::present_on_empty_file_appends ... ok
+test ssh::authorized_keys::tests::present_adds_missing_trailing_newline_when_writing ... ok
+test ssh::authorized_keys::tests::present_lacking_trailing_newline_alone_is_satisfied ... ok
+test ssh::authorized_keys::tests::unknown_user_is_an_error ... ok
+test ssh::authorized_keys::tests::user_form_creates_ssh_dir_and_file_with_mode_and_owner ... ok
+test ssh::authorized_keys::tests::present_exclusive_is_satisfied_when_exact ... ok
+test ssh::authorized_keys::tests::present_non_exclusive_leaves_strangers ... ok
+test ssh::authorized_keys::tests::user_form_refuses_missing_home ... ok
+test ssh::authorized_keys::tests::present_preserves_comments_blank_lines_and_options ... ok
+test ssh::authorized_keys::tests::present_matches_ignoring_comment_and_keeps_existing_line ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
