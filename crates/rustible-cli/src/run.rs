@@ -135,6 +135,11 @@ pub fn merged_vars(resolved: &Resolved, cli: &serde_json::Map<String, Value>) ->
 
 /// How the binary is launched on the target (vision 5.2 step 8, 11.3):
 /// bare, or behind the host's escalation method as `escalate_user`.
+///
+/// The binary's own position in the result is not fixed: it is first when
+/// nothing escalates, third behind `sudo -n`, and fifth behind `sudo -n -u
+/// <someone-not-root>`. Anything that needs the path (`Transport::kill`)
+/// takes it as `remote_path` gave it, never by scanning this.
 pub fn exec_argv(bin: &str, escalate: bool, method: Escalate, escalate_user: &str) -> Vec<String> {
     let mut argv = vec![];
     if escalate {
@@ -396,13 +401,51 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
     // mid-apply (vision 5.5).
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!(
-                "\nctrl-c: cancelling; each host gets {CANCEL_GRACE:?} to stop between steps"
-            );
-            let _ = cancel_tx.send(true);
+        // In a loop, and not just the first press: tokio's handler stays
+        // installed for the life of the process, so once this task ended
+        // every later ctrl-c was swallowed and the terminal could no longer
+        // stop the run at all. Local children are in their own process
+        // group precisely so the signal does not reach them, which makes
+        // this task the only thing standing between the user and a run they
+        // cannot abort.
+        let mut presses = 0u32;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            presses += 1;
+            if presses == 1 {
+                eprintln!(
+                    "\nctrl-c: cancelling; each host gets {CANCEL_GRACE:?} to stop between \
+                     steps. Press ctrl-c again to quit at once."
+                );
+                let _ = cancel_tx.send(true);
+            } else {
+                eprintln!(
+                    "\nctrl-c again: quitting now. Processes already started on the targets \
+                     are left running, and an ssh master may persist for its ControlPersist \
+                     window."
+                );
+                std::process::exit(EXIT_FAILED as i32);
+            }
         }
     });
+
+    // Between phases: connect, build and upload are not steps, so `Cancel`
+    // means "do not start the next phase" rather than anything on a target.
+    macro_rules! bail_if_cancelled {
+        ($hosts:expr) => {
+            if *cancel_rx.borrow() {
+                // The branch returns, so taking the hosts here is a move on
+                // a path that never reaches their later use.
+                for (r, tr, _) in $hosts {
+                    out.lock()
+                        .unwrap()
+                        .failed(&r.host, "cancelled before the playbook started");
+                    tr.close().await;
+                }
+                out.lock().unwrap().finish();
+                return Ok(EXIT_FAILED);
+            }
+        };
+    }
 
     // 4, 5. Connect and probe every host in parallel.
     let mut connects = vec![];
@@ -446,6 +489,8 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         }
     }
 
+    bail_if_cancelled!(hosts);
+
     if !hosts.is_empty() {
         // 6. One build for every triple.
         let triples: Vec<String> = hosts
@@ -480,6 +525,10 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
                 t0.elapsed()
             );
         }
+        // `cargo` runs in this process group, so a ctrl-c during the build
+        // reached it too and it may have died; either way the run stops here
+        // rather than uploading and starting playbooks nobody is waiting for.
+        bail_if_cancelled!(hosts);
 
         // 7, 8, 9. Per host: upload if missing, execute, stream frames.
         let plan = Arc::new(Plan {
@@ -592,7 +641,7 @@ async fn drive(
         r.params.escalate,
         &r.params.escalate_user,
     );
-    let mut proc = tr.spawn(&argv).await?;
+    let mut proc = tr.spawn(&argv, Some(path.as_str())).await?;
     // From here on the child owns the failure story: `sudo -n` refusing, a
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
@@ -707,7 +756,7 @@ async fn drive_frames(
         tokio::select! {
             frame = frames.recv() => {
                 let Some(up) = frame else { break };
-                handle_frame(plan, proc, out, host, name, up?).await?;
+                handle_frame(plan, proc, out, host, name, up?, &cancel_rx).await?;
             }
             changed = cancel_rx.changed(), if deadline.is_none() => {
                 if changed.is_err() || !*cancel_rx.borrow() {
@@ -736,6 +785,12 @@ async fn drive_frames(
 
 /// One `Up` frame: the `Hello` check, an event to render, a file to serve,
 /// or a chunk of a fetched file to write.
+///
+/// Serving a file is the one arm that can run for minutes (a 50 MB stream
+/// over a slow link), and while it does, nothing else watches `cancel_rx`.
+/// It therefore checks the flag between chunks and abandons the transfer,
+/// so ctrl-c during a stream is answered rather than queued behind it.
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     plan: &Plan,
     proc: &mut crate::transport::Proc,
@@ -743,6 +798,7 @@ async fn handle_frame(
     host: &str,
     name: &str,
     up: Up,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     match &up {
         Up::Hello { protocol, playbook } => {
@@ -769,6 +825,20 @@ async fn handle_frame(
                 Ok(file) => {
                     let mut total = 0u64;
                     for chunk in chunks(file) {
+                        // `borrow`, not `borrow_and_update`: the select loop
+                        // still has to see the change and send `Cancel`.
+                        if *cancel_rx.borrow() {
+                            let reason = "cancelled while the file was being sent".to_string();
+                            out.lock().unwrap().note(
+                                host,
+                                &format!("abandoning `{path}` after {total} bytes: cancelled"),
+                            );
+                            // Denied rather than silence: the binary's
+                            // `local_file` fails now instead of waiting for
+                            // chunks that will never come.
+                            write_frame(&mut proc.stdin, &Down::FileDenied { req, reason }).await?;
+                            return Ok(());
+                        }
                         let chunk = chunk.with_context(|| format!("reading `{path}`"))?;
                         total += chunk.bytes.len() as u64;
                         let last = chunk.last;
@@ -910,6 +980,32 @@ host "solo" addr="10.0.0.9"
         assert_eq!(
             exec_argv(bin, true, Escalate::None, "admin"),
             [bin, "--remote"]
+        );
+    }
+
+    /// Why `Transport::spawn` is handed the binary's path instead of
+    /// recovering it from `argv`. A filter that skips the escalation words
+    /// finds the binary in three of these four shapes and `-u` in the
+    /// fourth, so a host with a non-root `escalate_user` would hunt for a
+    /// process running `-u`, find none, and cancel nothing while reporting
+    /// that it had killed the binary.
+    #[test]
+    fn the_binary_is_not_at_a_fixed_place_in_exec_argv() {
+        let bin = "/home/admin/.cache/rustible/bin/cadu_slow-abc";
+        let skip_escalation = |argv: &Vec<String>| -> String {
+            argv.iter()
+                .find(|a| !matches!(a.as_str(), "sudo" | "doas" | "-n"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            skip_escalation(&exec_argv(bin, true, Escalate::Sudo, "root")),
+            bin
+        );
+        assert_eq!(
+            skip_escalation(&exec_argv(bin, true, Escalate::Sudo, "admin")),
+            "-u",
+            "a non-root escalate_user puts a flag where the scan expects the binary"
         );
     }
 

@@ -6,7 +6,7 @@
 //! `Cancel` flips a flag that `Ctx::step` checks between phases; file frames
 //! are queued by request id so requests may overlap.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -14,10 +14,27 @@ use crate::error::{Error, Result};
 use crate::protocol::{Down, Up, UpLink};
 use crate::stream::{Chunk, WorkspaceFiles, chunks};
 
+/// How many file frames may sit in the inbox before the reader thread
+/// stops taking them off the pipe. Chunks are 1 MiB, so this is the whole
+/// buffer between the orchestrator and the playbook's writer. Without a
+/// bound the reader always outruns the consumer writing to disk and
+/// `pending` grows to the size of the file, which is exactly what chunking
+/// exists to avoid: a 50 MB stream was held in memory whole on the target.
+///
+/// One global bound is safe because at most one file request is ever in
+/// flight: `Ctx` is `!Send` and `local_file`, `local_secret` and `fetch`
+/// each block the playbook thread until they finish. Genuinely concurrent
+/// requests would need per-request flow control, since one reader thread
+/// blocked on a full queue stops delivering every id, not just the full
+/// one.
+const MAX_PENDING_FRAMES: usize = 8;
+
 /// Frames queued for `local_file`/`local_secret`, by request id.
 #[derive(Default)]
 struct Inbox {
     frames: Mutex<InboxState>,
+    /// Signals both directions: a frame arrived, or one was taken. Both
+    /// waiters re-check their own predicate, so one condvar is enough.
     changed: Condvar,
 }
 
@@ -26,11 +43,45 @@ struct InboxState {
     pending: VecDeque<Down>,
     /// The reader thread saw EOF: nothing more will ever arrive.
     closed: bool,
+    /// Requests whose consumer gave up part way (a disk write failed, the
+    /// orchestrator denied the transfer mid-stream). Their frames are
+    /// dropped on arrival: queueing them would fill the inbox with frames
+    /// nobody will ever collect, and a reader thread blocked on a full
+    /// inbox stops delivering `Cancel` as well.
+    abandoned: BTreeSet<u32>,
 }
 
 impl Inbox {
     fn push(&self, frame: Down) {
-        self.frames.lock().unwrap().pending.push_back(frame);
+        let mut state = self.frames.lock().unwrap();
+        loop {
+            if let Some(req) = frame_req(&frame)
+                && state.abandoned.contains(&req)
+            {
+                if ends_a_request(&frame) {
+                    state.abandoned.remove(&req);
+                }
+                drop(state);
+                self.changed.notify_all();
+                return;
+            }
+            if state.pending.len() < MAX_PENDING_FRAMES || state.closed {
+                break;
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+        state.pending.push_back(frame);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// The consumer of `req` has gone. Drop what is queued for it and keep
+    /// dropping what arrives until the stream ends.
+    fn abandon(&self, req: u32) {
+        let mut state = self.frames.lock().unwrap();
+        state.pending.retain(|f| frame_req(f) != Some(req));
+        state.abandoned.insert(req);
+        drop(state);
         self.changed.notify_all();
     }
 
@@ -45,7 +96,11 @@ impl Inbox {
         let mut state = self.frames.lock().unwrap();
         loop {
             if let Some(i) = state.pending.iter().position(|f| frame_req(f) == Some(req)) {
-                return Ok(state.pending.remove(i).expect("indexed"));
+                let frame = state.pending.remove(i).expect("indexed");
+                drop(state);
+                // A slot opened: wake the reader thread if it was waiting.
+                self.changed.notify_all();
+                return Ok(frame);
             }
             if state.closed {
                 return Err(Error::msg(
@@ -55,6 +110,14 @@ impl Inbox {
             state = self.changed.wait(state).unwrap();
         }
     }
+}
+
+/// The last frame of a request: nothing more arrives for that id after it.
+fn ends_a_request(f: &Down) -> bool {
+    matches!(
+        f,
+        Down::FileDenied { .. } | Down::FileChunk { last: true, .. }
+    )
 }
 
 fn frame_req(f: &Down) -> Option<u32> {
@@ -175,29 +238,46 @@ impl Channel {
                     path: path.to_string(),
                 })
                 .map_err(|e| Error::msg(format!("requesting `{path}`: {e}")))?;
-                loop {
-                    match inbox.recv(req)? {
+                let mut ended = false;
+                let out = loop {
+                    let frame = match inbox.recv(req) {
+                        Ok(f) => f,
+                        Err(e) => break Err(e),
+                    };
+                    match frame {
                         Down::FileChunk {
                             offset,
                             bytes,
                             last,
                             ..
                         } => {
-                            sink(Chunk {
+                            if let Err(e) = sink(Chunk {
                                 offset,
                                 bytes,
                                 last,
-                            })?;
+                            }) {
+                                break Err(e);
+                            }
                             if last {
-                                return Ok(());
+                                ended = true;
+                                break Ok(());
                             }
                         }
                         Down::FileDenied { reason, .. } => {
-                            return Err(Error::msg(format!("`{path}` denied: {reason}")));
+                            ended = true;
+                            break Err(Error::msg(format!("`{path}` denied: {reason}")));
                         }
                         _ => unreachable!("inbox only holds file frames"),
                     }
+                };
+                if !ended {
+                    // The sink failed or the channel closed part way. The
+                    // orchestrator is still sending chunks for this id, so
+                    // say so rather than let them pile up behind a bounded
+                    // inbox and stall the reader thread.
+                    inbox.abandon(req);
                 }
+                out
             }
             Source::Local(files) => {
                 let f = files
@@ -281,6 +361,99 @@ mod tests {
                 .to_string()
                 .contains("closed the channel")
         );
+    }
+
+    /// The inbox is bounded, so a feeder that outruns the consumer waits
+    /// instead of buffering the whole file. Before this, a 50 MB stream was
+    /// held in memory on the target and the chunking bought nothing.
+    #[test]
+    fn the_feeder_waits_rather_than_buffering_a_whole_file() {
+        let (ch, feeder) = Channel::remote(Arc::new(Capture(Mutex::new(vec![]))));
+        let fed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (fed_w, total) = (fed.clone(), MAX_PENDING_FRAMES * 4);
+        std::thread::spawn(move || {
+            for i in 0..total {
+                feeder.feed(Down::FileChunk {
+                    req: 1,
+                    offset: i as u64,
+                    bytes: vec![b'x'],
+                    last: i + 1 == total,
+                });
+                fed_w.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // Give the feeder every chance to run ahead; it cannot get past the
+        // bound plus the one frame a blocked push is holding.
+        for _ in 0..50 {
+            if fed.load(Ordering::SeqCst) > MAX_PENDING_FRAMES {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fed.load(Ordering::SeqCst) <= MAX_PENDING_FRAMES + 1,
+            "the feeder buffered {} frames with a bound of {MAX_PENDING_FRAMES}",
+            fed.load(Ordering::SeqCst)
+        );
+        let mut got = 0usize;
+        ch.stream_file("files/big", &mut |c| {
+            got += c.bytes.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, total);
+    }
+
+    /// A consumer that gives up part way must not wedge the reader thread:
+    /// with a bounded inbox, frames nobody collects would fill it and the
+    /// thread that delivers `Cancel` would block behind them forever.
+    #[test]
+    fn abandoning_a_transfer_does_not_wedge_the_reader() {
+        let (ch, feeder) = Channel::remote(Arc::new(Capture(Mutex::new(vec![]))));
+        let feeder = Arc::new(feeder);
+        // The sink fails on the first chunk, so request 1 is abandoned with
+        // the orchestrator still sending.
+        feeder.feed(Down::FileChunk {
+            req: 1,
+            offset: 0,
+            bytes: vec![b'x'],
+            last: false,
+        });
+        let err = ch
+            .stream_file("files/big", &mut |_| Err(Error::msg("disk full")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("disk full"), "{err}");
+
+        // Far more leftover chunks than the bound. Each must be dropped on
+        // arrival rather than queued, so this returns rather than blocking.
+        let f = feeder.clone();
+        let done = std::thread::spawn(move || {
+            for i in 1..(MAX_PENDING_FRAMES * 5) {
+                f.feed(Down::FileChunk {
+                    req: 1,
+                    offset: i as u64,
+                    bytes: vec![b'x'],
+                    last: false,
+                });
+            }
+        });
+        for _ in 0..200 {
+            if done.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            done.is_finished(),
+            "the reader thread blocked on frames of an abandoned request"
+        );
+        done.join().unwrap();
+
+        // And the channel still works: `Cancel` gets through, and a fresh
+        // request is served normally.
+        feeder.feed(Down::Cancel);
+        assert!(ch.is_cancelled());
     }
 
     #[test]

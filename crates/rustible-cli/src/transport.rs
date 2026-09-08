@@ -58,9 +58,14 @@ pub struct Proc {
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
     stderr: Pin<Box<dyn AsyncRead + Send>>,
     waiter: Waiter,
-    /// What `kill` matches on a remote host: the first argument that is not
-    /// the escalation wrapper.
-    argv0: String,
+    /// The executable `kill` hunts for on a remote host, absolute. `None`
+    /// for a process that is never a kill target (the upload shell).
+    ///
+    /// It is passed in rather than recovered from `argv`, because `argv`
+    /// does not reliably contain it in a recoverable position: behind
+    /// `sudo -n -u <someone-not-root>` the binary is the fifth word, not
+    /// the first non-flag one. See `run::exec_argv`'s test.
+    binary: Option<String>,
 }
 
 enum Waiter {
@@ -256,7 +261,9 @@ impl Transport {
              mkdir -p \"$(dirname \"$p\")\"; \
              cat > \"$t\"; chmod 755 \"$t\"; mv \"$t\" \"$p\""
         );
-        let mut proc = self.spawn(&["sh".into(), "-c".into(), script]).await?;
+        let mut proc = self
+            .spawn(&["sh".into(), "-c".into(), script], None)
+            .await?;
         proc.stdin.write_all(bytes).await?;
         proc.stdin.shutdown().await?;
         // Close our handle so the remote sees EOF, then wait.
@@ -273,14 +280,11 @@ impl Transport {
 
     /// Spawn `argv` with piped stdio, no shell in between: paths are
     /// absolute by now and `openssh` quotes each argument for the remote
-    /// shell.
-    pub async fn spawn(&self, argv: &[String]) -> Result<Proc> {
+    /// shell. `binary` is the executable `kill` should hunt on the target,
+    /// `None` when this process is never cancelled (the upload shell).
+    pub async fn spawn(&self, argv: &[String], binary: Option<&str>) -> Result<Proc> {
         let (prog, rest) = argv.split_first().context("empty argv")?;
-        let argv0 = argv
-            .iter()
-            .find(|a| !matches!(a.as_str(), "sudo" | "doas" | "-n"))
-            .cloned()
-            .unwrap_or_default();
+        let binary = binary.map(str::to_string);
         match self {
             Transport::Local => {
                 let mut child = tokio::process::Command::new(prog)
@@ -299,7 +303,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout.take().unwrap()),
                     stderr: Box::pin(child.stderr.take().unwrap()),
                     waiter: Waiter::Local(child),
-                    argv0,
+                    binary,
                 })
             }
             Transport::Ssh { session, .. } => {
@@ -318,7 +322,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout().take().unwrap()),
                     stderr: Box::pin(child.stderr().take().unwrap()),
                     waiter: Waiter::Ssh(Some(child)),
-                    argv0,
+                    binary,
                 })
             }
         }
@@ -350,7 +354,10 @@ impl Transport {
                 // -f` loop kills the killer and whichever of the real
                 // targets it had not reached yet. `/proc/<pid>/exe` is the
                 // filter that tells the two apart.
-                self.sh(&kill_script(&proc.argv0)).await?;
+                let Some(bin) = &proc.binary else {
+                    bail!("no kill target for this process");
+                };
+                self.sh(&kill_script(bin)).await?;
                 Ok(())
             }
             _ => Ok(()),

@@ -89,7 +89,14 @@ pub enum Up {
 }
 
 /// A 1 MiB chunk of base64 plus JSON framing fits with room to spare.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// The largest payload that survives a single frame: bytes travel as
+/// base64, so four bytes on the wire carry three of payload, and the JSON
+/// envelope needs a little room besides. Anything that puts a whole file
+/// in one frame (`HelperResponse::Bytes`, and so every escalated read)
+/// must refuse above this rather than build a frame the far end rejects.
+pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = Zeroizing::new(serde_json::to_vec(msg).map_err(io::Error::other)?);

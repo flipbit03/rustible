@@ -150,14 +150,43 @@ impl WorkspaceFiles {
     }
 
     /// Resolve a `FetchChunk` destination inside the root, creating parent
-    /// directories. The parent is canonicalized after creation so a symlink
-    /// inside the workspace cannot redirect the write outside it.
+    /// directories.
+    ///
+    /// Confinement is decided before anything is created: the deepest
+    /// ancestor that already exists is canonicalized and must be inside the
+    /// root. Creating first and checking after still refused the write, but
+    /// a denied fetch through an in-workspace symlink pointing outward had
+    /// by then made `<outside>/deep/nested` on the orchestrator. The check
+    /// is repeated after `create_dir_all` because the last component of the
+    /// path may itself be a symlink planted in between.
     pub fn resolve_dest(&self, dest: &str) -> Result<PathBuf, String> {
         let joined = self.relative(dest)?;
         let Some(name) = joined.file_name() else {
             return Err(format!("`{dest}` has no file name"));
         };
         let parent = joined.parent().unwrap_or(&self.root);
+
+        let mut existing = parent;
+        loop {
+            if !existing.starts_with(&self.root) {
+                return Err(format!("`{dest}` resolves outside the workspace"));
+            }
+            match existing.canonicalize() {
+                Ok(real) if real.starts_with(&self.root) => break,
+                Ok(real) => {
+                    return Err(format!(
+                        "`{dest}` resolves outside the workspace ({})",
+                        real.display()
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match existing.parent() {
+                    Some(p) => existing = p,
+                    None => return Err(format!("`{dest}` resolves outside the workspace")),
+                },
+                Err(e) => return Err(format!("{}: {e}", existing.display())),
+            }
+        }
+
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         let real_parent = parent
@@ -313,6 +342,18 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
         assert!(ws.resolve_dest("escape/x").unwrap_err().contains("outside"));
+
+        // A denial creates nothing outside the workspace on the way to
+        // saying no, however deep the refused destination is.
+        assert!(
+            ws.resolve_dest("escape/deep/nested/x")
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            !outside.path().join("deep").exists(),
+            "a refused fetch created directories outside the workspace"
+        );
 
         ws.write_chunk("out/host", 0, b"abc").unwrap();
         ws.write_chunk("out/host", 3, b"def").unwrap();

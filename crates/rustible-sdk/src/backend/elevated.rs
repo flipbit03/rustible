@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{Backend, CmdSpec, Local, Output, Stat};
-use crate::protocol::{read_frame, write_frame};
+use crate::protocol::{MAX_FRAME_PAYLOAD, read_frame, write_frame};
 use crate::secret::Secret;
 
 /// One `Backend` primitive on the wire.
@@ -104,6 +104,25 @@ impl HelperOp {
             HelperOp::ReadLink { path } => one("read_link", path),
             HelperOp::ReadDir { path } => one("read_dir", path),
             HelperOp::Spawn(spec) => format!("spawn {}", spec.argv().join(" ")),
+        }
+    }
+
+    /// The file bytes this op would put in a single frame, with the path
+    /// they belong to. `None` for ops whose request carries no payload.
+    ///
+    /// Every primitive is one request and one response, so a file crosses
+    /// the helper boundary whole. Bytes travel as base64, so the ceiling is
+    /// `MAX_FRAME_PAYLOAD`, well under the size of artifacts people copy.
+    /// Streaming the primitives would lift it; until then the limit is
+    /// reported up front rather than discovered inside the framing.
+    pub fn payload(&self) -> Option<(&Path, usize)> {
+        match self {
+            HelperOp::Write { path, bytes } => Some((path, bytes.len())),
+            HelperOp::Spawn(spec) => spec
+                .stdin
+                .as_ref()
+                .map(|b| (Path::new(&spec.program), b.len())),
+            _ => None,
         }
     }
 
@@ -399,6 +418,12 @@ pub struct Elevated {
     /// The owning `System`'s phase cell; `Checking` travels with each request.
     phase: Arc<AtomicU8>,
     conn: Mutex<Option<Connection>>,
+    /// The first failure, latched. Once the helper has died, every later
+    /// primitive reports this instead of spawning another one: a wrong
+    /// password would otherwise mean one `sudo` authentication attempt per
+    /// file operation, which is a syslog line and mail to root each time
+    /// and `pam_faillock` locking the account out after a handful.
+    failed: Mutex<Option<String>>,
 }
 
 impl Elevated {
@@ -409,6 +434,7 @@ impl Elevated {
             spawner: Some(spawner),
             phase,
             conn: Mutex::new(None),
+            failed: Mutex::new(None),
         }
     }
 
@@ -429,6 +455,7 @@ impl Elevated {
                 child: None,
                 stderr_tail: Arc::default(),
             })),
+            failed: Mutex::new(None),
         }
     }
 
@@ -438,24 +465,68 @@ impl Elevated {
 
     fn call(&self, op: HelperOp) -> io::Result<HelperResponse> {
         let checking = self.phase.load(Ordering::SeqCst) == crate::system::Phase::Checking as u8;
+        if let Some(why) = self.failed.lock().unwrap().as_ref() {
+            return Err(io::Error::other(format!(
+                "the helper running as `{}` failed earlier and is not retried: {why}",
+                self.user
+            )));
+        }
+        if let Some((path, len)) = op.payload()
+            && len > MAX_FRAME_PAYLOAD
+        {
+            return Err(io::Error::other(format!(
+                "{}: {len} bytes is more than one helper frame can carry ({} bytes); \
+                 running as `{}` sends the whole file in one request, so a file this \
+                 large has to be handled without `as_user`/`as_root`",
+                path.display(),
+                MAX_FRAME_PAYLOAD,
+                self.user
+            )));
+        }
         let mut guard = self.conn.lock().unwrap();
         if guard.is_none() {
             let spawner = self
                 .spawner
                 .as_ref()
                 .ok_or_else(|| io::Error::other("helper connection is closed"))?;
-            *guard = Some(spawner.spawn(&self.user)?);
+            *guard = Some(self.latch(spawner.spawn(&self.user))?);
         }
         let conn = guard.as_mut().expect("connected");
+        let label = op.label();
         let req = HelperRequest { checking, op };
-        let resp = conn.call(&req);
+        let resp = conn.call(&req).map_err(|e| {
+            if e.to_string().contains("exceeds limit") {
+                io::Error::other(format!(
+                    "{label}: the helper's answer is larger than one frame can carry \
+                     ({MAX_FRAME_PAYLOAD} bytes of payload); reading a file this large \
+                     as `{}` is not supported, do it without `as_user`/`as_root`",
+                    self.user
+                ))
+            } else {
+                e
+            }
+        });
         if resp.is_err() {
-            // A dead helper is not reused; the next call reports the failure again.
+            // A dead helper is neither reused nor replaced: the connection
+            // goes, and `failed` stops the next call from spawning a
+            // successor that would fail exactly the same way.
             if let Some(c) = guard.take() {
                 c.shutdown();
             }
         }
-        resp.and_then(|r| r.into_io())
+        self.latch(resp)?.into_io()
+    }
+
+    /// Remember the first failure so later calls report it instead of
+    /// spawning another helper.
+    fn latch<T>(&self, r: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &r {
+            let mut f = self.failed.lock().unwrap();
+            if f.is_none() {
+                *f = Some(e.to_string());
+            }
+        }
+        r
     }
 
     fn expect_unit(&self, op: HelperOp) -> io::Result<()> {
@@ -746,6 +817,29 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_write_is_refused_before_it_reaches_the_wire() {
+        let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
+        let e = in_process(phase);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big");
+        // One byte over what a frame can carry. The refusal has to name the
+        // file, both numbers and the identity, because the failure it
+        // replaces was "frame of N bytes exceeds limit" from inside the
+        // framing, which named none of them.
+        let too_big = vec![0u8; MAX_FRAME_PAYLOAD + 1];
+        let err = e.write(&f, &too_big).unwrap_err().to_string();
+        assert!(err.contains(&f.display().to_string()), "{err}");
+        assert!(err.contains(&(MAX_FRAME_PAYLOAD + 1).to_string()), "{err}");
+        assert!(err.contains(&MAX_FRAME_PAYLOAD.to_string()), "{err}");
+        assert!(err.contains("tester"), "{err}");
+        assert!(!f.exists(), "the write reached the helper anyway");
+
+        // The helper is still usable: this is a refusal, not a failure.
+        e.write(&f, b"small").unwrap();
+        assert_eq!(e.read(&f).unwrap(), b"small");
+    }
+
+    #[test]
     fn dead_helper_reports_exit_and_stderr() {
         // A "helper" that prints to stderr and exits without answering.
         let spawner = Spawner {
@@ -780,9 +874,21 @@ mod tests {
             spawner: Some(spawner),
             phase: Arc::new(AtomicU8::new(0)),
             conn: Mutex::new(Some(conn)),
+            failed: Mutex::new(None),
         };
         reader.join().unwrap();
         let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
         assert!(err.contains("exited 7") && err.contains("boom"), "{err}");
+
+        // The failure is latched: the next primitive reports it rather than
+        // spawning a successor. A respawn would try `/nonexistent/rustible-bin`
+        // and say so, which is how this tells the two apart.
+        let again = e.stat(Path::new("/etc/hostname")).unwrap_err().to_string();
+        assert!(
+            again.contains("failed earlier and is not retried"),
+            "{again}"
+        );
+        assert!(again.contains("exited 7"), "{again}");
+        assert!(!again.contains("/nonexistent/rustible-bin"), "{again}");
     }
 }

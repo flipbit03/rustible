@@ -14,9 +14,10 @@ use crate::error::{Context as _, Error, Result};
 use crate::event::{Event, Level, Status, Summary};
 use crate::facts::Facts;
 use crate::op::{Applied, Op, Plan};
+use crate::protocol::MAX_FRAME_PAYLOAD;
 use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
-use crate::system::{Phase, System};
+use crate::system::{Identity, Phase, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
@@ -385,6 +386,25 @@ impl Ctx {
         } else {
             dest
         };
+        // `sys.read` puts the whole file in memory on this host, and an
+        // escalated read also puts it in one helper frame, base64-inflated
+        // by 4/3 against the frame ceiling. Refuse first, with the numbers
+        // and the reason: without this the escalated case failed deep in
+        // the framing with "frame of N bytes exceeds limit", naming neither
+        // the file nor the helper.
+        if let Some(st) = self.sys.stat_follow(remote)?
+            && matches!(self.sys.identity(), Identity::User(_))
+            && st.size > MAX_FRAME_PAYLOAD as u64
+        {
+            return Err(Error::msg(format!(
+                "fetching {}: {} bytes is more than an escalated read can carry \
+                 ({} bytes, the helper's frame limit); a file this large has to be \
+                 fetched without `as_user`/`as_root`, or copied to a readable path first",
+                remote.display(),
+                st.size,
+                MAX_FRAME_PAYLOAD
+            )));
+        }
         let bytes = self
             .sys
             .read(remote)
