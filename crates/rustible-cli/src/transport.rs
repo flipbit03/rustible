@@ -234,9 +234,15 @@ impl Transport {
     /// atomically move into place and mark executable.
     pub async fn upload(&self, bytes: &[u8], abs_path: &str) -> Result<()> {
         let p = shell_quote(abs_path);
+        // The temp name carries the remote shell's pid: the final path is a
+        // content hash, so two runs uploading the same binary at once would
+        // otherwise interleave into one `$p.tmp`, and `mv` would publish the
+        // mixture. `exists` only tests for an executable file, so that
+        // corruption would then be a cache hit forever.
         let script = format!(
-            "set -e; p={p}; mkdir -p \"$(dirname \"$p\")\"; \
-             cat > \"$p.tmp\"; chmod 755 \"$p.tmp\"; mv \"$p.tmp\" \"$p\""
+            "set -e; p={p}; t=\"$p.$$.tmp\"; trap 'rm -f \"$t\"' EXIT; \
+             mkdir -p \"$(dirname \"$p\")\"; \
+             cat > \"$t\"; chmod 755 \"$t\"; mv \"$t\" \"$p\""
         );
         let mut proc = self.spawn(&["sh".into(), "-c".into(), script]).await?;
         proc.stdin.write_all(bytes).await?;

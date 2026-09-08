@@ -396,14 +396,23 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
             .into_iter()
             .collect();
         let t0 = Instant::now();
-        cargo.build(Some(&name), &triples).await?;
-        let mut artifacts: BTreeMap<String, Arc<(Vec<u8>, String)>> = BTreeMap::new();
-        for t in &triples {
-            let p = cargo.dist_bin(t);
-            let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-            let hash = describe::hex(&Sha256::digest(&bytes));
-            artifacts.insert(t.clone(), Arc::new((bytes, hash)));
-        }
+        // Not `?`: the hosts are connected, so a build failure has to be
+        // reported against them and their control masters closed, or the run
+        // ends with no summary and an ssh master left behind for its
+        // ControlPersist window.
+        let built = build_artifacts(&cargo, &name, &triples).await;
+        let artifacts = match built {
+            Ok(a) => a,
+            Err(e) => {
+                for (r, tr, _) in hosts {
+                    out.lock().unwrap().failed(&r.host, &format!("{e:#}"));
+                    tr.close().await;
+                }
+                let failed = out.lock().unwrap().finish();
+                debug_assert!(failed);
+                return Ok(EXIT_FAILED);
+            }
+        };
         if args.verbose >= 1 {
             eprintln!(
                 "built {} for {} in {:.2?}",
@@ -442,6 +451,24 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         eprintln!("total {:.2?}", t_start.elapsed());
     }
     Ok(if failed { EXIT_FAILED } else { 0 })
+}
+
+/// One cargo build for every triple in play, then the bytes and the hash of
+/// each artifact.
+async fn build_artifacts(
+    cargo: &Cargo,
+    name: &str,
+    triples: &[String],
+) -> Result<BTreeMap<String, Arc<(Vec<u8>, String)>>> {
+    cargo.build(Some(name), triples).await?;
+    let mut artifacts = BTreeMap::new();
+    for t in triples {
+        let p = cargo.dist_bin(t);
+        let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+        let hash = describe::hex(&Sha256::digest(&bytes));
+        artifacts.insert(t.clone(), Arc::new((bytes, hash)));
+    }
+    Ok(artifacts)
 }
 
 /// What every host of one run shares.
@@ -496,7 +523,45 @@ async fn drive(
         &r.params.escalate_user,
     );
     let mut proc = tr.spawn(&argv).await?;
+    // From here on the child owns the failure story: `sudo -n` refusing, a
+    // binary that dies at once, a desynced stream. Returning early would drop
+    // its stderr and leave the user with "Broken pipe", so every error below
+    // is caught and told with what the child said.
+    match drive_frames(&mut proc, plan, r, probe, vars, out, host, name).await {
+        Ok(()) => {}
+        Err(e) => {
+            let stderr = proc.stderr_text().await;
+            let stderr = stderr.trim();
+            return Err(if stderr.is_empty() {
+                e
+            } else {
+                e.context(format!("the playbook binary said: {stderr}"))
+            });
+        }
+    }
+    let exit = proc.wait().await?;
+    let stderr = proc.stderr_text().await;
+    if !stderr.trim().is_empty() {
+        out.lock().unwrap().stderr(host, stderr.trim_end());
+    }
+    out.lock().unwrap().exited(host, exit);
+    Ok(())
+}
 
+/// `Start` down, every `Up` frame to the renderer, until the binary closes
+/// its stdout.
+#[allow(clippy::too_many_arguments)]
+async fn drive_frames(
+    proc: &mut crate::transport::Proc,
+    plan: &Plan,
+    r: &Resolved,
+    probe: &Probe,
+    vars: Value,
+    out: &Shared,
+    host: &str,
+    name: &str,
+) -> Result<()> {
+    let _ = probe;
     let start = Down::Start {
         run_id: format!(
             "{:x}",
@@ -535,12 +600,6 @@ async fn drive(
         }
         out.lock().unwrap().frame(host, &up);
     }
-    let exit = proc.wait().await?;
-    let stderr = proc.stderr_text().await;
-    if !stderr.trim().is_empty() {
-        out.lock().unwrap().stderr(host, stderr.trim_end());
-    }
-    out.lock().unwrap().exited(host, exit);
     Ok(())
 }
 
@@ -555,6 +614,11 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
     Ok(())
 }
 
+/// Same ceiling the SDK's framing uses. A playbook that writes to stdout
+/// desyncs the stream, and four bytes of prose read as a huge length; a cap
+/// turns that into a protocol error instead of an allocation.
+const MAX_FRAME: usize = 64 * 1024 * 1024;
+
 async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     r: &mut R,
 ) -> Result<Option<T>> {
@@ -565,6 +629,12 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOw
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_FRAME {
+        bail!(
+            "protocol error: the binary announced a {len}-byte frame (limit {MAX_FRAME}); \
+             a playbook that prints to stdout desyncs the stream, use ctx.log instead"
+        );
+    }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
     Ok(Some(serde_json::from_slice(&body)?))
@@ -574,6 +644,21 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOw
 mod tests {
     use super::*;
     use crate::Usage;
+
+    #[tokio::test]
+    async fn read_frame_refuses_an_absurd_length() {
+        // Four bytes of prose from a stray println! read as a length.
+        let mut stream: &[u8] = b"hello, world";
+        let err = read_frame::<_, Up>(&mut stream)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protocol error"), "{err}");
+        assert!(err.contains("ctx.log"), "{err}");
+        // A clean EOF is still not an error.
+        let mut empty: &[u8] = b"";
+        assert!(read_frame::<_, Up>(&mut empty).await.unwrap().is_none());
+    }
 
     const INV: &str = r#"
 defaults ssh_user="cadu"

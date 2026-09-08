@@ -132,7 +132,14 @@ async fn main() {
 async fn dispatch(cli: Cli) -> Result<u8> {
     let ws = cli.workspace.as_deref();
     match cli.cmd {
-        Cmd::Init(args) => init::run(args).map(|()| 0),
+        Cmd::Init(args) => {
+            if ws.is_some() {
+                return Err(usage(
+                    "--workspace does not apply to `init`; give the directory as its argument",
+                ));
+            }
+            init::run(args).map(|()| 0)
+        }
         Cmd::Playbook { cmd } => match cmd {
             PlaybookCmd::Run(args) => {
                 let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
@@ -143,7 +150,16 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
                 list(&ws)
             }
-            PlaybookCmd::Create(args) => create::run(args).map(|()| 0),
+            PlaybookCmd::Create(mut args) => {
+                // A relative path belongs to the workspace the user named,
+                // not to the current directory.
+                if let Some(root) = ws
+                    && args.path.is_relative()
+                {
+                    args.path = root.join(&args.path);
+                }
+                create::run(args).map(|()| 0)
+            }
         },
         Cmd::Inventory { cmd } => inventory(ws, cmd).await,
     }
@@ -230,7 +246,9 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result
         .context("building the workspace")?;
     let bin = cargo.debug_bin();
     let playbooks = describe::describe_bin(&bin).await?;
-    let inventory_file = ws.config.inventory.display().to_string();
+    // `shown` is the file the user pointed at (`--file staging.kdl`), which
+    // is not always the workspace default the config names.
+    let inventory_file = shown.to_string();
     let mut errors = 0usize;
     for d in &playbooks {
         let src = ws.playbook_file(&d.name);

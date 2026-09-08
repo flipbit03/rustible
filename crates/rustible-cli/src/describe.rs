@@ -54,6 +54,39 @@ struct Package {
 struct Target {
     name: String,
     kind: Vec<String>,
+    src_path: PathBuf,
+}
+
+/// A workspace's playbook binary is the `src/main.rs` one. Taking the first
+/// `bin` cargo lists would silently pick up a `src/bin/tool.rs` the user
+/// added, and cargo metadata promises no order.
+fn pick_bin<'a>(targets: impl Iterator<Item = &'a Target>, manifest: &Path) -> Result<String> {
+    let bins: Vec<&Target> = targets
+        .filter(|t| t.kind.iter().any(|k| k == "bin"))
+        .collect();
+    let from_main: Vec<&Target> = bins
+        .iter()
+        .copied()
+        .filter(|t| t.src_path.ends_with("src/main.rs"))
+        .collect();
+    match (from_main.as_slice(), bins.as_slice()) {
+        ([one], _) => Ok(one.name.clone()),
+        ([], [only]) => Ok(only.name.clone()),
+        ([], []) => bail!(
+            "{} has no bin target; a rustible workspace has one, src/main.rs",
+            manifest.display()
+        ),
+        (many, all) => {
+            let listed = if many.is_empty() { all } else { many };
+            let names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
+            bail!(
+                "{} has several bin targets ({}); rustible drives the one built from \
+                 src/main.rs, so keep exactly one",
+                manifest.display(),
+                names.join(", ")
+            )
+        }
+    }
 }
 
 impl Cargo {
@@ -78,18 +111,7 @@ impl Cargo {
             );
         }
         let md: Metadata = serde_json::from_slice(&out.stdout).context("parsing cargo metadata")?;
-        let bin = md
-            .packages
-            .iter()
-            .flat_map(|p| &p.targets)
-            .find(|t| t.kind.iter().any(|k| k == "bin"))
-            .map(|t| t.name.clone())
-            .with_context(|| {
-                format!(
-                    "{} has no bin target; a rustible workspace has one, src/main.rs",
-                    manifest.display()
-                )
-            })?;
+        let bin = pick_bin(md.packages.iter().flat_map(|p| &p.targets), manifest)?;
         Ok(Cargo {
             manifest: manifest.to_path_buf(),
             target_dir: md.target_directory,
@@ -273,6 +295,46 @@ pub async fn check_vars(bin: &Path, name: &str, hosts: &[HostVars]) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target(name: &str, src: &str) -> Target {
+        Target {
+            name: name.into(),
+            kind: vec!["bin".into()],
+            src_path: PathBuf::from(src),
+        }
+    }
+
+    #[test]
+    fn pick_bin_prefers_the_src_main_target() {
+        let m = Path::new("/ws/Cargo.toml");
+        let tool = target("tool", "/ws/src/bin/tool.rs");
+        let main = target("infra", "/ws/src/main.rs");
+        // Either order, the src/main.rs one wins.
+        assert_eq!(pick_bin([&tool, &main].into_iter(), m).unwrap(), "infra");
+        assert_eq!(pick_bin([&main, &tool].into_iter(), m).unwrap(), "infra");
+        // A lone bin elsewhere is still the one to drive.
+        assert_eq!(pick_bin([&tool].into_iter(), m).unwrap(), "tool");
+        // A lib-only workspace, and two src/main.rs bins (two packages).
+        let lib = Target {
+            name: "helpers".into(),
+            kind: vec!["lib".into()],
+            src_path: PathBuf::from("/ws/src/lib.rs"),
+        };
+        assert!(
+            pick_bin([&lib].into_iter(), m)
+                .unwrap_err()
+                .to_string()
+                .contains("no bin target")
+        );
+        let other = target("second", "/ws/other/src/main.rs");
+        let err = pick_bin([&main, &other].into_iter(), m)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("several bin targets") && err.contains("second"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn cache_key_covers_source_and_lock() {
