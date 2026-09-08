@@ -129,3 +129,31 @@ impl Backend for Local {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_read_link_read_dir_on_real_fs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("target.txt");
+        let link = root.join("link");
+        std::fs::write(&target, "x").unwrap();
+
+        Local.symlink(&target, &link).unwrap();
+        assert_eq!(Local.read_link(&link).unwrap(), target);
+        assert_eq!(Local.stat(&link).unwrap().unwrap().kind, FileKind::Symlink);
+        assert!(Local.read_link(&target).is_err(), "not a symlink");
+        assert!(Local.symlink(&target, &link).is_err(), "link exists");
+
+        let kids = Local.read_dir(root).unwrap();
+        assert_eq!(kids, vec![link.clone(), target.clone()]);
+
+        // Removing the link keeps the target.
+        Local.remove(&link).unwrap();
+        assert!(Local.stat(&link).unwrap().is_none());
+        assert!(Local.stat(&target).unwrap().is_some());
+    }
+}
