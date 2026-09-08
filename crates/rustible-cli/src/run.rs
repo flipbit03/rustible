@@ -5,11 +5,18 @@
 //! host in parallel; probe triple and `$HOME`; one `dist` build for every
 //! triple; upload if missing; execute with the host's escalation prefix and
 //! drive the protocol; render.
+//!
+//! While the protocol runs, this side also answers the binary's
+//! `FileRequest`s from the workspace root, writes its `FetchChunk`s back
+//! under the same root, and turns ctrl-c into a `Cancel` frame to every
+//! host with a ten second grace period before the binary is killed
+//! (vision doc 5.5).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rustible_cli::inventory::{
@@ -20,13 +27,15 @@ use rustible_sdk::HostInfo;
 use rustible_sdk::event::Event;
 use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
+use rustible_sdk::secret::Secret;
+use rustible_sdk::stream::{WorkspaceFiles, chunks, run_dir_name};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::describe::{self, Cargo, Describe};
 use crate::render::Renderer;
-use crate::transport::{Probe, SshTarget, Transport};
+use crate::transport::{KillTarget, Probe, SshTarget, Transport};
 use crate::usage;
 use crate::workspace::Workspace;
 
@@ -51,7 +60,16 @@ pub struct RunArgs {
     /// Print the raw frames as JSON lines instead of rendering.
     #[arg(long)]
     pub json: bool,
+    /// Name of an environment variable holding the escalation password, for
+    /// hosts where `sudo -n` is refused. It travels in the `Start` frame,
+    /// never on a command line, and is zeroized after use.
+    #[arg(long, value_name = "VAR")]
+    pub escalate_password_env: Option<String>,
 }
+
+/// How long a cancelled binary gets to stop between steps before the
+/// orchestrator kills it (vision doc 5.5).
+pub const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Exit codes of `playbook run`.
 pub const EXIT_FAILED: u8 = 2;
@@ -117,21 +135,46 @@ pub fn merged_vars(resolved: &Resolved, cli: &serde_json::Map<String, Value>) ->
 
 /// How the binary is launched on the target (vision 5.2 step 8, 11.3):
 /// bare, or behind the host's escalation method as `escalate_user`.
+///
+/// The binary's own position in the result is not fixed: it is first when
+/// nothing escalates, third behind `sudo -n`, and fifth behind `sudo -n -u
+/// <someone-not-root>`. Anything that needs the path (`Transport::kill`)
+/// takes it as `remote_path` gave it, never by scanning this.
 pub fn exec_argv(bin: &str, escalate: bool, method: Escalate, escalate_user: &str) -> Vec<String> {
+    let mut argv = escalate_prefix(escalate, method, escalate_user);
+    argv.push(bin.to_string());
+    argv.push("--remote".to_string());
+    argv
+}
+
+/// The escalation words the binary is launched behind, empty when it runs
+/// as the login user. Whatever the binary creates on the target belongs to
+/// that identity, so removing it later takes the same prefix.
+pub fn escalate_prefix(escalate: bool, method: Escalate, escalate_user: &str) -> Vec<String> {
     let mut argv = vec![];
     if escalate {
         match method {
             Escalate::Sudo => argv.extend(["sudo".to_string(), "-n".to_string()]),
             Escalate::Doas => argv.extend(["doas".to_string(), "-n".to_string()]),
-            Escalate::None => {}
+            Escalate::None => return argv,
         }
-        if method != Escalate::None && escalate_user != "root" {
+        if escalate_user != "root" {
             argv.extend(["-u".to_string(), escalate_user.to_string()]);
         }
     }
-    argv.push(bin.to_string());
-    argv.push("--remote".to_string());
     argv
+}
+
+/// A run id, unique per host run: the orchestrator sends it in `Start` and
+/// it names the run's temp directory on the target.
+fn new_run_id() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// `<home>/.cache/rustible/bin/<playbook with / as _>-<sha256>` (vision 5.2
@@ -210,6 +253,23 @@ impl Output {
     fn note(&mut self, host: &str, msg: &str) {
         if let Output::Pretty(r) = self {
             r.note(host, msg);
+        }
+    }
+
+    /// A `ctx.fetch` that landed. `--json` gets the path and size rather
+    /// than the `FetchChunk` frames themselves: a fetched file can be
+    /// hundreds of megabytes and its bytes are already on disk.
+    fn fetched(&mut self, host: &str, dest: &str, path: &Path, bytes: u64) {
+        match self {
+            Output::Pretty(r) => r.note(
+                host,
+                &format!("fetched `{dest}` ({bytes} bytes) to {}", path.display()),
+            ),
+            Output::Json { .. } => self.json(
+                host,
+                "fetched",
+                serde_json::json!({ "dest": dest, "path": path, "bytes": bytes }),
+            ),
         }
     }
 
@@ -345,6 +405,68 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         Output::Pretty(Renderer::new(std::io::stdout(), &host_names, args.verbose))
     }));
 
+    let escalate_password = match &args.escalate_password_env {
+        Some(var) => Some(Secret::from(
+            std::env::var(var).with_context(|| format!("reading ${var}"))?,
+        )),
+        None => None,
+    };
+    let files = Arc::new(
+        WorkspaceFiles::new(&ws.root)
+            .with_context(|| format!("serving files from {}", ws.root.display()))?,
+    );
+
+    // Ctrl-c: every host's frame loop watches this and sends `Cancel`. The
+    // signal handler only flips the flag, so no step is interrupted
+    // mid-apply (vision 5.5).
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // In a loop, and not just the first press: tokio's handler stays
+        // installed for the life of the process, so once this task ended
+        // every later ctrl-c was swallowed and the terminal could no longer
+        // stop the run at all. Local children are in their own process
+        // group precisely so the signal does not reach them, which makes
+        // this task the only thing standing between the user and a run they
+        // cannot abort.
+        let mut presses = 0u32;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            presses += 1;
+            if presses == 1 {
+                eprintln!(
+                    "\nctrl-c: cancelling; each host gets {CANCEL_GRACE:?} to stop between \
+                     steps. Press ctrl-c again to quit at once."
+                );
+                let _ = cancel_tx.send(true);
+            } else {
+                eprintln!(
+                    "\nctrl-c again: quitting now. Processes already started on the targets \
+                     are left running, and an ssh master may persist for its ControlPersist \
+                     window."
+                );
+                std::process::exit(EXIT_FAILED as i32);
+            }
+        }
+    });
+
+    // Between phases: connect, build and upload are not steps, so `Cancel`
+    // means "do not start the next phase" rather than anything on a target.
+    macro_rules! bail_if_cancelled {
+        ($hosts:expr) => {
+            if *cancel_rx.borrow() {
+                // The branch returns, so taking the hosts here is a move on
+                // a path that never reaches their later use.
+                for (r, tr, _) in $hosts {
+                    out.lock()
+                        .unwrap()
+                        .failed(&r.host, "cancelled before the playbook started");
+                    tr.close().await;
+                }
+                out.lock().unwrap().finish();
+                return Ok(EXIT_FAILED);
+            }
+        };
+    }
+
     // 4, 5. Connect and probe every host in parallel.
     let mut connects = vec![];
     for r in targets {
@@ -387,6 +509,8 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         }
     }
 
+    bail_if_cancelled!(hosts);
+
     if !hosts.is_empty() {
         // 6. One build for every triple.
         let triples: Vec<String> = hosts
@@ -421,6 +545,10 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
                 t0.elapsed()
             );
         }
+        // `cargo` runs in this process group, so a ctrl-c during the build
+        // reached it too and it may have died; either way the run stops here
+        // rather than uploading and starting playbooks nobody is waiting for.
+        bail_if_cancelled!(hosts);
 
         // 7, 8, 9. Per host: upload if missing, execute, stream frames.
         let plan = Arc::new(Plan {
@@ -428,14 +556,19 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
             escalate: d.escalate,
             check: args.check,
             verbosity: args.verbose,
+            files,
+            escalate_password,
         });
         let mut runs = vec![];
         for (r, tr, probe) in hosts {
             let artifact = artifacts[&probe.triple].clone();
             let (out, plan) = (out.clone(), plan.clone());
             let vars = merged_vars(&r, &cli);
+            let cancel_rx = cancel_rx.clone();
             runs.push(tokio::spawn(async move {
-                if let Err(e) = drive(&plan, &r, &tr, &probe, &artifact, vars, &out).await {
+                if let Err(e) =
+                    drive(&plan, &r, &tr, &probe, &artifact, vars, &out, cancel_rx).await
+                {
                     out.lock().unwrap().failed(&r.host, &format!("{e:#}"));
                 }
                 tr.close().await;
@@ -477,10 +610,15 @@ struct Plan {
     escalate: bool,
     check: bool,
     verbosity: u8,
+    /// Serves `FileRequest` and receives `FetchChunk`, rooted at the
+    /// workspace so a playbook cannot read outside it.
+    files: Arc<WorkspaceFiles>,
+    escalate_password: Option<Secret>,
 }
 
 /// Steps 7 to 9 for one host: upload if missing, execute, drive the
 /// protocol until EOF, hand every frame to the output.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     plan: &Plan,
     r: &Resolved,
@@ -489,6 +627,7 @@ async fn drive(
     artifact: &(Vec<u8>, String),
     vars: Value,
     out: &Shared,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let host = r.host.as_str();
     let name = plan.name.as_str();
@@ -522,13 +661,31 @@ async fn drive(
         r.params.escalate,
         &r.params.escalate_user,
     );
-    let mut proc = tr.spawn(&argv).await?;
+    let run_id = new_run_id();
+    let mut proc = tr
+        .spawn(
+            &argv,
+            Some(KillTarget {
+                binary: path.clone(),
+                run_dir: run_dir_name(&run_id),
+                escalate: escalate_prefix(
+                    plan.escalate,
+                    r.params.escalate,
+                    &r.params.escalate_user,
+                ),
+            }),
+        )
+        .await?;
     // From here on the child owns the failure story: `sudo -n` refusing, a
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
     // is caught and told with what the child said.
-    match drive_frames(&mut proc, plan, r, probe, vars, out, host, name).await {
-        Ok(()) => {}
+    let killed = match drive_frames(
+        tr, &mut proc, plan, r, probe, vars, out, host, name, cancel_rx, &run_id,
+    )
+    .await
+    {
+        Ok(killed) => killed,
         Err(e) => {
             let stderr = proc.stderr_text().await;
             let stderr = stderr.trim();
@@ -538,6 +695,24 @@ async fn drive(
                 e.context(format!("the playbook binary said: {stderr}"))
             });
         }
+    };
+    if killed {
+        // The binary was killed on purpose. Its exit status says only how it
+        // died, and over SSH `wait` reports the channel's own view of that
+        // ("the remote process has terminated"), so the host is closed with
+        // the reason rather than with that.
+        let _ = proc.wait().await;
+        let stderr = proc.stderr_text().await;
+        if !stderr.trim().is_empty() {
+            out.lock().unwrap().stderr(host, stderr.trim_end());
+        }
+        out.lock().unwrap().failed(
+            host,
+            &format!(
+                "cancelled: the running step did not finish within {CANCEL_GRACE:?}, the binary was killed"
+            ),
+        );
+        return Ok(());
     }
     let exit = proc.wait().await?;
     let stderr = proc.stderr_text().await;
@@ -549,9 +724,11 @@ async fn drive(
 }
 
 /// `Start` down, every `Up` frame to the renderer, until the binary closes
-/// its stdout.
+/// its stdout. `true` when the binary had to be killed after ignoring
+/// `Cancel` for the whole grace period.
 #[allow(clippy::too_many_arguments)]
 async fn drive_frames(
+    tr: &Transport,
     proc: &mut crate::transport::Proc,
     plan: &Plan,
     r: &Resolved,
@@ -560,34 +737,100 @@ async fn drive_frames(
     out: &Shared,
     host: &str,
     name: &str,
-) -> Result<()> {
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    run_id: &str,
+) -> Result<bool> {
     let _ = probe;
     let start = Down::Start {
-        run_id: format!(
-            "{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ),
+        run_id: run_id.to_string(),
         playbook: name.to_string(),
         host: HostInfo {
             name: host.to_string(),
             groups: r.groups.clone(),
             escalate_user: r.params.escalate_user.clone(),
+            escalate_method: r.params.escalate.as_str().to_string(),
             connection: r.params.connection.as_str().to_string(),
         },
         vars,
         check_mode: plan.check,
         verbosity: plan.verbosity,
+        escalate_password: plan.escalate_password.clone(),
     };
     write_frame(&mut proc.stdin, &start).await?;
 
+    // The frames are read by their own task: `read_exact` is not
+    // cancel-safe, so it cannot sit directly in the `select!` below.
+    let mut stdout = std::mem::replace(&mut proc.stdout, Box::pin(tokio::io::empty()));
+    let (tx, mut frames) = tokio::sync::mpsc::channel::<Result<Up>>(64);
+    tokio::spawn(async move {
+        loop {
+            match read_frame::<_, Up>(&mut stdout).await {
+                Ok(Some(up)) => {
+                    if tx.send(Ok(up)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut deadline: Option<tokio::time::Instant> = None;
+    let mut killed = false;
     loop {
-        let Some(up) = read_frame::<_, Up>(&mut proc.stdout).await? else {
-            break;
-        };
-        if let Up::Hello { protocol, playbook } = &up {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(up) = frame else { break };
+                handle_frame(plan, proc, out, host, name, up?, &cancel_rx).await?;
+            }
+            changed = cancel_rx.changed(), if deadline.is_none() => {
+                if changed.is_err() || !*cancel_rx.borrow() {
+                    continue;
+                }
+                eprintln!("[{host}] sending Cancel");
+                // A binary that already exited has closed its stdin; that is
+                // fine, the read side reports the exit.
+                let _ = write_frame(&mut proc.stdin, &Down::Cancel).await;
+                deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
+            }
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if deadline.is_some() =>
+            {
+                eprintln!(
+                    "[{host}] cancelled: the running step did not finish within {CANCEL_GRACE:?}, killing the binary"
+                );
+                tr.kill(proc).await?;
+                killed = true;
+                break;
+            }
+        }
+    }
+    Ok(killed)
+}
+
+/// One `Up` frame: the `Hello` check, an event to render, a file to serve,
+/// or a chunk of a fetched file to write.
+///
+/// Serving a file is the one arm that can run for minutes (a 50 MB stream
+/// over a slow link), and while it does, nothing else watches `cancel_rx`.
+/// It therefore checks the flag between chunks and abandons the transfer,
+/// so ctrl-c during a stream is answered rather than queued behind it.
+#[allow(clippy::too_many_arguments)]
+async fn handle_frame(
+    plan: &Plan,
+    proc: &mut crate::transport::Proc,
+    out: &Shared,
+    host: &str,
+    name: &str,
+    up: Up,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    match &up {
+        Up::Hello { protocol, playbook } => {
             if *protocol != PROTOCOL_VERSION {
                 bail!(
                     "protocol mismatch: rustible speaks {PROTOCOL_VERSION}, the binary speaks {protocol}; \
@@ -598,8 +841,77 @@ async fn drive_frames(
                 bail!("asked for playbook `{name}`, the binary answered with `{playbook}`");
             }
         }
-        out.lock().unwrap().frame(host, &up);
+        Up::FileRequest { req, path } => {
+            let (req, path) = (*req, path.clone());
+            let t0 = Instant::now();
+            match plan.files.open(&path) {
+                Err(reason) => {
+                    out.lock()
+                        .unwrap()
+                        .note(host, &format!("denied file request `{path}`: {reason}"));
+                    write_frame(&mut proc.stdin, &Down::FileDenied { req, reason }).await?;
+                }
+                Ok(file) => {
+                    let mut total = 0u64;
+                    for chunk in chunks(file) {
+                        // `borrow`, not `borrow_and_update`: the select loop
+                        // still has to see the change and send `Cancel`.
+                        if *cancel_rx.borrow() {
+                            let reason = "cancelled while the file was being sent".to_string();
+                            out.lock().unwrap().note(
+                                host,
+                                &format!("abandoning `{path}` after {total} bytes: cancelled"),
+                            );
+                            // Denied rather than silence: the binary's
+                            // `local_file` fails now instead of waiting for
+                            // chunks that will never come.
+                            write_frame(&mut proc.stdin, &Down::FileDenied { req, reason }).await?;
+                            return Ok(());
+                        }
+                        let chunk = chunk.with_context(|| format!("reading `{path}`"))?;
+                        total += chunk.bytes.len() as u64;
+                        let last = chunk.last;
+                        write_frame(
+                            &mut proc.stdin,
+                            &Down::FileChunk {
+                                req,
+                                offset: chunk.offset,
+                                bytes: chunk.bytes,
+                                last,
+                            },
+                        )
+                        .await?;
+                    }
+                    out.lock().unwrap().note(
+                        host,
+                        &format!("sent `{path}` ({total} bytes) in {:.2?}", t0.elapsed()),
+                    );
+                }
+            }
+        }
+        Up::FetchChunk {
+            dest,
+            offset,
+            bytes,
+            last,
+            ..
+        } => {
+            let written = plan
+                .files
+                .write_chunk(dest, *offset, bytes)
+                .map_err(|reason| anyhow::anyhow!("fetch to `{dest}` refused: {reason}"))?;
+            if *last {
+                out.lock()
+                    .unwrap()
+                    .fetched(host, dest, &written, offset + bytes.len() as u64);
+            }
+            // Not `frame`: the chunk's bytes would be re-encoded into the
+            // JSON stream after being written to disk.
+            return Ok(());
+        }
+        Up::Event(_) => {}
     }
+    out.lock().unwrap().frame(host, &up);
     Ok(())
 }
 
@@ -697,6 +1009,32 @@ host "solo" addr="10.0.0.9"
         assert_eq!(
             exec_argv(bin, true, Escalate::None, "admin"),
             [bin, "--remote"]
+        );
+    }
+
+    /// Why `Transport::spawn` is handed the binary's path instead of
+    /// recovering it from `argv`. A filter that skips the escalation words
+    /// finds the binary in three of these four shapes and `-u` in the
+    /// fourth, so a host with a non-root `escalate_user` would hunt for a
+    /// process running `-u`, find none, and cancel nothing while reporting
+    /// that it had killed the binary.
+    #[test]
+    fn the_binary_is_not_at_a_fixed_place_in_exec_argv() {
+        let bin = "/home/admin/.cache/rustible/bin/cadu_slow-abc";
+        let skip_escalation = |argv: &Vec<String>| -> String {
+            argv.iter()
+                .find(|a| !matches!(a.as_str(), "sudo" | "doas" | "-n"))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            skip_escalation(&exec_argv(bin, true, Escalate::Sudo, "root")),
+            bin
+        );
+        assert_eq!(
+            skip_escalation(&exec_argv(bin, true, Escalate::Sudo, "admin")),
+            "-u",
+            "a non-root escalate_user puts a flag where the scan expects the binary"
         );
     }
 

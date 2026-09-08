@@ -12,9 +12,12 @@
 //!   schema walk for per-var attribution, then serde on the typed struct).
 //! - `--remote`: driven by an orchestrator; read the `Start` frame on stdin,
 //!   write `Hello` and event frames on stdout.
-//! - `--helper`: serve `Backend` primitives to a sibling process (M5).
+//! - `--helper`: serve `Backend` primitives to a sibling process that runs
+//!   as another user (vision doc 11.3); this is the `Elevated` backend's
+//!   other half.
 //! - a plain local run: `<name> [--check] [-v|-vv] [--json] [--var k=v]...`,
-//!   printed one line per event (`Compact`) or as JSON lines.
+//!   printed one line per event (`Compact`) or as JSON lines, with
+//!   `local_file` served from the current directory.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -23,10 +26,14 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::backend::serve_helper;
+use crate::channel::{Channel, Feeder};
 use crate::ctx::{Ctx, HostInfo};
 use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink};
 use crate::protocol::{self, Down, FrameSink, Up};
 use crate::registry::{Named, describe_all};
+use crate::secret::Secret;
+use crate::stream::WorkspaceFiles;
 use crate::system::System;
 use crate::vars;
 
@@ -74,11 +81,22 @@ pub fn main(playbooks: &[Named]) -> ExitCode {
             }
         }
         Some("--remote") => remote(playbooks),
-        Some("--helper") => {
-            eprintln!("rustible: helper mode is not implemented until M5");
+        Some("--helper") => helper(),
+        _ => local(playbooks, &args),
+    }
+}
+
+/// Serve `Backend` requests from stdin until the parent closes it. Nothing
+/// else may touch stdout here.
+fn helper() -> ExitCode {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    match serve_helper(&mut stdin.lock(), &mut stdout.lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rustible: helper: {e}");
             ExitCode::from(EXIT_USAGE)
         }
-        _ => local(playbooks, &args),
     }
 }
 
@@ -219,10 +237,12 @@ fn remote(playbooks: &[Named]) -> ExitCode {
         }
     };
     let Some(Down::Start {
+        run_id,
         playbook,
         host,
         vars,
         check_mode,
+        escalate_password,
         ..
     }) = start
     else {
@@ -248,7 +268,35 @@ fn remote(playbooks: &[Named]) -> ExitCode {
             playbook: named.name.to_string(),
         },
     );
-    execute(named, host, vars, check_mode, sink)
+    let (channel, feeder) = Channel::remote(sink.clone());
+    // Everything after Start (Cancel, file chunks) arrives on this thread;
+    // EOF means the orchestrator is gone, which cancels the run.
+    std::thread::spawn(move || read_down_frames(feeder));
+    execute(
+        named,
+        host,
+        vars,
+        check_mode,
+        sink,
+        channel,
+        escalate_password,
+        run_id,
+    )
+}
+
+fn read_down_frames(feeder: Feeder) {
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        match protocol::read_frame::<_, Down>(&mut stdin) {
+            Ok(Some(frame)) => feeder.feed(frame),
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("rustible: bad frame from the orchestrator: {e}");
+                break;
+            }
+        }
+    }
+    feeder.close();
 }
 
 fn local(playbooks: &[Named], args: &[String]) -> ExitCode {
@@ -321,12 +369,27 @@ fn local(playbooks: &[Named], args: &[String]) -> ExitCode {
     } else {
         Arc::new(Compact::new(std::io::stdout(), verbosity))
     };
+    // A local run serves `local_file` from the working directory (the
+    // workspace root when run from there) under the orchestrator's rules.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let channel = match WorkspaceFiles::new(&cwd) {
+        Ok(files) => Channel::local(files).0,
+        Err(e) => {
+            eprintln!("rustible: cannot serve files from {}: {e}", cwd.display());
+            Channel::detached()
+        }
+    };
     execute(
         named,
         HostInfo::local(),
         Value::Object(vars),
         check_mode,
         sink,
+        channel,
+        None,
+        // No orchestrator, so no run id: unique among live runs on this
+        // host, which is all the temp directory's name needs.
+        format!("pid{}", std::process::id()),
     )
 }
 
@@ -353,14 +416,19 @@ fn print_usage(playbooks: &[Named]) {
 
 /// Gather facts, build the context, run the entry, report, and map the
 /// outcome to an exit code. Shared by every mode.
+#[allow(clippy::too_many_arguments)]
 fn execute(
     named: &Named,
     host: HostInfo,
     vars: Value,
     check_mode: bool,
     sink: Arc<dyn EventSink>,
+    channel: Arc<Channel>,
+    escalate_password: Option<Secret>,
+    run_id: String,
 ) -> ExitCode {
-    let sys = System::local(check_mode, sink.clone());
+    let sys = System::local(check_mode, sink.clone())
+        .with_escalation(&host.escalate_method, escalate_password);
     sink.emit(Event::Facts(sys.facts().clone()));
     // A host's var bag is shared by every playbook that targets it, so keys
     // this playbook does not declare are legitimate; still, a near-miss of a
@@ -371,7 +439,7 @@ fn execute(
             msg: w,
         });
     }
-    let mut ctx = Ctx::new(sys, host);
+    let mut ctx = Ctx::for_run(sys, host, channel, run_id);
     let entry = named.playbook.entry;
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry(&mut ctx, vars)));
@@ -400,6 +468,9 @@ fn execute(
     if failed && summary.failed == 0 {
         summary.failed += 1;
     }
+    // Dropping the last `Ctx` removes streamed files and closes the helpers
+    // (their `CmdRan` events are already in the sink).
+    drop(ctx);
     sink.emit(Event::Finished(summary.clone()));
     if summary.failed > 0 {
         ExitCode::from(EXIT_FAILED)

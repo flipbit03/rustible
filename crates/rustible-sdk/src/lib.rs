@@ -1,6 +1,7 @@
 //! Rustible SDK: everything a playbook or an operation crate needs.
 
 pub mod backend;
+pub mod channel;
 pub mod ctx;
 pub mod diff;
 pub mod error;
@@ -10,6 +11,8 @@ pub mod op;
 pub mod protocol;
 pub mod registry;
 pub mod runtime;
+pub mod secret;
+pub mod stream;
 pub mod system;
 pub mod testing;
 pub mod vars;
@@ -29,6 +32,7 @@ pub use error::{
 };
 pub use facts::{Arch, Distro, Facts, Init, Os, Pm};
 pub use op::{Applied, Change, Op, Plan};
+pub use secret::Secret;
 pub use system::{Cmd, Planned, System};
 
 pub mod prelude {
@@ -37,6 +41,7 @@ pub mod prelude {
     pub use crate::error::{Context, Error, Result};
     pub use crate::facts::{Arch, Distro, Facts, Init, Os, Pm};
     pub use crate::op::{Applied, Change, Op, Plan};
+    pub use crate::secret::Secret;
     pub use crate::system::System;
     pub use crate::{bail, ensure};
 }

@@ -46,6 +46,8 @@ tar = { version = "0.4", default-features = false }
 flate2 = "1"
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "xz"] }
 ruzstd = "0.9"
+zeroize = "1"
+base64 = "0.22"
 
 # Profile for binaries shipped to targets: small over fast-to-build.
 [profile.dist]

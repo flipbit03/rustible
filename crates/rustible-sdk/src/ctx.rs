@@ -1,17 +1,23 @@
 //! What `main` receives.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::channel::Channel;
+use crate::error::{Context as _, Error, Result};
 use crate::event::{Event, Level, Status, Summary};
 use crate::facts::Facts;
 use crate::op::{Applied, Op, Plan};
-use crate::system::{Phase, System};
+use crate::protocol::MAX_FRAME_PAYLOAD;
+use crate::secret::Secret;
+use crate::stream::{Chunk, chunks, write_chunks};
+use crate::system::{Identity, Phase, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
@@ -24,10 +30,18 @@ pub struct HostInfo {
     /// `"ssh"` or `"local"`.
     #[serde(default = "default_connection")]
     pub connection: String,
+    /// The inventory's `escalate` parameter: `"sudo"`, `"doas"`, or
+    /// `"none"`. How `as_user` reaches other identities (vision doc 11.3).
+    #[serde(default = "default_escalate_method")]
+    pub escalate_method: String,
 }
 
 fn default_escalate_user() -> String {
     "root".into()
+}
+
+fn default_escalate_method() -> String {
+    "sudo".into()
 }
 
 fn default_connection() -> String {
@@ -41,14 +55,55 @@ impl HostInfo {
             groups: vec![],
             escalate_user: default_escalate_user(),
             connection: default_connection(),
+            escalate_method: default_escalate_method(),
         }
     }
 }
 
-#[derive(Default)]
+/// State every `Ctx` of a run shares: one step sequence and summary across
+/// `section` and `as_user` clones (vision doc 11.1), the channel, and the
+/// directory streamed files land in, removed when the run's last `Ctx` drops.
 pub(crate) struct Shared {
     pub(crate) step_counter: Cell<u32>,
-    pub(crate) summary: std::cell::RefCell<Summary>,
+    pub(crate) summary: RefCell<Summary>,
+    channel: Arc<Channel>,
+    run_id: String,
+    tempdir: OnceCell<RunDir>,
+}
+
+/// The run's temp directory, removed when the run's last `Ctx` drops.
+///
+/// Named `.rustible-<run id>` rather than randomly, so that an orchestrator
+/// that has to kill this process can remove it too: SIGKILL runs no
+/// destructor, and a random name is known only here.
+struct RunDir(PathBuf);
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Shared {
+    fn tempdir(&self) -> Result<&Path> {
+        if let Some(d) = self.tempdir.get() {
+            return Ok(&d.0);
+        }
+        let path = std::env::temp_dir().join(crate::stream::run_dir_name(&self.run_id));
+        // `create_dir`, not `create_dir_all`: it fails on anything already
+        // at that path instead of following it. The name is derived from
+        // the run id, which is predictable enough to squat in a
+        // world-writable /tmp, and this run's files are not for sharing.
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating the run's temp directory {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", path.display()))?;
+        }
+        Ok(&self.tempdir.get_or_init(|| RunDir(path)).0)
+    }
 }
 
 pub struct Ctx {
@@ -59,11 +114,37 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// A context with no orchestrator behind it: steps work, `local_file`
+    /// and friends fail. Tests and ad-hoc use.
     pub fn new(sys: System, host: HostInfo) -> Self {
+        Self::with_channel(sys, host, Channel::detached())
+    }
+
+    /// A run with no id from an orchestrator: the temp directory is named
+    /// from the process id, which is unique among live runs on this host.
+    pub fn with_channel(sys: System, host: HostInfo, channel: Arc<Channel>) -> Self {
+        Self::for_run(sys, host, channel, format!("pid{}", std::process::id()))
+    }
+
+    /// The orchestrator-driven form. `run_id` comes from `Start` and names
+    /// the run's temp directory, so the orchestrator can remove it after
+    /// killing a binary that ignored `Cancel`.
+    pub fn for_run(
+        sys: System,
+        host: HostInfo,
+        channel: Arc<Channel>,
+        run_id: impl Into<String>,
+    ) -> Self {
         Ctx {
             sys,
             host,
-            shared: Rc::new(Shared::default()),
+            shared: Rc::new(Shared {
+                step_counter: Cell::new(0),
+                summary: RefCell::new(Summary::default()),
+                channel,
+                run_id: run_id.into(),
+                tempdir: OnceCell::new(),
+            }),
             depth: 0,
         }
     }
@@ -73,6 +154,12 @@ impl Ctx {
     /// The one verb. Reconcile an op, report it, return its typed output.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
+        // A cancelled run stops between steps: nothing is interrupted
+        // mid-apply, and no further step starts (vision doc 5.5, 16.10).
+        self.shared
+            .channel
+            .check_cancelled()
+            .with_context(|| format!("step `{name}` not started"))?;
         let id = self.next_id();
         let identity = self.sys.identity().label();
         let sink = self.sys.sink().clone();
@@ -132,6 +219,11 @@ impl Ctx {
             }
             Ok(Plan::Change(change)) => {
                 let diff = change.diff.clone();
+                if let Err(e) = self.shared.channel.check_cancelled() {
+                    finish(Status::Failed, Some(diff), Some(e.chain()));
+                    self.bump(|s| s.failed += 1);
+                    return Err(e.context(format!("step `{name}` not applied")));
+                }
                 self.sys.set_phase(Phase::Applying);
                 let applied = op.apply(&self.sys, change);
                 self.sys.set_phase(Phase::Idle);
@@ -202,15 +294,56 @@ impl Ctx {
         &self.sys
     }
 
-    /// Streamed from the orchestrator. In this local spike there is no
-    /// orchestrator, so it resolves against the current directory.
+    /// A file from the workspace (path relative to its root), streamed over
+    /// the channel into the run's temp directory on this host. The path is
+    /// removed when the run ends. Anything outside the workspace is denied
+    /// by the orchestrator (vision doc 5.6).
     pub fn local_file(&mut self, path: impl AsRef<Path>) -> Result<PathBuf> {
-        let p = path.as_ref();
-        if p.exists() {
-            Ok(p.to_path_buf())
-        } else {
-            Err(Error::msg(format!("local file not found: {}", p.display())))
-        }
+        let requested = path_str(path.as_ref());
+        let name = Path::new(&requested)
+            .file_name()
+            .ok_or_else(|| Error::msg(format!("`{requested}` has no file name")))?
+            .to_owned();
+        let n = self.shared.channel.next_req();
+        let dir = self.shared.tempdir()?.join(n.to_string());
+        std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dest = dir.join(name);
+        let mut file =
+            std::fs::File::create(&dest).with_context(|| format!("creating {}", dest.display()))?;
+        let mut received = 0u64;
+        self.shared.channel.stream_file(&requested, &mut |chunk| {
+            received = write_chunks(&mut file, &chunk, received)
+                .with_context(|| format!("writing {}", dest.display()))?;
+            Ok(())
+        })?;
+        file.flush()
+            .with_context(|| format!("writing {}", dest.display()))?;
+        self.debug(format!(
+            "{requested}: {received} bytes at {}",
+            dest.display()
+        ));
+        Ok(dest)
+    }
+
+    /// A workspace file streamed into memory only: never on this host's
+    /// disk, zeroized when the `Secret` drops (vision doc 5.6, 11).
+    pub fn local_secret(&mut self, path: impl AsRef<Path>) -> Result<Secret> {
+        let requested = path_str(path.as_ref());
+        let mut secret = Secret::new(Vec::new());
+        let mut received = 0u64;
+        self.shared.channel.stream_file(&requested, &mut |chunk| {
+            if chunk.offset != received {
+                return Err(Error::msg(format!(
+                    "`{requested}`: chunk at offset {} after {received} bytes",
+                    chunk.offset
+                )));
+            }
+            received += chunk.bytes.len() as u64;
+            secret.push(&chunk.bytes);
+            Ok(())
+        })?;
+        self.debug(format!("{requested}: {received} secret bytes in memory"));
+        Ok(secret)
     }
 
     // ---- tier 2 ----
@@ -274,6 +407,59 @@ impl Ctx {
         self.as_user(&user)
     }
 
+    /// Reverse transfer: send a file from this host to the workspace on the
+    /// orchestrator. `local_dest` is relative to the workspace root; a
+    /// trailing `/` means a directory, and the file lands at
+    /// `<dest>/<host name>/<file name>` so several hosts do not collide
+    /// (Ansible's `fetch` layout). The read goes through `sys`, so an
+    /// escalated `Ctx` fetches what its identity can read.
+    pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
+        let remote = remote.as_ref();
+        let dest = path_str(local_dest.as_ref());
+        let dest = if dest.ends_with('/') {
+            let name = remote
+                .file_name()
+                .ok_or_else(|| Error::msg(format!("`{}` has no file name", remote.display())))?;
+            format!("{dest}{}/{}", self.host.name, name.to_string_lossy())
+        } else {
+            dest
+        };
+        // `sys.read` puts the whole file in memory on this host, and an
+        // escalated read also puts it in one helper frame, base64-inflated
+        // by 4/3 against the frame ceiling. Refuse first, with the numbers
+        // and the reason: without this the escalated case failed deep in
+        // the framing with "frame of N bytes exceeds limit", naming neither
+        // the file nor the helper.
+        if let Some(st) = self.sys.stat_follow(remote)?
+            && matches!(self.sys.identity(), Identity::User(_))
+            && st.size > MAX_FRAME_PAYLOAD as u64
+        {
+            return Err(Error::msg(format!(
+                "fetching {}: {} bytes is more than an escalated read can carry \
+                 ({} bytes, the helper's frame limit); a file this large has to be \
+                 fetched without `as_user`/`as_root`, or copied to a readable path first",
+                remote.display(),
+                st.size,
+                MAX_FRAME_PAYLOAD
+            )));
+        }
+        let bytes = self
+            .sys
+            .read(remote)
+            .with_context(|| format!("fetching {}", remote.display()))?;
+        let req = self.shared.channel.next_req();
+        for chunk in chunks(bytes.as_slice()) {
+            let chunk: Chunk = chunk.with_context(|| format!("reading {}", remote.display()))?;
+            self.shared.channel.send_fetch(req, &dest, &chunk)?;
+        }
+        self.debug(format!(
+            "fetched {} ({} bytes) to {dest}",
+            remote.display(),
+            bytes.len()
+        ));
+        Ok(())
+    }
+
     // ---- internals ----
 
     fn next_id(&self) -> u32 {
@@ -288,5 +474,207 @@ impl Ctx {
 
     pub(crate) fn summary(&self) -> Summary {
         self.shared.summary.borrow().clone()
+    }
+}
+
+fn path_str(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Fake;
+    use crate::event::Collect;
+    use crate::protocol::{Down, Up, UpLink};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct NoUp;
+    impl UpLink for NoUp {
+        fn send(&self, _: &Up) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Counts check and apply calls; optionally cancels the run from inside
+    /// `check` to model a Cancel frame arriving mid-step.
+    struct Probe {
+        checks: Arc<AtomicU32>,
+        applies: Arc<AtomicU32>,
+        cancel_in_check: Option<Arc<Channel>>,
+    }
+
+    impl Op for Probe {
+        type Output = ();
+        fn check(&self, _: &System) -> Result<Plan<()>> {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            if let Some(ch) = &self.cancel_in_check {
+                ch.cancel("cancelled by the orchestrator");
+            }
+            Ok(Plan::change(crate::Diff::summary("do it")))
+        }
+        fn apply(&self, _: &System, _: crate::Change<()>) -> Result<()> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn ctx_with_channel() -> (Ctx, Arc<Channel>, crate::channel::Feeder, Arc<Collect>) {
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink.clone());
+        let (channel, feeder) = Channel::remote(Arc::new(NoUp));
+        (
+            Ctx::with_channel(sys, HostInfo::local(), channel.clone()),
+            channel,
+            feeder,
+            sink,
+        )
+    }
+
+    #[test]
+    fn cancelled_run_starts_no_further_step() {
+        let (mut ctx, _channel, feeder, sink) = ctx_with_channel();
+        let checks = Arc::new(AtomicU32::new(0));
+        let applies = Arc::new(AtomicU32::new(0));
+        let probe = || Probe {
+            checks: checks.clone(),
+            applies: applies.clone(),
+            cancel_in_check: None,
+        };
+        ctx.step("first", probe()).unwrap();
+        feeder.feed(Down::Cancel);
+        let err = ctx.step("second", probe()).unwrap_err().chain();
+        assert!(
+            err.contains("step `second` not started") && err.contains("cancelled"),
+            "{err}"
+        );
+        assert_eq!(
+            (
+                checks.load(Ordering::SeqCst),
+                applies.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+        // The refused step never started, so no StepStarted for it.
+        let started: Vec<String> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepStarted { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, ["first"]);
+    }
+
+    #[test]
+    fn cancel_during_check_skips_apply_and_fails_the_step() {
+        let (mut ctx, channel, _feeder, sink) = ctx_with_channel();
+        let checks = Arc::new(AtomicU32::new(0));
+        let applies = Arc::new(AtomicU32::new(0));
+        let err = ctx
+            .step(
+                "slow",
+                Probe {
+                    checks: checks.clone(),
+                    applies: applies.clone(),
+                    cancel_in_check: Some(channel),
+                },
+            )
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("not applied") && err.contains("cancelled"),
+            "{err}"
+        );
+        assert_eq!(
+            (
+                checks.load(Ordering::SeqCst),
+                applies.load(Ordering::SeqCst)
+            ),
+            (1, 0)
+        );
+        assert!(sink.events().iter().any(|e| matches!(
+            e,
+            Event::StepFinished { status: Status::Failed, note: Some(n), .. } if n.contains("cancelled")
+        )));
+        assert_eq!(ctx.summary().failed, 1);
+    }
+
+    #[test]
+    fn local_file_lands_in_a_temp_dir_and_secret_stays_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("files")).unwrap();
+        std::fs::write(dir.path().join("files/big"), vec![7u8; 3000]).unwrap();
+        std::fs::write(dir.path().join("files/token"), b"s3cr3t\n").unwrap();
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink);
+        let (channel, _feeder) =
+            Channel::local(crate::stream::WorkspaceFiles::new(dir.path()).unwrap());
+        let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+
+        let p = ctx.local_file("files/big").unwrap();
+        assert!(p.starts_with(std::env::temp_dir()));
+        assert_eq!(std::fs::read(&p).unwrap(), vec![7u8; 3000]);
+        let run_dir = p.parent().unwrap().parent().unwrap().to_path_buf();
+
+        let secret = ctx.local_secret("files/token").unwrap();
+        assert_eq!(secret.as_str().unwrap(), "s3cr3t");
+        // Nothing but the streamed file is under the run's temp dir.
+        let mut names = vec![];
+        for e in walkdir(&run_dir) {
+            names.push(e.file_name().unwrap().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, ["big"]);
+        assert!(
+            ctx.local_file("../etc/passwd")
+                .unwrap_err()
+                .chain()
+                .contains("denied")
+        );
+
+        drop(ctx);
+        assert!(!run_dir.exists(), "temp dir removed when the run ends");
+    }
+
+    fn walkdir(p: &Path) -> Vec<PathBuf> {
+        let mut out = vec![];
+        for e in std::fs::read_dir(p).unwrap() {
+            let e = e.unwrap().path();
+            if e.is_dir() {
+                out.extend(walkdir(&e));
+            } else {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fetch_reads_through_sys_and_lands_under_host_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(Collect::default());
+        let fake = Arc::new(Fake::new().with_file("/etc/hostname", "box1\n"));
+        let sys = System::fake(fake, sink);
+        let (channel, _feeder) =
+            Channel::local(crate::stream::WorkspaceFiles::new(dir.path()).unwrap());
+        let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+        ctx.fetch("/etc/hostname", "out/").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("out/local/hostname")).unwrap(),
+            b"box1\n"
+        );
+        ctx.fetch("/etc/hostname", "exact.txt").unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("exact.txt")).unwrap(),
+            b"box1\n"
+        );
+        assert!(
+            ctx.fetch("/etc/hostname", "../x")
+                .unwrap_err()
+                .chain()
+                .contains("denied")
+        );
+        assert!(ctx.fetch("/missing", "out/").is_err());
     }
 }
