@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod secret;
 pub mod stream;
 pub mod system;
+pub mod testing;
 pub mod vars;
 
 /// Re-exports the macros expand to. Not part of the public API.

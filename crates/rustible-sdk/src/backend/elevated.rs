@@ -32,11 +32,21 @@ pub enum HelperOp {
     Stat {
         path: PathBuf,
     },
+    StatFollow {
+        path: PathBuf,
+    },
     MkdirAll {
         path: PathBuf,
     },
     Remove {
         path: PathBuf,
+    },
+    RemoveAll {
+        path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
     },
     SetMode {
         path: PathBuf,
@@ -51,6 +61,16 @@ pub enum HelperOp {
         from: PathBuf,
         to: PathBuf,
     },
+    Symlink {
+        target: PathBuf,
+        link: PathBuf,
+    },
+    ReadLink {
+        path: PathBuf,
+    },
+    ReadDir {
+        path: PathBuf,
+    },
     Spawn(CmdSpec),
 }
 
@@ -60,7 +80,12 @@ impl HelperOp {
     pub fn mutates(&self) -> bool {
         !matches!(
             self,
-            HelperOp::Read { .. } | HelperOp::Stat { .. } | HelperOp::Spawn(_)
+            HelperOp::Read { .. }
+                | HelperOp::Stat { .. }
+                | HelperOp::StatFollow { .. }
+                | HelperOp::ReadLink { .. }
+                | HelperOp::ReadDir { .. }
+                | HelperOp::Spawn(_)
         )
     }
 }
@@ -79,6 +104,8 @@ pub enum HelperResponse {
     Unit,
     Bytes(#[serde(with = "crate::protocol::b64")] Vec<u8>),
     Stat(Option<Stat>),
+    Path(PathBuf),
+    Paths(Vec<PathBuf>),
     Output(Output),
     Err {
         /// The OS errno when there was one, so `NotFound` and friends survive.
@@ -127,11 +154,26 @@ pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()>
                     .stat(&path)
                     .map(HelperResponse::Stat)
                     .unwrap_or_else(HelperResponse::from_io),
+                HelperOp::StatFollow { path } => local
+                    .stat_follow(&path)
+                    .map(HelperResponse::Stat)
+                    .unwrap_or_else(HelperResponse::from_io),
                 HelperOp::MkdirAll { path } => unit(local.mkdir_all(&path)),
                 HelperOp::Remove { path } => unit(local.remove(&path)),
+                HelperOp::RemoveAll { path } => unit(local.remove_all(&path)),
+                HelperOp::Rename { from, to } => unit(local.rename(&from, &to)),
                 HelperOp::SetMode { path, mode } => unit(local.set_mode(&path, mode)),
                 HelperOp::SetOwner { path, uid, gid } => unit(local.set_owner(&path, uid, gid)),
                 HelperOp::Copy { from, to } => unit(local.copy(&from, &to)),
+                HelperOp::Symlink { target, link } => unit(local.symlink(&target, &link)),
+                HelperOp::ReadLink { path } => local
+                    .read_link(&path)
+                    .map(HelperResponse::Path)
+                    .unwrap_or_else(HelperResponse::from_io),
+                HelperOp::ReadDir { path } => local
+                    .read_dir(&path)
+                    .map(HelperResponse::Paths)
+                    .unwrap_or_else(HelperResponse::from_io),
                 HelperOp::Spawn(spec) => local
                     .spawn(&spec)
                     .map(HelperResponse::Output)
@@ -425,12 +467,30 @@ impl Backend for Elevated {
         }
     }
 
+    fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+        match self.call(HelperOp::StatFollow { path: p.into() })? {
+            HelperResponse::Stat(s) => Ok(s),
+            other => Err(unexpected(other)),
+        }
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {
         self.expect_unit(HelperOp::MkdirAll { path: p.into() })
     }
 
     fn remove(&self, p: &Path) -> io::Result<()> {
         self.expect_unit(HelperOp::Remove { path: p.into() })
+    }
+
+    fn remove_all(&self, p: &Path) -> io::Result<()> {
+        self.expect_unit(HelperOp::RemoveAll { path: p.into() })
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.expect_unit(HelperOp::Rename {
+            from: from.into(),
+            to: to.into(),
+        })
     }
 
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
@@ -455,6 +515,27 @@ impl Backend for Elevated {
         })
     }
 
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        self.expect_unit(HelperOp::Symlink {
+            target: target.into(),
+            link: link.into(),
+        })
+    }
+
+    fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+        match self.call(HelperOp::ReadLink { path: p.into() })? {
+            HelperResponse::Path(p) => Ok(p),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        match self.call(HelperOp::ReadDir { path: p.into() })? {
+            HelperResponse::Paths(v) => Ok(v),
+            other => Err(unexpected(other)),
+        }
+    }
+
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
         match self.call(HelperOp::Spawn(spec.clone()))? {
             HelperResponse::Output(o) => Ok(o),
@@ -466,6 +547,7 @@ impl Backend for Elevated {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::FileKind;
     use crate::system::Phase;
     use std::collections::BTreeMap;
 
@@ -499,6 +581,30 @@ mod tests {
         assert_eq!(e.read(&dir.path().join("y")).unwrap(), payload);
         e.remove(&f).unwrap();
         assert_eq!(e.stat(&f).unwrap(), None);
+
+        // The M6 primitives: symlinks, listing, rename, recursive removal.
+        let sub = dir.path().join("sub");
+        let link = dir.path().join("link");
+        e.symlink(&sub, &link).unwrap();
+        assert_eq!(e.read_link(&link).unwrap(), sub);
+        assert_eq!(e.stat(&link).unwrap().unwrap().kind, FileKind::Symlink);
+        assert_eq!(e.stat_follow(&link).unwrap().unwrap().kind, FileKind::Dir);
+        assert!(e.read_link(&sub).is_err(), "a directory is not a link");
+        e.write(&sub.join("a"), b"a").unwrap();
+        e.write(&sub.join("b"), b"b").unwrap();
+        assert_eq!(
+            e.read_dir(&sub).unwrap(),
+            vec![sub.join("a"), sub.join("b")]
+        );
+        let moved = dir.path().join("moved");
+        e.rename(&sub, &moved).unwrap();
+        assert_eq!(e.stat(&sub).unwrap(), None);
+        assert_eq!(e.read(&moved.join("b")).unwrap(), b"b");
+        let full = e.remove(&moved).unwrap_err();
+        assert_eq!(full.kind(), io::ErrorKind::DirectoryNotEmpty, "{full}");
+        e.remove_all(&moved).unwrap();
+        assert_eq!(e.stat(&moved).unwrap(), None);
+        e.remove(&link).unwrap();
 
         let missing = e.read(&dir.path().join("nope")).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound, "{missing}");

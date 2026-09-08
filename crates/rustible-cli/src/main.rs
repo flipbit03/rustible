@@ -2,7 +2,9 @@
 //! per target triple, ship it, run it over the framed protocol, render the
 //! events, serve `FileRequest`s from the workspace, write `FetchChunk`s under
 //! it, and turn ctrl-c into a `Cancel` frame with a ten second grace period);
-//! `init` and `playbook create` scaffold workspaces and playbooks.
+//! `init` and `playbook create` scaffold workspaces and playbooks; `inventory
+//! show` and `inventory check` are the M2 subcommands over
+//! `rustible_cli::inventory`.
 
 mod create;
 mod init;
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use rustible_cli::inventory::{Inventory, render_show};
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::{Event, EventSink, Pretty};
 use rustible_sdk::protocol::{Down, Up};
@@ -42,7 +45,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Build a playbook and run it on hosts (spike orchestrator).
+    /// Build a playbook and run it on hosts (spike orchestrator; `playbook
+    /// run` replaces it in M3).
     Run(RunArgs),
     /// Create a Rustible workspace in a directory.
     Init(init::InitArgs),
@@ -51,12 +55,35 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PlaybookCmd,
     },
+    /// Inspect and validate `hosts.kdl`.
+    Inventory {
+        #[command(subcommand)]
+        cmd: InventoryCmd,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum PlaybookCmd {
     /// Scaffold a playbook file.
     Create(create::CreateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum InventoryCmd {
+    /// Resolved parameters and vars of one host, with the source of each.
+    Show {
+        /// Host name as written in the inventory.
+        host: String,
+        /// Inventory file.
+        #[arg(long, default_value = "hosts.kdl")]
+        file: PathBuf,
+    },
+    /// Load the inventory and report every error (exit 1 on any).
+    Check {
+        /// Inventory file.
+        #[arg(long, default_value = "hosts.kdl")]
+        file: PathBuf,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -101,6 +128,52 @@ async fn main() -> Result<()> {
         Cmd::Playbook {
             cmd: PlaybookCmd::Create(args),
         } => create::run(args),
+        Cmd::Inventory { cmd } => inventory(cmd),
+    }
+}
+
+/// `inventory show` and `inventory check`. Load errors go to stderr one per
+/// line as `file:line:col: error: message`; any error exits 1.
+fn inventory(cmd: InventoryCmd) -> Result<()> {
+    match cmd {
+        InventoryCmd::Show { host, file } => {
+            let inv = load_or_exit(&file);
+            match inv.resolve(&host) {
+                Ok(resolved) => print!("{}", render_show(&resolved)),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        InventoryCmd::Check { file } => {
+            let inv = load_or_exit(&file);
+            println!(
+                "{}: ok ({} hosts, {} groups)",
+                file.display(),
+                inv.hosts.len(),
+                inv.groups.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_or_exit(file: &std::path::Path) -> Inventory {
+    match Inventory::load(file) {
+        Ok(inv) => inv,
+        Err(errs) => {
+            for e in errs.iter() {
+                eprintln!("{e}");
+            }
+            let n = errs.len();
+            eprintln!(
+                "{}: {n} error{}",
+                file.display(),
+                if n == 1 { "" } else { "s" }
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -108,12 +181,8 @@ async fn run(cli: RunArgs) -> Result<()> {
     let t_start = Instant::now();
     let mut vars_map = serde_json::Map::new();
     for kv in &cli.vars {
-        let Some((k, v)) = kv.split_once('=') else {
-            bail!("--var needs key=value, got `{kv}`");
-        };
-        let value = serde_json::from_str::<serde_json::Value>(v)
-            .unwrap_or(serde_json::Value::String(v.to_string()));
-        vars_map.insert(k.to_string(), value);
+        let (k, v) = rustible_sdk::vars::parse_var(kv).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        vars_map.insert(k, v);
     }
     let vars_json = serde_json::Value::Object(vars_map);
     let escalate_password = match &cli.escalate_password_env {
