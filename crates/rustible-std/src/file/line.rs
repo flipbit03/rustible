@@ -1,18 +1,11 @@
-//! File operations.
+//! `file::Line`: Ansible's `lineinfile` with `state: present`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use regex::Regex;
 use rustible_sdk::prelude::*;
 
-/// Where to put a line that is not present yet.
-#[derive(Debug, Clone)]
-pub enum Insert {
-    Append,
-    Prepend,
-    After(Regex),
-    Before(Regex),
-}
+use super::Insert;
 
 /// Ensure a line is present in a file, replacing the line matched by `matching`
 /// if any. Ansible's `lineinfile` with `state: present`.
@@ -111,27 +104,16 @@ pub fn plan_line(
             i
         }
         None => {
-            let at = match insert {
-                Insert::Append => lines.len(),
-                Insert::Prepend => 0,
-                Insert::After(re) => lines
-                    .iter()
-                    .rposition(|l| re.is_match(l))
-                    .map(|i| i + 1)
-                    .unwrap_or(lines.len()),
-                Insert::Before(re) => lines
-                    .iter()
-                    .position(|l| re.is_match(l))
-                    .unwrap_or(lines.len()),
-            };
+            let at = insert.position(&lines);
             lines.insert(at, line.to_string());
             at
         }
     };
 
-    // Always terminate with a newline; we normalize files that lacked one.
-    let mut out = lines.join("\n");
-    out.push('\n');
+    // Keep the file's line ending; always terminate the last line.
+    let eol = super::eol_of(text);
+    let mut out = lines.join(eol);
+    out.push_str(eol);
     Some((out, line_no + 1))
 }
 
@@ -139,14 +121,7 @@ impl Op for Line {
     type Output = LineReport;
 
     fn check(&self, sys: &System) -> Result<Plan<LineReport>> {
-        let text = match sys.exists(&self.path)? {
-            true => sys.read_to_string(&self.path)?,
-            false if self.create => String::new(),
-            false => bail!(
-                "{} does not exist (use .create(true) to create it)",
-                self.path.display()
-            ),
-        };
+        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
             None => {
@@ -171,122 +146,23 @@ impl Op for Line {
     }
 
     fn apply(&self, sys: &System, change: Change<LineReport>) -> Result<LineReport> {
-        let Diff::Text { after, .. } = &change.diff else {
-            bail!("Line::apply received a non-text diff");
+        // Re-plan from the current text (cheap, pure) rather than trusting a
+        // copy carried in the diff: the file may have moved on since check.
+        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
+        let Some((after, line_no)) =
+            plan_line(&text, self.matching.as_ref(), &self.line, &self.insert)
+        else {
+            return Ok(LineReport {
+                line_no: change.predicted.map(|p| p.line_no).unwrap_or(0),
+                backup_path: None,
+            });
         };
-        let backup_path = if self.backup && sys.exists(&self.path)? {
-            Some(sys.backup(&self.path)?)
-        } else {
-            None
-        };
-        sys.write_atomic(&self.path, after.as_bytes())?;
-        let line_no = change.predicted.map(|p| p.line_no).unwrap_or(0);
+        let backup_path = super::write_with_backup(sys, &self.path, self.backup, after.as_bytes())?;
         Ok(LineReport {
             line_no,
             backup_path,
         })
     }
-}
-
-/// Ensure a directory exists with the given mode. Minimal for the spike.
-#[derive(Debug, Clone)]
-pub struct Directory {
-    path: PathBuf,
-    mode: Option<u32>,
-}
-
-impl Directory {
-    pub fn at(path: impl Into<PathBuf>) -> Self {
-        Directory {
-            path: path.into(),
-            mode: None,
-        }
-    }
-
-    pub fn mode(mut self, mode: u32) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirReport {
-    pub path: PathBuf,
-    pub created: bool,
-}
-
-impl Op for Directory {
-    type Output = DirReport;
-
-    fn check(&self, sys: &System) -> Result<Plan<DirReport>> {
-        let mut changes = vec![];
-        let stat = sys.stat(&self.path)?;
-        let created = match &stat {
-            None => {
-                changes.push(AttrChange {
-                    name: "exists".into(),
-                    from: "no".into(),
-                    to: "yes".into(),
-                });
-                true
-            }
-            Some(s) if s.kind != rustible_sdk::backend::FileKind::Dir => {
-                bail!("{} exists and is not a directory", self.path.display())
-            }
-            Some(_) => false,
-        };
-        if let (Some(want), Some(s)) = (self.mode, &stat)
-            && s.mode != want
-        {
-            changes.push(AttrChange {
-                name: "mode".into(),
-                from: format!("{:04o}", s.mode),
-                to: format!("{want:04o}"),
-            });
-        }
-        if let (Some(want), None) = (self.mode, &stat) {
-            changes.push(AttrChange {
-                name: "mode".into(),
-                from: "-".into(),
-                to: format!("{want:04o}"),
-            });
-        }
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(DirReport {
-                path: self.path.clone(),
-                created: false,
-            }));
-        }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.path.display().to_string(),
-                changes,
-            },
-            DirReport {
-                path: self.path.clone(),
-                created,
-            },
-        ))
-    }
-
-    fn apply(&self, sys: &System, change: Change<DirReport>) -> Result<DirReport> {
-        let created = change.predicted.map(|p| p.created).unwrap_or(false);
-        if created {
-            sys.mkdir_all(&self.path)?;
-        }
-        if let Some(mode) = self.mode {
-            sys.set_mode(&self.path, mode)?;
-        }
-        Ok(DirReport {
-            path: self.path.clone(),
-            created,
-        })
-    }
-}
-
-/// Helper for ops that take a path.
-pub fn path_str(p: &Path) -> String {
-    p.display().to_string()
 }
 
 #[cfg(test)]
@@ -296,6 +172,7 @@ mod tests {
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::Collect;
 
+    use super::super::testing::fake_sys;
     use super::*;
 
     #[test]
@@ -347,10 +224,6 @@ mod tests {
     fn plan_handles_missing_trailing_newline() {
         let (out, _) = plan_line("A\nB", None, "C", &Insert::Append).unwrap();
         assert_eq!(out, "A\nB\nC\n");
-    }
-
-    fn fake_sys(fake: &Arc<Fake>) -> System {
-        System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
     #[test]

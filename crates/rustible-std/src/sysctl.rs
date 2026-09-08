@@ -154,24 +154,20 @@ pub fn plan_sysctl_line(text: &str, key: &str, value: &str) -> Option<String> {
 }
 
 impl Present {
-    /// Current file text, `""` when the file does not exist yet.
+    /// Current file text, `""` when the file does not exist yet. The
+    /// directory must exist; the file is created but not its parent.
     fn read_file(&self, sys: &System) -> Result<String> {
-        match sys.stat(&self.file)? {
-            Some(s) if s.kind == rustible_sdk::backend::FileKind::File => {
-                sys.read_to_string(&self.file)
-            }
-            Some(_) => bail!("{} exists and is not a regular file", self.file.display()),
-            None => {
-                let parent = self.file.parent().unwrap_or(Path::new("/"));
-                match sys.stat_follow(parent)? {
-                    Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => Ok(String::new()),
-                    _ => bail!(
-                        "{} does not exist; sysctl::Present creates the file but not its directory (use file::Directory)",
-                        parent.display()
-                    ),
-                }
+        if sys.stat(&self.file)?.is_none() {
+            let parent = self.file.parent().unwrap_or(Path::new("/"));
+            match sys.stat_follow(parent)? {
+                Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => {}
+                _ => bail!(
+                    "{} does not exist; sysctl::Present creates the file but not its directory (use file::Directory)",
+                    parent.display()
+                ),
             }
         }
+        crate::file::read_text_or_empty(sys, &self.file, true)
     }
 
     fn read_live(&self, sys: &System) -> Result<Option<String>> {
