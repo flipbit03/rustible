@@ -158,4 +158,47 @@ reversal:
 
 ## Self-review
 
-Self-review: run by the lead on the PR.
+Self-review: run by the lead on PR #5, see below.
+
+## Self-review (lead, PR #5)
+
+`code-review` at effort high: ten consolidated findings, five confirmed.
+Applied on the branch:
+
+1. The in-container branch was selected by `RUSTIBLE_INTEGRATION_IMAGE` alone,
+   so a stray host export ran the test body on the host. The harness now
+   sets `RUSTIBLE_INTEGRATION_INSIDE` and the branch requires it plus the
+   mounted binary at `/t`; a bare image variable on the host is ignored with
+   a note.
+2. `rustible-std`'s dev-dependency on `rustible` carried a version, which
+   would make a publish-time cycle. Path-only now, like `rustible-macros`.
+3. The author's attributes (`#[ignore]`, `#[should_panic]`, `#[cfg]`, docs)
+   landed on the inner fn. They move to the generated outer `#[test]`.
+4. `wait_for_systemd` ignored `docker exec`'s exit status and spun 60 s on a
+   dead container. A non-zero exit with empty stdout fails at once with the
+   stderr.
+5. A panic on the host side leaked a privileged systemd container. A `Drop`
+   guard removes it; the body runs under coreutils `timeout 600` inside the
+   container (plain and systemd runs) so a hung body cannot block CI.
+6. With `RUSTIBLE_INTEGRATION=1` explicitly set, a missing docker or an image
+   filter selecting nothing turned tests into passing skips. Both now fail;
+   the silent skip remains only for the unset-variable case.
+7. `--test <CARGO_CRATE_NAME>` only matches top-level, underscore-named test
+   files; cargo's "no test target named" is now translated into a message
+   saying so, and the dead hyphen-normalizing lookup is gone.
+
+Dismissed, with reasons:
+- Replacing the harness's `Report`/`StepReport` with a replay of `event::Event`
+  through `JsonLines`: a real simplification, but a refactor of working code
+  with no behaviour change; deferred, recorded in DECISIONS.md for M7.
+- Dropping `--cgroupns=host` and the host cgroup bind mount: the jrei images
+  declare `VOLUME /sys/fs/cgroup` and a finder reproduced that they fail to
+  boot under the default private cgroup namespace; the flags are what makes
+  them work. A purpose-built systemd image without the volume would allow the
+  safer form; recorded in DECISIONS.md.
+- Module path `rustible_sdk::testing` instead of the brief's
+  `testing::integration`: kept, recorded as a deviation here.
+
+Verified after the fixes: `cargo test --workspace` green without docker;
+`RUSTIBLE_INTEGRATION=1` runs of `it_file_line` (debian 0.7 s, ubuntu 0.3 s)
+and `it_systemd_image` pass with the new marker, timeout, and guard.

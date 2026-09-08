@@ -16,5 +16,8 @@ regex.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-# For `#[rustible::integration_test]` in tests/ (dev-only cycle, like rustible-macros).
-rustible.workspace = true
+# For `#[rustible::integration_test]` in tests/. Path-only on purpose: cargo
+# strips a path-only dev-dependency at publish, so there is no
+# rustible -> rustible-std -> rustible cycle on crates.io (same as
+# rustible-macros).
+rustible = { path = "../rustible" }

@@ -60,6 +60,13 @@ use crate::system::System;
 pub const ENABLE_VAR: &str = "RUSTIBLE_INTEGRATION";
 /// Set by the harness inside the container to the image name. Never set it by hand.
 pub const IMAGE_VAR: &str = "RUSTIBLE_INTEGRATION_IMAGE";
+/// Set by the harness on the container command line, never by hand: the
+/// in-container branch is taken only when this is set AND the mounted test
+/// binary is at `/t`, so a stray host export of the image variable cannot
+/// run a test body on the host.
+pub const INSIDE_VAR: &str = "RUSTIBLE_INTEGRATION_INSIDE";
+/// Seconds a test body may run inside a container before `timeout` kills it.
+const BODY_TIMEOUT_SECS: &str = "600";
 /// Optional comma-separated subset of the attribute's images to run.
 pub const IMAGES_FILTER_VAR: &str = "RUSTIBLE_INTEGRATION_IMAGES";
 
@@ -90,6 +97,7 @@ impl Image {
         }
     }
 
+    /// Whether this image boots systemd as PID 1 (`systemd_images`).
     pub fn is_systemd(&self) -> bool {
         matches!(self, Image::Systemd(_))
     }
@@ -159,6 +167,7 @@ pub struct ImageResult {
 }
 
 impl ImageResult {
+    /// The container ran the test and its report says every step succeeded.
     pub fn passed(&self) -> bool {
         self.status == 0 && self.report.as_ref().is_some_and(|r| r.error.is_none())
     }
@@ -174,22 +183,34 @@ pub type Twice<T> = (Applied<T>, Applied<T>);
 /// Entry point of the generated `#[test]`. Skips, runs inside the container,
 /// or drives docker for every image and panics with every failure at the end.
 pub fn run(spec: &Spec, body: Body) {
-    if let Ok(image) = std::env::var(IMAGE_VAR) {
+    if std::env::var_os(INSIDE_VAR).is_some() && Path::new("/t").exists() {
+        let image = std::env::var(IMAGE_VAR).unwrap_or_else(|_| "?".into());
         inside(spec, &image, body);
         return;
     }
-    let images = selected_images(spec.images);
-    if let Some(reason) = skip_reason(&images) {
-        println!(
-            "integration test `{}` skipped: {reason} (images: {})",
-            spec.name,
-            spec.images
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+    if std::env::var_os(IMAGE_VAR).is_some() {
+        eprintln!(
+            "integration: {IMAGE_VAR} is set but this is not a harness container; ignoring it              (the harness sets {INSIDE_VAR} and mounts the binary at /t)"
         );
-        return;
+    }
+    let images = selected_images(spec.images);
+    match gate(&images) {
+        Gate::Run => {}
+        Gate::Skip(reason) => {
+            println!(
+                "integration test `{}` skipped: {reason} (images: {})",
+                spec.name,
+                spec.images
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return;
+        }
+        // Explicitly enabled and nothing can run: that is a failure, so a
+        // CI leg with a broken docker or a mistyped image filter goes red.
+        Gate::Fail(reason) => panic!("integration test `{}`: {reason}", spec.name),
     }
     let results = run_images(spec, &images);
     let mut failures = vec![];
@@ -387,19 +408,27 @@ fn selected_images(all: &[Image]) -> Vec<Image> {
     }
 }
 
-fn skip_reason(images: &[Image]) -> Option<String> {
+enum Gate {
+    Run,
+    Skip(String),
+    Fail(String),
+}
+
+fn gate(images: &[Image]) -> Gate {
     if std::env::var(ENABLE_VAR).map_or(true, |v| v.is_empty()) {
-        return Some(format!("set {ENABLE_VAR}=1 to run it in docker"));
+        return Gate::Skip(format!("set {ENABLE_VAR}=1 to run it in docker"));
     }
     if images.is_empty() {
-        return Some(format!(
-            "{IMAGES_FILTER_VAR} selects none of this test's images"
+        return Gate::Fail(format!(
+            "{ENABLE_VAR} is set but {IMAGES_FILTER_VAR} selects none of this test's images"
         ));
     }
     if !docker_available() {
-        return Some("docker is not available (`docker info` failed)".into());
+        return Gate::Fail(format!(
+            "{ENABLE_VAR} is set but docker is not available (`docker info` failed)"
+        ));
     }
-    None
+    Gate::Run
 }
 
 fn docker_available() -> bool {
@@ -442,10 +471,20 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
         .arg(&manifest)
         .args(["--test", spec.crate_name, "--message-format=json"])
         .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("could not run `{cargo}`: {e}"))?;
+    // Mirror cargo's stderr for the reader, since it was captured.
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("no test target named") {
+            return Err(format!(
+                "the harness needs the test in a top-level `tests/{}.rs` file with an underscore \
+                 name (cargo test target `{}`); it cannot run from `src/` or a hyphenated file",
+                spec.crate_name, spec.crate_name
+            ));
+        }
         return Err(format!(
             "`cargo test --no-run --target {triple}` failed ({}); if the target is missing, \
              run `rustup target add {triple}`",
@@ -480,7 +519,7 @@ fn test_artifact(cargo_json: &str, crate_name: &str) -> Option<PathBuf> {
                 .as_array()
                 .is_some_and(|k| k.iter().any(|v| v == "test"));
             let name = target["name"].as_str().unwrap_or_default();
-            kind_is_test && name.replace('-', "_") == crate_name
+            kind_is_test && name == crate_name
         })
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
 }
@@ -499,9 +538,12 @@ fn test_path(module_path: &str, crate_name: &str, name: &str) -> String {
     }
 }
 
-/// The libtest arguments that run exactly one test with its output visible.
-fn test_args(test_path: &str) -> [&str; 5] {
+/// The command that runs exactly one test inside the container with its
+/// output visible, under coreutils `timeout` so a hung body cannot block CI.
+fn test_args(test_path: &str) -> [&str; 7] {
     [
+        "timeout",
+        BODY_TIMEOUT_SECS,
         "/t",
         "--exact",
         test_path,
@@ -524,6 +566,7 @@ fn run_in_image(bin: &Path, image: &str, test_path: &str) -> ImageResult {
             "-e",
         ])
         .arg(format!("{IMAGE_VAR}={image}"))
+        .args(["-e", &format!("{INSIDE_VAR}=1")])
         .arg(image)
         .args(test_args(test_path))
         .stdin(Stdio::null())
@@ -562,6 +605,19 @@ fn run_in_systemd_image(bin: &Path, image: &str, test_path: &str) -> ImageResult
         ])
         .stdin(Stdio::null())
         .output();
+    /// Removes the container when dropped, so a panic on the host side (or
+    /// an early return) never leaves a privileged systemd container running.
+    struct Container(String);
+    impl Drop for Container {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
     let id = match started {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => {
@@ -574,10 +630,12 @@ fn run_in_systemd_image(bin: &Path, image: &str, test_path: &str) -> ImageResult
         }
         Err(e) => return finish(image, t0, Err(format!("could not run docker: {e}"))),
     };
+    let guard = Container(id.clone());
     let out = match wait_for_systemd(&id) {
         Ok(()) => Command::new("docker")
             .args(["exec", "-e"])
             .arg(format!("{IMAGE_VAR}={image}"))
+            .args(["-e", &format!("{INSIDE_VAR}=1")])
             .arg(&id)
             .args(test_args(test_path))
             .stdin(Stdio::null())
@@ -585,12 +643,7 @@ fn run_in_systemd_image(bin: &Path, image: &str, test_path: &str) -> ImageResult
             .map_err(|e| format!("could not run docker exec: {e}")),
         Err(why) => Err(why),
     };
-    let _ = Command::new("docker")
-        .args(["rm", "-f", &id])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    drop(guard);
     finish(image, t0, out)
 }
 
@@ -608,6 +661,14 @@ fn wait_for_systemd(id: &str) -> std::result::Result<(), String> {
             .output()
             .map_err(|e| format!("could not run docker exec: {e}"))?;
         last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // A dead container answers with empty stdout and a non-zero exit;
+        // fail now instead of polling until the cap.
+        if !out.status.success() && last.is_empty() {
+            return Err(format!(
+                "container {id} is not running (docker exec: {})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
         match last.as_str() {
             "running" | "degraded" => return Ok(()),
             // Terminal states that will not improve.
@@ -708,9 +769,13 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_matches_hyphenated_target_names() {
-        let json = r#"{"reason":"compiler-artifact","target":{"name":"it-x","kind":["test"]},"executable":"/x/it_x"}"#;
+    fn test_artifact_matches_the_exact_target_name_only() {
+        // Hyphenated targets are refused earlier with a clear message, so
+        // the artifact lookup is exact and never guesses.
+        let json = r#"{"reason":"compiler-artifact","target":{"name":"it_x","kind":["test"]},"executable":"/x/it_x"}"#;
         assert_eq!(test_artifact(json, "it_x"), Some(PathBuf::from("/x/it_x")));
+        let json = r#"{"reason":"compiler-artifact","target":{"name":"it-x","kind":["test"]},"executable":"/x/it_x"}"#;
+        assert_eq!(test_artifact(json, "it_x"), None);
     }
 
     #[test]

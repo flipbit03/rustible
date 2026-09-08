@@ -381,12 +381,16 @@ fn integration_test_impl(
     let name = f.sig.ident.clone();
     let inner = format_ident!("__rustible_integration_{}", name);
     f.sig.ident = inner.clone();
+    // The author's attributes (`#[ignore]`, `#[should_panic]`, `#[cfg(..)]`,
+    // doc comments) belong on the test libtest runs, not on the inner body.
+    let outer_attrs: Vec<syn::Attribute> = std::mem::take(&mut f.attrs);
     f.attrs
         .push(syn::parse_quote!(#[allow(clippy::needless_pass_by_ref_mut)]));
 
     Ok(quote! {
         #f
 
+        #(#outer_attrs)*
         #[::core::prelude::v1::test]
         fn #name() {
             ::rustible::sdk::testing::run(
