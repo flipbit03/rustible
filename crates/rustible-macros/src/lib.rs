@@ -304,7 +304,10 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
 /// Expands to a `#[test]` that calls `rustible::sdk::testing::run`: skipped
 /// unless `RUSTIBLE_INTEGRATION=1` and docker work; otherwise the test binary
 /// is built for musl and the body runs inside each image as root over the
-/// real `Local` backend. `images` is required and non-empty. The function
+/// real `Local` backend. `images` are stock images run as-is;
+/// `systemd_images` (the `SystemdImage` variant, for the systemd ops) are
+/// booted with systemd as PID 1 first, see `testing::Image::Systemd` for the
+/// images that work. At least one of the two lists is required. The function
 /// takes exactly `ctx: &mut Ctx` and returns `Result<()>`.
 #[proc_macro_attribute]
 pub fn integration_test(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -318,36 +321,51 @@ fn integration_test_impl(
     attr: proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let mut images: Vec<LitStr> = Vec::new();
+    // (image literal, is systemd) in attribute order.
+    let mut images: Vec<(LitStr, bool)> = Vec::new();
     let parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("images") {
-            let arr: syn::ExprArray = meta.value()?.parse()?;
-            for elem in arr.elems {
-                match elem {
-                    syn::Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Str(s),
-                        ..
-                    }) => images.push(s),
-                    other => {
-                        return Err(Error::new_spanned(
-                            other,
-                            "`images` takes string literals like \"debian:12\"",
-                        ));
-                    }
+        let systemd = if meta.path.is_ident("images") {
+            false
+        } else if meta.path.is_ident("systemd_images") {
+            true
+        } else {
+            return Err(meta.error(
+                "unknown option; expected `images = [\"debian:12\", ...]` \
+                 or `systemd_images = [\"jrei/systemd-debian:12\", ...]`",
+            ));
+        };
+        let arr: syn::ExprArray = meta.value()?.parse()?;
+        for elem in arr.elems {
+            match elem {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => images.push((s, systemd)),
+                other => {
+                    return Err(Error::new_spanned(
+                        other,
+                        "image lists take string literals like \"debian:12\"",
+                    ));
                 }
             }
-            Ok(())
-        } else {
-            Err(meta.error("unknown option; expected `images = [\"debian:12\", ...]`"))
         }
+        Ok(())
     });
     parser.parse2(attr)?;
     if images.is_empty() {
         return Err(Error::new(
             proc_macro2::Span::call_site(),
-            "`#[rustible::integration_test]` needs `images = [\"debian:12\", ...]`",
+            "`#[rustible::integration_test]` needs `images = [\"debian:12\", ...]` \
+             and/or `systemd_images = [\"jrei/systemd-debian:12\", ...]`",
         ));
     }
+    let images = images.iter().map(|(lit, systemd)| {
+        if *systemd {
+            quote!(::rustible::sdk::testing::Image::Systemd(#lit))
+        } else {
+            quote!(::rustible::sdk::testing::Image::Plain(#lit))
+        }
+    });
 
     let mut f: ItemFn = syn::parse2(item)?;
     let bad_signature = f.sig.inputs.len() != 1

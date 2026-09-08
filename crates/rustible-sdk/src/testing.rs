@@ -28,6 +28,19 @@
 //! of the attribute's images. Test file names must use underscores
 //! (`tests/it_file_line.rs`): the file name is both the cargo `--test` target
 //! and the crate name the harness reads at compile time.
+//!
+//! **Systemd images** (`systemd_images = [...]`, [`Image::Systemd`]) are for
+//! the systemd ops, which need a live `systemd` as PID 1. Those run as
+//! `docker run -d --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup
+//! --tmpfs /run --tmpfs /run/lock <image> /sbin/init`, the harness waits for
+//! `systemctl is-system-running` to settle, then `docker exec`s the test binary
+//! and force-removes the container. The image must ship systemd; stock
+//! `debian:12` does not. The documented, tested choice is the `jrei/systemd-*`
+//! family: `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`. Vision 8
+//! reserves VMs for what Docker does badly; this variant covers unit
+//! enable/start/stop, not reboots or kernel modules. Containers carry the
+//! label `rustible.integration=1`, so a run killed half way leaves something
+//! `docker ps -q --filter label=rustible.integration` can find.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -51,6 +64,42 @@ pub const IMAGE_VAR: &str = "RUSTIBLE_INTEGRATION_IMAGE";
 pub const IMAGES_FILTER_VAR: &str = "RUSTIBLE_INTEGRATION_IMAGES";
 
 const REPORT_PREFIX: &str = "RUSTIBLE_INTEGRATION_REPORT ";
+/// Label on every container the harness starts.
+const CONTAINER_LABEL: &str = "rustible.integration=1";
+/// How long a systemd image may take to reach `running` or `degraded`.
+const SYSTEMD_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// An image a test runs in. Built by the `#[rustible::integration_test]`
+/// expansion from `images = [...]` (`Plain`) and `systemd_images = [...]`
+/// (`Systemd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Image {
+    /// A stock image; the test binary is the container's only process.
+    Plain(&'static str),
+    /// An image with systemd installed, booted with `/sbin/init` as PID 1
+    /// before the test runs (needs `--privileged`). Known to work:
+    /// `jrei/systemd-debian:12`, `jrei/systemd-ubuntu:24.04`.
+    Systemd(&'static str),
+}
+
+impl Image {
+    /// The docker image name, as passed to `docker run`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Image::Plain(n) | Image::Systemd(n) => n,
+        }
+    }
+
+    pub fn is_systemd(&self) -> bool {
+        matches!(self, Image::Systemd(_))
+    }
+}
+
+impl std::fmt::Display for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// What the `#[rustible::integration_test]` expansion hands to [`run`].
 /// All fields come from `stringify!`, `module_path!`, and `env!` at the
@@ -66,8 +115,8 @@ pub struct Spec {
     pub crate_name: &'static str,
     /// `env!("CARGO_MANIFEST_DIR")`: the package the test target belongs to.
     pub manifest_dir: &'static str,
-    /// Images to run in, e.g. `debian:12`.
-    pub images: &'static [&'static str],
+    /// Images to run in, e.g. `Image::Plain("debian:12")`.
+    pub images: &'static [Image],
 }
 
 /// One finished step inside the container, as reported to the outside.
@@ -134,7 +183,11 @@ pub fn run(spec: &Spec, body: Body) {
         println!(
             "integration test `{}` skipped: {reason} (images: {})",
             spec.name,
-            spec.images.join(", ")
+            spec.images
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         return;
     }
@@ -215,7 +268,7 @@ pub fn changed_then_ok<O: Op>(
 /// Build the current test binary for musl (once per process) and run `spec`
 /// in each of `images`. Does not skip and does not panic on test failure;
 /// [`run`] does both.
-pub fn run_images(spec: &Spec, images: &[String]) -> Vec<ImageResult> {
+pub fn run_images(spec: &Spec, images: &[Image]) -> Vec<ImageResult> {
     let bin = match test_binary(spec) {
         Ok(p) => p,
         Err(e) => panic!("integration test `{}`: {e}", spec.name),
@@ -223,7 +276,10 @@ pub fn run_images(spec: &Spec, images: &[String]) -> Vec<ImageResult> {
     let path = test_path(spec.module_path, spec.crate_name, spec.name);
     images
         .iter()
-        .map(|image| run_in_image(&bin, image, &path))
+        .map(|image| match image {
+            Image::Plain(name) => run_in_image(&bin, name, &path),
+            Image::Systemd(name) => run_in_systemd_image(&bin, name, &path),
+        })
         .collect()
 }
 
@@ -318,20 +374,20 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 
 // ---- the host side ----
 
-fn selected_images(all: &[&str]) -> Vec<String> {
+fn selected_images(all: &[Image]) -> Vec<Image> {
     match std::env::var(IMAGES_FILTER_VAR) {
         Ok(filter) if !filter.trim().is_empty() => {
             let wanted: Vec<&str> = filter.split(',').map(str::trim).collect();
             all.iter()
-                .filter(|i| wanted.contains(i))
-                .map(|i| i.to_string())
+                .filter(|i| wanted.contains(&i.name()))
+                .copied()
                 .collect()
         }
-        _ => all.iter().map(|i| i.to_string()).collect(),
+        _ => all.to_vec(),
     }
 }
 
-fn skip_reason(images: &[String]) -> Option<String> {
+fn skip_reason(images: &[Image]) -> Option<String> {
     if std::env::var(ENABLE_VAR).map_or(true, |v| v.is_empty()) {
         return Some(format!("set {ENABLE_VAR}=1 to run it in docker"));
     }
@@ -443,22 +499,135 @@ fn test_path(module_path: &str, crate_name: &str, name: &str) -> String {
     }
 }
 
+/// The libtest arguments that run exactly one test with its output visible.
+fn test_args(test_path: &str) -> [&str; 5] {
+    [
+        "/t",
+        "--exact",
+        test_path,
+        "--nocapture",
+        "--test-threads=1",
+    ]
+}
+
 fn run_in_image(bin: &Path, image: &str, test_path: &str) -> ImageResult {
     let t0 = Instant::now();
     let mount = format!("{}:/t:ro", bin.display());
     let out = Command::new("docker")
-        .args(["run", "--rm", "-v", &mount, "-e"])
+        .args([
+            "run",
+            "--rm",
+            "--label",
+            CONTAINER_LABEL,
+            "-v",
+            &mount,
+            "-e",
+        ])
         .arg(format!("{IMAGE_VAR}={image}"))
         .arg(image)
+        .args(test_args(test_path))
+        .stdin(Stdio::null())
+        .output();
+    finish(
+        image,
+        t0,
+        out.map_err(|e| format!("could not run docker: {e}")),
+    )
+}
+
+/// Boot `image` with systemd as PID 1, wait for it to settle, run the test
+/// with `docker exec`, and remove the container whatever happened.
+fn run_in_systemd_image(bin: &Path, image: &str, test_path: &str) -> ImageResult {
+    let t0 = Instant::now();
+    let mount = format!("{}:/t:ro", bin.display());
+    let started = Command::new("docker")
         .args([
-            "/t",
-            "--exact",
-            test_path,
-            "--nocapture",
-            "--test-threads=1",
+            "run",
+            "-d",
+            "--rm",
+            "--label",
+            CONTAINER_LABEL,
+            "--privileged",
+            "--cgroupns=host",
+            "-v",
+            "/sys/fs/cgroup:/sys/fs/cgroup:rw",
+            "--tmpfs",
+            "/run",
+            "--tmpfs",
+            "/run/lock",
+            "-v",
+            &mount,
+            image,
+            "/sbin/init",
         ])
         .stdin(Stdio::null())
         .output();
+    let id = match started {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            let why = format!(
+                "docker run {image} /sbin/init failed ({}):\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim_end()
+            );
+            return finish(image, t0, Err(why));
+        }
+        Err(e) => return finish(image, t0, Err(format!("could not run docker: {e}"))),
+    };
+    let out = match wait_for_systemd(&id) {
+        Ok(()) => Command::new("docker")
+            .args(["exec", "-e"])
+            .arg(format!("{IMAGE_VAR}={image}"))
+            .arg(&id)
+            .args(test_args(test_path))
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not run docker exec: {e}")),
+        Err(why) => Err(why),
+    };
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    finish(image, t0, out)
+}
+
+/// Poll `systemctl is-system-running` until systemd reports a final state.
+/// `degraded` (some unit failed to start) is accepted: the test decides what
+/// it needs. Anything else after [`SYSTEMD_BOOT_TIMEOUT`] is an error naming
+/// the last state seen.
+fn wait_for_systemd(id: &str) -> std::result::Result<(), String> {
+    let t0 = Instant::now();
+    let mut last = String::from("(not started)");
+    while t0.elapsed() < SYSTEMD_BOOT_TIMEOUT {
+        let out = Command::new("docker")
+            .args(["exec", id, "systemctl", "is-system-running"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not run docker exec: {e}"))?;
+        last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        match last.as_str() {
+            "running" | "degraded" => return Ok(()),
+            // Terminal states that will not improve.
+            "stopping" | "offline" | "maintenance" => break,
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    Err(format!(
+        "systemd did not reach `running` in {}s (last state: `{last}`)",
+        SYSTEMD_BOOT_TIMEOUT.as_secs()
+    ))
+}
+
+/// Turn the outcome of the test process (or the reason it never ran) into an
+/// [`ImageResult`], folding stderr into the output for the failure message.
+fn finish(
+    image: &str,
+    t0: Instant,
+    out: std::result::Result<std::process::Output, String>,
+) -> ImageResult {
     let elapsed = t0.elapsed();
     match out {
         Ok(out) => {
@@ -477,12 +646,12 @@ fn run_in_image(bin: &Path, image: &str, test_path: &str) -> ImageResult {
                 output,
             }
         }
-        Err(e) => ImageResult {
+        Err(why) => ImageResult {
             image: image.to_string(),
             elapsed,
             report: None,
             status: -1,
-            output: format!("could not run docker: {e}"),
+            output: why,
         },
     }
 }

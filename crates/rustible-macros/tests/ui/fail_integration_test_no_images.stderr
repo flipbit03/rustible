@@ -1,4 +1,4 @@
-error: `#[rustible::integration_test]` needs `images = ["debian:12", ...]`
+error: `#[rustible::integration_test]` needs `images = ["debian:12", ...]` and/or `systemd_images = ["jrei/systemd-debian:12", ...]`
  --> tests/ui/fail_integration_test_no_images.rs:1:1
   |
 1 | #[rustible::integration_test]
