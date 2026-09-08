@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod registry;
 pub mod runtime;
 pub mod system;
+pub mod testing;
 pub mod vars;
 
 /// Re-exports the macros expand to. Not part of the public API.

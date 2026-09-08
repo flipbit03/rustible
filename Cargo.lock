@@ -605,6 +605,7 @@ name = "rustible-std"
 version = "0.0.1"
 dependencies = [
  "regex",
+ "rustible",
  "rustible-sdk",
  "serde",
 ]
