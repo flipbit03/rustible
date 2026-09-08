@@ -10,7 +10,7 @@ Updated by whoever is working; read first on every resume.
 | M3 real run | in-progress (m3-run) | subagent, started after M2 merged |
 | M4 init | merged | PR #2, 2026-09-08; review: 10 findings, 9 fixed, 1 recorded as proposed amendment |
 | M5 elevated/cancel/streaming | in-progress (m5-elevated-streaming) | subagent, unattended run 1; ARM VM may be down |
-| M6 stdlib wave one | in-progress | merged: `ssh::authorized_keys` (#3), `user`+`group` (#6), `file` family (#7), apt-Absent/Latest+hostname+sysctl (#9), `systemd` (#8); remaining: http::Download, archive::Extracted, shell::Command extras, rustible-github |
+| M6 stdlib wave one | in-progress | merged: `ssh::authorized_keys` (#3), `user`+`group` (#6), `file` family (#7), apt-Absent/Latest+hostname+sysctl (#9), `systemd` (#8); in progress: `m6-net-archive` (http::Download, archive::Extracted), `m6-shell-tests` (shell extras, container tests for file/user/group/keys, two PR-#6 follow-ups); remaining: rustible-github |
 | M6 rustible-github | todo | |
 | M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
@@ -35,3 +35,4 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 11:08 UTC  M6  user/group merged as PR #6 after review (optional groups, uid-taken guard on existing accounts, private-gid guess dropped, useradd HOME= default, tool probing, absolute-home check); PRs #8 systemd and #9 small-ops open for review
 - 2026-09-08 14:53 UTC  M6  small ops merged as PR #9 after review (apt::Present predicts only with a known candidate, apply works from the diff, hostname limited to HOST_NAME_MAX; container tests re-run green)
 - 2026-09-08 14:54 UTC  M6  systemd merged as PR #8 after review (no code changes needed; container test re-run green on both jrei images). ARM VM came back up: M3 and M5 agents restarted to run their ARM legs
+- 2026-09-08 14:56 UTC  M6,M3,M5  ARM VM back up: agents `m3-arm` and `m5-arm` running the ARM legs on the existing m3-run and m5-elevated-streaming worktrees. M6 wave two started: `m6-net-archive` and `m6-shell-tests`. Lead is on M7 prep (CI and release workflows).
