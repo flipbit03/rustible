@@ -1,5 +1,7 @@
 # Spike 1: cross-compile to aarch64 musl and run on the ARM VM
 
+> **Frozen history.** The code this document describes was replaced in M3 (2026-09-08) by `crates/rustible-cli` (`rustible playbook run`) and the runtime in `crates/rustible-sdk`; `crates/spike-playbook` is deleted. Measurements and reasoning still apply; file names and commands do not.
+
 **Date:** 2026-09-06. **Status:** done. **Verdict:** the compile story holds
 with the stock rustup toolchain. No zig, no distro cross-compiler, no Docker.
 

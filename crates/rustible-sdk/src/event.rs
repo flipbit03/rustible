@@ -1,6 +1,8 @@
 //! Events the binary emits toward the orchestrator. This is the `Up` side of
-//! the protocol, minus transport concerns. For the spike they are written as
-//! JSON lines or rendered directly.
+//! the protocol, minus transport concerns. The `rustible` command renders
+//! them; the sinks here are the framed channel's building blocks, a JSON
+//! lines writer, an in-memory collector for tests, and a compact printer for
+//! running a playbook binary by hand.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -138,51 +140,35 @@ impl Collect {
     }
 }
 
-/// The sink a local run writes to: JSON lines or the pretty renderer.
-pub fn stdout_sink(json: bool, host: &str, verbosity: u8) -> SharedSink {
-    if json {
-        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
-    } else {
-        Arc::new(Pretty::new(std::io::stdout(), host, verbosity))
-    }
-}
-
-/// Renders the Ansible-style step list straight to a writer. This is what the
-/// orchestrator will do from the event stream; for the spike the binary does it.
-pub struct Pretty<W: Write + Send> {
+/// One line per event, unbuffered, for a playbook binary run by hand
+/// (`<binary> <name>`). The `rustible` command renders the real view from
+/// the frame stream; this only has to be readable.
+pub struct Compact<W: Write + Send> {
     w: Mutex<W>,
-    host: String,
     verbosity: u8,
 }
 
-impl<W: Write + Send> Pretty<W> {
-    pub fn new(w: W, host: impl Into<String>, verbosity: u8) -> Self {
-        Pretty {
+impl<W: Write + Send> Compact<W> {
+    pub fn new(w: W, verbosity: u8) -> Self {
+        Compact {
             w: Mutex::new(w),
-            host: host.into(),
             verbosity,
         }
     }
 }
 
-impl<W: Write + Send> EventSink for Pretty<W> {
+impl<W: Write + Send> EventSink for Compact<W> {
     fn emit(&self, event: Event) {
         let mut w = self.w.lock().unwrap();
-        let host = &self.host;
-        let indent = |d: u8| "  ".repeat(d as usize);
         let _ = match event {
             Event::Facts(f) => writeln!(
                 w,
-                "[{host}]  facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
+                "facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
                 f.distro, f.distro_version, f.arch, f.package_manager, f.cpus, f.memory_mb, f.user
             ),
-            Event::SectionStarted { depth, name } => {
-                writeln!(w, "[{host}]  {}{name}", indent(depth))
-            }
-            Event::SectionFinished { .. } => Ok(()),
-            Event::StepStarted { .. } => Ok(()),
+            Event::SectionStarted { name, .. } => writeln!(w, "section: {name}"),
+            Event::SectionFinished { .. } | Event::StepStarted { .. } => Ok(()),
             Event::StepFinished {
-                depth,
                 name,
                 identity,
                 status,
@@ -190,7 +176,6 @@ impl<W: Write + Send> EventSink for Pretty<W> {
                 note,
                 ..
             } => {
-                let label = format!("{}{name} ", indent(depth));
                 let status_s = match status {
                     Status::Ok => "ok",
                     Status::Changed => "changed",
@@ -200,74 +185,61 @@ impl<W: Write + Send> EventSink for Pretty<W> {
                 };
                 let mut tail = String::new();
                 if let Some(d) = &diff {
-                    tail.push_str(&format!("   {}", d.short()));
+                    tail.push_str(&format!("  {}", d.short()));
                 }
                 if let Some(n) = note {
-                    tail.push_str(&format!("   {n}"));
+                    tail.push_str(&format!("  {n}"));
                 }
                 if identity != "self" {
-                    tail.push_str(&format!("   as {identity}"));
+                    tail.push_str(&format!("  as {identity}"));
                 }
-                let r = writeln!(w, "[{host}]  {label:.<44} {status_s:<13}{tail}");
+                let r = writeln!(w, "{status_s}: {name}{tail}");
                 if self.verbosity >= 1
                     && let Some(d) = diff
                     && matches!(status, Status::Changed | Status::WouldChange)
                 {
                     for line in d.render().lines() {
-                        let _ = writeln!(w, "{}      | {line}", indent(depth));
+                        let _ = writeln!(w, "    | {line}");
                     }
                 }
                 r
             }
-            Event::StepSkipped {
-                depth,
-                name,
-                reason,
-                ..
-            } => {
-                let label = format!("{}{name} ", indent(depth));
-                writeln!(w, "[{host}]  {label:.<44} {:<13}   {reason}", "skipped")
-            }
+            Event::StepSkipped { name, reason, .. } => writeln!(w, "skipped: {name}  {reason}"),
             Event::Log { level, msg } => match level {
                 Level::Debug if self.verbosity < 1 => Ok(()),
-                Level::Debug => writeln!(w, "[{host}]    debug: {msg}"),
-                Level::Info => writeln!(w, "[{host}]    {msg}"),
-                Level::Warn => writeln!(w, "[{host}]    WARNING: {msg}"),
+                Level::Debug => writeln!(w, "debug: {msg}"),
+                Level::Info => writeln!(w, "{msg}"),
+                Level::Warn => writeln!(w, "WARNING: {msg}"),
             },
             Event::CmdRan {
                 identity,
                 argv,
                 status,
                 elapsed_ms,
-            } => {
-                if self.verbosity >= 2 {
-                    writeln!(
-                        w,
-                        "[{host}]    $ {} (as {identity}, exit {status}, {elapsed_ms}ms)",
-                        argv.join(" ")
-                    )
-                } else {
-                    Ok(())
-                }
-            }
+            } if self.verbosity >= 2 => writeln!(
+                w,
+                "$ {} (as {identity}, exit {status}, {elapsed_ms}ms)",
+                argv.join(" ")
+            ),
+            Event::CmdRan { .. } => Ok(()),
             Event::Failed { step, error, cmd } => {
                 let r = match step {
-                    Some(s) => writeln!(w, "[{host}]  FAILED at `{s}`: {error}"),
-                    None => writeln!(w, "[{host}]  FAILED: {error}"),
+                    Some(s) => writeln!(w, "FAILED at `{s}`: {error}"),
+                    None => writeln!(w, "FAILED: {error}"),
                 };
                 if self.verbosity >= 1
                     && let Some(c) = cmd
                 {
-                    let _ = writeln!(w, "[{host}]    $ {} (exit {})", c.argv.join(" "), c.status);
+                    let _ = writeln!(w, "  $ {} (exit {})", c.argv.join(" "), c.status);
                     for line in c.stderr.lines() {
-                        let _ = writeln!(w, "[{host}]      {line}");
+                        let _ = writeln!(w, "    {line}");
                     }
                 }
                 r
             }
             Event::Finished(s) => writeln!(
                 w,
-                "\n{host:<8} ok={} changed={} would_change={} skipped={} failed={} warnings={}",
+                "ok={} changed={} would_change={} skipped={} failed={} warnings={}",
                 s.ok, s.changed, s.would_change, s.skipped, s.failed, s.warnings
             ),
         };

@@ -1,5 +1,7 @@
 # Spike 3: SDK core, run locally
 
+> **Frozen history.** The code this document describes was replaced in M3 (2026-09-08) by `crates/rustible-cli` (`rustible playbook run`) and the runtime in `crates/rustible-sdk`; `crates/spike-playbook` is deleted. Measurements and reasoning still apply; file names and commands do not.
+
 **Date:** 2026-09-06. **Status:** done, in-tree. **Verdict:** the sketches in
 `01_VISION.md` sections 6, 7, 11, 12, 13 (numbering after the 2026-09-06 restructure) hold up in code with one small
 deviation. No blockers found.

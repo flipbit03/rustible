@@ -1,5 +1,7 @@
 # Spike 2: framed protocol over SSH, multi-arch, with a real apt op
 
+> **Frozen history.** The code this document describes was replaced in M3 (2026-09-08) by `crates/rustible-cli` (`rustible playbook run`) and the runtime in `crates/rustible-sdk`; `crates/spike-playbook` is deleted. Measurements and reasoning still apply; file names and commands do not.
+
 **Date:** 2026-09-06. **Status:** done, in-tree. **Verdict:** the
 orchestrator/binary split works as designed. Two hosts, two architectures, one
 command, 345 ms warm.
