@@ -88,7 +88,27 @@ for h in "${HOSTS[@]}"; do
   echo "[$h] marker: $(remote_sh "$h" 'ls /tmp/rustible-m5-next-step-ran 2>&1 || true')"
 done
 
-echo; echo "## 4. cargo test --workspace"
+echo; echo "## 4. ctrl-c DURING the 50 MB transfer: answered inside the transfer, not after it"
+# Only worth running where the transfer is slow enough to interrupt: locally
+# the 50 MB stream takes about a third of a second.
+for h in "${HOSTS[@]}"; do
+  [ "$h" = arm ] || { echo "[$h] skipped: the local stream finishes too fast to interrupt"; continue; }
+  LOG=$(mktemp)
+  rustible playbook run playbooks/cadu/streaming.rs -v --limit "$h" >"$LOG" 2>&1 &
+  CLI=$!
+  for _ in $(seq 1 480); do grep -q 'facts:' "$LOG" && break; sleep 0.5; done
+  sleep 15   # well inside a transfer that takes minutes on this link
+  echo "[$h] bytes on the target when interrupted: $(remote_sh "$h" 'cat /tmp/.rustible-*/*/big.bin 2>/dev/null | wc -c')"
+  T0=$(date +%s)
+  echo "[$h] SIGINT to the orchestrator (pid $CLI) mid-transfer"
+  kill -INT "$CLI"; wait "$CLI"; CODE=$?
+  echo "[$h] orchestrator exited $CODE after $(( $(date +%s) - T0 )) s"
+  sed 's/^/    /' "$LOG"; rm -f "$LOG"
+  sleep 1
+  echo "[$h] leftover run temp dirs: $(remote_sh "$h" 'ls -d /tmp/.rustible-* 2>/dev/null || echo none')"
+done
+
+echo; echo "## 5. cargo test --workspace"
 (cd "$ROOT" && run cargo test --workspace)
 
 echo; echo "## cleanup"
