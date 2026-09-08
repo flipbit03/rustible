@@ -597,12 +597,12 @@ async fn drive(
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
     // is caught and told with what the child said.
-    match drive_frames(
+    let killed = match drive_frames(
         tr, &mut proc, plan, r, probe, vars, out, host, name, cancel_rx,
     )
     .await
     {
-        Ok(()) => {}
+        Ok(killed) => killed,
         Err(e) => {
             let stderr = proc.stderr_text().await;
             let stderr = stderr.trim();
@@ -612,6 +612,24 @@ async fn drive(
                 e.context(format!("the playbook binary said: {stderr}"))
             });
         }
+    };
+    if killed {
+        // The binary was killed on purpose. Its exit status says only how it
+        // died, and over SSH `wait` reports the channel's own view of that
+        // ("the remote process has terminated"), so the host is closed with
+        // the reason rather than with that.
+        let _ = proc.wait().await;
+        let stderr = proc.stderr_text().await;
+        if !stderr.trim().is_empty() {
+            out.lock().unwrap().stderr(host, stderr.trim_end());
+        }
+        out.lock().unwrap().failed(
+            host,
+            &format!(
+                "cancelled: the running step did not finish within {CANCEL_GRACE:?}, the binary was killed"
+            ),
+        );
+        return Ok(());
     }
     let exit = proc.wait().await?;
     let stderr = proc.stderr_text().await;
@@ -623,7 +641,8 @@ async fn drive(
 }
 
 /// `Start` down, every `Up` frame to the renderer, until the binary closes
-/// its stdout.
+/// its stdout. `true` when the binary had to be killed after ignoring
+/// `Cancel` for the whole grace period.
 #[allow(clippy::too_many_arguments)]
 async fn drive_frames(
     tr: &Transport,
@@ -636,7 +655,7 @@ async fn drive_frames(
     host: &str,
     name: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<bool> {
     let _ = probe;
     let start = Down::Start {
         run_id: format!(
@@ -683,6 +702,7 @@ async fn drive_frames(
     });
 
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut killed = false;
     loop {
         tokio::select! {
             frame = frames.recv() => {
@@ -706,11 +726,12 @@ async fn drive_frames(
                     "[{host}] cancelled: the running step did not finish within {CANCEL_GRACE:?}, killing the binary"
                 );
                 tr.kill(proc).await?;
+                killed = true;
                 break;
             }
         }
     }
-    Ok(())
+    Ok(killed)
 }
 
 /// One `Up` frame: the `Hello` check, an event to render, a file to serve,

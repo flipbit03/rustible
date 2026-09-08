@@ -64,13 +64,19 @@ for h in "${HOSTS[@]}"; do
   # line only prints when it finishes, which is exactly what must not happen.
   for _ in $(seq 1 480); do grep -q 'facts:' "$LOG" && break; sleep 0.5; done
   sleep 2
+  # The exact pids to look for afterwards: the playbook binary on the target
+  # and its children (the step's `sleep 30`). Matching on the command line
+  # instead would also catch anything else on the box that says `sleep 30`.
+  PIDS=$(remote_sh "$h" 'b=$(pgrep -f "cache/rustible/bin/cadu_slow"); echo $b $(pgrep -P "$b" 2>/dev/null)')
+  echo "[$h] running before the interrupt:"
+  remote_sh "$h" "ps -o pid=,cmd= -p \$(echo $PIDS | tr ' ' ,)" | cut -c1-110 | sed 's/^/    /'
   T0=$(date +%s)
   echo "[$h] SIGINT to the orchestrator (pid $CLI)"
   kill -INT "$CLI"; wait "$CLI"; CODE=$?
   echo "[$h] orchestrator exited $CODE after $(( $(date +%s) - T0 )) s"
   sed 's/^/    /' "$LOG"; rm -f "$LOG"
   sleep 1
-  echo "[$h] leftover processes: $(remote_sh "$h" 'pgrep -af "cache/rustible/bin/cadu_slow|sleep 30$" | grep -v pgrep || echo none')"
+  echo "[$h] leftover of those pids ($PIDS): $(remote_sh "$h" "ps -o pid=,cmd= -p \$(echo $PIDS | tr ' ' ,) || echo none")"
   echo "[$h] marker: $(remote_sh "$h" 'ls /tmp/rustible-m5-next-step-ran 2>&1 || true')"
 done
 
