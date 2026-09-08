@@ -1,0 +1,5 @@
+error: vars field `labels` is a map; vars are flat (vision doc 10.3)
+ --> tests/ui/fail_map_var.rs:7:17
+  |
+7 |         labels: std::collections::HashMap<String, String>,
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,13 @@
+error: `#[rustible::playbook]` goes on `fn main`
+ --> tests/ui/fail_not_main.rs:6:8
+  |
+6 |     fn run(_ctx: &mut Ctx) -> Result<()> {
+  |        ^^^
+
+warning: unused import: `rustible::prelude::*`
+ --> tests/ui/fail_not_main.rs:3:9
+  |
+3 |     use rustible::prelude::*;
+  |         ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
