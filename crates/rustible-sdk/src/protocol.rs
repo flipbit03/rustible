@@ -196,13 +196,30 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()>
     w.flush()
 }
 
+/// A frame's length prefix asked for more than [`MAX_FRAME`] bytes.
+///
+/// Carried as the inner error of the `io::Error` [`read_frame`] returns, so
+/// a caller that has a better refusal to offer can recognise this case with
+/// `err.get_ref().and_then(|e| e.downcast_ref::<FrameTooLarge>())` instead
+/// of matching on the message text. The
+/// [`Elevated`](crate::backend::Elevated) backend does exactly that, to say
+/// which file was too large to read as another user.
+#[derive(Debug, thiserror::Error)]
+#[error("frame of {len} bytes exceeds limit")]
+pub struct FrameTooLarge {
+    /// What the length prefix asked for, in bytes. Nothing was allocated:
+    /// the prefix is checked before the body is read.
+    pub len: usize,
+}
+
 /// Read one length-prefixed frame and deserialize it.
 ///
 /// `Ok(None)` on clean EOF before a frame starts, which is how each end
 /// learns the other has gone away. EOF part way through a frame is an error,
 /// as is a length above [`MAX_FRAME`] (refused before allocating, so a
-/// corrupt or hostile prefix cannot ask for gigabytes) and a body that does
-/// not deserialize into `T`. The body is held in `Zeroizing` memory and
+/// corrupt or hostile prefix cannot ask for gigabytes, and reported as a
+/// [`FrameTooLarge`] inside the `io::Error`) and a body that does not
+/// deserialize into `T`. The body is held in `Zeroizing` memory and
 /// wiped once decoded.
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<T>> {
     let mut len_buf = [0u8; 4];
@@ -213,9 +230,7 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::other(format!(
-            "frame of {len} bytes exceeds limit"
-        )));
+        return Err(io::Error::other(FrameTooLarge { len }));
     }
     let mut body = Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut body)?;

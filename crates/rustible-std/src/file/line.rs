@@ -51,7 +51,10 @@ pub struct Line {
 /// taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineReport {
-    /// 1-based line number where the line now sits.
+    /// 1-based line number where the line now sits: the line `matching`
+    /// selected, which with duplicates is not necessarily the first line
+    /// equal to the desired text. `0` only if the file lost the line between
+    /// the write and the report, which nothing here can cause.
     pub line_no: usize,
     /// The copy taken before the rewrite, set only when `.backup(true)` and
     /// `apply` actually wrote. Always `None` on a satisfied step and on the
@@ -128,6 +131,23 @@ impl LineBuilder {
     }
 }
 
+/// Index of the line the op acts on: the first match of `matching`, or the
+/// first line equal to `line` when there is no regex.
+///
+/// One function so the planner and the reports cannot disagree about which
+/// of several identical lines the step is talking about.
+fn selected<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    matching: Option<&Regex>,
+    line: &str,
+) -> Option<usize> {
+    let mut lines = lines;
+    lines.position(|l| match matching {
+        Some(re) => re.is_match(l),
+        None => l == line,
+    })
+}
+
 /// Pure planning: given the current text, compute the new text and where the
 /// line ends up. `None` means already satisfied.
 pub fn plan_line(
@@ -138,10 +158,7 @@ pub fn plan_line(
 ) -> Option<(String, usize)> {
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
-    let hit = lines.iter().position(|l| match matching {
-        Some(re) => re.is_match(l),
-        None => l == line,
-    });
+    let hit = selected(lines.iter().map(String::as_str), matching, line);
 
     let line_no = match hit {
         Some(i) if lines[i] == line => return None,
@@ -171,9 +188,7 @@ impl Op for Line {
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
             None => {
-                let line_no = text
-                    .lines()
-                    .position(|l| l == self.line)
+                let line_no = selected(text.lines(), self.matching.as_ref(), &self.line)
                     .map(|i| i + 1)
                     .unwrap_or(0);
                 Ok(Plan::Satisfied(LineReport {
@@ -191,15 +206,21 @@ impl Op for Line {
         }
     }
 
-    fn apply(&self, sys: &System, change: Change<LineReport>) -> Result<LineReport> {
+    fn apply(&self, sys: &System, _change: Change<LineReport>) -> Result<LineReport> {
         // Re-plan from the current text (cheap, pure) rather than trusting a
         // copy carried in the diff: the file may have moved on since check.
         let text = super::read_text_or_empty(sys, &self.path, self.create)?;
         let Some((after, line_no)) =
             plan_line(&text, self.matching.as_ref(), &self.line, &self.insert)
         else {
+            // The file satisfied the op between `check` and here, so nothing
+            // is written. Where the line sits is read from the file as it is
+            // now: `check`'s prediction described the text before whatever
+            // changed it, and with duplicates it can name a different line.
             return Ok(LineReport {
-                line_no: change.predicted.map(|p| p.line_no).unwrap_or(0),
+                line_no: selected(text.lines(), self.matching.as_ref(), &self.line)
+                    .map(|i| i + 1)
+                    .unwrap_or(0),
                 backup_path: None,
             });
         };
@@ -299,6 +320,39 @@ mod tests {
 
         // Second check is satisfied.
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// With duplicates, the satisfied report has to name the line
+    /// `matching` selected, not the first line that happens to equal the
+    /// desired one. Only the report is at stake; the file is untouched
+    /// either way.
+    #[test]
+    fn a_satisfied_step_reports_the_line_matching_selected() {
+        let fake = Arc::new(Fake::new().with_file(
+            "/etc/ssh/sshd_config",
+            "Port 22\nPasswordAuthentication no\nPort 22\n",
+        ));
+        let sys = fake_sys(&fake);
+        // `matching` selects line 1; the desired text is already there, so
+        // this is satisfied at line 1 and not at line 3.
+        let op = Line::in_path("/etc/ssh/sshd_config")
+            .matching(r"^Port\b")
+            .set("Port 22");
+        let Plan::Satisfied(report) = op.check(&sys).unwrap() else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(report.line_no, 1);
+
+        // And apply, reached when the file changed under a stale plan,
+        // agrees rather than falling back to the prediction.
+        let change = Change {
+            diff: Diff::summary("stale"),
+            predicted: Some(LineReport {
+                line_no: 99,
+                backup_path: None,
+            }),
+        };
+        assert_eq!(op.apply(&sys, change).unwrap().line_no, 1);
     }
 
     #[test]
