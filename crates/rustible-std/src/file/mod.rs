@@ -204,14 +204,6 @@ pub(crate) mod testing {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
-    /// A `Ctx` in check mode over the fake, for "check writes nothing" tests.
-    pub fn check_mode_ctx(fake: &Arc<Fake>) -> Ctx {
-        Ctx::new(
-            fake_sys(fake).with_check_mode(true),
-            rustible_sdk::HostInfo::local(),
-        )
-    }
-
     /// Run `check`, insist on a change, return it.
     pub fn expect_change<O: Op>(op: &O, sys: &System) -> Change<O::Output> {
         match op.check(sys).unwrap() {
