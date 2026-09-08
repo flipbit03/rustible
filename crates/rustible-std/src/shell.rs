@@ -56,12 +56,23 @@ pub struct Command {
     changed_when: Option<Predicate>,
 }
 
+/// `{:?}` for [`Command`] shows what a value *is* without showing the value:
+/// stdin as a byte count, env as its names with each value's length. Both
+/// carry secrets in ordinary use (`.stdin(password)`, `.env("PGPASSWORD",
+/// ..)`), and a `dbg!` or a formatted error should not put them in a log.
+/// `program` and `args` are printed in full: they reach the process table on
+/// every host anyway, so hiding them here would buy nothing.
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: BTreeMap<&str, String> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), format!("{} bytes", v.len())))
+            .collect();
         f.debug_struct("Command")
             .field("program", &self.program)
             .field("args", &self.args)
-            .field("env", &self.env)
+            .field("env", &env)
             .field(
                 "stdin",
                 &self.stdin.as_ref().map(|b| format!("{} bytes", b.len())),
@@ -386,12 +397,25 @@ mod tests {
     }
 
     #[test]
-    fn debug_hides_stdin_bytes_and_names_the_closure() {
-        let op = Command::new("x").stdin("secret").changed_when(|_| true);
+    fn debug_hides_stdin_and_env_values_and_names_the_closure() {
+        let op = Command::new("psql")
+            .arg("app")
+            .stdin("secret")
+            .env("PGPASSWORD", "s3cret")
+            .env("LANG", "C")
+            .changed_when(|_| true);
         let d = format!("{op:?}");
         assert!(d.contains("stdin: Some(\"6 bytes\")"), "{d}");
-        assert!(!d.contains("secret"), "{d}");
         assert!(d.contains("changed_when: Some(\"<closure>\")"), "{d}");
+        // Env names stay, so `{:?}` still says what the command was given.
+        assert!(d.contains("\"PGPASSWORD\": \"6 bytes\""), "{d}");
+        assert!(d.contains("\"LANG\": \"1 bytes\""), "{d}");
+        // Neither a stdin secret nor an env secret appears anywhere.
+        assert!(!d.contains("secret"), "{d}");
+        assert!(!d.contains("s3cret"), "{d}");
+        // What is not a secret is still printed in full.
+        assert!(d.contains("program: \"psql\""), "{d}");
+        assert!(d.contains("\"app\""), "{d}");
         let _ = op.clone();
     }
 }

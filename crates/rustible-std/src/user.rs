@@ -575,14 +575,20 @@ impl Present {
                     name: g.name,
                     gid: Some(g.gid),
                 }),
-                None if sys.would_create("group", name) => Some(Primary {
-                    name: name.clone(),
-                    gid: None,
-                }),
-                None => bail!(
-                    "group `{name}` does not exist; user::Present does not create groups, use \
-                     group::Present first"
-                ),
+                // A group an earlier step in this dry run would create. Take
+                // the gid it planned when it has one, so `.gid("web")` and
+                // `.gid(&*web)` predict alike; without one the diff names the
+                // group and prediction is blocked (vision 12).
+                None => match sys.would_create_id_by_name("group", name) {
+                    Some(planned) => Some(Primary {
+                        name: name.clone(),
+                        gid: planned.id,
+                    }),
+                    None => bail!(
+                        "group `{name}` does not exist; user::Present does not create groups, \
+                         use group::Present first"
+                    ),
+                },
             },
         })
     }
@@ -597,13 +603,13 @@ impl Present {
                 name: g.name,
                 gid: Some(g.gid),
             }),
-            None if sys.would_create("group", &self.name) => Some(Primary {
-                name: self.name.clone(),
-                gid: sys
-                    .would_create_id_by_name("group", &self.name)
-                    .and_then(|p| p.id),
-            }),
-            None => None,
+            None => match sys.would_create_id_by_name("group", &self.name) {
+                Some(planned) => Some(Primary {
+                    name: self.name.clone(),
+                    gid: planned.id,
+                }),
+                None => None,
+            },
         })
     }
 
@@ -997,8 +1003,28 @@ pub struct Removed {
 ///
 /// `remove_home` is Ansible's `remove: yes`: `userdel -r` (or BusyBox
 /// `deluser --remove-home`) deletes the home directory and mail spool with
-/// the account. The user's private group goes with the account when the
-/// tool removes it, as it does by default; other groups are never touched.
+/// the account. Other groups are never touched.
+///
+/// # A group named after the account can go with it
+///
+/// `userdel` removes the account's primary group when that group has the
+/// account's name and no other members (`USERGROUPS_ENAB`, the Debian and
+/// Ubuntu default). Normally that is the private group `useradd` made, and
+/// nobody misses it. But [`Present`] deliberately adopts an existing
+/// same-named group as the primary group rather than failing, so this
+/// sequence removes a group no step asked to remove:
+///
+/// ```ignore
+/// ctx.step("group", group::Present::new("app"))?;   // creates group `app`
+/// ctx.step("user", user::Present::new("app"))?;     // adopts it as primary
+/// ctx.step("gone", user::Absent::new("app"))?;      // takes group `app` too
+/// ```
+///
+/// Give the group a member other than the account, or a name of its own, if
+/// it must outlive the account. The alternative was for [`Present`] to pass
+/// `useradd -N` as Ansible does, which leaves the account in the system
+/// default group (`users`, gid 100) that nobody asked for; see
+/// `docs/plan/DECISIONS.md`.
 #[derive(Debug, Clone)]
 pub struct Absent {
     name: String,
@@ -2078,6 +2104,36 @@ mod tests {
         assert_eq!(
             u.diff.as_ref().unwrap().short(),
             "exists=yes uid=1002 gid=5000 home=/home/svc shell=/bin/sh"
+        );
+
+        // ...and identically through the name, `.gid("fixed")`. Two spellings
+        // of one intent: the by-name form used to drop the planned gid and
+        // silently lose the prediction, which is worse than failing.
+        let by_name = ctx
+            .step(
+                "user in fixed by name",
+                Present::new("svc2").uid(1003).gid("fixed").shell("/bin/sh"),
+            )
+            .unwrap();
+        assert!(by_name.predicted, "the planned gid is known by name too");
+        assert_eq!(by_name.gid, 5000);
+        assert_eq!(
+            by_name.diff.as_ref().unwrap().short(),
+            "exists=yes uid=1003 gid=5000 home=/home/svc2 shell=/bin/sh"
+        );
+
+        // A planned group with no gid still blocks prediction by either
+        // spelling: the gid is genuinely unknown (vision 12).
+        let u = ctx
+            .step(
+                "user in a gid-less planned group",
+                Present::new("svc3").uid(1004).gid("rustible"),
+            )
+            .unwrap();
+        assert!(!u.predicted);
+        assert!(
+            u.diff.as_ref().unwrap().short().contains("group=rustible"),
+            "the diff names the group it cannot number"
         );
 
         // A group nobody planned is still refused in check mode.

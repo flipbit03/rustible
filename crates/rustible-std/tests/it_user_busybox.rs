@@ -17,8 +17,12 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use rustible::prelude::*;
+use rustible::sdk::event::Collect;
 use rustible::sdk::testing::changed_then_ok;
+use rustible::sdk::{HostInfo, System};
 use rustible_std::shell::Command;
 use rustible_std::{group, user};
 
@@ -35,15 +39,59 @@ fn passwd_line(ctx: &mut Ctx, name: &str) -> Result<Option<String>> {
 fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
     assert!(ctx.sys().is_root());
 
-    // No `.shell()`: the op neither predicts nor names a shell in the diff.
-    // The second, read-back run reports whatever BusyBox actually chose.
+    // No `.shell()`: the op must neither predict the account nor name a shell
+    // in the diff, because on BusyBox it cannot know which shell it will get.
+    // Prediction only means anything in check mode, so this claim is made
+    // against a dry `Ctx` over the same real machine; a plain `ctx.step` here
+    // would report `predicted: false` no matter what the op decided, and the
+    // assertion would hold even if the `/bin/sh` guess came back.
+    let mut dry = Ctx::new(
+        System::local(true, Arc::new(Collect::default())),
+        HostInfo::local(),
+    );
+    // uid and gid are pinned in both dry steps (`users` is gid 100 on this
+    // image), so the shell is the only thing left that can block a
+    // prediction. Without one: no prediction, and no `shell=` in the diff.
+    let planned = dry.step(
+        "dry user without a shell",
+        user::Present::new("rustible-ash").uid(4100).gid("users"),
+    )?;
+    assert!(
+        planned.changed && !planned.predicted,
+        "an unknown shell blocks prediction (vision 12)"
+    );
+    let short = planned.diff.as_ref().unwrap().short();
+    assert!(
+        !short.contains("shell="),
+        "the diff must not name a shell the op was not given: {short}"
+    );
+    // With one, everything is knowable and the step predicts. The only
+    // difference between the two steps is `.shell()`, which is what makes the
+    // assertion above a real one rather than a tautology.
+    let planned = dry.step(
+        "dry user with a shell",
+        user::Present::new("rustible-ash")
+            .uid(4100)
+            .gid("users")
+            .shell("/bin/sh"),
+    )?;
+    assert!(planned.predicted, "an explicit shell is knowable");
+    assert_eq!(planned.shell, Path::new("/bin/sh"));
+    assert!(
+        planned
+            .diff
+            .as_ref()
+            .unwrap()
+            .short()
+            .contains("shell=/bin/sh"),
+        "{:?}",
+        planned.diff
+    );
+
+    // Now for real. The second, read-back run reports the shell BusyBox chose.
     let (account, _) = changed_then_ok(ctx, "user without a shell", || {
         user::Present::new("rustible-ash")
     })?;
-    assert!(
-        !account.predicted,
-        "an unknown shell blocks prediction (vision 12)"
-    );
     let line = passwd_line(ctx, "rustible-ash")?.expect("account created");
     let real_shell = line.rsplit(':').next().unwrap();
     assert_eq!(

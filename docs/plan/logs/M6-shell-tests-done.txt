@@ -1749,3 +1749,122 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 finished 2026-09-08T15:41:44Z  all four gates and all eleven container test binaries green on the second merge
 DONE
+
+# Review round: the four PR 16 findings fixed, gates re-run 2026-09-08T15:52:03Z
+
+$ cargo fmt --all --check
+fmt: clean
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+
+$ cargo test --workspace   (per-result tally)
+      5 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      2 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.45s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.14s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.31s
+      1 test result: ok. 26 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 281 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.88s
+   Generated /home/cadu/w/cadu/rustible-m6sh/target/doc/rustible/index.html and 6 other files
+
+## container tests, RUSTIBLE_INTEGRATION=1
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command -- --nocapture    # 2026-09-08T15:52:50Z
+[debian:12] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+[ubuntu:24.04] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+test command_options_against_a_real_shell ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+  it_shell_command: pass, wall 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_ops -- --nocapture    # 2026-09-08T15:52:52Z
+[debian:12] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+[ubuntu:24.04] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+test file_family_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  it_file_ops: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group -- --nocapture    # 2026-09-08T15:52:53Z
+[debian:12] ok in 0.6s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+[ubuntu:24.04] ok in 0.6s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+test users_and_groups_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+  it_user_group: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_busybox -- --nocapture    # 2026-09-08T15:52:54Z
+[alpine:3.20] ok in 0.4s  user without a shell: changed, user without a shell (again): ok, adduser under SHELL=/bin/ash: changed, user with a shell: changed, user with a shell (again): ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, group: changed, group (again): ok, membership: changed, membership (again): ok, user with missing group: failed, modify an existing account: failed, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok
+test busybox_user_and_group ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+  it_user_busybox: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys -- --nocapture    # 2026-09-08T15:52:55Z
+[debian:12] ok in 0.4s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+[ubuntu:24.04] ok in 0.3s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+test authorized_keys_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+  it_authorized_keys: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line -- --nocapture    # 2026-09-08T15:52:56Z
+[debian:12] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+[ubuntu:24.04] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+test line_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+  it_file_line: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture    # 2026-09-08T15:52:57Z
+[debian:12] ok in 2.1s  install sl: changed, install sl (again): ok
+[ubuntu:24.04] ok in 6.8s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.93s
+  it_apt_present: pass, wall 9s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture    # 2026-09-08T15:53:06Z
+[debian:12] ok in 3.4s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+[ubuntu:24.04] ok in 8.4s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.94s
+  it_apt_absent: pass, wall 12s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture    # 2026-09-08T15:53:18Z
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  it_sysctl_present: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image -- --nocapture    # 2026-09-08T15:53:19Z
+[jrei/systemd-debian:12] ok in 0.7s  journald is active: changed
+[jrei/systemd-ubuntu:24.04] ok in 0.7s  journald is active: changed
+test systemd_is_pid1 ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+  it_systemd_image: pass, wall 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd -- --nocapture    # 2026-09-08T15:53:21Z
+[jrei/systemd-debian:12] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+[jrei/systemd-ubuntu:24.04] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+test unit_lifecycle_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+  it_systemd: pass, wall 2s
+
+all four gates and all eleven container test binaries green after the review fixes
+finished 2026-09-08T15:53:23Z
+DONE

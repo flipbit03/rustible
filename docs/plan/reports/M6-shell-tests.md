@@ -287,6 +287,67 @@ table because the branch touches the harness they run on.
 All four GitHub checks pass on the head commit: format/clippy/test, MSRV 1.88,
 the `examples/workspace` build, and the Docker harness (1m25s).
 
+## Review round
+
+Four findings on PR 16, all fixed on the branch. Two were real bugs, one was a
+test that could not fail, one was a documentation gap.
+
+**The named form of a planned group lost its gid.** In `resolve_primary`, the
+`GroupId::Name` branch answered a `would_create` hit with `gid: None` and never
+asked `would_create_id_by_name`, although `same_named_group` a few lines below
+did exactly that. So `.gid("web")` and `.gid(&*web)` behaved differently for
+one intent: the by-name spelling produced no prediction and a diff reading
+`group=web` rather than `gid=4000`, and any later step chaining on
+`account.gid` aborted the dry run. Both branches now go through
+`would_create_id_by_name`, which also collapses the double lookup that was
+there. The regression test is in
+`check_mode_accepts_a_group_an_earlier_step_would_create`: with a planned
+group at gid 5000, `.gid("fixed")` predicts and reports `gid=5000`, exactly as
+`.gid(&*grp)` already did; a planned group with no gid still blocks prediction
+by either spelling. Confirmed to fail against the old code before the fix went
+in.
+
+**The `Debug` impl redacted stdin and then printed env values in full.** The
+impl exists to keep secrets out of `{:?}`, and `.env("PGPASSWORD", ..)` is the
+canonical case it missed. Env values are now shown as byte counts the same way
+stdin is, while env *names* stay visible so the output still says what the
+command was given. `program` and `args` are still printed whole, deliberately:
+they reach the process table on every host anyway, so hiding them buys nothing
+and costs debuggability. The unit test now asserts that neither a stdin secret
+nor an env secret appears anywhere in the formatted output, and that the names
+and argv survive.
+
+**An assertion in the Alpine test could not fail.** `assert!(!account.predicted)`
+was made against a non-check `System`, where `Ctx::step`'s ordinary success arm
+always builds `Applied` with `predicted: false`. The claim it was there to make
+is a check-mode claim, so it now runs against a dry `Ctx` over the same real
+machine, the way `it_user_group` already does. Both dry steps pin uid and gid
+(`users` is gid 100 on that image), so `.shell()` is the only variable left:
+without it the step does not predict and the diff carries no `shell=`, with it
+the step predicts and the diff reads `shell=/bin/sh`. Confirmed by putting the
+`/bin/sh` guess back and watching the test fail on the "unknown shell blocks
+prediction" assertion.
+
+**`user::Absent` can take a group with it.** Because `Present` adopts a
+same-named group as the primary group, and `userdel` removes a primary group
+that shares the account's name and has no other members (`USERGROUPS_ENAB`,
+the Debian and Ubuntu default), the sequence group `app`, user `app`, absent
+`app` deletes group `app` although no step asked. `it_user_group` already
+asserted the outcome, so it was known rather than accidental, but a reader of
+the op's docs would have been surprised. The `user::Absent` rustdoc now has a
+section naming the sequence and the workaround, which is to give the group
+another member or another name. There is a DECISIONS entry with a Reverse
+clause pointing at Ansible's `-N` as the alternative, and the reason it was not
+taken: a surprising group membership is worse than a surprising group removal
+that the account's own name invited.
+
+Two things the reviewer raised and did not ask to change, noted here so they
+are on the record rather than forgotten. `note_would_create` runs on real runs
+too, where it is inert, and the planned list is a linear scan, which does not
+matter at playbook sizes. And if `wait_with_output` errors, the stdin feeder
+thread is detached rather than joined; it drains through EPIPE, so nothing
+hangs.
+
 ## Not verified
 
 - **ARM.** Everything above ran on the x86 VM only. The images are
