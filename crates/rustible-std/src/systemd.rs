@@ -47,6 +47,10 @@ pub struct UnitState {
 /// What `systemctl is-enabled` printed, one variant per documented word.
 /// `Other` carries anything a newer systemd may add.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Variants transcribe the words `systemctl is-enabled` prints; the meaning is
+// in the type's own docs and in `as_str`. Individually documenting each would
+// restate the name.
+#[allow(missing_docs)]
 pub enum EnabledState {
     Enabled,
     EnabledRuntime,
@@ -94,6 +98,10 @@ impl EnabledState {
         )
     }
 
+    /// True for `masked` and `masked-runtime`: the unit is symlinked to
+    /// `/dev/null` and can be neither started nor enabled until `systemctl
+    /// unmask` undoes it. [`Enabled`] and [`Running`] refuse such a unit
+    /// instead of unmasking it on the caller's behalf.
     pub fn is_masked(&self) -> bool {
         matches!(self, EnabledState::Masked | EnabledState::MaskedRuntime)
     }
@@ -120,7 +128,13 @@ impl EnabledState {
 }
 
 /// What `systemctl is-active` printed.
+/// [`ActiveState::is_running`] sorts those words into up and not up; `Other`
+/// carries one this build does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Variants transcribe the words `systemctl is-active` prints; the meaning is
+// in the type's own docs and in `as_str`. Individually documenting each would
+// restate the name.
+#[allow(missing_docs)]
 pub enum ActiveState {
     Active,
     Reloading,
@@ -416,6 +430,10 @@ pub struct Enabled {
 }
 
 impl Enabled {
+    /// Enable `unit`, given either as a bare name (`nginx`) or in full
+    /// (`getty@tty1.service`). Targets the system manager and only enables;
+    /// [`Enabled::now`] starts the unit too, [`Enabled::user`] switches
+    /// managers. The name is validated in `check`, not here.
     pub fn new(unit: impl Into<String>) -> Self {
         Enabled {
             unit: Unit::new(unit),
@@ -516,6 +534,9 @@ pub struct Disabled {
 }
 
 impl Disabled {
+    /// Disable `unit` on the system manager. A unit that is running keeps
+    /// running: it just no longer starts at the next boot. [`Disabled::now`]
+    /// stops it as well.
     pub fn new(unit: impl Into<String>) -> Self {
         Disabled {
             unit: Unit::new(unit),
@@ -620,6 +641,9 @@ pub struct Running {
 }
 
 impl Running {
+    /// Start `unit` on the system manager if it is not up. Says nothing about
+    /// boot: pair it with [`Enabled`], or use `Enabled::new(unit).now(true)`,
+    /// for a unit that must also come back after a reboot.
     pub fn new(unit: impl Into<String>) -> Self {
         Running {
             unit: Unit::new(unit),
@@ -684,6 +708,8 @@ pub struct Stopped {
 }
 
 impl Stopped {
+    /// Stop `unit` on the system manager. The unit stays enabled and will come
+    /// back at the next boot; [`Disabled`] with `.now(true)` does both.
     pub fn new(unit: impl Into<String>) -> Self {
         Stopped {
             unit: Unit::new(unit),
@@ -746,6 +772,9 @@ pub struct Restart {
 }
 
 impl Restart {
+    /// Restart `unit` on the system manager, with no `daemon-reload` first
+    /// ([`Restart::daemon_reload`] adds one). Being an action, it runs whether
+    /// or not the unit is up, and `systemctl restart` starts a stopped unit.
     pub fn new(unit: impl Into<String>) -> Self {
         Restart {
             unit: Unit::new(unit),
@@ -820,6 +849,9 @@ pub struct Reload {
 }
 
 impl Reload {
+    /// Reload `unit` on the system manager with plain `systemctl reload` and
+    /// no `daemon-reload` first. [`Reload::or_restart`] picks the forgiving
+    /// verb, [`Reload::daemon_reload`] adds the reload of the unit files.
     pub fn new(unit: impl Into<String>) -> Self {
         Reload {
             unit: Unit::new(unit),
@@ -921,6 +953,9 @@ impl Default for DaemonReload {
 }
 
 impl DaemonReload {
+    /// Reload the system manager's unit files; [`DaemonReload::user`] switches
+    /// to the caller's own manager. There is no unit to name, so nothing here
+    /// is validated and nothing is read back afterwards.
     pub fn new() -> Self {
         DaemonReload {
             manager: Unit::manager(),

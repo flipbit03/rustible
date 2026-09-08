@@ -12,6 +12,8 @@
 //! one playbook and a broken sibling cannot block a run. Without the feature
 //! the variable is refused, so a stray export never narrows an IDE or CI build.
 
+#![deny(missing_docs)]
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -24,23 +26,54 @@ pub struct Discovered {
     pub path: PathBuf,
 }
 
+/// Why discovery stopped. [`discover`] prints one of these as `error: ...`
+/// and exits non-zero, so the wording here is what a user reads in `cargo
+/// build` output.
 #[derive(Debug)]
 pub enum DiscoverError {
+    /// Reading a directory or a playbook file failed, or writing
+    /// `playbooks.rs` did. Carries the path that was being read or, for the
+    /// write, `$OUT_DIR`.
     Io(PathBuf, std::io::Error),
+    /// A `.rs` file under `playbooks/` does not parse. Finding the marker
+    /// attribute needs the syntax tree, so during a full scan a syntax
+    /// error anywhere stops the build; that is exactly what
+    /// `RUSTIBLE_PLAYBOOK` selection sidesteps by parsing one file.
     Parse {
+        /// The file that did not parse.
         path: PathBuf,
+        /// 1-based line, from `syn`'s span.
         line: usize,
+        /// 1-based column: `syn` counts columns from 0, and this is that
+        /// plus one, to match how editors and rustc report a position.
         col: usize,
+        /// `syn`'s own message, unchanged.
         msg: String,
     },
+    /// A file carries more than one `#[rustible::playbook]` function. A
+    /// playbook is named by its path, so two in one file would have no way
+    /// to be told apart in the registry.
     TwoMarkers {
+        /// The file with the extra markers.
         path: PathBuf,
+        /// Every marked function name in it, in source order.
         fns: Vec<String>,
     },
+    /// `RUSTIBLE_PLAYBOOK` names something that is not a playbook.
     UnknownSelection {
+        /// The value of `RUSTIBLE_PLAYBOOK`.
         wanted: String,
+        /// What could have been written instead. Selected mode never parses
+        /// the siblings, so these are filenames under `playbooks/` and may
+        /// include a file that carries no marker. When the named file does
+        /// exist but has no marker, this holds one sentence saying so
+        /// rather than a list of names.
         available: Vec<String>,
     },
+    /// `RUSTIBLE_PLAYBOOK` is set without the `selected` Cargo feature;
+    /// carries its value. Refused rather than honored, because a variable
+    /// left exported in a shell would otherwise quietly narrow every IDE
+    /// and CI build to a single playbook.
     SelectedWithoutFeature(String),
 }
 

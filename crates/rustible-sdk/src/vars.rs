@@ -140,7 +140,12 @@ pub fn unknown_key_warnings(schema: &Value, raw: &Value) -> Vec<String> {
 /// one is close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownKey {
+    /// The key as the inventory spells it, so the message quotes it back
+    /// unaltered.
     pub key: String,
+    /// The declared name within two edits of `key`, closest one wins.
+    /// `None` when nothing is that close, which is the ordinary case for a
+    /// var meant for a different playbook.
     pub suggestion: Option<String>,
 }
 
@@ -203,6 +208,9 @@ pub fn missing_required(schema: &Value, raw: &Value) -> Vec<String> {
 /// A var whose value does not fit the type its schema declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeMismatch {
+    /// The declared name the value belongs to. Found by walking the schema
+    /// rather than by parsing serde's message, so the problem always names a
+    /// var the inventory author can go and edit.
     pub var: String,
     /// What the schema asks for, in words: `integer`, `list of string`,
     /// `one of "sudo" | "doas"`, `string or null`.

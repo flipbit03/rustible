@@ -107,7 +107,11 @@ fn find<'a>(playbooks: &'a [Named], name: &str) -> Option<&'a Named> {
 /// One host's vars as the orchestrator sends them to `--check-vars`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostVars {
+    /// The inventory name, echoed back in the matching [`HostCheck`] so the
+    /// orchestrator can pair results with hosts.
     pub host: String,
+    /// The merged bag for this host, exactly as `Start` would carry it.
+    /// `null` is read as an empty object, so a host with no vars is legal.
     pub vars: Value,
 }
 
@@ -116,14 +120,24 @@ pub struct HostVars {
 /// error the schema walk did not anticipate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarProblem {
+    /// The var the problem is about: a declared name for an error, the
+    /// inventory's own key for an unknown-key warning.
     pub var: String,
+    /// Whether this stops the run; see [`Severity`].
     pub severity: Severity,
+    /// One sentence, already written for a person to read, so the
+    /// orchestrator prints it rather than rephrasing it.
     pub message: String,
 }
 
+/// How much a [`VarProblem`] matters. `--check-vars` reports both kinds; the
+/// orchestrator refuses to start the run only on `Error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    /// The vars would not deserialize into the playbook's struct, so the run
+    /// would fail on the `Start` frame: a missing required var, a value of
+    /// the wrong type, a nested object where vars must be flat.
     Error,
     /// An undeclared var: the bag is shared by every playbook targeting the
     /// host (vision 10.3), so this never fails a run.
@@ -133,7 +147,12 @@ pub enum Severity {
 /// `--check-vars` output for one host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCheck {
+    /// Copied from the [`HostVars`] entry this answers; the output keeps the
+    /// input's order.
     pub host: String,
+    /// Empty when this host's vars would deserialize cleanly. Errors come
+    /// first and warnings last, and a list holding only warnings still
+    /// describes a runnable host.
     pub problems: Vec<VarProblem>,
 }
 

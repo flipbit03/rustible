@@ -6,11 +6,17 @@ use std::fmt;
 /// One problem found while loading an inventory file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadError {
+    /// The path as given to [`Inventory::load`](super::Inventory::load), or
+    /// the label passed to [`Inventory::parse`](super::Inventory::parse).
+    /// Never canonicalized, so it stays what the user typed and an editor
+    /// can jump to it.
     pub file: String,
     /// 1-based.
     pub line: usize,
     /// 1-based, in characters.
     pub column: usize,
+    /// The problem alone, with no position and no `error:` prefix; the
+    /// [`Display`](fmt::Display) of this type adds both.
     pub message: String,
 }
 
@@ -31,14 +37,20 @@ impl std::error::Error for LoadError {}
 pub struct LoadErrors(pub Vec<LoadError>);
 
 impl LoadErrors {
+    /// True only for a `LoadErrors` built by hand: a load with no problems
+    /// returns the inventory, so one that returns this always carries at
+    /// least one error.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// How many problems the file has. A load reports all of them, so this
+    /// is the real count and not a truncated one.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// The problems in source order, earliest position first.
     pub fn iter(&self) -> impl Iterator<Item = &LoadError> {
         self.0.iter()
     }
@@ -61,7 +73,13 @@ impl std::error::Error for LoadErrors {}
 /// A name that is neither a host nor a group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownName {
+    /// The name as it was written, on the command line or in a playbook's
+    /// `hosts = "..."`.
     pub name: String,
+    /// The closest defined name, when one is close enough to be worth
+    /// suggesting; `None` when nothing is. Candidates are hosts and groups
+    /// for [`Inventory::select`](super::Inventory::select), hosts only for
+    /// [`Inventory::resolve`](super::Inventory::resolve).
     pub suggestion: Option<String>,
 }
 

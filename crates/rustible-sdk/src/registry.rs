@@ -28,11 +28,21 @@ pub struct Playbook {
 /// A playbook with the name the build script derived from its path
 /// (`cadu/mc` for `playbooks/cadu/mc.rs`).
 pub struct Named {
+    /// The name the orchestrator selects with `Down::Start`'s `playbook`
+    /// field and a hand run passes as `<binary> <name>`. Slash-separated,
+    /// following the file's path under `playbooks/`.
     pub name: &'static str,
+    /// The `__RUSTIBLE_PLAYBOOK` static the `#[playbook]` macro generated in
+    /// that module.
     pub playbook: &'static Playbook,
 }
 
 impl Named {
+    /// One entry of the `--describe` document: name, target hosts, whether
+    /// the binary wants escalation, and the vars JSON Schema, obtained by
+    /// calling [`Playbook::schema`]. The orchestrator reads this to know
+    /// what to put in `Start` and to validate inventory vars before it
+    /// bothers uploading the binary.
     pub fn describe(&self) -> Value {
         serde_json::json!({
             "name": self.name,

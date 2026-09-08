@@ -19,9 +19,21 @@ use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
 use crate::system::{Identity, Phase, System};
 
+/// The inventory's view of the host this process is configuring: its name,
+/// the groups it inherits from, and the connection and escalation parameters
+/// resolved for it (vision doc 10.1).
+///
+/// The orchestrator resolves all of this and sends it in the `Start` frame.
+/// A binary run by hand builds it with [`HostInfo::local`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
+    /// The host's name in the inventory file, which need not resolve in DNS.
+    /// The report labels this host with it, and [`Ctx::fetch`] uses it as the
+    /// per-host directory so two hosts do not overwrite each other.
     pub name: String,
+    /// Every group the host belongs to, nearest first and transitively
+    /// closed, so a playbook can branch on membership without reading the
+    /// inventory. Empty for a host that is in no group.
     pub groups: Vec<String>,
     /// The inventory's privileged account for this host (default `root`);
     /// what `escalate = true` launches as and `as_escalated()` switches to.
@@ -49,6 +61,10 @@ fn default_connection() -> String {
 }
 
 impl HostInfo {
+    /// The host a plain local run configures: named `local`, in no group,
+    /// connection `local`, escalating to `root` through `sudo`. Used by
+    /// `--check-vars` and by tests; a run driven by an orchestrator gets its
+    /// `HostInfo` from the `Start` frame instead.
     pub fn local() -> Self {
         HostInfo {
             name: "local".into(),
@@ -106,6 +122,20 @@ impl Shared {
     }
 }
 
+/// The handle a playbook body is given: one host, one run.
+///
+/// Everything a playbook does goes through it. [`Ctx::step`] is the only
+/// verb; the rest is context ([`Ctx::host`], [`Ctx::facts`],
+/// [`Ctx::check_mode`]), reporting ([`Ctx::log`], [`Ctx::warn`],
+/// [`Ctx::skip`], [`Ctx::section`]), and moving files between the
+/// orchestrator's workspace and this host ([`Ctx::local_file`],
+/// [`Ctx::local_secret`], [`Ctx::fetch`]).
+///
+/// [`Ctx::section`], [`Ctx::as_user`] and their friends hand out further
+/// `Ctx` values, and every one of them shares a single step counter and a
+/// single summary with this one (vision doc 11.1). However deeply a playbook
+/// nests, the report stays one numbered sequence and the counts at the end
+/// add up.
 pub struct Ctx {
     sys: System,
     host: HostInfo,
@@ -152,6 +182,30 @@ impl Ctx {
     // ---- tier 1 ----
 
     /// The one verb. Reconcile an op, report it, return its typed output.
+    ///
+    /// Calls [`Op::check`]. A satisfied op finishes the step `ok` and
+    /// [`Op::apply`] is never reached. A change finishes `would change` in
+    /// check mode; otherwise `apply` runs and the step finishes `changed`,
+    /// or `ok` when the op's [`Op::changed_by_apply`] reports that running
+    /// it altered nothing. Whichever way it goes, one `StepStarted` and one
+    /// `StepFinished` event are emitted and exactly one counter in the run
+    /// summary moves.
+    ///
+    /// `name` is what the report shows and what error messages quote. It is
+    /// not an identifier: nothing dedupes on it and repeats are fine.
+    ///
+    /// Errors when `check` or `apply` fails, with `` `step <name>` `` added
+    /// as the outermost context layer, and when the run has been cancelled.
+    /// Cancellation is tested before `check` and again after it, so a
+    /// `Cancel` frame stops the run between steps and never interrupts an
+    /// `apply` half way through (vision doc 5.5, 16.10). A failed step does
+    /// not by itself end the playbook; the `?` in the playbook body does.
+    ///
+    /// The returned [`Applied`] derefs to the op's output and *panics* on
+    /// deref when there is none, which happens for a step that would change
+    /// in check mode unless the op predicted its output. Reach for
+    /// [`Applied::is_available`] or [`Applied::output`] to handle that
+    /// instead of panicking.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
@@ -261,18 +315,28 @@ impl Ctx {
         Ok(result)
     }
 
+    /// The inventory's view of this host, including the `escalate_user` and
+    /// `escalate_method` that [`Ctx::as_escalated`] follows.
     pub fn host(&self) -> &HostInfo {
         &self.host
     }
 
+    /// What was gathered from the machine when the run started. Read once,
+    /// not re-read per step, so an op that changes the system does not change
+    /// the facts under a later branch.
     pub fn facts(&self) -> &Facts {
         self.sys.facts()
     }
 
+    /// True under `--check`. Ops seldom need it, since the `check`/`apply`
+    /// split already keeps them honest; a playbook needs it when its own
+    /// control flow would otherwise act on an output no step produced.
     pub fn check_mode(&self) -> bool {
         self.sys.check_mode()
     }
 
+    /// A line in the report at any verbosity, for something the user should
+    /// see that is not a step. Use [`Ctx::debug`] for detail worth `-v` only.
     pub fn log(&self, msg: impl Into<String>) {
         self.sys.sink().emit(Event::Log {
             level: Level::Info,
@@ -280,11 +344,17 @@ impl Ctx {
         });
     }
 
+    /// A `WARNING:` line, and one more on the run's warning count that the
+    /// summary prints at the end. Nothing fails; this is how a playbook says
+    /// something is off without giving up on the host.
     pub fn warn(&self, msg: impl Into<String>) {
         self.bump(|s| s.warnings += 1);
         self.sys.warn(msg);
     }
 
+    /// A line shown only at `-v` and above. The SDK uses it for byte counts
+    /// and temp paths, which are noise at the default verbosity. Unlike
+    /// [`Ctx::warn`], it touches no counter.
     pub fn debug(&self, msg: impl Into<String>) {
         self.sys.debug(msg);
     }

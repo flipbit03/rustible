@@ -36,7 +36,14 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_BYTES: u64 = 1 << 30;
 
 /// A checksum algorithm the `.checksum("<algorithm>:<hex>")` option accepts.
+/// One variant per word the spec takes before the colon; [`Algorithm::name`]
+/// gives that word back and [`Algorithm::hex_len`] the digest length. MD5 and
+/// SHA-1 have no variant on purpose, see [`parse_checksum`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Variants transcribe the words the `<algorithm>:<hex>` spec accepts; the
+// meaning is in the type's own docs and in `name`. Individually documenting
+// each would restate the name.
+#[allow(missing_docs)]
 pub enum Algorithm {
     Sha224,
     Sha256,
@@ -55,6 +62,9 @@ impl Algorithm {
         }
     }
 
+    /// The lowercase word that selects this algorithm in a `.checksum` spec,
+    /// and the one error messages print. The inverse of what
+    /// [`parse_checksum`] accepts before the colon.
     pub fn name(self) -> &'static str {
         match self {
             Algorithm::Sha224 => "sha224",
@@ -68,6 +78,8 @@ impl Algorithm {
 /// An expected digest, as given to [`Download::checksum`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checksum {
+    /// Which digest [`Checksum::hex`] is, from the part of the spec before
+    /// the colon.
     pub algorithm: Algorithm,
     /// Lowercase hex.
     pub hex: String,
@@ -214,7 +226,11 @@ pub struct DownloadBuilder {
 /// Output of [`Download`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadReport {
+    /// The URL as given to [`Download::get`]. Redirects are followed, but the
+    /// address they land on is not reported here.
     pub url: String,
+    /// `dest` as given to [`DownloadBuilder::to`], not the temporary file the
+    /// atomic write went through.
     pub path: PathBuf,
     /// Whether the URL was (or would be) fetched, as opposed to an
     /// attributes-only change or nothing at all.
@@ -247,6 +263,10 @@ impl Download {
         self
     }
 
+    /// Permission bits for `dest` (`0o644`, `0o755`). Unset by default: a new
+    /// file keeps whatever `write_atomic` gives it, an existing one keeps its
+    /// own. Enforced on every run, so a file whose only difference is its mode
+    /// is a `changed` step with an attribute diff and no download.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
         self

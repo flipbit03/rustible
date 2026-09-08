@@ -21,14 +21,18 @@ pub struct Absent {
     recursive: bool,
 }
 
+/// Output of [`Absent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbsentReport {
+    /// The path that is now absent, as given to [`Absent::at`].
     pub path: PathBuf,
     /// False when there was nothing to remove.
     pub removed: bool,
 }
 
 impl Absent {
+    /// Start an `Absent` op on this path. Not recursive: a directory that
+    /// still has entries is refused at `check` until `.recursive(true)`.
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Absent {
             path: path.into(),

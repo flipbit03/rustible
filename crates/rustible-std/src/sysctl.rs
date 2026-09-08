@@ -13,7 +13,12 @@ const DEFAULT_FILE: &str = "/etc/sysctl.d/99-rustible.conf";
 /// Output of [`Present`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SysctlReport {
+    /// The parameter in dotted form (`net.ipv4.ip_forward`), as given to the
+    /// op.
     pub key: String,
+    /// The value now in force, as the op spelled it rather than as the
+    /// kernel echoes it back: the two differ in whitespace for multi-value
+    /// keys such as `net.ipv4.tcp_rmem`, which `/proc` writes tab-separated.
     pub value: String,
     /// The live value before this step; `None` when the kernel has no such
     /// key (only possible with `.apply_now(false)`).
@@ -39,6 +44,11 @@ pub struct Present {
 }
 
 impl Present {
+    /// Ensure `key` holds `value`, both persistently and live. The drop-in
+    /// defaults to `/etc/sysctl.d/99-rustible.conf` and `sysctl -w` runs as
+    /// well; [`Present::file`] and [`Present::apply_now`] change either
+    /// half. The key is validated at `check`, not here, so building the op
+    /// never fails.
     pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
         Present {
             key: key.into(),

@@ -9,14 +9,51 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// In-memory secret bytes. `Clone` copies the bytes into another zeroized
 /// buffer; `Debug` prints only the length.
+///
+/// # What the redaction covers
+///
+/// Guaranteed:
+///
+/// - `Debug` prints `Secret(<n> bytes)` and never the bytes, so a `{:?}` on
+///   any struct holding one, in an error message or an event, is safe.
+/// - There is no `Display`, so `{}` and `to_string()` do not compile.
+/// - The buffer is wiped when the value drops, when [`Secret::zeroize`] is
+///   called, and on the temporary `String` that `Deserialize` decodes into.
+/// - The SDK never puts one on disk: `ctx.local_secret` streams into memory
+///   without a file, and the escalation password reaches `sudo` on stdin
+///   (`-S`), so it appears in no argv, no `CmdRan` event, no
+///   [`CmdFailed`](crate::error::CmdFailed), and not in the host's process
+///   list.
+///
+/// Not covered:
+///
+/// - [`Secret::as_bytes`] and [`Secret::as_str`] hand back the plaintext.
+///   Whatever the caller then prints, formats into a message, or passes as a
+///   command argument is entirely outside this type.
+/// - `Serialize` writes the plaintext as a JSON string; that is how the
+///   escalation password travels in the `Start` frame. What protects it
+///   there is the transport plus `protocol` zeroizing the frame buffer after
+///   decoding, not this type.
+/// - Only this value's own buffer is wiped. A copy the caller made, or the
+///   `Vec` a secret was built from, lives and dies on its own.
+/// - Nothing is pinned in RAM: a swapped page or a core dump can still hold
+///   the bytes. The SDK does not `mlock`.
+///
+/// [`Secret::zeroize`]: Zeroize::zeroize
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
+    /// Moves the bytes into a buffer that is wiped on drop. Any copy the
+    /// caller kept is untouched, so build the `Secret` from the buffer that
+    /// read the bytes rather than from a clone of it.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         Secret(Zeroizing::new(bytes.into()))
     }
 
+    /// The plaintext, for writing to a process's stdin or a file. Use
+    /// [`Secret::as_str`] when the secret is text. What the borrow is copied
+    /// into is no longer protected.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -29,10 +66,15 @@ impl Secret {
         Ok(s.strip_suffix('\n').unwrap_or(s))
     }
 
+    /// Length in bytes, not characters, and counting the trailing newline
+    /// that [`Secret::as_str`] strips. Zero after a wipe, which truncates as
+    /// well as overwrites.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// True for a secret of zero bytes: an empty file streamed by
+    /// `ctx.local_secret`, or one that has already been wiped.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

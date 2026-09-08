@@ -4,6 +4,8 @@
 //! Everything the expansions reference lives under `::rustible::sdk`, so a
 //! workspace only needs the `rustible` crate as a dependency.
 
+#![deny(missing_docs)]
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser;
@@ -11,9 +13,16 @@ use syn::{Error, FnArg, ItemFn, ItemStruct, LitBool, LitStr, Type};
 
 /// Marks a playbook's `main` (vision doc sections 6.1, 9, 10.3).
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible::prelude::*;
+/// # #[rustible::vars]
+/// # struct Vars { greeting: String }
 /// #[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
-/// fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { .. }
+/// fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
+///     ctx.log(vars.greeting);
+///     Ok(())
+/// }
+/// # fn main() {}
 /// ```
 ///
 /// `hosts` is required. `vars` names a `#[rustible::vars]` struct and adds a
@@ -308,12 +317,16 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
 
 /// Marks a Docker integration test (vision doc section 8, tier 3).
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible::prelude::*;
+/// # use rustible::sdk::testing::changed_then_ok;
+/// # use rustible::std_ops::file::Line;
 /// #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 /// fn line_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 ///     changed_then_ok(ctx, "add line", || Line::in_path("/etc/x").create(true).set("hi"))?;
 ///     Ok(())
 /// }
+/// # fn main() {}
 /// ```
 ///
 /// Expands to a `#[test]` that calls `rustible::sdk::testing::run`: skipped

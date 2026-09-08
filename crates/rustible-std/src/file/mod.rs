@@ -43,12 +43,23 @@ pub use directory::{DirReport, Directory};
 pub use line::{Line, LineBuilder, LineReport, plan_line};
 pub use symlink::{Symlink, SymlinkBuilder, SymlinkReport};
 
-/// Where to put a line (or block) that is not present yet.
+/// Where to put a line (or block) that is not present yet. Only consulted
+/// when nothing matched: a line or a marked block that is already in the
+/// file is edited where it stands and never moved. Both [`Line`] and
+/// [`Block`] default to `Append`.
 #[derive(Debug, Clone)]
 pub enum Insert {
+    /// After the last line of the file, which is where Ansible puts a line
+    /// given neither `insertafter` nor `insertbefore`.
     Append,
+    /// Before the first line of the file. Ansible's `insertbefore: BOF`.
     Prepend,
+    /// After the *last* line the regex matches, as Ansible's `insertafter`.
+    /// A regex that matches nothing appends.
     After(Regex),
+    /// Before the *first* line the regex matches, as Ansible's
+    /// `insertbefore`. A regex that matches nothing appends; it does not
+    /// prepend.
     Before(Regex),
 }
 
@@ -76,7 +87,12 @@ impl Insert {
 /// Numeric owner, as `chown uid:gid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Owner {
+    /// Numeric user id. Names are never resolved here, so a playbook that
+    /// wants `www-data` reads the uid off a [`user::Account`](crate::user::Account) first.
     pub uid: u32,
+    /// Numeric group id, the half after the colon in `chown uid:gid`. It is
+    /// independent of the user: nothing forces it to be that user's primary
+    /// group.
     pub gid: u32,
 }
 

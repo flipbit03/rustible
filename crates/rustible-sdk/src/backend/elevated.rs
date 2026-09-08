@@ -4,6 +4,40 @@
 //! `Local` backend wrapped in a request loop (`serve_helper`); frames are the
 //! same length-prefixed JSON as the main channel. One helper per identity,
 //! spawned on first use, kept for the run, closed on drop.
+//!
+//! ## What crosses, and what does not
+//!
+//! The escalation password is never in an argument vector: `/proc` makes
+//! argv readable by every user on the host, so it goes to `sudo -S` on the
+//! helper's stdin, as the first line, ahead of any frame. On a NOPASSWD host
+//! it is not sent at all, because [`Spawner`] probes with
+//! `sudo -n -u <user> true` first and only feeds the password when that
+//! probe fails. It lives in a [`Secret`] the whole time, which zeroizes on
+//! drop and prints its length rather than its bytes.
+//!
+//! No message this module produces quotes file contents.
+//! [`HelperOp::label`] gives the primitive, its paths, and for a write the
+//! byte count: the contents may be a secret (`ctx.local_secret`), and these
+//! messages are rendered, logged and shipped to the orchestrator.
+//!
+//! Mutations are refused while the calling step is in its `check` phase, on
+//! both sides: the main process guards before it builds the request, and
+//! [`serve_helper`] refuses again after it arrives. The helper's copy is a
+//! second latch against an op that reaches around the first one, not a
+//! boundary against a hostile parent: it believes
+//! [`HelperRequest::checking`], and a parent that lies gets its mutation.
+//! That parent chose the helper's binary and its user, so it had the
+//! authority already.
+//!
+//! Nothing here narrows what the helper may do. The far side is a full
+//! [`Local`] backend running as the target user, so a request is bounded by
+//! that user's permissions and by nothing else: there is no path allowlist
+//! and no read-only mode, and `as_root` means root.
+//!
+//! A helper that dies is not replaced. The first failure is latched, because
+//! retrying costs one `sudo` authentication per primitive: a syslog line and
+//! mail to root each time, and `pam_faillock` locking the account out after
+//! a handful.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,58 +53,131 @@ use crate::protocol::{MAX_FRAME_PAYLOAD, read_frame, write_frame};
 use crate::secret::Secret;
 
 /// One `Backend` primitive on the wire.
+///
+/// One variant per method of [`Backend`], carrying that method's arguments
+/// and nothing more. There is deliberately no variant the trait does not
+/// have: a helper offers the same surface as a local run, not a wider one.
+/// Paths travel exactly as the op wrote them, resolved on the helper's side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelperOp {
+    /// [`Backend::read`], answered with [`HelperResponse::Bytes`]. The file
+    /// crosses whole in one frame, so one larger than `MAX_FRAME_PAYLOAD`
+    /// cannot be read through a helper at all.
     Read {
+        /// Read by the helper's user, so a file the main process cannot open
+        /// is still fine.
         path: PathBuf,
     },
+    /// [`Backend::write`]. The only request that carries file contents, and
+    /// the reason [`HelperOp::label`] prints sizes instead of payloads.
     Write {
+        /// Written with `Local`'s temp file and rename, so the helper's user
+        /// needs write permission on the parent directory, not just the file.
         path: PathBuf,
+        /// The complete new contents. Base64 on the wire, and checked
+        /// against `MAX_FRAME_PAYLOAD` before the frame is built, so an
+        /// oversized write is refused by a message that names the file
+        /// rather than by the framing code, which does not know it.
         #[serde(with = "crate::protocol::b64")]
         bytes: Vec<u8>,
     },
+    /// [`Backend::stat`]: `lstat`, so a symlink reports itself.
     Stat {
+        /// A path that is not there is not an error; the answer is
+        /// [`HelperResponse::Stat`] carrying `None`.
         path: PathBuf,
     },
+    /// [`Backend::stat_follow`]: follows the link and reports what it lands
+    /// on.
     StatFollow {
+        /// A dangling link answers `None`, exactly as a missing path does.
         path: PathBuf,
     },
+    /// [`Backend::mkdir_all`].
     MkdirAll {
+        /// The deepest directory. Every missing parent is created too, and
+        /// all of them belong to the helper's user with the helper's umask.
         path: PathBuf,
     },
+    /// [`Backend::remove`]: one entry, and a populated directory is an
+    /// error.
     Remove {
+        /// A path that is already gone succeeds, so removal is idempotent.
         path: PathBuf,
     },
+    /// [`Backend::remove_all`]. The only recursive delete a helper will do,
+    /// and so the one request where a wrong path costs a tree.
     RemoveAll {
+        /// The root of what goes, followed by everything under it.
         path: PathBuf,
     },
+    /// [`Backend::rename`]. Both ends are the helper's, and it is one
+    /// syscall, so it cannot cross filesystems.
     Rename {
+        /// Must exist.
         from: PathBuf,
+        /// Replaced atomically if it exists.
         to: PathBuf,
     },
+    /// [`Backend::set_mode`].
     SetMode {
+        /// Followed if it is a symlink: the target's mode changes, not the
+        /// link's.
         path: PathBuf,
+        /// Permission bits as `chmod` takes them (`0o644`), not a whole
+        /// `st_mode` with the file type in it.
         mode: u32,
     },
+    /// [`Backend::set_owner`]. Handing a file to a third user needs the
+    /// helper to be root; a helper running as an ordinary user can only fail
+    /// this, which is why ops that chown ask for `as_root` and not just
+    /// `as_user`.
     SetOwner {
+        /// Followed if it is a symlink: `chown(2)`, not `lchown(2)`.
         path: PathBuf,
+        /// Numeric. Names are resolved before the request is built, never by
+        /// the helper.
         uid: u32,
+        /// Numeric, likewise.
         gid: u32,
     },
+    /// [`Backend::copy`]. Both ends are on the target host and the bytes
+    /// never touch the wire, so copying a file as another user works at
+    /// sizes at which reading it would be refused.
     Copy {
+        /// Must exist and be readable by the helper's user.
         from: PathBuf,
+        /// Created or truncated. Not atomic, so a reader can catch it half
+        /// written.
         to: PathBuf,
     },
+    /// [`Backend::symlink`]. Fails if `link` exists: there is no
+    /// replace-in-place primitive, so an op that wants one removes first.
     Symlink {
+        /// What the link will point at. Never resolved and never checked, so
+        /// a link to something that does not exist yet is legal and is
+        /// usually the point.
         target: PathBuf,
+        /// The link to create.
         link: PathBuf,
     },
+    /// [`Backend::read_link`].
     ReadLink {
+        /// The link itself; nothing is followed. Failing rather than
+        /// answering `None` is how a caller learns `path` is not a link.
         path: PathBuf,
     },
+    /// [`Backend::read_dir`]. The whole listing comes back in one frame.
     ReadDir {
+        /// The directory. The answer holds full paths of the direct
+        /// children, sorted, not bare names and not the tree.
         path: PathBuf,
     },
+    /// [`Backend::spawn`]. The command runs as the helper's user with no
+    /// further `sudo`, so [`CmdSpec::prefix`] is empty on this path;
+    /// `sys.cmd` only fills it in for a `Fake` system, which has no helper
+    /// to be the user for it. [`CmdSpec::stdin`] rides in the request and
+    /// counts against the frame limit.
     Spawn(CmdSpec),
 }
 
@@ -142,25 +249,56 @@ impl HelperOp {
 }
 
 /// Main process -> helper.
+///
+/// One request, one response, in lockstep down one pipe: [`Elevated`] holds
+/// the connection lock across both halves, so a helper never has two of
+/// these in flight and never has to correlate them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelperRequest {
     /// True while the requesting step is in `check`; mutations are refused.
     pub checking: bool,
+    /// The primitive to perform. Nothing else is negotiated: there is no
+    /// session, no state kept between requests, and no way to ask a helper
+    /// for something [`Backend`] does not have.
     pub op: HelperOp,
 }
 
 /// Helper -> main process.
+///
+/// The request decides the shape: [`Elevated`] knows which variant each
+/// primitive should come back as and turns anything else into
+/// `unexpected helper response`, so a helper built from different source is
+/// a failed step rather than a misread value. [`Err`](Self::Err) can answer
+/// any request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelperResponse {
+    /// The primitive succeeded and had nothing to return: the writes, the
+    /// removals, the rename, the mode and owner changes, the copy, the
+    /// symlink.
     Unit,
+    /// A whole file, from [`HelperOp::Read`]. Base64 on the wire; a file too
+    /// large for a frame fails inside the framing, and [`Elevated`] rewrites
+    /// that failure to name the file and the identity.
     Bytes(#[serde(with = "crate::protocol::b64")] Vec<u8>),
+    /// From [`HelperOp::Stat`] or [`HelperOp::StatFollow`]. `None` means the
+    /// path is not there, which is an answer and not a failure.
     Stat(Option<Stat>),
+    /// A link target, from [`HelperOp::ReadLink`].
     Path(PathBuf),
+    /// The direct children of a directory, from [`HelperOp::ReadDir`].
     Paths(Vec<PathBuf>),
+    /// A finished command, from [`HelperOp::Spawn`]. A non-zero exit arrives
+    /// here and not in [`Err`](Self::Err): the command ran, and what it did
+    /// is the op's business.
     Output(Output),
+    /// The primitive failed, or the helper refused it. Carries no payload,
+    /// so nothing the op was writing can come back inside an error message.
     Err {
         /// The OS errno when there was one, so `NotFound` and friends survive.
         code: Option<i32>,
+        /// The `Display` of the helper's `io::Error`, or the refusal text
+        /// [`serve_helper`] wrote. Rebuilt into an `io::Error` on the main
+        /// side, so this string is what the playbook eventually prints.
         message: String,
     },
 }
@@ -186,6 +324,17 @@ impl HelperResponse {
 
 /// Serve requests from `rx` on a `Local` backend until EOF. This is what
 /// `--helper` runs; tests run it on a pipe in a thread.
+///
+/// A failed primitive is a [`HelperResponse::Err`] frame, not a return: the
+/// loop ends only when the far end closes the pipe, and the `io::Result`
+/// reports a broken channel rather than anything a playbook asked for. A
+/// request whose [`checking`](HelperRequest::checking) flag is set and whose
+/// op [`mutates`](HelperOp::mutates) is refused before it reaches the
+/// filesystem, and the refusal quotes [`HelperOp::label`], never a payload.
+///
+/// `tx` is the frame stream and nothing else may write to it. Under
+/// `--helper` that is the process's stdout, which is why the helper's own
+/// diagnostics go to stderr.
 pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()> {
     let local = Local;
     while let Some(req) = read_frame::<_, HelperRequest>(rx)? {
@@ -248,6 +397,15 @@ fn unit(r: io::Result<()>) -> HelperResponse {
 /// (`sudo` or `doas`, the inventory's `escalate` parameter). With a
 /// password, sudo reads it from stdin (`-S`); doas cannot, and `none` means
 /// the host forbids escalation.
+///
+/// The vector is safe to print, and error messages do print it: it holds the
+/// method, the user, the binary and `--helper`, and never the password,
+/// which in argv would be readable by every user on the host through
+/// `/proc/<pid>/cmdline`.
+///
+/// Fails for `doas` with a password, since it has no way to read one from a
+/// pipe; for `none`, which is how the inventory says this host does not
+/// escalate; and for any other method name, quoted back.
 pub fn helper_argv(
     method: &str,
     user: &str,
@@ -285,8 +443,19 @@ pub fn helper_argv(
 /// password. Shared by every identity of a run.
 #[derive(Clone)]
 pub struct Spawner {
+    /// `sudo`, `doas` or `none`, from the inventory's `escalate` parameter.
+    /// Anything else is not a fallback to `sudo`; it fails at spawn with the
+    /// name quoted.
     pub method: String,
+    /// The binary to re-exec in `--helper` mode, normally
+    /// `std::env::current_exe()`. The helper is this same playbook binary,
+    /// so escalation installs nothing on the target.
     pub exe: PathBuf,
+    /// The escalation password, when the host needs one. `None` means
+    /// passwordless escalation only, and a host that then asks for one gets
+    /// a failed step, not a prompt: there is no terminal to prompt on. When
+    /// present it reaches `sudo -S` on the helper's stdin and never argv,
+    /// and only after `sudo -n` has been seen to fail.
     pub password: Option<Secret>,
 }
 
@@ -412,6 +581,19 @@ impl Connection {
 }
 
 /// A `Backend` that runs as another user by proxying to a helper process.
+///
+/// One per identity per run, made by
+/// [`System::as_user`](crate::system::System::as_user) and shared by every
+/// clone that asks for the same user. The helper is spawned on the first
+/// primitive rather than at construction, so naming a user the playbook
+/// never reaches costs nothing and `sudo` is never asked about an identity
+/// nobody used.
+///
+/// It narrows nothing. The far side is a full [`Local`] running as that
+/// user, so a request is bounded by that user's permissions and by nothing
+/// this type adds. What it does add is three refusals: a mutation while the
+/// step is checking, a payload larger than one frame, and every primitive
+/// after the first failure.
 pub struct Elevated {
     user: String,
     spawner: Option<Spawner>,
@@ -427,7 +609,13 @@ pub struct Elevated {
 }
 
 impl Elevated {
-    /// Spawns the helper on first use.
+    /// Spawns the helper on first use, so this itself runs no `sudo` and
+    /// cannot fail.
+    ///
+    /// `phase` is the owning [`System`](crate::system::System)'s phase cell,
+    /// shared rather than copied: the flag on each request reflects where
+    /// the run is at the moment the request is made, so one long-lived
+    /// helper is guarded correctly across many steps.
     pub fn new(user: impl Into<String>, spawner: Spawner, phase: Arc<AtomicU8>) -> Self {
         Elevated {
             user: user.into(),
@@ -439,6 +627,10 @@ impl Elevated {
     }
 
     /// Talk to an already running helper over any pair of streams (tests).
+    ///
+    /// There is no [`Spawner`], so a connection that dies is not replaced:
+    /// the next primitive reports `helper connection is closed` instead of
+    /// starting a process the caller never asked for.
     pub fn connected(
         user: impl Into<String>,
         tx: Box<dyn Write + Send>,
@@ -459,6 +651,10 @@ impl Elevated {
         }
     }
 
+    /// The user the helper runs as, as messages name it. Never the calling
+    /// process's own user:
+    /// [`System::as_user`](crate::system::System::as_user) hands back the
+    /// plain local backend for that one instead of building this.
     pub fn user(&self) -> &str {
         &self.user
     }

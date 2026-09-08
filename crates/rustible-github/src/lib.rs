@@ -39,7 +39,7 @@
 //!
 //! ## A playbook using it
 //!
-//! ```ignore
+//! ```no_run
 //! use rustible::prelude::*;
 //! use rustible_github as github;
 //! use rustible_std::{file, user};
@@ -47,7 +47,10 @@
 //! #[rustible::playbook(hosts = "all", escalate = true)]
 //! fn main(ctx: &mut Ctx) -> Result<()> {
 //!     let account = ctx.step("Ensure cadu exists", user::Present::new("cadu").create_home(true))?;
-//!     ctx.step("Ensure ~/.ssh", file::Directory::at(account.home.join(".ssh")).owner(&account).mode(0o700))?;
+//!     ctx.step("Ensure ~/.ssh",
+//!         file::Directory::at(account.home.join(".ssh"))
+//!             .owner(account.uid, account.gid)
+//!             .mode(0o700))?;
 //!
 //!     // Two steps in the run output: the fetch (always `ok`) and the install.
 //!     let installed = github::keys_to_user(ctx, "flipbit03", "cadu")?;
@@ -62,6 +65,7 @@
 //!     }
 //!     Ok(())
 //! }
+//! # fn main() {}
 //! ```
 //!
 //! ## Errors versus empty
@@ -80,7 +84,7 @@
 //! handshake panic; see `rustible_std::tls` for what is excluded.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 mod fetch;
 mod keys_to_user;

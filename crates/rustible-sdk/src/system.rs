@@ -12,14 +12,33 @@ use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
 use crate::secret::Secret;
 
+/// Which half of a step is running.
+///
+/// [`Ctx::step`](crate::ctx::Ctx::step) sets this around each call to
+/// `check` and `apply` and puts it back to `Idle` afterwards. Every mutating
+/// primitive on [`System`] consults it, so an op that writes from `check`
+/// gets a [`MutationDuringCheck`] error instead of quietly breaking dry
+/// runs. One atomic is shared by every clone of a `System` and by each
+/// `Elevated` helper, so going through [`System::as_user`] does not escape
+/// the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Phase {
+    /// Between steps: playbook code, or an op's constructor. Mutations are
+    /// allowed, because nothing here is claiming to be a dry run.
     Idle = 0,
+    /// Inside `Op::check`, which is contractually read-only. Every mutating
+    /// primitive refuses.
     Checking = 1,
+    /// Inside `Op::apply`, reached only outside check mode. Mutations go
+    /// through.
     Applying = 2,
 }
 
+/// Who the primitives on a [`System`] handle run as.
+///
+/// A handle starts at `Own` and only [`System::as_user`] produces anything
+/// else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
     /// Whatever the process runs as.
@@ -31,6 +50,8 @@ pub enum Identity {
 }
 
 impl Identity {
+    /// How the identity appears in the report and in `CmdRan` events:
+    /// `"self"` for [`Identity::Own`], otherwise the user name.
     pub fn label(&self) -> String {
         match self {
             Identity::Own => "self".into(),
@@ -45,6 +66,9 @@ impl Identity {
 pub struct Planned {
     /// The kind of resource, e.g. `"group"`. Ops agree on these strings.
     pub kind: String,
+    /// The resource's own name, as the creating op would pass it to the
+    /// system. Matched literally, so the looker-up and the noter have to
+    /// spell it the same way.
     pub name: String,
     /// A numeric id the creating step knows for sure (a requested gid).
     pub id: Option<u32>,
@@ -74,6 +98,22 @@ impl Escalation {
     }
 }
 
+/// The op's handle to one machine, at one identity.
+///
+/// Everything an op is allowed to do to the world goes through this: the
+/// reads, the mutations (guarded by [`Phase`] so `check` cannot cheat),
+/// [`System::cmd`], the [`Facts`] gathered at startup, and the check-mode
+/// bookkeeping that lets a dry run accept a prerequisite an earlier step
+/// planned. The runtime builds one per host and hands it to every op; a
+/// playbook never needs to build one outside tests.
+///
+/// Cloning is cheap and deliberate. A clone shares the backend, the facts,
+/// the phase and the planned-resource list with the original, so the handles
+/// produced by [`System::as_user`] and by nested sections all speak for one
+/// run. What a clone can differ in is its identity, its backend, and its
+/// check-mode flag.
+///
+/// Use [`System::local`] for a real machine and [`System::fake`] for tests.
 #[derive(Clone)]
 pub struct System {
     backend: Arc<dyn Backend>,
@@ -88,6 +128,14 @@ pub struct System {
 }
 
 impl System {
+    /// A system over a backend of your own: a test double, a recording
+    /// proxy, anything implementing `Backend`. [`System::local`] and
+    /// [`System::fake`] cover the two cases that exist in practice.
+    ///
+    /// The identity is [`Identity::Own`] and the phase starts at
+    /// [`Phase::Idle`]. There is no escalation, so [`System::as_user`] on
+    /// the result only relabels the handle: primitives keep going to the
+    /// same backend, and commands pick up a `sudo -n -u <user>` prefix.
     pub fn new(
         backend: Arc<dyn Backend>,
         facts: Facts,
@@ -164,11 +212,22 @@ impl System {
         Self::new(fake, facts, false, sink)
     }
 
+    /// Replace the facts, for a test that needs a different distro, init or
+    /// unprivileged user than [`System::fake`]'s Debian default. Handles
+    /// cloned before this call keep the facts they were built with.
     pub fn with_facts(mut self, facts: Facts) -> Self {
         self.facts = Arc::new(facts);
         self
     }
 
+    /// Turn dry-run mode on or off.
+    ///
+    /// This flag is not what stops a mutation: [`Phase`] does that, and it
+    /// does it in every mode. What the flag decides is that
+    /// [`Ctx::step`](crate::ctx::Ctx::step) never calls `apply` at all, and
+    /// that the [`System::would_create`] family answers rather than
+    /// returning nothing. As with [`System::with_facts`], only handles
+    /// cloned after the call see the new value.
     pub fn with_check_mode(mut self, on: bool) -> Self {
         self.check_mode = on;
         self
@@ -176,18 +235,31 @@ impl System {
 
     // ---- context ----
 
+    /// The facts gathered once before the first step. They describe the
+    /// machine as it was then: an op that installs `systemd` does not change
+    /// what [`Facts::init`] says for the rest of the run.
     pub fn facts(&self) -> &Facts {
         &self.facts
     }
 
+    /// True during a dry run. The usual reason an op looks is to decide
+    /// whether a missing prerequisite may still be satisfied, which
+    /// [`System::would_create`] answers.
     pub fn check_mode(&self) -> bool {
         self.check_mode
     }
 
+    /// Who the primitives on this handle run as. [`Identity::Own`] unless
+    /// the handle came from [`System::as_user`].
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
 
+    /// True when the primitives on this handle run with uid 0: the
+    /// process's own [`Facts::is_root`] for [`Identity::Own`], and simply
+    /// whether the name is `root` for a switched identity. An op that
+    /// refuses to run unprivileged gates on this rather than on the facts,
+    /// so `as_user("root")` counts as root even when the process is not.
     pub fn is_root(&self) -> bool {
         match &self.identity {
             Identity::Own => self.facts.is_root,
@@ -308,6 +380,10 @@ impl System {
 
     // ---- reads ----
 
+    /// Whether anything at all sits at `p`, without following symlinks, so
+    /// a dangling symlink exists. An absent path is `Ok(false)`, not an
+    /// error; the error case is a stat that fails for another reason, such
+    /// as a parent directory this identity cannot search.
     pub fn exists(&self, p: impl AsRef<Path>) -> Result<bool> {
         let p = p.as_ref();
         Ok(self.backend.stat(p).map_err(Self::io(p))?.is_some())
@@ -325,11 +401,21 @@ impl System {
         self.backend.stat_follow(p).map_err(Self::io(p))
     }
 
+    /// The whole file, in memory, as bytes. A missing or unreadable file is
+    /// an [`IoAt`] error naming the path: there is no "missing counts as
+    /// empty" shortcut, so an op that tolerates absence asks
+    /// [`System::exists`] first. Reading through a helper puts the file in
+    /// one frame, which caps it at
+    /// [`MAX_FRAME_PAYLOAD`](crate::protocol::MAX_FRAME_PAYLOAD).
     pub fn read(&self, p: impl AsRef<Path>) -> Result<Vec<u8>> {
         let p = p.as_ref();
         self.backend.read(p).map_err(Self::io(p))
     }
 
+    /// The whole file as text. Errors with `not utf-8` on bytes that are
+    /// not, rather than substituting replacement characters, so an op never
+    /// rewrites a config file it silently mangled. Use [`System::read`] for
+    /// anything that may be binary.
     pub fn read_to_string(&self, p: impl AsRef<Path>) -> Result<String> {
         let bytes = self.read(p)?;
         String::from_utf8(bytes).map_err(|e| Error::msg(format!("not utf-8: {e}")))
@@ -349,6 +435,15 @@ impl System {
 
     // ---- mutations: guarded and logged ----
 
+    /// Replace the contents of `p` through a temporary file in the same
+    /// directory and a rename, so a concurrent reader sees either the old
+    /// file or the new one and a failure part way leaves the old one intact.
+    ///
+    /// An existing file keeps its mode and owner; a new one is created with
+    /// the mode any newly created file gets, 0666 minus the umask. Refused
+    /// with [`MutationDuringCheck`] inside `check`, and errors as [`IoAt`]
+    /// if the directory is not writable or the rename fails. Logs the path
+    /// and byte count at debug level.
     pub fn write_atomic(&self, p: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
@@ -357,6 +452,11 @@ impl System {
         Ok(())
     }
 
+    /// Create `p` and every missing parent. Succeeds when `p` is already a
+    /// directory, and fails when it exists as something else. New
+    /// directories get the default mode; set the ones that matter afterwards
+    /// with [`System::set_mode`], which is a separate step so an op can
+    /// report it as a separate change. Refused inside `check`.
     pub fn mkdir_all(&self, p: impl AsRef<Path>) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
@@ -387,12 +487,23 @@ impl System {
         self.backend.rename(from, to).map_err(Self::io(to))
     }
 
+    /// Set the permission bits of `p` to `mode`, written as an octal
+    /// literal such as `0o644`. The value replaces the current bits instead
+    /// of merging with them, and setuid, setgid and sticky live in the same
+    /// number. Symlinks are followed, so this changes the target's mode.
+    /// Refused inside `check`; fails when this identity owns neither the
+    /// file nor root.
     pub fn set_mode(&self, p: impl AsRef<Path>, mode: u32) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
         self.backend.set_mode(p, mode).map_err(Self::io(p))
     }
 
+    /// Set the owner and group of `p`. Both are numeric ids, not names: an
+    /// op resolves a name first, usually from what the user or group op
+    /// returned. Symlinks are followed. Refused inside `check`, and fails
+    /// with `EPERM` unless this identity is root, since Linux lets nobody
+    /// else give a file away.
     pub fn set_owner(&self, p: impl AsRef<Path>, uid: u32, gid: u32) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
@@ -426,6 +537,16 @@ impl System {
 
     // ---- processes ----
 
+    /// Start building a command to run on the target as this handle's
+    /// identity. Nothing runs until [`Cmd::run`] or [`Cmd::ok`], so this
+    /// itself is safe to call from `check`; the [`Phase`] guard covers the
+    /// filesystem primitives, not commands, and keeping `check` read-only
+    /// is the op's job from here on.
+    ///
+    /// On a real system a switched identity is already the helper process's
+    /// own user, so the argv is exactly what you build. On a `Fake` system
+    /// there is no helper, so a switched identity gets a
+    /// `sudo -n -u <user>` prefix instead, which is what a test asserts on.
     pub fn cmd(&self, program: impl Into<String>) -> Cmd {
         Cmd {
             sys: self.clone(),
@@ -450,6 +571,10 @@ impl System {
 
     // ---- reporting ----
 
+    /// Put a warning in the run's event stream. It is shown at every
+    /// verbosity, prefixed `WARNING:`, and does not affect the step's
+    /// status: this is for something the operator should know that is not
+    /// worth failing over.
     pub fn warn(&self, msg: impl Into<String>) {
         self.sink.emit(Event::Log {
             level: Level::Warn,
@@ -457,6 +582,9 @@ impl System {
         });
     }
 
+    /// Put a line in the run's event stream that only `-v` and above
+    /// renders. The mutating primitives here use it to record what they
+    /// touched, so an op rarely has to narrate its own writes.
     pub fn debug(&self, msg: impl Into<String>) {
         self.sink.emit(Event::Log {
             level: Level::Debug,
@@ -477,11 +605,16 @@ pub struct Cmd {
 }
 
 impl Cmd {
+    /// Append one argument. It reaches the program exactly as written:
+    /// there is no shell in the way, so quoting, `*` globbing, `|` and `>`
+    /// are all just characters in an argument.
     pub fn arg(mut self, a: impl Into<String>) -> Self {
         self.spec.args.push(a.into());
         self
     }
 
+    /// Append several arguments in order. The same as calling
+    /// [`Cmd::arg`] once per item.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -491,16 +624,31 @@ impl Cmd {
         self
     }
 
+    /// Set one environment variable on top of the environment the child
+    /// would inherit. Setting the same key twice keeps the last value.
+    /// `LANG` and `LC_ALL` are already forced to `C` for every command, so
+    /// an op can parse a tool's output without a locale changing the words
+    /// under it; overriding them here is how you get the locale back.
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.spec.env.insert(k.into(), v.into());
         self
     }
 
+    /// Run the child in this directory. The default is to inherit the
+    /// current directory of whichever process spawns it, which is the
+    /// playbook binary or, for a switched identity, its helper. A directory
+    /// that does not exist fails the spawn, not the command.
     pub fn cwd(mut self, p: impl Into<PathBuf>) -> Self {
         self.spec.cwd = Some(p.into());
         self
     }
 
+    /// Feed these bytes to the child's stdin, then close it. Without this
+    /// the child gets `/dev/null`, never the operator's terminal, so a
+    /// program that would prompt reads EOF instead of hanging the run. The
+    /// bytes are written from a separate thread while stdout and stderr are
+    /// drained, so a child that talks back before reading its input does not
+    /// deadlock.
     pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.spec.stdin = Some(bytes.into());
         self

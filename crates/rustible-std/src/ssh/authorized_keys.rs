@@ -457,10 +457,14 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 /// Ensure keys are in a user's `authorized_keys`. Ansible's
 /// `ansible.posix.authorized_key` with `state: present`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::ssh::authorized_keys;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// let keys = ["ssh-ed25519 AAAAC3...XYZ cadu@x86", "ssh-ed25519 AAAAC3...ABC cadu@arm"];
 /// ctx.step("Install authorized keys",
 ///     authorized_keys::Present::for_user_name("cadu").keys(keys).exclusive(true))?;
+/// # Ok(()) }
 /// ```
 ///
 /// The user-name form reads `/etc/passwd` for home, uid, and gid; the
@@ -587,10 +591,15 @@ impl Op for Present {
 /// Ensure keys are not in a user's `authorized_keys`. Ansible's
 /// `ansible.posix.authorized_key` with `state: absent`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::ssh::authorized_keys;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
+/// # let old_keys = ["ssh-ed25519 AAAAC3...OLD cadu@retired-laptop"];
 /// let revoked = ctx.step("Revoke compromised keys",
 ///     authorized_keys::Absent::for_user_name("rustible").keys(old_keys))?;
 /// ctx.log(format!("removed {} key(s)", revoked.removed.len()));
+/// # Ok(()) }
 /// ```
 ///
 /// A missing file is already satisfied. Nothing is created and no

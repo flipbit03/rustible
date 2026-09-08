@@ -29,13 +29,26 @@ const READ_CAPACITY_CEILING: u64 = 1 << 20;
 /// A supported archive format, as detected from the first bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// No compression: a `ustar` header block at offset 257 of the file
+    /// itself.
     Tar,
+    /// gzip (magic `1f 8b`), read with `flate2`'s multi-member decoder, so a
+    /// tarball concatenated by `pigz` is read to its end and not just to the
+    /// first member.
     TarGz,
+    /// xz (magic `fd 37 7a 58 5a 00`), read with `lzma-rust2`.
     TarXz,
+    /// zstd (magic `28 b5 2f fd`), read frame by frame with `ruzstd` so the
+    /// several frames `pzstd` and `zstd --rsyncable` write are all decoded
+    /// and their content checksums verified. The only format whose
+    /// decompressed stream is also held in memory in full.
     TarZst,
 }
 
 impl Format {
+    /// The word used in diffs and error messages (`tar`, `tar.gz`, `tar.xz`,
+    /// `tar.zst`). It names what the magic bytes said, which need not match
+    /// what the file is called.
     pub fn name(self) -> &'static str {
         match self {
             Format::Tar => "tar",
@@ -149,7 +162,11 @@ pub fn validate_link_target(link: &Path, target: &Path) -> std::result::Result<(
 /// What one archive member is, after validation and stripping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
+    /// A regular file, which for tar also covers the contiguous and GNU
+    /// sparse entry types. `apply` writes it with `write_atomic`.
     File,
+    /// A directory the archive names in its own right. `apply` creates it and
+    /// any missing parent with `mkdir_all`.
     Dir,
     /// Target as written in the archive (relative, validated).
     Symlink(PathBuf),
@@ -163,22 +180,36 @@ pub enum Kind {
 pub struct Member {
     /// Relative to the destination.
     pub path: PathBuf,
+    /// What to create there and, for a link, where it points.
     pub kind: Kind,
     /// Permission bits (`& 0o7777`).
     pub mode: u32,
+    /// Content length as the tar header declares it, `0` for directories,
+    /// symlinks and hard links. Attacker-controlled and unverified, so it is
+    /// only ever a capacity hint, capped at 1 MiB before the real stream is
+    /// read.
     pub size: u64,
 }
 
 /// Output of [`Extracted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractReport {
+    /// The archive, as given to [`Extracted::from_path`].
     pub src: PathBuf,
+    /// The directory it was (or would be) unpacked into, as given to
+    /// [`ExtractedBuilder::to`].
     pub dest: PathBuf,
     /// `None` when the `creates` marker made the step `ok` without opening
     /// the archive.
     pub format: Option<Format>,
+    /// Regular files written, hard links included: each one lands as a full
+    /// copy of the file it points at.
     pub files: usize,
+    /// Directory members in the archive. A parent directory `apply` has to
+    /// create for a file whose own directory the archive never names is not
+    /// counted.
     pub dirs: usize,
+    /// Symlink members. Hard links are counted in `files`, not here.
     pub symlinks: usize,
     /// Bytes of regular-file content, as the archive's headers declare it.
     /// A hard link's header carries `size == 0`, so a hard link raises
@@ -564,8 +595,6 @@ fn zstd_decompress_all(mut input: &[u8]) -> Result<Vec<u8>> {
 /// `strip_components` or for an empty path) and a reader of its data.
 type Visit<'a> = dyn FnMut(Option<&Member>, &mut dyn Read) -> Result<()> + 'a;
 
-/// Walk every member in order, validating paths and link targets, and hand
-/// each to `visit` with its data. Errors name the member.
 /// What a member is, for a collision message.
 fn kind_label(kind: &Kind) -> &'static str {
     match kind {
@@ -576,6 +605,8 @@ fn kind_label(kind: &Kind) -> &'static str {
     }
 }
 
+/// Walk every member in order, validating paths and link targets, and hand
+/// each to `visit` with its data. Errors name the member.
 fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<'_>) -> Result<()> {
     let mut symlinks: Vec<PathBuf> = vec![];
     let mut files: BTreeSet<PathBuf> = BTreeSet::new();

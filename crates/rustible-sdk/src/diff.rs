@@ -1,3 +1,12 @@
+//! What a step says it would change.
+//!
+//! An op builds a [`Diff`] in `check` and hands it to [`Plan::Change`]; the
+//! runtime puts it in the `StepFinished` event and the orchestrator renders
+//! it. These strings are the only account of a change a user ever sees, so
+//! they are written for a reader, not for a machine.
+//!
+//! [`Plan::Change`]: crate::op::Plan::Change
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -8,27 +17,49 @@ use serde::{Deserialize, Serialize};
 pub enum Diff {
     /// Whole-text change of a file.
     Text {
+        /// The file the op is about. Rendered as the diff header only; the
+        /// path is never opened again.
         path: PathBuf,
+        /// The contents now. The empty string when the file does not exist,
+        /// which renders as a diff that adds every line.
         before: String,
+        /// The contents the op would write, in full: `render` computes the
+        /// unified diff, so ops never build a patch themselves.
         after: String,
     },
     /// One or more attribute changes on a resource (mode, owner, enabled, ...).
     Attrs {
+        /// What the attributes belong to, as the reader knows it: a unit
+        /// name, a path, a user name.
         subject: String,
+        /// One entry per differing attribute. An op with an empty list has
+        /// nothing to change and returns [`Plan::Satisfied`] instead.
+        ///
+        /// [`Plan::Satisfied`]: crate::op::Plan::Satisfied
         changes: Vec<AttrChange>,
     },
     /// Something with no meaningful before/after (a restart, a command).
     Summary(String),
 }
 
+/// One line of a [`Diff::Attrs`]. Both sides are already rendered as text by
+/// the op, so it decides how a mode, a gid or a boolean should read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttrChange {
+    /// The attribute under the name a user would recognize: `mode`, `owner`,
+    /// `enabled`, `exists`.
     pub name: String,
+    /// The value now. Ops spell out an absence rather than leaving this
+    /// empty, e.g. `yes (dir)` against a `to` of `no`.
     pub from: String,
+    /// The value the op would leave behind.
     pub to: String,
 }
 
 impl Diff {
+    /// A whole-file [`Diff::Text`]. Pass the complete before and after text;
+    /// the unified diff is computed at render time, not here, so building
+    /// this costs no diffing.
     pub fn text(
         path: impl Into<PathBuf>,
         before: impl Into<String>,
@@ -41,6 +72,9 @@ impl Diff {
         }
     }
 
+    /// A [`Diff::Summary`]: the fallback when there is no before and after
+    /// worth showing. Also what text-oriented ops fall back to when a file
+    /// is binary or too large to diff.
     pub fn summary(s: impl Into<String>) -> Self {
         Diff::Summary(s.into())
     }

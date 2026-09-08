@@ -32,12 +32,17 @@ type Predicate = Arc<dyn Fn(&CommandOutput) -> bool + Send + Sync>;
 /// Run a program with arguments. `ansible.builtin.command` (and
 /// `ansible.builtin.shell` through [`Command::sh`]).
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::shell;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// ctx.step("Build", shell::Command::new("make").arg("install").cwd("/src").creates("/usr/local/bin/x"))?;
 /// let sync = ctx.step("Sync repo",
 ///     shell::Command::new("git").args(["pull", "--ff-only"]).cwd("/srv/app")
 ///         .changed_when(|out| !out.stdout.contains("Already up to date")))?;
-/// ctx.step("Load schema", shell::Command::new("psql").arg("app").stdin(include_str!("schema.sql")))?;
+/// # let _ = sync;
+/// ctx.step("Load schema", shell::Command::new("psql").arg("app").stdin("CREATE TABLE app (id int);"))?;
+/// # Ok(()) }
 /// ```
 ///
 /// Always changes, unless `creates`/`removes` (skip without running) or
@@ -92,12 +97,33 @@ impl fmt::Debug for Command {
 /// without running, `status` is 0 and both streams are empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
+    /// Exit status of the process, and in practice always 0: a non-zero
+    /// exit fails the step before this value reaches the playbook, so
+    /// testing it is not how a failure is tolerated. Match on the `Result`
+    /// from `ctx.step` for that (vision 6.1).
     pub status: i32,
+    /// Everything the process wrote to standard output, decoded as UTF-8
+    /// with invalid bytes replaced rather than rejected. Not streamed: the
+    /// whole of it is held in memory.
     pub stdout: String,
+    /// Standard error, decoded the same way. Kept even for a command that
+    /// succeeded, since plenty of tools report their real work there.
     pub stderr: String,
 }
 
 impl Command {
+    /// Run `program` directly, with no shell: each argument added later is
+    /// passed to the process as one argument, so quotes, globs, `|` and `>`
+    /// are literal text. Use [`Command::sh`] when a shell is wanted.
+    ///
+    /// Nothing is set beyond the program: no arguments, no extra
+    /// environment, `/dev/null` on standard input, the runtime's own working
+    /// directory, and no `creates`, `removes` or `changed_when`. That last
+    /// part means the step always changes. In check mode the command is not
+    /// run at all and the step reports `would change`; `check` predicts
+    /// nothing, so a later step that reads this one's [`CommandOutput`] gets
+    /// [`OutputUnavailable`](rustible_sdk::error::OutputUnavailable) instead
+    /// of an invented one.
     pub fn new(program: impl Into<String>) -> Self {
         Command {
             program: program.into(),
@@ -117,11 +143,16 @@ impl Command {
         Command::new("/bin/sh").args(["-c".to_string(), script.into()])
     }
 
+    /// Append one argument, handed to the process as it stands: no word
+    /// splitting, no glob expansion, no quote removal. A path with a space
+    /// in it needs no escaping.
     pub fn arg(mut self, a: impl Into<String>) -> Self {
         self.args.push(a.into());
         self
     }
 
+    /// Append several arguments, in order. The same as calling
+    /// [`Command::arg`] for each.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -157,6 +188,9 @@ impl Command {
         self
     }
 
+    /// Working directory for the process. Ansible's `args: chdir`. Without
+    /// it the process inherits the runtime's own working directory; a
+    /// directory that does not exist fails the spawn, not `check`.
     pub fn cwd(mut self, p: impl Into<PathBuf>) -> Self {
         self.cwd = Some(p.into());
         self

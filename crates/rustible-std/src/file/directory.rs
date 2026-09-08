@@ -19,6 +19,10 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// Start a `Directory` op on this path. With neither `.mode()` nor
+    /// `.owner()` added it only ensures the directory (and its missing
+    /// parents) exists, leaving the permissions of one that is already there
+    /// alone.
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Directory {
             path: path.into(),
@@ -27,6 +31,11 @@ impl Directory {
         }
     }
 
+    /// Permission bits as an octal literal (`0o750`). Only the low twelve
+    /// bits are compared and set, so the file type bits of a value read out
+    /// of a `stat` do not matter. Left unset, the mode is neither checked
+    /// nor changed, and a directory this op creates keeps whatever `mkdir`
+    /// gave it.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
         self
@@ -39,9 +48,15 @@ impl Directory {
     }
 }
 
+/// Output of [`Directory`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirReport {
+    /// The directory, as given to [`Directory::at`].
     pub path: PathBuf,
+    /// True only when this step made the directory. A step that found the
+    /// directory already there and merely fixed its mode or owner reports
+    /// `false` while still counting as `changed`. `check` predicts it, so a
+    /// check-mode run sees the value the real run would produce.
     pub created: bool,
 }
 
