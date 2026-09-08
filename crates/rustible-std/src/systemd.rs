@@ -855,13 +855,6 @@ impl Op for Reload {
     }
 }
 
-// TODO(M6 harness): once `#[rustible::integration_test(systemd_images = [..])]`
-// from the m6-harness branch is on main, add `tests/it_systemd.rs`: write a
-// `sleep infinity` unit to `/etc/systemd/system/rustible-test.service`, then
-// `Enabled::new("rustible-test").now(true)` changed-then-ok, `Restart`,
-// `Stopped` changed-then-ok, `Disabled` changed-then-ok, on
-// `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

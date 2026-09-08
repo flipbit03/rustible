@@ -1,53 +1,224 @@
    Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sd/crates/rustible-std)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
-     Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6sd/crates/rustible)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.91s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-9d0784a2374a76da)
 
 running 40 tests
-test systemd::tests::active_state_classification ... ok
-test systemd::tests::check_mode_through_ctx_runs_only_probes_and_predicts_state_ops ... ok
-test systemd::tests::disabled_now_stops_and_fails_with_journal_if_still_running ... ok
-test systemd::tests::disabled_refuses_static_generated_transient ... ok
 test systemd::tests::disabled_plans_and_applies_disable ... ok
-test systemd::tests::enabled_apply_runs_enable_then_reads_both_probes ... ok
+test systemd::tests::enabled_surfaces_systemctl_failure ... ok
+test systemd::tests::active_state_classification ... ok
+test systemd::tests::enabled_now_fails_with_journal_when_unit_does_not_come_up ... ok
+test systemd::tests::every_op_rejects_a_bad_unit_name ... ok
+test systemd::tests::disabled_refuses_static_generated_transient ... ok
 test systemd::tests::disabled_satisfied_on_disabled_masked_and_linked ... ok
-test systemd::tests::enabled_now_adds_active_change_and_the_flag ... ok
+test systemd::tests::every_op_refuses_a_non_systemd_init_without_running_anything ... ok
 test systemd::tests::enabled_fails_when_still_disabled_after_enable ... ok
 test systemd::tests::enabled_plans_change_with_diff_and_prediction ... ok
-test systemd::tests::enabled_now_fails_with_journal_when_unit_does_not_come_up ... ok
-test systemd::tests::enabled_refuses_masked_and_missing_units ... ok
 test systemd::tests::enabled_satisfied_and_only_probes_ran ... ok
-test systemd::tests::enabled_satisfied_on_static_alias_indirect_even_when_inactive ... ok
+test systemd::tests::enabled_apply_runs_enable_then_reads_both_probes ... ok
 test systemd::tests::enabled_state_classification ... ok
-test systemd::tests::enabled_surfaces_systemctl_failure ... ok
-test systemd::tests::every_op_refuses_without_root_and_names_the_user ... ok
-test systemd::tests::every_op_rejects_a_bad_unit_name ... ok
-test systemd::tests::every_op_refuses_a_non_systemd_init_without_running_anything ... ok
-test systemd::tests::parse_is_active_every_documented_word ... ok
-test systemd::tests::parse_is_active_exit_codes_and_unknowns ... ok
-test systemd::tests::parse_is_enabled_every_documented_word ... ok
-test systemd::tests::reload_uses_reload_and_or_restart_switches_verb ... ok
-test systemd::tests::parse_is_enabled_nonzero_exit_with_meaningful_stdout ... ok
-test systemd::tests::restart_apply_daemon_reloads_restarts_and_verifies ... ok
+test systemd::tests::disabled_now_stops_and_fails_with_journal_if_still_running ... ok
+test systemd::tests::enabled_refuses_masked_and_missing_units ... ok
 test systemd::tests::restart_fails_with_journal_when_unit_stays_down ... ok
+test systemd::tests::enabled_now_adds_active_change_and_the_flag ... ok
+test systemd::tests::parse_is_enabled_every_documented_word ... ok
+test systemd::tests::parse_is_enabled_nonzero_exit_with_meaningful_stdout ... ok
+test systemd::tests::parse_is_active_every_documented_word ... ok
+test systemd::tests::reload_uses_reload_and_or_restart_switches_verb ... ok
+test systemd::tests::reload_surfaces_systemctl_failure_on_inactive_unit ... ok
+test systemd::tests::check_mode_through_ctx_runs_only_probes_and_predicts_state_ops ... ok
+test systemd::tests::parse_is_active_exit_codes_and_unknowns ... ok
+test systemd::tests::enabled_satisfied_on_static_alias_indirect_even_when_inactive ... ok
+test systemd::tests::every_op_refuses_without_root_and_names_the_user ... ok
 test systemd::tests::running_fails_with_journal_when_failed_after_start ... ok
-test systemd::tests::running_failure_message_survives_a_missing_journal ... ok
 test systemd::tests::restart_through_ctx_passes_the_mutation_guard_and_reports_changed ... ok
-test systemd::tests::running_satisfied_on_active_and_transitional_states ... ok
+test systemd::tests::restart_always_changes_and_check_runs_nothing ... ok
+test systemd::tests::user_mode_adds_the_flag_everywhere_and_needs_no_root ... ok
+test systemd::tests::validate_unit_rejects_unusable_names ... ok
+test systemd::tests::running_failure_message_survives_a_missing_journal ... ok
+test systemd::tests::running_plans_change_from_failed_with_prediction ... ok
+test systemd::tests::stopped_satisfied_on_inactive_and_failed ... ok
 test systemd::tests::stopped_fails_when_still_running_after_stop ... ok
+test systemd::tests::running_apply_starts_then_verifies ... ok
+test systemd::tests::restart_apply_daemon_reloads_restarts_and_verifies ... ok
 test systemd::tests::stopped_plans_and_applies_stop ... ok
 test systemd::tests::running_refuses_masked_and_missing_units ... ok
-test systemd::tests::stopped_satisfied_on_inactive_and_failed ... ok
-test systemd::tests::validate_unit_rejects_unusable_names ... ok
-test systemd::tests::user_mode_adds_the_flag_everywhere_and_needs_no_root ... ok
-test systemd::tests::restart_always_changes_and_check_runs_nothing ... ok
-test systemd::tests::reload_surfaces_systemctl_failure_on_inactive_unit ... ok
-test systemd::tests::running_plans_change_from_failed_with_prediction ... ok
-test systemd::tests::running_apply_starts_then_verifies ... ok
+test systemd::tests::running_satisfied_on_active_and_transitional_states ... ok
 
-test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 101 filtered out; finished in 0.03s
+
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-1e0b34b8ba04f13a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-2996363f7dd91def)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-f53739c7bb4c3e88)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-3188b37632ee022e)
+
+running 1 test
+test systemd_is_pid1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 
-=== Manual container run (harness PR #5 not merged yet; scratch musl binary driving the ops through Ctx, see report) ===
+=== RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd -- --nocapture ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-f53739c7bb4c3e88)
+
+running 1 test
+integration: building test target `it_systemd` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sd/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6sd/crates/rustible)
+    Finished `release` profile [optimized] target(s) in 2.19s
+integration: built /home/cadu/w/cadu/rustible-m6sd/target/x86_64-unknown-linux-musl/release/deps/it_systemd-779748bb14a01da0 in 2.2s
+  [jrei/systemd-debian:12]    debug: wrote /etc/systemd/system/rustible-test.service (124 bytes)
+  [jrei/systemd-debian:12]    $ systemctl daemon-reload (as self, exit 0, 87ms)
+  [jrei/systemd-debian:12]    $ systemctl reload-or-restart systemd-journald (as self, exit 0, 28ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled systemd-journald (as self, exit 0, 8ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]  journald reload-or-restart with daemon-reload  changed         systemctl daemon-reload && systemctl reload-or-restart systemd-journald   action
+        | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 7ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl enable --now rustible-test (as self, exit 0, 64ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 6ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]  unit enabled and started ................... changed         enabled=enabled active=active
+        | rustible-test:
+        |   enabled: disabled -> enabled
+        |   active: inactive -> active
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]  unit enabled and started (again) ........... ok           
+  [jrei/systemd-debian:12]    $ systemctl restart rustible-test (as self, exit 0, 12ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit restarted ............................. changed         systemctl restart rustible-test   action
+        | systemctl restart rustible-test
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl stop rustible-test (as self, exit 0, 6ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 10ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 4ms)
+  [jrei/systemd-debian:12]  unit stopped ............................... changed         active=inactive
+        | rustible-test:
+        |   active: active -> inactive
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 4ms)
+  [jrei/systemd-debian:12]  unit stopped (again) ....................... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl start rustible-test (as self, exit 0, 16ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 6ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]  unit running ............................... changed         active=active
+        | rustible-test:
+        |   active: inactive -> active
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 6ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit running (again) ....................... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl disable --now rustible-test (as self, exit 0, 133ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 8ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 4ms)
+  [jrei/systemd-debian:12]  unit disabled and stopped .................. changed         enabled=disabled active=inactive
+        | rustible-test:
+        |   enabled: enabled -> disabled
+        |   active: active -> inactive
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 6ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 5ms)
+  [jrei/systemd-debian:12]  unit disabled and stopped (again) .......... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled systemd-journald (as self, exit 0, 7ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]  static unit cannot be disabled ............. FAILED          systemd::Disabled: unit `systemd-journald` is static: it has no [Install] section, so it cannot be disabled; mask it (`systemctl mask systemd-journald`) or stop it instead
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-nope (as self, exit 1, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-nope (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  missing unit ............................... FAILED          systemd::Enabled: unit `rustible-nope` not found by `systemctl is-enabled`
+[jrei/systemd-debian:12] ok in 1.9s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+  [jrei/systemd-ubuntu:24.04]    debug: wrote /etc/systemd/system/rustible-test.service (124 bytes)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl daemon-reload (as self, exit 0, 43ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl reload-or-restart systemd-journald (as self, exit 0, 37ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled systemd-journald (as self, exit 0, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  journald reload-or-restart with daemon-reload  changed         systemctl daemon-reload && systemctl reload-or-restart systemd-journald   action
+        | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl enable --now rustible-test (as self, exit 0, 42ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit enabled and started ................... changed         enabled=enabled active=active
+        | rustible-test:
+        |   enabled: disabled -> enabled
+        |   active: inactive -> active
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit enabled and started (again) ........... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl restart rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 2ms)
+  [jrei/systemd-ubuntu:24.04]  unit restarted ............................. changed         systemctl restart rustible-test   action
+        | systemctl restart rustible-test
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl stop rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 2ms)
+  [jrei/systemd-ubuntu:24.04]  unit stopped ............................... changed         active=inactive
+        | rustible-test:
+        |   active: active -> inactive
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 2ms)
+  [jrei/systemd-ubuntu:24.04]  unit stopped (again) ....................... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl start rustible-test (as self, exit 0, 14ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit running ............................... changed         active=active
+        | rustible-test:
+        |   active: inactive -> active
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit running (again) ....................... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 2ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl disable --now rustible-test (as self, exit 0, 45ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 5ms)
+  [jrei/systemd-ubuntu:24.04]  unit disabled and stopped .................. changed         enabled=disabled active=inactive
+        | rustible-test:
+        |   enabled: enabled -> disabled
+        |   active: active -> inactive
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit disabled and stopped (again) .......... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled systemd-journald (as self, exit 0, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  static unit cannot be disabled ............. FAILED          systemd::Disabled: unit `systemd-journald` is static: it has no [Install] section, so it cannot be disabled; mask it (`systemctl mask systemd-journald`) or stop it instead
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-nope (as self, exit 4, 2ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-nope (as self, exit 4, 2ms)
+  [jrei/systemd-ubuntu:24.04]  missing unit ............................... FAILED          systemd::Enabled: unit `rustible-nope` not found by `systemctl is-enabled`
+[jrei/systemd-ubuntu:24.04] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+test unit_lifecycle_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.28s
+
+
+=== Manual container run before the harness merged (scratch musl binary driving the ops through Ctx; kept for the record) ===
 =================== jrei/systemd-debian:12
 system state: running after 2s
 init=Systemd root=true

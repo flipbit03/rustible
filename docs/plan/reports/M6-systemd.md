@@ -3,7 +3,7 @@
 **Branch:** `m6-systemd`. **Governing sections:** vision 6.2, 6.3, 6.4, 6.7,
 6.8 (systemd translation), 6.9, 7, 8, 12, 13. **Files:**
 `crates/rustible-std/src/systemd.rs` (new), `crates/rustible-std/src/lib.rs`
-(one `pub mod` line), `docs/plan/DECISIONS.md`, `docs/plan/logs/M6-systemd-done.txt`.
+(one `pub mod` line), `docs/plan/DECISIONS.md`, `docs/plan/logs/M6-systemd-done.txt`, `crates/rustible-std/tests/it_systemd.rs` (new).
 No new dependencies, no SDK changes.
 
 ## What was built, per op
@@ -97,13 +97,9 @@ Recorded in `docs/plan/DECISIONS.md` under `[M6-sd]`:
 
 ## Deviations from the brief
 
-- **Container test not added.** The harness (`m6-harness`, PR #5) is still
-  open, so `#[rustible::integration_test(systemd_images = [..])]` is not on
-  `main`. A `TODO(M6 harness)` comment at the bottom of `systemd.rs` spells
-  out the test to write (`/etc/systemd/system/rustible-test.service` with
-  `sleep infinity`, `Enabled.now` changed-then-ok, `Restart`, `Stopped`,
-  `Disabled`). In its place the ops were run by hand inside both systemd
-  images, see Verification.
+- **Container test landed after the PR opened.** The harness (PR #5) merged
+  while this PR was open; `tests/it_systemd.rs` was added on the merge with
+  main and the manual run it replaced is kept in the done log for the record.
 - `Disabled` refuses more than `static` (decision 2).
 - The action summary includes `daemon-reload` when set
   (`systemctl daemon-reload && systemctl restart <unit>`) and `--user` when
@@ -126,21 +122,28 @@ Recorded in `docs/plan/DECISIONS.md` under `[M6-sd]`:
   argv including `journalctl`; check mode through `Ctx` running only the
   probes with state ops predicted and actions unavailable (vision 12);
   `Restart` and `Running` through `Ctx` under the mutation guard.
-- **Manual container run** (appended to the done log): a scratch musl binary
-  in the session scratchpad, depending on the worktree's `rustible-sdk` and
-  `rustible-std` by path, was copied into `jrei/systemd-debian:12` and
-  `jrei/systemd-ubuntu:24.04` booted the way the harness boots them
-  (`--privileged --cgroupns=host`, cgroup mount, wait for
-  `is-system-running`). It wrote `rustible-test.service` (`sleep infinity`)
-  and drove every op through `Ctx`: `Enabled.now(true)`, `Stopped`,
-  `Running`, `Disabled.now(true)` each changed then ok; `Restart` with
-  `daemon_reload` and `Reload.or_restart` changed; plain `Reload` on a
-  stopped unit surfaces `systemctl reload ... exited 3`; `Disabled` on
-  `systemd-journald` refuses with the static message; `Enabled` on
-  `nope-xyz` refuses as not found on both systemd 252 (empty stdout, exit 1)
-  and 255 (`not-found`, exit 4); `Running` on a unit whose `ExecStart` is
-  `/bin/false` fails with the three journal lines showing the exit. Identical
-  results on both images; no containers left behind.
+- **Container test** `crates/rustible-std/tests/it_systemd.rs`
+  (`#[rustible::integration_test(systemd_images = ["jrei/systemd-debian:12",
+  "jrei/systemd-ubuntu:24.04"])]`), run with `RUSTIBLE_INTEGRATION=1 cargo
+  test -p rustible-std --test it_systemd -- --nocapture`. It writes
+  `/etc/systemd/system/rustible-test.service` (`sleep infinity`), runs
+  `Reload::new("systemd-journald").daemon_reload(true).or_restart(true)` so
+  systemd sees the file, then `Enabled.now(true)`, `Stopped`, `Running`,
+  `Disabled.now(true)` through `changed_then_ok`, `Restart` in between, and
+  asserts the two refusals against real systemctl (`Disabled` on the static
+  `systemd-journald`, `Enabled` on a unit that does not exist, which is
+  `not-found`/exit 4 on Ubuntu's systemd 255 and empty stdout/exit 1 on
+  Debian's 252). Run three times (docs/07 rule 5): 6 of 6 green, no
+  containers left behind (`docker ps -aq --filter label=rustible.integration`
+  empty).
+
+  | image | in-container time | whole test (both images, warm build) |
+  |---|---|---|
+  | `jrei/systemd-debian:12` | 0.9 to 1.9 s | 1.9 to 5.3 s |
+  | `jrei/systemd-ubuntu:24.04` | 0.9 to 1.0 s | |
+
+  Before the harness merged, the same sequence was run by hand with a scratch
+  musl binary; that output is still appended to the done log.
 - Hard limits: no sudo on the VM (the read-only `systemctl is-enabled` /
   `is-active` were run once as the user to confirm exit codes), no remote
   hosts, `my_infra` untouched, root only inside throwaway containers.
