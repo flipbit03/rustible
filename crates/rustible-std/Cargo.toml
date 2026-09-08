@@ -14,6 +14,16 @@ readme = "../../README.md"
 rustible-sdk.workspace = true
 regex.workspace = true
 serde.workspace = true
+# http::Download
+ureq.workspace = true
+rustls.workspace = true
+rustls-rustcrypto.workspace = true
+sha2.workspace = true
+# archive::Extracted
+tar.workspace = true
+flate2.workspace = true
+lzma-rust2.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 # For `#[rustible::integration_test]` in tests/. Path-only on purpose: cargo

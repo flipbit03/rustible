@@ -2,9 +2,11 @@
 //! collection.
 
 pub mod apt;
+pub mod archive;
 pub mod file;
 pub mod group;
 pub mod hostname;
+pub mod http;
 pub mod shell;
 pub mod ssh;
 pub mod sysctl;
