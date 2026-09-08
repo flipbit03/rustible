@@ -1,0 +1,24 @@
+# M7 prep done-when log (lead, 2026-09-08 15:04 UTC)
+
+$ cargo package -p <each publishable crate> --no-verify --allow-dirty
+rustible-sdk     Packaged 21 files, 143.8KiB (39.2KiB compressed)
+rustible-macros  Packaged 25 files, 29.6KiB (9.3KiB compressed)
+rustible-build   Packaged 6 files, 22.9KiB (7.7KiB compressed)
+rustible-std     Packaged 29 files, 379.1KiB (77.9KiB compressed)
+rustible-github  Packaged 6 files, 9.4KiB (3.6KiB compressed)
+rustible         Packaged 6 files, 11.6KiB (4.1KiB compressed)
+rustible-cli     Packaged 31 files, 170.0KiB (45.7KiB compressed)
+
+$ cargo build -p rustible-cli --profile dist --target <musl triples>
+x86_64-unknown-linux-musl: 1641224 bytes, ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV)
+aarch64-unknown-linux-musl: 1405344 bytes, ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV)
+
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+   Generated /home/cadu/w/cadu/rustible-m7/target/doc/rustible/index.html and 6 other files
+
+$ cargo build --manifest-path examples/workspace/Cargo.toml
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+
+$ cargo test --workspace  => 366 passed, 0 failed
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests  => 268 unit + 6 container tests, all green (apt absent 19.6s, apt present 10.5s, file line 0.9s, sysctl 0.9s, systemd 2.3s, systemd image 1.6s)

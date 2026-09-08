@@ -36,7 +36,7 @@ pub enum CopySource {
 ///
 /// `check` compares bytes and, when given, mode and owner. A content change
 /// is shown as a unified diff when both old and new content are UTF-8 and
-/// under [`TEXT_DIFF_LIMIT`], otherwise as `<n> bytes -> <m> bytes`. Fails
+/// under `TEXT_DIFF_LIMIT`, otherwise as `<n> bytes -> <m> bytes`. Fails
 /// if `dest` exists and is not a regular file (vision 6.7: use
 /// [`super::Absent`] first to replace a directory or a link).
 #[derive(Debug, Clone)]

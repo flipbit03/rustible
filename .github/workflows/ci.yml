@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Format, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-check-cargo-
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - run: cargo test --workspace
+
+      # `--lib` keeps the `rustible` facade crate's docs from colliding with
+      # the `rustible` binary of rustible-cli in the output directory.
+      - name: Rustdoc must be warning-free
+        run: cargo doc --workspace --no-deps --lib
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Kept in step with `rust-version` in the workspace manifest. Let-chains
+      # need 1.88, so this is a real floor, not a guess.
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - run: cargo check --workspace --all-targets
+
+  example-workspace:
+    name: Example workspace builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `examples/workspace` is excluded from the workspace on purpose: it is a
+      # user's workspace, wired to these crates by path, and it exercises the
+      # generated build script and the playbook registry.
+      - run: cargo build --manifest-path examples/workspace/Cargo.toml
+
+  harness:
+    name: Container ops (Docker harness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-harness-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-harness-cargo-
+
+      # The harness builds each test as a static musl binary and runs it inside
+      # the images the test names; without RUSTIBLE_INTEGRATION=1 these tests
+      # skip themselves (vision 8, tier 3).
+      - name: Integration tests in containers
+        run: cargo test -p rustible-std --tests
+        env:
+          RUSTIBLE_INTEGRATION: "1"

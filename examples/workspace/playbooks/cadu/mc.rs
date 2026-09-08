@@ -26,6 +26,8 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     let name = format!("{} present", vars.package);
     let mut present = apt::Present::new([vars.package.as_str()]);
     if vars.update_cache {
+        // `update_cache` takes the age at which the apt lists count as stale;
+        // ZERO means "always refresh before installing".
         present = present.update_cache(Duration::ZERO);
     }
     let pkg = ctx.step(name, present)?;

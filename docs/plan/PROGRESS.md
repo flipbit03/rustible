@@ -7,14 +7,14 @@ Updated by whoever is working; read first on every resume.
 |---|---|---|
 | M1 foundation | merged | PR #1, 2026-09-08; ARM VM leg deferred (VM unreachable for an hour), see logs/M1-arm.txt |
 | M2 inventory | merged | PR #4, 2026-09-08; review: 10 fixes applied by the lead; --check-vars recommendation recorded for M3 |
-| M3 real run | in-progress (m3-run) | subagent, started after M2 merged |
+| M3 real run | pr-open (#10) | done-when block run verbatim three times, ARM legs verified (connect, cross build, upload, cached rerun, sudo escalation); under review by the lead; conflicts with main in examples/workspace/playbooks/cadu/mc.rs (both branches fixed the apt Duration change) |
 | M4 init | merged | PR #2, 2026-09-08; review: 10 findings, 9 fixed, 1 recorded as proposed amendment |
-| M5 elevated/cancel/streaming | in-progress (m5-elevated-streaming) | subagent, unattended run 1; ARM VM may be down |
-| M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` merged (PR #6); `file` family merged (PR #7); apt-Absent/Latest+hostname+sysctl merged (PR #9); `systemd` pr-open (#8, reviewed, merging); http::Download, archive::Extracted, shell extras todo |
+| M5 elevated/cancel/streaming | pr-open (#12) | Elevated helper (all thirteen Backend primitives), Cancel, file/secret streaming and fetch, protocol 3; verified on local and the ARM VM; must merge main AFTER PR #10 lands (both rewrite runtime.rs, transport.rs, main.rs) |
+| M6 stdlib wave one | in-progress | merged: `ssh::authorized_keys` (#3), `user`+`group` (#6), `file` family (#7), apt-Absent/Latest+hostname+sysctl (#9), `systemd` (#8); in progress: `m6-net-archive` (http::Download, archive::Extracted), `m6-shell-tests` (shell extras, container tests for file/user/group/keys, two PR-#6 follow-ups); remaining: rustible-github |
 | M6 rustible-github | todo | |
 | M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
-| M7 release prep | todo | workflow + dry run only; publishing is Cadu's |
+| M7 release prep | partly done | CI and release workflows merged (PR #11), all four CI jobs green on GitHub, seven crates package cleanly, both musl dist builds verified; README rewrite and the rustdoc pass wait for M3; publishing is Cadu's |
 
 ## Log
 (append one line per event: date, milestone, what happened)
@@ -34,3 +34,7 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 12:45 UTC  M6  Docker harness merged as PR #5 (container-side marker, Drop guard, timeout, fail-not-skip when enabled; verified on debian/ubuntu and jrei systemd images)
 - 2026-09-08 11:08 UTC  M6  user/group merged as PR #6 after review (optional groups, uid-taken guard on existing accounts, private-gid guess dropped, useradd HOME= default, tool probing, absolute-home check); PRs #8 systemd and #9 small-ops open for review
 - 2026-09-08 14:53 UTC  M6  small ops merged as PR #9 after review (apt::Present predicts only with a known candidate, apply works from the diff, hostname limited to HOST_NAME_MAX; container tests re-run green)
+- 2026-09-08 14:54 UTC  M6  systemd merged as PR #8 after review (no code changes needed; container test re-run green on both jrei images). ARM VM came back up: M3 and M5 agents restarted to run their ARM legs
+- 2026-09-08 14:56 UTC  M6,M3,M5  ARM VM back up: agents `m3-arm` and `m5-arm` running the ARM legs on the existing m3-run and m5-elevated-streaming worktrees. M6 wave two started: `m6-net-archive` and `m6-shell-tests`. Lead is on M7 prep (CI and release workflows).
+- 2026-09-08 15:08 UTC  M7  prep merged as PR #11: .github/workflows/ci.yml (gate, MSRV 1.88, example workspace, Docker harness) and release.yml (version patch, seven crates in dependency order with index-lag retries, musl + macOS binaries). All four CI jobs passed on the PR itself. Two real breakages fixed on the way: examples/workspace had stopped compiling after the apt update_cache signature change, and cargo doc failed on three bad doc links. README rewrite and the full rustdoc pass wait for M3. NOTE for Cadu: pushing .github/workflows over the https remote is rejected (the gh OAuth token has no `workflow` scope); pushed over ssh instead, or run `gh auth refresh -s workflow`.
+- 2026-09-08 15:16 UTC  M3,M5,M6  PR #10 (M3) and PR #12 (M5) open, both with their ARM legs verified. Review running on #10. Merge order is #10 then #12, because M5 and M3 both rewrite runtime.rs, transport.rs and main.rs. M6 wave two in flight: net/archive, shell+container tests, github collection.
