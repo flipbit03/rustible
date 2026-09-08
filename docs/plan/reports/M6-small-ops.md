@@ -1,0 +1,251 @@
+# M6 report: `apt::{Absent, Latest}`, `apt::Present::update_cache(Duration)`, `hostname::Is`, `sysctl::Present`
+
+**Branch:** `m6-small-ops`. **Run:** unattended run 1, 2026-09-08, subagent.
+**Brief:** the `apt`, `hostname` and `sysctl` rows of `docs/plan/M6.md` plus
+the wave-one template in `docs/06_BUILD_PLAN.md` section 4; governing vision
+sections 6.2, 6.3, 6.7, 6.8, 7, 8, 12, 13.
+**Done-when log:** `docs/plan/logs/M6-small-ops-done.txt`.
+**Tests:** 67 in the three modules (63 new; the four pre-existing
+`apt::Present` tests stay, one adjusted to assert that no `stat` or
+`apt-get update` runs without `update_cache`).
+
+## What was built
+
+### `crates/rustible-std/src/apt.rs` (extended)
+
+1. **Pure parsers**, all public and string-tested: `parse_dpkg_status`
+   (`${Status}\t${Version}` into `DpkgStatus::{Unknown, Installed,
+   ConfigFiles, Other}`), `parse_policy` (`Installed:` and `Candidate:` lines
+   of `apt-cache policy`, `(none)` and empty output both mapping to `None`),
+   `parse_stat_mtime`.
+2. **`Present::update_cache(Duration)`** replaces `update_cache(bool)`.
+   `apply` (only reached when something is missing) runs `apt-get update`
+   when the lists are older than the given max age; `Duration::ZERO` always
+   updates. The age is the mtime of `/var/lib/apt/lists`, falling back to
+   `/var/cache/apt/pkgcache.bin`, read with `stat -c %Y` through `sys.cmd`;
+   when neither can be read the cache counts as stale.
+3. **`Absent::new([..]).purge(bool).autoremove(bool)`** → `RemoveReport {
+   removed: Vec<Package>, not_present: Vec<String> }`. `check` asks
+   `dpkg-query` per name: `install ok installed` is present; `deinstall ok
+   config-files` is present only with `purge` (so a plain `Absent` after a
+   plain remove is `ok`, a purging one is `changed`); any other dpkg state
+   fails the step naming it. `apply` runs `apt-get remove -y <names>` (or
+   `purge -y`), then `apt-get autoremove -y` (`--purge` when purging) when
+   asked and something was removed. Versions are known from dpkg, so the
+   prediction is exact and `apply` returns it.
+4. **`Latest::new([..]).update_cache(Duration).install_recommends(bool)`** →
+   `UpgradeReport { upgraded: Vec<(Package, String)>, installed:
+   Vec<Package>, current: Vec<Package> }`. `check` compares the installed
+   version from `dpkg-query` with the candidate from `apt-cache policy`; a
+   name with no candidate fails the step ("unknown name, or the lists need
+   `apt-get update`"). `apply` refreshes the cache per `update_cache`, then
+   `apt-get install -y [--no-install-recommends] <missing>` and `apt-get
+   install -y --only-upgrade <outdated>` as two commands, and reports the
+   versions dpkg has afterwards. Predicts with the candidate versions.
+5. **`require_apt_root`**: every apt op refuses on a non-apt host
+   (`facts.package_manager`) and without root, before running anything.
+   `check` runs only `dpkg-query`, `apt-cache policy` and `stat`.
+6. Module docs name `ansible.builtin.apt` and each `state`, and spell out
+   what `update_cache` does and does not do in `check` (see Decisions).
+
+### `crates/rustible-std/src/hostname.rs` (new)
+
+`Is::new(name)` → `HostnameReport { previous, current }`. `validate_hostname`
+(pure, public) accepts RFC 1123 labels of at most 63 characters joined by
+dots, 253 in all, letters, digits and hyphens, no leading or trailing hyphen;
+`check` fails on anything else. `check` reads `/etc/hostname` and
+`/proc/sys/kernel/hostname` through `sys` (a missing file reads as
+`absent`; an unreadable `/proc` falls back to `facts.hostname`) and is
+satisfied when both equal the name; the diff lists whichever differ.
+`apply` runs `hostnamectl set-hostname <name>` when `facts.init ==
+Init::Systemd`, else writes `/etc/hostname` atomically and runs `hostname
+<name>`. Needs root. `previous` is the kernel hostname before the step.
+Rustdoc names `ansible.builtin.hostname`.
+
+### `crates/rustible-std/src/sysctl.rs` (new)
+
+`Present::new(key, value).file(path).apply_now(bool)` → `SysctlReport { key,
+value, previous_live: Option<String>, file: PathBuf }`. Pure, public:
+`validate_key` (`[A-Za-z0-9_./-]`), `proc_path` (dots to slashes under
+`/proc/sys`), `normalize` (token-wise comparison), `parse_line` (comments,
+blanks, `key=value` and `key = value`, sysctl's leading `-` marker),
+`value_in` (last line wins, as sysctl reads it), and `plan_sysctl_line`
+(rewrite the first line for the key in place, drop later duplicates, append
+when missing, `None` when exactly one matching line already carries the
+value). `check` reads the drop-in (default `/etc/sysctl.d/99-rustible.conf`;
+missing file is fine, missing directory is refused) and the live value from
+`/proc/sys/<key>`; changed when either differs. With `apply_now` (default
+on) a key the kernel lacks is refused; with `.apply_now(false)` it is
+persisted only and `previous_live` is `None`. `apply` writes the file
+atomically when it differs and runs `sysctl -w key=value` when the live
+value differs. Needs root; `check` runs no commands at all. Rustdoc names
+`ansible.posix.sysctl`.
+
+`crates/rustible-std/src/lib.rs` gains `pub mod hostname; pub mod sysctl;`.
+
+## Usage
+
+```rust
+use std::time::Duration;
+use rustible_std::{apt, hostname, sysctl};
+
+ctx.step("Install nginx and curl",
+    apt::Present::new(["nginx", "curl"]).update_cache(Duration::from_secs(3600)))?;
+let gone = ctx.step("Remove apache2",
+    apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
+ctx.log(format!("removed {} package(s)", gone.removed.len()));
+let up = ctx.step("Keep openssl current",
+    apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
+for (pkg, from) in &up.upgraded { ctx.log(format!("{}: {from} -> {}", pkg.name, pkg.version)); }
+
+let name = ctx.step("Hostname", hostname::Is::new("HOME-GAMES"))?;
+if name.changed { ctx.step("avahi restarted", systemd::Restart::new("avahi-daemon"))?; }
+
+ctx.step("IP forwarding on", sysctl::Present::new("net.ipv4.ip_forward", "1"))?;
+ctx.step("Persist only (container)",
+    sysctl::Present::new("vm.swappiness", "10").file("/etc/sysctl.d/10-vm.conf").apply_now(false))?;
+```
+
+## Verified
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test --workspace`: clean (log).
+- `cargo test -p rustible-std apt`: 31 tests. Pure: dpkg status variants
+  (installed, config-files, empty, other, no tab), policy with both
+  versions, `(none)` installed, unknown package (empty and `(none)`
+  candidate), stat mtime. `Present`: the four existing tests; stale lists
+  run `apt-get update` before `install` with the exact `stat` argv; fresh
+  lists skip it; `Duration::ZERO` updates without `stat`; fallback to
+  `pkgcache.bin`, and unknown age updates; non-root refusal runs nothing.
+  `Absent`: satisfied when not installed; change with exact `apt-get remove
+  -y apache2` and the mixed report; purge with `purge -y` and `autoremove -y
+  --purge` in order; autoremove without purge; config-files present only
+  when purging (rendered diff); half-configured refused; wrong pm and
+  non-root refusals run nothing; apply without prediction refused; check
+  mode through `ctx.step` predicts and runs only `dpkg-query`. `Latest`:
+  satisfied at candidate; upgrade with exact `--only-upgrade` argv and the
+  `(Package, from)` prediction; missing package installed with
+  `--no-install-recommends`; mixed install, upgrade and current in two
+  commands with `install_recommends(true)`; unknown package refused; wrong
+  pm and non-root; `update` runs before `install` and not in `check`; check
+  mode runs only `dpkg-query` and `apt-cache`.
+- `cargo test -p rustible-std hostname`: 15 tests. Pure: valid names
+  (uppercase, FQDN, digits, 63-char label) and invalid ones (empty,
+  underscore, space, leading and trailing hyphen, empty label, 64-char
+  label, over 253). Fake: satisfied; file-only and kernel-only changes with
+  the rendered diff and `previous`; missing `/etc/hostname` as `absent`;
+  facts fallback; systemd apply with exact `hostnamectl` argv and the file
+  left to it; non-systemd apply writing the file and running `hostname`;
+  creating a missing `/etc/hostname`; invalid name and non-root refusals;
+  apply without prediction refused; check mode through `ctx.step` predicts,
+  writes nothing, runs nothing; changed then ok across two steps.
+- `cargo test -p rustible-std sysctl`: 21 tests. Pure: key validation,
+  proc path, line parsing, append, replace in place, satisfied regardless
+  of spacing and tabs, duplicate collapsing (and `value_in` last-wins),
+  no prefix or comment match. Fake: satisfied; file-only change writes
+  without `sysctl`; live-only change runs exact `sysctl -w`; both; persist
+  only; missing `/proc` key refused unless persist-only; custom file;
+  missing directory refused; token-wise multi-value comparison; bad key,
+  newline value and non-root refusals; apply without prediction refused;
+  check mode through `ctx.step` predicts, writes nothing, runs nothing;
+  changed then ok across two steps.
+- Container tests (harness merged into main at f7471aa while this PR was
+  open), run with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test
+  <file> -- --nocapture`, full output in the log:
+  - `tests/it_apt_absent.rs`: `Absent` on a missing package is `ok` with the
+    name in `not_present`; `Present` installs `sl` (`update_cache(ZERO)`);
+    `Absent::new(["sl"]).purge(true).autoremove(true)` changed then ok, the
+    removed entry carries the dpkg version, `/usr/games/sl` is gone and
+    `dpkg-query` no longer says installed. debian:12 3.4s, ubuntu:24.04 9.6s
+    (apt-get update dominates), wall 14.4s.
+  - `tests/it_sysctl_present.rs` (`.apply_now(false)`, containers cannot
+    write `/proc/sys`): on debian:12, which ships no `/etc/sysctl.d`, the
+    missing-directory refusal is asserted first and the directory created;
+    then `net.ipv4.ip_forward = 1` changed then ok with `previous_live` read
+    from `/proc/sys`; a second key appends; flipping the first rewrites its
+    line in place (file asserted byte for byte); a key the kernel lacks is
+    refused live and persisted with `previous_live == None`. 0.3s per image,
+    wall 1.2s.
+  - `tests/it_apt_present.rs` (pre-existing) adjusted to
+    `update_cache(Duration::ZERO)`; still passes: debian:12 2.1s,
+    ubuntu:24.04 9.0s, wall 11.7s.
+- Nothing was run against a real host: every apt, hostname and sysctl op
+  needs root, and the protocol forbids sudo on this VM.
+
+## Deviations
+
+- The apt lists' age comes from `stat -c %Y` via `sys.cmd`, not `sys.stat`:
+  the SDK's `Stat` has no mtime and the SDK is out of scope for this op.
+- `hostname::Is::check` reads `/proc/sys/kernel/hostname` through `sys`
+  rather than `sys.facts().hostname` (facts only as a fallback), so a second
+  step in one run is `ok` after `apply`.
+- `sysctl::Present` uses a local planner, not `file::plan_line`, because
+  `key=value` and `key = value` must compare equal.
+- `apt::Latest` also has `.install_recommends(bool)` (mirrors `Present`).
+- No `update_cache_always()`; `update_cache(Duration::ZERO)` is the spelling.
+- After merging main (9379095): the sysctl drop-in is read through the shared
+  `file::read_text_or_empty` (symlink and directory refusals for free); the
+  parent-directory check stays local. After merging main again (f7471aa):
+  container tests added, harness TODOs removed.
+
+## Decisions
+
+Recorded in `docs/plan/DECISIONS.md` under `[M6-so]`:
+
+- `update_cache(bool)` → `update_cache(Duration)`; no `update_cache_always()`.
+- Lists' age via `stat -c %Y` through `sys.cmd` (no `Stat.mtime`; m6-file-ops
+  is editing `backend/mod.rs`).
+- `apt::Latest` refreshes in `apply` only (vision 6.8), so stale lists can
+  make it report `ok`. **Proposed amendment for Cadu:** let `Latest::check`
+  run `apt-get update` when the lists are older than `max_age`, as Ansible
+  does in check mode; a command is not a file mutation under 7.3.
+- All apt ops, `Present` included, refuse without root.
+- `apt::Absent` fails on half-configured or unpacked packages instead of
+  guessing.
+- `apt::Latest::install_recommends(bool)`, default off.
+- `hostname::Is` reads the live kernel name through `sys`; validation in
+  `check`; dotted FQDNs and uppercase accepted.
+- `sysctl::Present` has its own planner; refuses a missing drop-in
+  directory and, when applying live, a missing `/proc/sys` key; `apply`
+  re-plans from the current file (`Diff::Attrs`, not `Diff::Text`).
+
+## Self-review
+
+Run by the lead on the PR.
+
+### Self-review (lead, PR #9)
+
+Reviewed by the lead against vision 6.2, 6.8 and 12. Three fixes applied on
+the branch before merge:
+
+- **`apt::Present` no longer predicts an empty version.** `check` asks
+  `apt-cache policy` for the candidate of every missing package and predicts
+  that; when the lists cannot name one (a stock image with no lists, an
+  unknown name, no runnable `apt-cache`) the plan carries no prediction at
+  all, so a check-mode run that chains from the step stops with the vision's
+  message instead of receiving `version: ""`. Tests:
+  `present_predicts_the_candidate_version_when_the_lists_know_it`,
+  `present_does_not_predict_when_the_lists_have_no_candidate`.
+- **`apt::Present::apply` works from the diff, not the prediction.** It used
+  `change.predicted.unwrap_or_default()`, so a change without a prediction
+  would have run `apt-get install -y` with no package arguments and reported
+  success. It now installs exactly the names `check` planned (vision 6.2),
+  refuses a plan that names none, and rebuilds the report from what dpkg has
+  after the install. Tests:
+  `present_apply_installs_what_the_plan_named_and_rereads_versions`,
+  `present_apply_refuses_a_plan_with_no_packages`.
+- **`hostname::Is` rejects names over 64 characters**, the kernel's
+  `HOST_NAME_MAX` and systemd's limit, instead of accepting DNS-legal names up
+  to 253 that `hostnamectl set-hostname` then refuses with its own message.
+
+Verification after the fixes: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace`
+(rustible-std: 168 unit tests), and the three container tests re-run with
+`RUSTIBLE_INTEGRATION=1` on debian:12 and ubuntu:24.04 (apt absent 14.6 s,
+apt present 9.2 s, sysctl 0.9 s, all green).
+
+Left as the agent proposed, for Cadu: `apt::Latest` refreshes the cache in
+`apply` only (vision 6.8 places it there), so a stale list can make a package
+look current in `check` and stay unupgraded. Ansible refreshes during check.
+This is a vision question, not a bug in the branch.
+

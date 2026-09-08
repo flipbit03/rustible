@@ -1,6 +1,8 @@
 //! Docker integration test for `apt::Present` (vision 8, tier 3).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present`.
 
+use std::time::Duration;
+
 use rustible::prelude::*;
 use rustible::sdk::testing::changed_then_ok;
 use rustible_std::apt;
@@ -11,7 +13,7 @@ fn present_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     // Stock images ship without package lists; `update_cache` runs
     // `apt-get update` in apply, so only the first step pays for it.
     let (first, second) = changed_then_ok(ctx, "install sl", || {
-        apt::Present::new(["sl"]).update_cache(true)
+        apt::Present::new(["sl"]).update_cache(Duration::ZERO)
     })?;
     assert_eq!(first.installed.len(), 1);
     assert_eq!(first.installed[0].name, "sl");
