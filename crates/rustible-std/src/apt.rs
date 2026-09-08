@@ -328,7 +328,7 @@ impl Op for Present {
             "apt::Present::apply: the plan names no package to install"
         );
         if let Some(max_age) = self.update_cache {
-            let _refreshed = update_cache_if_stale(sys, max_age)?;
+            update_cache_if_stale(sys, max_age)?;
         }
         let mut cmd = apt_get(sys).args(["install", "-y"]);
         if !self.install_recommends {
