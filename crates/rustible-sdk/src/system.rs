@@ -168,9 +168,16 @@ impl System {
         Ok(self.backend.stat(p).map_err(Self::io(p))?.is_some())
     }
 
+    /// `lstat`: a symlink reports `FileKind::Symlink`.
     pub fn stat(&self, p: impl AsRef<Path>) -> Result<Option<Stat>> {
         let p = p.as_ref();
         self.backend.stat(p).map_err(Self::io(p))
+    }
+
+    /// `stat` that follows symlinks: a link to a directory reports `Dir`.
+    pub fn stat_follow(&self, p: impl AsRef<Path>) -> Result<Option<Stat>> {
+        let p = p.as_ref();
+        self.backend.stat_follow(p).map_err(Self::io(p))
     }
 
     pub fn read(&self, p: impl AsRef<Path>) -> Result<Vec<u8>> {
