@@ -26,8 +26,35 @@ pub fn from_value<T: DeserializeOwned + schemars::JsonSchema>(raw: Value) -> Res
         raw
     };
     let schema = schema_for::<T>();
+    let raw = coerce_scalars_to_lists(&schema, raw);
     validate(&schema, &raw)?;
     serde_json::from_value(raw).map_err(|e| Error::msg(format!("vars: {e}")))
+}
+
+/// An inventory `vars` block cannot spell a one-element list (a single
+/// positional value is a scalar), so where the schema wants a list and the
+/// bag holds a scalar, wrap it. Applied on both sides (orchestrator pre-check
+/// and `Start`) so they agree. Objects and existing arrays pass through.
+pub fn coerce_scalars_to_lists(schema: &Value, raw: Value) -> Value {
+    let Value::Object(mut obj) = raw else {
+        return raw;
+    };
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        for (name, p) in props {
+            let wants_list = resolve(schema, p).get("type").is_some_and(|t| {
+                t == "array" || t.as_array().is_some_and(|a| a.iter().any(|x| x == "array"))
+            });
+            if wants_list
+                && let Some(v) = obj.get_mut(name)
+                && !v.is_array()
+                && !v.is_null()
+            {
+                let scalar = v.take();
+                *v = Value::Array(vec![scalar]);
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 /// Check a vars object against a playbook's schema: every required key
@@ -50,15 +77,21 @@ pub fn validate(schema: &Value, raw: &Value) -> Result<()> {
 /// object cannot be filled from an inventory `vars` block. Returns one
 /// message per offending field.
 pub fn flatness_violations(schema: &Value) -> Vec<String> {
+    non_flat_vars(schema)
+        .into_iter()
+        .map(|name| format!("var `{name}` is an object; vars are flat scalars, lists, or enums"))
+        .collect()
+}
+
+/// The names of the properties `flatness_violations` complains about.
+pub fn non_flat_vars(schema: &Value) -> Vec<String> {
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return vec![];
     };
     props
         .iter()
         .filter(|(_, p)| is_object_schema(schema, resolve(schema, p)))
-        .map(|(name, _)| {
-            format!("var `{name}` is an object; vars are flat scalars, lists, or enums")
-        })
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -97,6 +130,39 @@ fn is_object_schema(root: &Value, p: &Value) -> bool {
 /// shared across playbooks), but worth a warning, especially when one is
 /// within an edit or two of a declared name.
 pub fn unknown_key_warnings(schema: &Value, raw: &Value) -> Vec<String> {
+    unknown_keys(schema, raw)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// A key the playbook does not declare, with the nearest declared name if
+/// one is close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    pub key: String,
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.suggestion {
+            Some(near) => write!(
+                f,
+                "var `{}` is not declared by this playbook; did you mean `{near}`?",
+                self.key
+            ),
+            None => write!(
+                f,
+                "var `{}` is not declared by this playbook (ignored)",
+                self.key
+            ),
+        }
+    }
+}
+
+/// Keys in `raw` that the schema does not declare, structured.
+pub fn unknown_keys(schema: &Value, raw: &Value) -> Vec<UnknownKey> {
     let declared: Vec<&str> = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -107,11 +173,9 @@ pub fn unknown_key_warnings(schema: &Value, raw: &Value) -> Vec<String> {
     };
     obj.keys()
         .filter(|k| !declared.contains(&k.as_str()))
-        .map(|k| match did_you_mean(k, declared.iter().copied()) {
-            Some(near) => {
-                format!("var `{k}` is not declared by this playbook; did you mean `{near}`?")
-            }
-            None => format!("var `{k}` is not declared by this playbook (ignored)"),
+        .map(|k| UnknownKey {
+            key: k.clone(),
+            suggestion: did_you_mean(k, declared.iter().copied()).map(str::to_string),
         })
         .collect()
 }
@@ -469,6 +533,26 @@ mod tests {
         );
         assert_eq!(did_you_mean("prot", ["port", "post"]), Some("port"));
         assert_eq!(did_you_mean("zzzzz", ["port"]), None);
+    }
+
+    #[derive(serde::Deserialize, schemars::JsonSchema, Debug, PartialEq)]
+    struct Lists {
+        packages: Vec<String>,
+        ports: Option<Vec<u16>>,
+    }
+
+    #[test]
+    fn scalar_for_a_list_field_becomes_a_one_element_list() {
+        let v: Lists = from_value(serde_json::json!({"packages": "nginx", "ports": 22})).unwrap();
+        assert_eq!(
+            v,
+            Lists {
+                packages: vec!["nginx".into()],
+                ports: Some(vec![22])
+            }
+        );
+        let v: Lists = from_value(serde_json::json!({"packages": []})).unwrap();
+        assert_eq!(v.packages, Vec::<String>::new());
     }
 
     #[test]

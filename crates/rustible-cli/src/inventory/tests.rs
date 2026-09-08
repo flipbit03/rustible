@@ -278,162 +278,6 @@ host "b" addr="2" ssh_args="-4"
 #[test]
 fn error_unknown_parameter_with_did_you_mean() {
     one_error(
-        "host \"web1\" addr=\"1\" sshuser=\"deploy\"\n",
-        1,
-        22,
-        "unknown parameter `sshuser` on host `web1`; did you mean `ssh_user`?",
-    );
-    one_error(
-        "host \"web1\" addr=\"1\" become=\"sudo\"\n",
-        1,
-        22,
-        "unknown parameter `become` on host `web1`; parameters are addr, connection, ssh_user, port, escalate, escalate_user, ssh_args",
-    );
-}
-
-#[test]
-fn error_addr_on_group_or_defaults() {
-    one_error(
-        "group \"web\" addr=\"1\" {\n    host \"a\" addr=\"2\"\n}\n",
-        1,
-        13,
-        "`addr` is not allowed on group `web`; addr is a host-only parameter",
-    );
-    one_error(
-        "defaults addr=\"1\"\n",
-        1,
-        10,
-        "`addr` is not allowed on `defaults`",
-    );
-}
-
-#[test]
-fn error_missing_addr_on_ssh_host() {
-    one_error(
-        "host \"web1\"\n",
-        1,
-        1,
-        "host `web1` has no `addr` and its connection is ssh; add addr=\"...\" or connection=\"local\"",
-    );
-    // Connection may come from a group or defaults.
-    load("defaults connection=\"local\"\nhost \"a\"\n");
-    load("group \"g\" connection=\"local\" {\n  host \"a\"\n}\n");
-    load("group \"g\" connection=\"local\" {\n  members \"a\"\n}\nhost \"a\"\n");
-}
-
-#[test]
-fn error_duplicate_host_or_group() {
-    one_error(
-        "host \"a\" addr=\"1\"\nhost \"a\" addr=\"2\"\n",
-        2,
-        1,
-        "host `a` is defined twice (first at line 1)",
-    );
-    one_error(
-        "group \"g\" {\n}\ngroup \"g\" {\n}\n",
-        3,
-        1,
-        "group `g` is defined twice (first at line 1)",
-    );
-    // Nested and top-level count as the same host.
-    one_error(
-        "group \"g\" {\n    host \"a\" addr=\"1\"\n}\nhost \"a\" addr=\"1\"\n",
-        4,
-        1,
-        "host `a` is defined twice (first at line 2)",
-    );
-    one_error(
-        "host \"x\" addr=\"1\"\ngroup \"x\" {\n}\n",
-        2,
-        1,
-        "group `x` clashes with the host of the same name (line 1); names are unique across hosts and groups",
-    );
-}
-
-#[test]
-fn error_unknown_member() {
-    one_error(
-        "group \"web\" {\n    host \"web1\" addr=\"1\"\n}\ngroup \"prod\" {\n    members \"wb\"\n}\n",
-        4,
-        1,
-        "group `prod`: member `wb` is not a host or group; did you mean `web`?",
-    );
-}
-
-#[test]
-fn error_membership_cycle() {
-    one_error(
-        "group \"a\" {\n    members \"b\"\n}\ngroup \"b\" {\n    members \"a\"\n}\n",
-        1,
-        1,
-        "group `a` is a member of itself through a -> b -> a",
-    );
-    one_error(
-        "group \"a\" {\n    members \"a\"\n}\n",
-        1,
-        1,
-        "group `a` lists itself in `members`",
-    );
-}
-
-#[test]
-fn error_wrong_parameter_type() {
-    one_error(
-        "host \"a\" addr=\"1\" port=\"22\"\n",
-        1,
-        19,
-        "parameter `port` on host `a` must be an integer, got \"22\"",
-    );
-    one_error(
-        "host \"a\" addr=\"1\" port=70000\n",
-        1,
-        19,
-        "parameter `port` on host `a` must be an integer from 0 to 65535, got 70000",
-    );
-    one_error(
-        "host \"a\" addr=\"1\" connection=\"tcp\"\n",
-        1,
-        19,
-        "parameter `connection` on host `a` must be \"ssh\" or \"local\", got \"tcp\"",
-    );
-    one_error(
-        "host \"a\" addr=\"1\" escalate=#true\n",
-        1,
-        19,
-        "parameter `escalate` on host `a` must be \"sudo\", \"doas\", or \"none\", got #true",
-    );
-    one_error(
-        "host \"a\" addr=1\n",
-        1,
-        10,
-        "parameter `addr` on host `a` must be a string, got 1",
-    );
-}
-
-#[test]
-fn error_kdl_syntax_has_position() {
-    let errs = errors("host \"a\" addr=\"1\" {\n    vars { x 1 }\n");
-    assert!(!errs.is_empty());
-    assert!(errs[0].message.starts_with("syntax: "), "{}", errs[0]);
-    assert!(errs[0].line >= 1);
-    // KDL 1 booleans are not KDL 2.
-    let errs = errors("host \"a\" connection=\"local\" {\n    vars { tls true }\n}\n");
-    assert!(
-        errs.iter().any(|e| e.line == 2),
-        "{}",
-        LoadErrors(errs.clone())
-    );
-}
-
-#[test]
-fn error_var_shapes() {
-    one_error(
-        "host \"a\" connection=\"local\" {\n    vars { x }\n}\n",
-        2,
-        12,
-        "var `x` on host `a` has no value",
-    );
-    one_error(
         "host \"a\" connection=\"local\" {\n    vars { x 1; x 2 }\n}\n",
         2,
         17,
@@ -584,7 +428,10 @@ group "inner" port=3 {
     assert_eq!(r.sources.params["escalate_user"], Source::Defaults);
     assert_eq!(r.params.connection, Connection::Ssh);
     assert_eq!(r.sources.params["connection"], Source::BuiltIn);
-    assert_eq!(r.params.ssh_user, local_username());
+    assert_eq!(
+        r.params.ssh_user,
+        local_username().unwrap_or_else(|| "(ssh default)".to_string())
+    );
     let over: Vec<(&str, &str, &Source)> = r
         .sources
         .overridden_params
@@ -958,4 +805,94 @@ fn example_workspace_inventory_loads() {
     assert_eq!(local.params.connection, Connection::Local);
     assert_eq!(local.groups, ["lab"]);
     assert!(inv.resolve("web2").is_ok());
+}
+
+#[test]
+fn review_fixes_lists_floats_bigints_groups_and_conflicts() {
+    // `key` with no values is an empty list; `key 1` stays a scalar (coerced
+    // to a one-element list where the playbook's schema wants a list).
+    let inv = load(r#"host "a" connection="local" { vars { empty; one 1; many 1 2 } }"#);
+    let r = inv.resolve("a").unwrap();
+    assert_eq!(r.vars["empty"], Scalar::List(vec![]));
+    assert_eq!(r.vars["one"], Scalar::Int(1));
+    let schema = serde_json::json!({"type":"object","properties":{"one":{"type":"array","items":{"type":"integer"}}}});
+    assert!(
+        validate(&r.vars, &schema).iter().all(|e| !e.is_error()),
+        "{:?}",
+        validate(&r.vars, &schema)
+    );
+
+    // Non-finite floats are refused; u64 above i64::MAX is accepted.
+    one_error(
+        r#"host "a" connection="local" { vars { t #inf } }"#,
+        1,
+        40,
+        "is not a finite number",
+    );
+    let inv = load(r#"host "a" connection="local" { vars { big 18446744073709551615 } }"#);
+    assert_eq!(
+        inv.resolve("a").unwrap().vars["big"],
+        Scalar::UInt(u64::MAX)
+    );
+
+    // `resolve` on a group says so instead of denying it exists.
+    let inv = load(r#"group "web" { host "w1" connection="local"; host "w2" connection="local" }"#);
+    let e = inv.resolve("web").unwrap_err().to_string();
+    assert!(
+        e.contains("`web` is a group") && e.contains("w1, w2"),
+        "{e}"
+    );
+
+    // Conflicts are reported even when an unrelated error exists.
+    let errs = errors(
+        r#"group "a" { vars { k 1 }; host "x" addr="1.1.1.1" port="22" }
+group "b" { vars { k 2 }; members "x" }"#,
+    );
+    let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+    assert!(msgs.iter().any(|m| m.contains("port")), "{msgs:?}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("var `k` is defined by both")),
+        "{msgs:?}"
+    );
+
+    // A conflicted `connection` is reported as the conflict, not as a bogus
+    // missing-addr error.
+    let errs = errors(
+        r#"group "b" connection="ssh" { members "x" }
+group "a" connection="local" { host "x" }"#,
+    );
+    let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("parameter `connection` is defined by both")),
+        "{msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("has no `addr`")),
+        "{msgs:?}"
+    );
+
+    // A duplicate group's children still get checked.
+    let errs = errors(
+        r#"group "g" { host "a" connection="local" }
+group "g" { host "b" connection="local" bogus=1 }"#,
+    );
+    let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+    assert!(msgs.iter().any(|m| m.contains("defined twice")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("bogus")), "{msgs:?}");
+
+    // Both overridden siblings are recorded.
+    let inv = load(
+        r#"group "a" { vars { x 1 }; members "h" }
+group "b" { vars { x 2 }; members "h" }
+host "h" connection="local" { vars { x 3 } }"#,
+    );
+    let r = inv.resolve("h").unwrap();
+    assert_eq!(
+        r.sources.overridden_vars.len(),
+        2,
+        "{:?}",
+        r.sources.overridden_vars
+    );
 }

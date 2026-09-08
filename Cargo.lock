@@ -560,6 +560,7 @@ dependencies = [
  "openssh",
  "rustible-build",
  "rustible-sdk",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

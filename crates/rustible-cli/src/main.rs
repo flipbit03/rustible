@@ -169,12 +169,8 @@ async fn run(cli: RunArgs) -> Result<()> {
     let t_start = Instant::now();
     let mut vars_map = serde_json::Map::new();
     for kv in &cli.vars {
-        let Some((k, v)) = kv.split_once('=') else {
-            bail!("--var needs key=value, got `{kv}`");
-        };
-        let value = serde_json::from_str::<serde_json::Value>(v)
-            .unwrap_or(serde_json::Value::String(v.to_string()));
-        vars_map.insert(k.to_string(), value);
+        let (k, v) = rustible_sdk::vars::parse_var(kv).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        vars_map.insert(k, v);
     }
     let vars_json = serde_json::Value::Object(vars_map);
 

@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub enum Scalar {
     Str(String),
     Int(i64),
+    /// Only for values above `i64::MAX`.
+    UInt(u64),
     Float(f64),
     Bool(bool),
     List(Vec<Scalar>),
@@ -25,6 +27,7 @@ impl Scalar {
         match self {
             Scalar::Str(s) => serde_json::Value::String(s.clone()),
             Scalar::Int(i) => serde_json::Value::from(*i),
+            Scalar::UInt(u) => serde_json::Value::from(*u),
             Scalar::Float(f) => serde_json::Value::from(*f),
             Scalar::Bool(b) => serde_json::Value::Bool(*b),
             Scalar::List(items) => {
@@ -40,6 +43,7 @@ impl fmt::Display for Scalar {
         match self {
             Scalar::Str(s) => write!(f, "{s:?}"),
             Scalar::Int(i) => write!(f, "{i}"),
+            Scalar::UInt(u) => write!(f, "{u}"),
             Scalar::Float(x) => write!(f, "{x:?}"),
             Scalar::Bool(true) => f.write_str("#true"),
             Scalar::Bool(false) => f.write_str("#false"),

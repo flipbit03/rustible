@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 rustible-sdk.workspace = true
 rustible-build.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"

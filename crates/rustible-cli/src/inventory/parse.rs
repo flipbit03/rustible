@@ -26,6 +26,8 @@ pub fn parse(src: &str, file: &str) -> Result<Inventory, LoadErrors> {
         seen_top_vars: None,
         seen_defaults: None,
         bad_addr: vec![],
+        structural_errors: false,
+        conflicted: std::collections::HashSet::new(),
     };
     match KdlDocument::parse_v2(src) {
         Ok(doc) => {
@@ -34,8 +36,10 @@ pub fn parse(src: &str, file: &str) -> Result<Inventory, LoadErrors> {
             }
             p.check_members();
             p.check_cycles();
-            p.check_addr();
+            // Conflicts before addr: a conflicted `connection` must not turn
+            // into a misleading "no addr" error.
             p.check_conflicts();
+            p.check_addr();
         }
         Err(e) => {
             for d in &e.diagnostics {
@@ -68,6 +72,12 @@ struct Parser<'a> {
     defined_at: BTreeMap<String, usize>,
     seen_top_vars: Option<usize>,
     seen_defaults: Option<usize>,
+    /// Unknown members or membership cycles were reported; distances are
+    /// then meaningless and the conflict check is skipped.
+    structural_errors: bool,
+    /// (host, parameter or var) pairs with a sibling conflict; `check_addr`
+    /// skips hosts whose `connection` is conflicted.
+    conflicted: std::collections::HashSet<(String, String)>,
     /// Hosts whose `addr` was given but rejected; `check_addr` skips them.
     bad_addr: Vec<String>,
 }
@@ -257,19 +267,23 @@ impl<'a> Parser<'a> {
         };
         let owner = Owner::Group(&name);
         let (params, vars) = self.params_and_children(node, owner, &IN_GROUP);
-        if !self.define("group", &name, at) {
-            return;
+        // A duplicate is reported by `define`; its children are still walked
+        // so their own errors surface in the same run (vision 10.2.3).
+        let duplicate = !self.define("group", &name, at);
+        if duplicate && self.inv.groups.contains_key(&name) {
+            // fall through: hosts nested here attach to the first definition
+        } else {
+            self.inv.groups.insert(
+                name.clone(),
+                Group {
+                    name: name.clone(),
+                    params,
+                    vars,
+                    members: vec![],
+                    hosts: vec![],
+                },
+            );
         }
-        self.inv.groups.insert(
-            name.clone(),
-            Group {
-                name: name.clone(),
-                params,
-                vars,
-                members: vec![],
-                hosts: vec![],
-            },
-        );
         // Second pass over children for what needs the group registered.
         for child in node.iter_children() {
             let cat = child.name().span().offset();
@@ -590,11 +604,11 @@ impl<'a> Parser<'a> {
             if !ok {
                 continue;
             }
+            // `key` with no values is an empty list; `key 1` is a scalar (a
+            // one-element list is spelled the same way and coerced where the
+            // playbook's schema says list); `key 1 2` is a list.
             let value = match items.len() {
-                0 => {
-                    self.err(at, format!("var `{key}` on {owner} has no value"));
-                    continue;
-                }
+                0 => Scalar::List(vec![]),
                 1 => items.pop().expect("one item"),
                 _ => Scalar::List(items),
             };
@@ -625,16 +639,27 @@ impl<'a> Parser<'a> {
     fn scalar(&mut self, at: usize, key: &str, owner: Owner<'_>, v: &KdlValue) -> Option<Scalar> {
         match v {
             KdlValue::String(s) => Some(Scalar::Str(s.clone())),
-            KdlValue::Integer(i) => match i64::try_from(*i) {
-                Ok(i) => Some(Scalar::Int(i)),
-                Err(_) => {
+            KdlValue::Integer(i) => match (i64::try_from(*i), u64::try_from(*i)) {
+                (Ok(i), _) => Some(Scalar::Int(i)),
+                (_, Ok(u)) => Some(Scalar::UInt(u)),
+                _ => {
                     self.err(
                         at,
-                        format!("var `{key}` on {owner}: integer {i} does not fit in 64 bits"),
+                        format!("var `{key}` on {owner}: integer {i} does not fit in a 64-bit signed or unsigned integer"),
                     );
                     None
                 }
             },
+            KdlValue::Float(f) if !f.is_finite() => {
+                self.err(
+                    at,
+                    format!(
+                        "var `{key}` on {owner}: {} is not a finite number and cannot be a var",
+                        render(v)
+                    ),
+                );
+                None
+            }
             KdlValue::Float(f) => Some(Scalar::Float(*f)),
             KdlValue::Bool(b) => Some(Scalar::Bool(*b)),
             KdlValue::Null => {
@@ -649,6 +674,7 @@ impl<'a> Parser<'a> {
     fn check_members(&mut self) {
         let names: Vec<String> = self.defined_at.keys().cloned().collect();
         let mut errs = vec![];
+        let before = self.errors.len();
         for g in self.inv.groups.values() {
             let at = self.defined_at[&g.name];
             for m in &g.members {
@@ -669,11 +695,15 @@ impl<'a> Parser<'a> {
         for (at, msg) in errs {
             self.err(at, msg);
         }
+        if self.errors.len() > before {
+            self.structural_errors = true;
+        }
     }
 
     /// Membership cycles through `members` (group -> group). Each cycle is
     /// reported once, on the first group of the cycle in file order.
     fn check_cycles(&mut self) {
+        let before = self.errors.len();
         let mut reported: Vec<Vec<String>> = vec![];
         let mut errs = vec![];
         for start in self.inv.order.clone() {
@@ -701,6 +731,9 @@ impl<'a> Parser<'a> {
         }
         for (at, msg) in errs {
             self.err(at, msg);
+        }
+        if self.errors.len() > before {
+            self.structural_errors = true;
         }
     }
 
@@ -732,7 +765,12 @@ impl<'a> Parser<'a> {
     fn check_addr(&mut self) {
         let mut errs = vec![];
         for h in self.inv.hosts.values() {
-            if h.params.addr.is_some() || self.bad_addr.contains(&h.name) {
+            if h.params.addr.is_some()
+                || self.bad_addr.contains(&h.name)
+                || self
+                    .conflicted
+                    .contains(&(h.name.clone(), "connection".to_string()))
+            {
                 continue;
             }
             let connection = self
@@ -757,14 +795,16 @@ impl<'a> Parser<'a> {
 
     /// Sibling-group conflicts (vision 10.3), for every host.
     fn check_conflicts(&mut self) {
-        if !self.errors.is_empty() {
-            // Unknown members or cycles make distances meaningless.
+        if self.structural_errors {
+            // Unknown members or cycles make distances meaningless; any
+            // other error (a bad port, an unknown parameter) does not.
             return;
         }
         let mut errs = vec![];
         for name in self.inv.host_names() {
             if let Err(conflicts) = self.inv.resolve_checked(&name) {
                 for c in conflicts {
+                    self.conflicted.insert((name.clone(), c.key.clone()));
                     errs.push((self.defined_at[&name], conflict_message(&c)));
                 }
             }

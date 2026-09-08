@@ -9,7 +9,7 @@
 use std::fmt;
 
 use rustible_sdk::vars::{
-    flatness_violations, missing_required, type_mismatches, unknown_key_warnings,
+    coerce_scalars_to_lists, missing_required, non_flat_vars, type_mismatches, unknown_keys,
 };
 use serde_json::Value;
 
@@ -52,16 +52,15 @@ pub fn validate(vars: &VarBag, schema: &Value) -> Vec<VarError> {
     if schema.is_null() {
         return vec![];
     }
-    let raw = bag_to_json(vars);
+    // Same coercion the binary applies at `Start` (a scalar where the
+    // schema wants a list becomes a one-element list), so both sides agree.
+    let raw = coerce_scalars_to_lists(schema, bag_to_json(vars));
     let mut out = vec![];
-    for (name, msg) in flatness_violations(schema)
-        .into_iter()
-        .map(|m| (var_in(&m), m))
-    {
+    for name in non_flat_vars(schema) {
         out.push(VarError {
+            message: format!("var `{name}` is an object; vars are flat scalars, lists, or enums"),
             var: name,
             severity: Severity::Error,
-            message: msg,
         });
     }
     for name in missing_required(schema, &raw) {
@@ -78,28 +77,14 @@ pub fn validate(vars: &VarBag, schema: &Value) -> Vec<VarError> {
             severity: Severity::Error,
         });
     }
-    // `unknown_key_warnings` walks the object's keys in order; the object
-    // came from a BTreeMap, so the undeclared keys in sorted order line up
-    // with its messages one to one.
-    let declared: Vec<&str> = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .map(|p| p.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    let undeclared = vars.keys().filter(|k| !declared.contains(&k.as_str()));
-    for (name, msg) in undeclared.zip(unknown_key_warnings(schema, &raw)) {
+    for u in unknown_keys(schema, &raw) {
         out.push(VarError {
-            var: name.clone(),
+            message: u.to_string(),
+            var: u.key,
             severity: Severity::Warning,
-            message: msg,
         });
     }
     out
-}
-
-/// The var a message names: the text between its first pair of backticks.
-fn var_in(message: &str) -> String {
-    message.split('`').nth(1).unwrap_or_default().to_string()
 }
 
 /// Per-host results for one playbook, in the order the hosts were selected.

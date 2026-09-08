@@ -130,6 +130,11 @@ pub struct Conflict {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
     UnknownHost(UnknownName),
+    /// The name is a group; `resolve` and `inventory show` take a host.
+    IsGroup {
+        name: String,
+        hosts: Vec<String>,
+    },
     Conflicts(Vec<Conflict>),
 }
 
@@ -137,6 +142,15 @@ impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ResolveError::UnknownHost(u) => write!(f, "{u}"),
+            ResolveError::IsGroup { name, hosts } => write!(
+                f,
+                "`{name}` is a group, and this takes a host; its hosts are: {}",
+                if hosts.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    hosts.join(", ")
+                }
+            ),
             ResolveError::Conflicts(cs) => {
                 for (i, c) in cs.iter().enumerate() {
                     if i > 0 {
@@ -269,6 +283,16 @@ impl Inventory {
     /// Resolve a host. After a successful load conflicts cannot occur, so
     /// the only error is an unknown host name.
     pub fn resolve(&self, host: &str) -> Result<Resolved, ResolveError> {
+        if self.groups.contains_key(host) {
+            let hosts = self
+                .select(host)
+                .map(|hs| hs.iter().map(|h| h.name.clone()).collect())
+                .unwrap_or_default();
+            return Err(ResolveError::IsGroup {
+                name: host.to_string(),
+                hosts,
+            });
+        }
         if !self.hosts.contains_key(host) {
             return Err(ResolveError::UnknownHost(UnknownName {
                 name: host.to_string(),
@@ -337,6 +361,14 @@ impl Inventory {
                                 kind: ConflictKind::Var,
                                 key: k.clone(),
                                 groups: (other.clone(), g.clone()),
+                            });
+                        } else {
+                            // Overridden by a nearer level, like the first
+                            // sibling was; record it so `show` lists both.
+                            sources.overridden_vars.push(Overridden {
+                                key: k.clone(),
+                                value: v.to_string(),
+                                source: Source::Group(g.clone()),
                             });
                         }
                         continue;
@@ -420,7 +452,7 @@ impl Inventory {
             ssh_user: param!(
                 "ssh_user",
                 |p: &HostParams| p.ssh_user.clone(),
-                local_username(),
+                local_username().unwrap_or_else(|| "(ssh default)".to_string()),
                 quoted
             ),
             port: param!("port", |p: &HostParams| p.port, 22, |p: &u16| p.to_string()),
@@ -469,9 +501,22 @@ fn param_is_set(name: &str) -> impl Fn(&HostParams) -> bool {
     }
 }
 
-/// The built-in `ssh_user`: the local username (vision 10.2.1).
-pub fn local_username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "root".to_string())
+/// The built-in `ssh_user`: the local username (vision 10.2.1). `USER`,
+/// then `LOGNAME`, then the current uid's `/etc/passwd` entry. Never a
+/// guess: with none of those, the parameter is left to ssh's own default and
+/// `inventory show` says so.
+pub fn local_username() -> Option<String> {
+    if let Ok(u) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"))
+        && !u.is_empty()
+    {
+        return Some(u);
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        let _ = f.next()?;
+        (f.next()?.parse::<u32>().ok()? == uid).then(|| name.to_string())
+    })
 }
