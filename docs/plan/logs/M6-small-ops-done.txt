@@ -1,0 +1,277 @@
+$ cargo test -p rustible-std apt
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6so/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6so/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.60s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
+
+running 31 tests
+test apt::tests::absent_apply_without_prediction_is_refused ... ok
+test apt::tests::absent_autoremove_without_purge ... ok
+test apt::tests::absent_check_mode_runs_only_dpkg_query_and_predicts ... ok
+test apt::tests::absent_change_and_apply_runs_apt_get_remove ... ok
+test apt::tests::absent_config_files_count_as_present_only_when_purging ... ok
+test apt::tests::absent_purge_uses_apt_get_purge_and_autoremove_purge ... ok
+test apt::tests::absent_refuses_half_configured_package ... ok
+test apt::tests::absent_satisfied_when_not_installed ... ok
+test apt::tests::absent_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::latest_installs_missing_packages ... ok
+test apt::tests::latest_check_mode_runs_only_read_only_commands ... ok
+test apt::tests::latest_refuses_unknown_package ... ok
+test apt::tests::latest_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::latest_satisfied_when_at_candidate ... ok
+test apt::tests::latest_update_cache_runs_before_install ... ok
+test apt::tests::latest_upgrades_with_only_upgrade ... ok
+test apt::tests::parse_dpkg_status_variants ... ok
+test apt::tests::parse_policy_none_means_not_installed ... ok
+test apt::tests::parse_policy_installed_and_candidate ... ok
+test apt::tests::parse_policy_unknown_package_has_no_candidate ... ok
+test apt::tests::parse_stat_mtime_reads_seconds ... ok
+test apt::tests::present_refuses_without_root ... ok
+test apt::tests::latest_mixed_install_upgrade_current ... ok
+test apt::tests::satisfied_when_installed ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::update_cache_skips_update_when_lists_are_fresh ... ok
+test apt::tests::update_cache_falls_back_to_pkgcache_then_updates_when_unknown ... ok
+test apt::tests::update_cache_zero_always_updates_without_stat ... ok
+test apt::tests::update_cache_runs_apt_get_update_when_lists_are_stale ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 133 filtered out; finished in 0.00s
+
+
+$ cargo test -p rustible-std hostname
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
+
+running 15 tests
+test hostname::tests::apply_without_prediction_is_refused ... ok
+test hostname::tests::apply_creates_etc_hostname_when_missing ... ok
+test hostname::tests::apply_on_systemd_uses_hostnamectl ... ok
+test hostname::tests::apply_without_systemd_writes_file_and_runs_hostname ... ok
+test hostname::tests::change_when_only_the_kernel_differs ... ok
+test hostname::tests::change_when_only_the_file_differs ... ok
+test hostname::tests::invalid_hostnames ... ok
+test hostname::tests::check_mode_predicts_and_runs_nothing ... ok
+test hostname::tests::kernel_falls_back_to_facts_when_proc_is_unreadable ... ok
+test hostname::tests::missing_etc_hostname_reads_as_absent ... ok
+test hostname::tests::refuses_invalid_name_before_touching_anything ... ok
+test hostname::tests::refuses_without_root ... ok
+test hostname::tests::satisfied_when_file_and_kernel_match ... ok
+test hostname::tests::step_is_ok_on_second_run_after_apply ... ok
+test hostname::tests::valid_hostnames ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.00s
+
+
+$ cargo test -p rustible-std sysctl
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
+
+running 21 tests
+test sysctl::tests::apply_now_false_only_persists ... ok
+test sysctl::tests::change_when_only_live_differs_and_apply_runs_sysctl_w ... ok
+test sysctl::tests::change_when_only_the_file_differs_and_apply_writes_without_sysctl ... ok
+test sysctl::tests::check_mode_predicts_writes_nothing_and_runs_nothing ... ok
+test sysctl::tests::apply_without_prediction_is_refused ... ok
+test sysctl::tests::custom_file_is_used ... ok
+test sysctl::tests::change_when_both_differ ... ok
+test sysctl::tests::key_validation ... ok
+test sysctl::tests::missing_directory_is_refused ... ok
+test sysctl::tests::missing_proc_key_is_refused_unless_persist_only ... ok
+test sysctl::tests::multi_value_keys_compare_token_wise ... ok
+test sysctl::tests::parse_line_handles_spacing_comments_and_ignore_marker ... ok
+test sysctl::tests::plan_appends_to_empty_and_existing_text ... ok
+test sysctl::tests::plan_collapses_duplicates_onto_the_first_line ... ok
+test sysctl::tests::plan_does_not_match_a_key_prefix_or_comment ... ok
+test sysctl::tests::plan_is_satisfied_regardless_of_spacing ... ok
+test sysctl::tests::plan_replaces_in_place_and_keeps_the_rest ... ok
+test sysctl::tests::proc_path_maps_dots_to_slashes ... ok
+test sysctl::tests::refuses_bad_key_newline_value_and_non_root ... ok
+test sysctl::tests::satisfied_when_file_and_live_match ... ok
+test sysctl::tests::step_changed_then_ok_when_live_follows ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 143 filtered out; finished in 0.00s
+
+
+$ cargo fmt --all --check
+(clean)
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+
+$ cargo test --workspace
+     Running unittests src/lib.rs (target/debug/deps/rustible-9b3428ddd10b8556)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_cli-d38d885f9236faab)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/main.rs (target/debug/deps/rustible-f916215e11041cf8)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/init.rs (target/debug/deps/init-06bfb95df5a92ea6)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-f4bd8a732f3fe82b)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-3c628cdf2feaa5e1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ui.rs (target/debug/deps/ui-03e2bf62c6153ec4)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-9603fe1879444ace)
+test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-f66f4918ce89550d)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-0ea54633e4475fe6)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_build
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_cli
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_github
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_macros
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_sdk
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_std
+test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+# Container tests (harness on main at f7471aa), 2026-09-08T11:03Z
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture
+
+running 1 test
+integration: building test target `it_apt_absent` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_apt_absent-bda802958248f8c3 in 0.9s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (not installed) .................. ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get update (as self, exit 0, 1044ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 791ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get purge -y sl (as self, exit 0, 609ms)
+  [debian:12]    $ apt-get autoremove -y --purge (as self, exit 0, 619ms)
+  [debian:12]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (again) .......................... ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}
+[debian:12] ok in 3.4s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (not installed) .................. ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 3668ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 3727ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get purge -y sl (as self, exit 0, 958ms)
+  [ubuntu:24.04]    $ apt-get autoremove -y --purge (as self, exit 0, 931ms)
+  [ubuntu:24.04]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (again) .......................... ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}
+[ubuntu:24.04] ok in 9.6s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.00s
+
+wall 14.44s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture
+
+running 1 test
+integration: building test target `it_sysctl_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_sysctl_present-8d91a699c9dce57a in 0.3s
+  [debian:12]  persist without the directory .............. FAILED          /etc/sysctl.d does not exist; sysctl::Present creates the file but not its directory (use file::Directory)
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [debian:12]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [debian:12]  persist ip_forward (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [debian:12]  persist swappiness (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [debian:12]  flip ip_forward (again) .................... ok           
+  [debian:12]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [debian:12]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [ubuntu:24.04]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [ubuntu:24.04]  persist ip_forward (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [ubuntu:24.04]  persist swappiness (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [ubuntu:24.04]  flip ip_forward (again) .................... ok           
+  [ubuntu:24.04]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [ubuntu:24.04]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+wall 1.20s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture
+
+running 1 test
+integration: building test target `it_apt_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.3s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get update (as self, exit 0, 1020ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 719ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl (again) ......................... ok           
+[debian:12] ok in 2.1s  install sl: changed, install sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 5055ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 3596ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl (again) ......................... ok           
+[ubuntu:24.04] ok in 9.0s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.46s
+
+wall 11.72s
