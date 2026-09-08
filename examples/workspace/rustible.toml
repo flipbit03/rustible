@@ -1,2 +1,3 @@
-# Rustible workspace settings. Read from M3 on.
+# Rustible workspace settings. The `rustible` command finds the workspace root
+# by walking up to this file.
 inventory = "hosts.kdl"
