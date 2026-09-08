@@ -64,9 +64,41 @@ pub enum Event {
     },
     Failed {
         step: Option<String>,
+        /// The rendered context chain, outermost first.
         error: String,
+        /// Present when a command failure is in the chain (rendered at -v).
+        cmd: Option<FailedCmd>,
     },
     Finished(Summary),
+}
+
+/// Serializable mirror of `error::CmdFailed` for the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedCmd {
+    pub argv: Vec<String>,
+    pub status: i32,
+    pub stderr: String,
+}
+
+impl From<&crate::error::CmdFailed> for FailedCmd {
+    fn from(c: &crate::error::CmdFailed) -> Self {
+        FailedCmd {
+            argv: c.argv.clone(),
+            status: c.status,
+            stderr: c.stderr.clone(),
+        }
+    }
+}
+
+impl Event {
+    /// Build a `Failed` event from an error, extracting the command if any.
+    pub fn failed(step: Option<String>, e: &crate::Error) -> Event {
+        Event::Failed {
+            step,
+            error: e.chain(),
+            cmd: e.cmd_failed().map(FailedCmd::from),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,10 +256,21 @@ impl<W: Write + Send> EventSink for Pretty<W> {
                     Ok(())
                 }
             }
-            Event::Failed { step, error } => match step {
-                Some(s) => writeln!(w, "[{host}]  FAILED at `{s}`: {error}"),
-                None => writeln!(w, "[{host}]  FAILED: {error}"),
-            },
+            Event::Failed { step, error, cmd } => {
+                let r = match step {
+                    Some(s) => writeln!(w, "[{host}]  FAILED at `{s}`: {error}"),
+                    None => writeln!(w, "[{host}]  FAILED: {error}"),
+                };
+                if self.verbosity >= 1
+                    && let Some(c) = cmd
+                {
+                    let _ = writeln!(w, "[{host}]    $ {} (exit {})", c.argv.join(" "), c.status);
+                    for line in c.stderr.lines() {
+                        let _ = writeln!(w, "[{host}]      {line}");
+                    }
+                }
+                r
+            }
             Event::Finished(s) => writeln!(
                 w,
                 "\n{host:<8} ok={} changed={} would_change={} skipped={} failed={} warnings={}",

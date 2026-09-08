@@ -428,7 +428,7 @@ mod tests {
                 groups: vec![],
             },
         );
-        let err = ctx.step("bad", Bad).unwrap_err().to_string();
+        let err = ctx.step("bad", Bad).unwrap_err().chain();
         assert!(err.contains("during check()"), "{err}");
         assert!(fake.content("/x").is_none());
     }

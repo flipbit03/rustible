@@ -112,10 +112,7 @@ pub fn run(mut opts: RunOptions, main: impl FnOnce(&mut Ctx) -> Result<()>) -> E
     let failed = match outcome {
         Ok(Ok(())) => false,
         Ok(Err(e)) => {
-            sink.emit(Event::Failed {
-                step: None,
-                error: e.to_string(),
-            });
+            sink.emit(Event::failed(None, &e));
             true
         }
         Err(payload) => {
@@ -127,6 +124,7 @@ pub fn run(mut opts: RunOptions, main: impl FnOnce(&mut Ctx) -> Result<()>) -> E
             sink.emit(Event::Failed {
                 step: None,
                 error: format!("panic: {msg}"),
+                cmd: None,
             });
             true
         }

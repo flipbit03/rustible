@@ -77,9 +77,9 @@ impl Ctx {
 
         let result = match plan {
             Err(e) => {
-                finish(Status::Failed, None, Some(e.to_string()));
+                finish(Status::Failed, None, Some(e.chain()));
                 self.bump(|s| s.failed += 1);
-                return Err(e);
+                return Err(e.context(format!("step `{name}`")));
             }
             Ok(Plan::Satisfied(out)) => {
                 finish(Status::Ok, None, None);
@@ -111,9 +111,9 @@ impl Ctx {
                 self.sys.set_phase(Phase::Idle);
                 match applied {
                     Err(e) => {
-                        finish(Status::Failed, Some(diff), Some(e.to_string()));
+                        finish(Status::Failed, Some(diff), Some(e.chain()));
                         self.bump(|s| s.failed += 1);
-                        return Err(e);
+                        return Err(e.context(format!("step `{name}`")));
                     }
                     Ok(out) => {
                         let note = if op.always_changes() {

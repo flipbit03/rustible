@@ -27,10 +27,10 @@ fn playbook(ctx: &mut Ctx) -> Result<()> {
         .unwrap_or_else(|| {
             std::env::temp_dir().join(format!("rustible-spike-{}", std::process::id()))
         });
-    std::fs::create_dir_all(&scratch).map_err(|e| Error::msg(e.to_string()))?;
+    std::fs::create_dir_all(&scratch)?;
     let sshd = scratch.join("sshd_config");
     if !sshd.exists() {
-        std::fs::write(&sshd, SAMPLE).map_err(|e| Error::msg(e.to_string()))?;
+        std::fs::write(&sshd, SAMPLE)?;
     }
 
     ctx.step(
