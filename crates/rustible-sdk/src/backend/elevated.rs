@@ -711,6 +711,40 @@ mod tests {
         assert!(helper_argv("pkexec", "root", exe, false).is_err());
     }
 
+    /// A command run through the helper with a large stdin, against a child
+    /// that fills its stdout pipe before reading a byte of its input. The
+    /// helper executes through `Local`, so this pins the escalated path to
+    /// `Local::spawn`'s threaded feeder: with a blocking inline write the
+    /// two would wait on each other forever. Bounded by a channel timeout so
+    /// a regression fails the test instead of hanging the suite.
+    #[test]
+    fn a_command_through_the_helper_does_not_deadlock_on_large_stdin() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
+            let e = in_process(phase);
+            // 1 MiB in, and the child writes 1 MiB out before it reads.
+            let input = vec![b'x'; 1024 * 1024];
+            let spec = CmdSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), "yes hello | head -c 1048576; wc -c".into()],
+                env: Default::default(),
+                cwd: None,
+                stdin: Some(input),
+                prefix: vec![],
+            };
+            let out = e.spawn(&spec);
+            let _ = done_tx.send(out);
+        });
+        let out = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the helper deadlocked writing stdin to a chatty child")
+            .expect("spawn through the helper");
+        assert_eq!(out.status, 0);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.ends_with("1048576\n"), "{}", &text[text.len() - 40..]);
+    }
+
     #[test]
     fn dead_helper_reports_exit_and_stderr() {
         // A "helper" that prints to stderr and exits without answering.
