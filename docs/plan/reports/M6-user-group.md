@@ -130,8 +130,11 @@ ctx.step("Remove old deploy user", user::Absent::new("deploy").remove_home(true)
   prediction and a re-read compare equal.
 - `Desired::default()` has `append: true` (manual `Default`) so the default
   asks for nothing.
-- `ssh::authorized_keys::Present::for_user(&Account)` is not added (other
-  op); see Decisions.
+- `ssh::authorized_keys::{Present, Absent}::for_user(&Account)` added on the
+  lead's instruction after PR #3 merged: one-line wrappers over
+  `for_account(&account.home, account.uid, account.gid)`, with a Fake test
+  chaining `user::Existing` into `Present::for_user` and `Absent::for_user`
+  through `ctx.step`.
 
 ## Decisions
 
@@ -151,7 +154,7 @@ See the `[M6-ug]` entries in `docs/plan/DECISIONS.md`. In short:
 - `Membership` counts the primary group as membership and never removes.
 - `/etc/passwd` and `/etc/group` are read directly (no NSS); malformed lines
   for the requested name are errors.
-- `for_user(&Account)` on authorized_keys left for the lead (other op).
+- `for_user(&Account)` on authorized_keys added at the lead's request.
 
 ## Self-review
 

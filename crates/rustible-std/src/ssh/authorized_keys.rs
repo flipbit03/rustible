@@ -479,8 +479,8 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 /// ```
 ///
 /// The user-name form reads `/etc/passwd` for home, uid, and gid; the
-/// `for_account` form takes them directly (from `user::Present` or
-/// `user::Existing`) with no lookup. Both create `authorized_keys` (0600,
+/// `for_user(&account)` and `for_account(home, uid, gid)` forms take them
+/// directly (from `user::Present` or `user::Existing`) with no lookup. Both create `authorized_keys` (0600,
 /// owned by the user) when missing and never touch the attributes of one
 /// that exists; `~/.ssh` must already exist (vision 6.7: ensure it with
 /// `file::Directory` first). The `in_file` form writes an explicit path and
@@ -513,6 +513,12 @@ impl Present {
             },
             exclusive: false,
         }
+    }
+
+    /// Keys for a `user::Account` (vision 6.1): `for_account` with the
+    /// account's home, uid, and gid. No lookup.
+    pub fn for_user(account: &crate::user::Account) -> PresentBuilder {
+        Self::for_account(&account.home, account.uid, account.gid)
     }
 
     /// Keys in an explicit file. No ownership handling.
@@ -627,6 +633,12 @@ impl Absent {
                 gid,
             },
         }
+    }
+
+    /// Keys for a `user::Account`: `for_account` with the account's home,
+    /// uid, and gid. No lookup.
+    pub fn for_user(account: &crate::user::Account) -> AbsentBuilder {
+        Self::for_account(&account.home, account.uid, account.gid)
     }
 
     /// Keys in an explicit file.
@@ -958,6 +970,34 @@ mod tests {
         op.apply(&sys, c).unwrap();
         let f = fake.file("/srv/home/.ssh/authorized_keys").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o600, 42, 43));
+    }
+
+    #[test]
+    fn for_user_chains_from_user_existing() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", PASSWD)
+                .with_file("/etc/group", "root:x:0:\ncadu:x:1001:\n")
+                .with_dir("/home/cadu")
+                .with_dir("/home/cadu/.ssh"),
+        );
+        let sys = fake_sys(&fake);
+        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let account = ctx
+            .step("lookup", crate::user::Existing::named("cadu"))
+            .unwrap();
+        let r = ctx
+            .step("keys", Present::for_user(&account).keys([K1]))
+            .unwrap();
+        assert!(r.changed);
+        assert_eq!(r.path, PathBuf::from("/home/cadu/.ssh/authorized_keys"));
+        let f = fake.file("/home/cadu/.ssh/authorized_keys").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o600, 1000, 1001));
+        let r = ctx
+            .step("revoke", Absent::for_user(&account).keys([K1]))
+            .unwrap();
+        assert!(r.changed);
+        assert_eq!(fake.content("/home/cadu/.ssh/authorized_keys").unwrap(), "");
     }
 
     // ---- Fake backend ----
