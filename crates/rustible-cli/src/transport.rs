@@ -1,16 +1,47 @@
-//! How the orchestrator reaches a host: run a process locally, or over an SSH
-//! ControlMaster session. The playbook binary never knows which.
+//! How the orchestrator reaches a host (vision doc 5.2 steps 4, 5, 7, 8
+//! and 5.4): a child process for `connection="local"`, or the system `ssh`
+//! through a ControlMaster session for everything else. The playbook
+//! binary never knows which.
+//!
+//! The master is launched here rather than through `openssh`'s builder so
+//! the inventory's `ssh_args` reach the `ssh` command line verbatim; the
+//! `openssh` crate then drives the multiplexed session (`Session::resume`).
 
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use openssh::{KnownHosts, Session};
+use openssh::Session;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// The connection parameters a host resolved to, as the transport needs
+/// them. `user` and `port` are `None` when the inventory left them to the
+/// built-in default, so `~/.ssh/config` keeps the last word (vision 5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub addr: String,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub args: Vec<String>,
+}
 
 pub enum Transport {
     Local,
-    Ssh(Arc<Session>),
+    Ssh {
+        session: Arc<Session>,
+        /// Holds the control socket; removed when the transport is dropped.
+        _dir: tempfile::TempDir,
+    },
+}
+
+/// What the bootstrap probe learns (vision 5.2 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The musl triple to build for.
+    pub triple: String,
+    /// The login user's `$HOME`, absolute; every later path hangs off it.
+    pub home: String,
 }
 
 /// A running remote process with piped stdio.
@@ -48,64 +79,163 @@ impl Proc {
     }
 }
 
+/// The `ssh` command that opens the ControlMaster for `target`: forks after
+/// authentication (`-f -N`), keeps the socket alive between commands, and
+/// never prompts (`BatchMode`). Inventory `ssh_args` go in verbatim, after
+/// ours so they can override them.
+pub fn master_argv(ctl: &Path, log: &Path, target: &SshTarget) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "-E",
+        &log.display().to_string(),
+        "-S",
+        &ctl.display().to_string(),
+        "-M",
+        "-f",
+        "-N",
+        "-o",
+        "ControlPersist=300",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(p) = target.port {
+        argv.push("-p".into());
+        argv.push(p.to_string());
+    }
+    if let Some(u) = &target.user {
+        argv.push("-l".into());
+        argv.push(u.clone());
+    }
+    argv.extend(target.args.iter().cloned());
+    argv.push("--".into());
+    argv.push(target.addr.clone());
+    argv
+}
+
+/// `uname -sm` output to the musl triple the binary is built for.
+pub fn triple_for(uname: &str) -> Result<String> {
+    Ok(match uname.trim() {
+        "Linux x86_64" => "x86_64-unknown-linux-musl".into(),
+        "Linux aarch64" => "aarch64-unknown-linux-musl".into(),
+        other => {
+            bail!("unsupported target {other:?}; rustible builds for Linux x86_64 and aarch64")
+        }
+    })
+}
+
+/// Single-quote for `sh`.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 impl Transport {
-    pub async fn connect(spec: &str) -> Result<Transport> {
-        if spec == "local" {
-            return Ok(Transport::Local);
-        }
-        let session = Session::connect(spec, KnownHosts::Accept)
+    pub async fn ssh(target: &SshTarget) -> Result<Transport> {
+        let dir = tempfile::Builder::new()
+            .prefix(".rustible-ssh")
+            .tempdir()
+            .context("creating the ssh control directory")?;
+        let ctl = dir.path().join("master");
+        let log = dir.path().join("log");
+        let status = tokio::process::Command::new("ssh")
+            .args(master_argv(&ctl, &log, target))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
             .await
-            .with_context(|| format!("ssh to {spec}"))?;
-        Ok(Transport::Ssh(Arc::new(session)))
-    }
-
-    /// Run a shell snippet, return stdout. The bootstrap probe and cache
-    /// checks use this; everything else is the static binary.
-    async fn sh(&self, script: &str) -> Result<(i32, String)> {
-        match self {
-            Transport::Local => {
-                let out = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(script)
-                    .output()
-                    .await?;
-                Ok((
-                    out.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                ))
-            }
-            Transport::Ssh(s) => {
-                let out = s.command("sh").arg("-c").arg(script).output().await?;
-                Ok((
-                    out.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&out.stdout).into_owned(),
-                ))
-            }
+            .context("running ssh")?;
+        if !status.success() {
+            let detail = std::fs::read_to_string(&log).unwrap_or_default();
+            let detail = detail.trim();
+            bail!(
+                "ssh to {}{}",
+                target.addr,
+                if detail.is_empty() {
+                    format!(": exit {}", status.code().unwrap_or(-1))
+                } else {
+                    format!(": {detail}")
+                }
+            );
         }
-    }
-
-    pub async fn probe_triple(&self) -> Result<String> {
-        let (_, out) = self.sh("uname -sm").await?;
-        let out = out.trim();
-        Ok(match out {
-            "Linux x86_64" => "x86_64-unknown-linux-musl".into(),
-            "Linux aarch64" => "aarch64-unknown-linux-musl".into(),
-            other => bail!("unsupported target: {other:?}"),
+        let session = Session::resume(ctl.into_boxed_path(), Some(log.into_boxed_path()));
+        session
+            .check()
+            .await
+            .with_context(|| format!("ssh master for {} did not answer", target.addr))?;
+        Ok(Transport::Ssh {
+            session: Arc::new(session),
+            _dir: dir,
         })
     }
 
-    pub async fn exists(&self, rel_home_path: &str) -> Result<bool> {
-        let (code, _) = self
-            .sh(&format!("test -x \"$HOME/{rel_home_path}\""))
+    /// Tear the master down. Dropping the transport removes the socket
+    /// directory anyway; this ends the `ssh` process now instead of at
+    /// `ControlPersist`.
+    pub async fn close(self) {
+        if let Transport::Ssh { session, _dir } = self
+            && let Ok(s) = Arc::try_unwrap(session)
+        {
+            let _ = s.close().await;
+        }
+    }
+
+    /// Run a shell snippet; stdout and stderr captured. The bootstrap probe
+    /// and the cache check use this; everything else is the static binary.
+    async fn sh(&self, script: &str) -> Result<(i32, String, String)> {
+        let out = match self {
+            Transport::Local => {
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .output()
+                    .await?
+            }
+            Transport::Ssh { session, .. } => {
+                session.command("sh").arg("-c").arg(script).output().await?
+            }
+        };
+        Ok((
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    /// One shell round trip: the machine's triple and `$HOME`.
+    pub async fn probe(&self) -> Result<Probe> {
+        let (code, out, err) = self.sh("uname -sm && printf '%s\\n' \"$HOME\"").await?;
+        if code != 0 {
+            bail!("probe failed with exit {code}: {}", err.trim());
+        }
+        let mut lines = out.lines();
+        let uname = lines.next().unwrap_or_default();
+        let home = lines.next().unwrap_or_default().trim().to_string();
+        if !home.starts_with('/') {
+            bail!("probe returned a $HOME that is not absolute: {home:?}");
+        }
+        Ok(Probe {
+            triple: triple_for(uname)?,
+            home,
+        })
+    }
+
+    pub async fn exists(&self, abs_path: &str) -> Result<bool> {
+        let (code, _, _) = self
+            .sh(&format!("test -x {}", shell_quote(abs_path)))
             .await?;
         Ok(code == 0)
     }
 
-    /// Stream bytes to `$HOME/<path>` through the process's stdin, then
+    /// Stream bytes to `abs_path` through the process's stdin, then
     /// atomically move into place and mark executable.
-    pub async fn upload(&self, bytes: &[u8], rel_home_path: &str) -> Result<()> {
+    pub async fn upload(&self, bytes: &[u8], abs_path: &str) -> Result<()> {
+        let p = shell_quote(abs_path);
         let script = format!(
-            "set -e; p=\"$HOME/{rel_home_path}\"; mkdir -p \"$(dirname \"$p\")\"; \
+            "set -e; p={p}; mkdir -p \"$(dirname \"$p\")\"; \
              cat > \"$p.tmp\"; chmod 755 \"$p.tmp\"; mv \"$p.tmp\" \"$p\""
         );
         let mut proc = self.spawn(&["sh".into(), "-c".into(), script]).await?;
@@ -116,27 +246,27 @@ impl Transport {
         let code = proc.wait().await?;
         if code != 0 {
             bail!(
-                "upload failed with exit {code}: {}",
-                proc.stderr_text().await
+                "upload to {abs_path} failed with exit {code}: {}",
+                proc.stderr_text().await.trim()
             );
         }
         Ok(())
     }
 
-    /// Spawn argv with piped stdio. argv[0] may contain `$HOME`, which the
-    /// remote shell expands; that is why it goes through `sh -c`.
+    /// Spawn `argv` with piped stdio, no shell in between: paths are
+    /// absolute by now and `openssh` quotes each argument for the remote
+    /// shell.
     pub async fn spawn(&self, argv: &[String]) -> Result<Proc> {
-        let script = argv.join(" ");
+        let (prog, rest) = argv.split_first().context("empty argv")?;
         match self {
             Transport::Local => {
-                let mut child = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&script)
+                let mut child = tokio::process::Command::new(prog)
+                    .args(rest)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .with_context(|| format!("spawning {script}"))?;
+                    .with_context(|| format!("spawning {}", argv.join(" ")))?;
                 Ok(Proc {
                     stdin: Box::pin(child.stdin.take().unwrap()),
                     stdout: Box::pin(child.stdout.take().unwrap()),
@@ -144,18 +274,17 @@ impl Transport {
                     waiter: Waiter::Local(child),
                 })
             }
-            Transport::Ssh(s) => {
-                let mut child = s
+            Transport::Ssh { session, .. } => {
+                let mut child = session
                     .clone()
-                    .arc_command("sh")
-                    .arg("-c")
-                    .arg(&script)
+                    .arc_command(prog.clone())
+                    .args(rest)
                     .stdin(openssh::Stdio::piped())
                     .stdout(openssh::Stdio::piped())
                     .stderr(openssh::Stdio::piped())
                     .spawn()
                     .await
-                    .with_context(|| format!("spawning {script} over ssh"))?;
+                    .with_context(|| format!("spawning {} over ssh", argv.join(" ")))?;
                 Ok(Proc {
                     stdin: Box::pin(child.stdin().take().unwrap()),
                     stdout: Box::pin(child.stdout().take().unwrap()),
@@ -164,5 +293,70 @@ impl Transport {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn master_argv_passes_only_what_the_inventory_set() {
+        let ctl = Path::new("/tmp/x/master");
+        let log = Path::new("/tmp/x/log");
+        let bare = SshTarget {
+            addr: "arm".into(),
+            user: None,
+            port: None,
+            args: vec![],
+        };
+        let argv = master_argv(ctl, log, &bare);
+        assert!(!argv.contains(&"-l".to_string()));
+        assert!(!argv.contains(&"-p".to_string()));
+        assert_eq!(&argv[argv.len() - 2..], ["--", "arm"]);
+        assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+
+        let full = SshTarget {
+            addr: "10.0.0.1".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            args: vec!["-4".into(), "-o".into(), "ConnectTimeout=5".into()],
+        };
+        let argv = master_argv(ctl, log, &full);
+        assert!(argv.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(argv.windows(2).any(|w| w == ["-l", "deploy"]));
+        assert_eq!(
+            &argv[argv.len() - 5..],
+            ["-4", "-o", "ConnectTimeout=5", "--", "10.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn triples() {
+        assert_eq!(
+            triple_for("Linux x86_64\n").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            triple_for("Linux aarch64").unwrap(),
+            "aarch64-unknown-linux-musl"
+        );
+        assert!(triple_for("Darwin arm64").is_err());
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("/home/a b"), "'/home/a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[tokio::test]
+    async fn local_probe_and_exists() {
+        let t = Transport::Local;
+        let p = t.probe().await.unwrap();
+        assert!(p.home.starts_with('/'));
+        assert!(p.triple.ends_with("-unknown-linux-musl"));
+        assert!(t.exists("/bin/sh").await.unwrap());
+        assert!(!t.exists("/definitely/not/here").await.unwrap());
     }
 }
