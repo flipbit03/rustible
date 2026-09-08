@@ -554,7 +554,7 @@ arm      0        1             0        0       0         0
             r.event("local", &step_started(1, "x"));
             r.event("local", &finished);
             r.event(
-                "h",
+                "local",
                 &Event::Failed {
                     step: None,
                     error: "step `x`: boom: deeper".into(),
@@ -562,7 +562,7 @@ arm      0        1             0        0       0         0
                 },
             );
             r.event(
-                "h",
+                "local",
                 &Event::Finished(Summary {
                     failed: 1,
                     ..Default::default()
@@ -584,7 +584,7 @@ arm      0        1             0        0       0         0
             r.event("local", &step_started(2, "y"));
             r.event("local", &step_finished(2, "y", Status::Ok));
             r.event(
-                "h",
+                "local",
                 &Event::Finished(Summary {
                     failed: 1,
                     ok: 1,
