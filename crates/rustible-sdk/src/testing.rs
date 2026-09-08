@@ -130,22 +130,38 @@ pub struct Spec {
 /// One finished step inside the container, as reported to the outside.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepReport {
+    /// The name the test body passed to `ctx.step`, which is how an
+    /// assertion in the outer test finds the step it cares about.
     pub name: String,
+    /// `Ok`, `Changed`, `Failed`; `WouldChange` never appears, since the
+    /// harness runs the body with check mode off.
     pub status: Status,
+    /// `Diff::short`, not the full rendering: enough to see what moved, and
+    /// small enough to keep the report on one line.
     pub diff: Option<String>,
+    /// Wall time of the step inside the container, which includes the
+    /// processes it spawned.
     pub elapsed_ms: u64,
 }
 
 /// What one container run prints as its last line, JSON-encoded.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Report {
+    /// [`Spec::name`], so a report can be traced back to a test function
+    /// even when several ran against the same image.
     pub test: String,
+    /// The image the container was started from, taken from
+    /// [`IMAGE_VAR`] inside the container rather than from the outside.
     pub image: String,
     /// `Distro VERSION_ID` as the binary saw it, so a wrong image is obvious.
     pub distro: String,
+    /// One entry per finished step, in the order the body ran them.
+    /// Steps skipped with `ctx.skip` do not appear.
     pub steps: Vec<StepReport>,
     /// Commands the body ran, through `sys.cmd` or through ops.
     pub commands: u32,
+    /// Wall time of the body alone, measured inside the container, so it
+    /// excludes the image pull and the container's own startup.
     pub elapsed_ms: u64,
     /// `None` on success; the error chain or panic message otherwise.
     pub error: Option<String>,
@@ -155,6 +171,8 @@ pub struct Report {
 /// [`run_images`].
 #[derive(Debug, Clone)]
 pub struct ImageResult {
+    /// The image as named in the attribute, so a failure message says which
+    /// of several images went wrong.
     pub image: String,
     /// Wall time of `docker run`, image pull included on the first use.
     pub elapsed: Duration,

@@ -8,6 +8,17 @@
 //! listing a distance-d group is at d+1. Two groups at the same distance
 //! that both set a key the host (or a nearer group) does not override is a
 //! conflict and a load-time error.
+//!
+//! The two chains differ in one way worth knowing: `defaults` is a
+//! parameter level only, so a var written there has nowhere to go, and
+//! there is no built-in default for a var. A parameter nobody sets falls
+//! back to [`Source::BuiltIn`]: `ssh`, port 22, `sudo`, `root`,
+//! [`local_username`] for `ssh_user`, no `addr`, and no ssh arguments.
+//!
+//! Nothing merges. The nearest level that sets a key supplies the whole
+//! value, `ssh_args` included, and every level it beat is recorded in
+//! [`Sources::overridden_params`] or [`Sources::overridden_vars`] so
+//! `inventory show` can print what was shadowed rather than losing it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,9 +31,16 @@ use super::model::{Connection, Escalate, HostParams, Inventory, Scalar, VarBag};
 pub enum Source {
     /// Top-level `vars`.
     All,
+    /// A group's `vars` or parameters. The named group is the nearest one
+    /// to the host that set the key; see [`Inventory::group_levels`].
     Group(String),
+    /// The `host` node itself, which outranks every group.
     Host,
+    /// The top-level `defaults` node, the last level before the built-in.
+    /// Parameters only: `defaults` takes no vars.
     Defaults,
+    /// Nothing in the file set it, so the value is Rustible's own, listed
+    /// in this module's header.
     BuiltIn,
 }
 
@@ -43,11 +61,20 @@ impl fmt::Display for Source {
 pub struct ResolvedParams {
     /// `None` only when `connection` is `local`.
     pub addr: Option<String>,
+    /// [`Connection::Ssh`] when no level set it.
     pub connection: Connection,
+    /// [`local_username`] when no level set it, or the literal
+    /// `(ssh default)` when even that cannot be determined, which is not a
+    /// username but a note for `inventory show` that ssh will pick.
     pub ssh_user: String,
+    /// 22 when no level set it.
     pub port: u16,
+    /// [`Escalate::Sudo`] when no level set it.
     pub escalate: Escalate,
+    /// `root` when no level set it.
     pub escalate_user: String,
+    /// The one level's list, never a concatenation of several. Empty when
+    /// no level set it.
     pub ssh_args: Vec<String>,
 }
 
@@ -76,36 +103,63 @@ impl ResolvedParams {
 /// A value that lost to a nearer one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Overridden {
+    /// The parameter or var name. It repeats across the list when more than
+    /// one level lost the same key.
     pub key: String,
     /// Rendered, so parameters and vars share the type.
     pub value: String,
+    /// The level that set the losing value.
     pub source: Source,
 }
 
 /// Provenance of everything in a [`Resolved`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sources {
+    /// The winning level per parameter, keyed by the names in
+    /// [`HostParams::NAMES`]. Always all seven: a parameter nobody set maps
+    /// to [`Source::BuiltIn`].
     pub params: BTreeMap<&'static str, Source>,
+    /// The winning level per var. Only vars that exist, since a var nobody
+    /// set does not exist.
     pub vars: BTreeMap<String, Source>,
+    /// Every parameter value that lost, grouped by key, nearest loser
+    /// first within a key.
     pub overridden_params: Vec<Overridden>,
+    /// Every var value that lost. This includes a sibling-group value that
+    /// tied with another sibling but lost to a nearer level anyway, which
+    /// is a tie [`Inventory::resolve`] deliberately does not treat as a
+    /// [`Conflict`], so `inventory show` still lists both.
     pub overridden_vars: Vec<Overridden>,
 }
 
 /// One host, fully resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resolved {
+    /// The name passed to [`Inventory::resolve`]; always a host, never a
+    /// group.
     pub host: String,
     /// Every group the host belongs to, nearest first (what
     /// `HostInfo::groups` carries).
     pub groups: Vec<String>,
+    /// All seven parameters, each one filled from the nearest level that
+    /// set it or from the built-in default.
     pub params: ResolvedParams,
+    /// Every var visible to this host, from all four levels merged, nearest
+    /// winning. What the playbook binary receives in its `Start` frame.
     pub vars: VarBag,
+    /// Which level each of the above came from, and what it beat.
     pub sources: Sources,
 }
 
+/// Which of the two precedence chains a [`Conflict`] is in. The two are
+/// separate namespaces, so a group setting the var `port` never collides
+/// with a group setting the parameter `port`. [`Display`](fmt::Display)
+/// prints the word the error message uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictKind {
+    /// A key in a `vars` block, which can be any name.
     Var,
+    /// One of the seven [`HostParams::NAMES`].
     Param,
 }
 
@@ -121,20 +175,36 @@ impl fmt::Display for ConflictKind {
 /// Two sibling groups set the same key for a host with no nearer override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conflict {
+    /// The host whose resolution is ambiguous. Two groups conflict only
+    /// relative to a host: the same pair is fine for a host that belongs to
+    /// only one of them, or that settles the key itself.
     pub host: String,
+    /// Whether `key` is a var or a parameter.
     pub kind: ConflictKind,
+    /// The var name or parameter name both groups set.
     pub key: String,
+    /// The two groups, in file order. When three or more tie, each later
+    /// group is reported in its own [`Conflict`] paired with the first.
     pub groups: (String, String),
 }
 
+/// Why [`Inventory::resolve`] could not produce a [`Resolved`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
+    /// No host of that name, with a suggestion when one is spelled close.
+    /// A group of that name gives [`ResolveError::IsGroup`] instead.
     UnknownHost(UnknownName),
     /// The name is a group; `resolve` and `inventory show` take a host.
     IsGroup {
+        /// The group that was asked for.
         name: String,
+        /// Its hosts, transitively and in file order, so the message can
+        /// name one to try instead. Empty for a group with no hosts.
         hosts: Vec<String>,
     },
+    /// Sibling-group ties, one per key and host. Loading rejects these, so
+    /// an [`Inventory`] that came from [`Inventory::load`] never yields
+    /// this; only one assembled field by field can.
     Conflicts(Vec<Conflict>),
 }
 

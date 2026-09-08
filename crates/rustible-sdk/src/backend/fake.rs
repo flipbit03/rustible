@@ -35,14 +35,29 @@ pub struct Fake {
 }
 
 impl Fake {
+    /// An empty machine: no files, no directories, no canned commands.
+    ///
+    /// Nothing exists until a `with_*` builder plants it, and a command
+    /// nobody canned fails with `no canned response`. That is the point: a
+    /// test learns when the op under test reaches for something the test did
+    /// not think about, instead of getting a plausible default.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Plant a regular file with these contents, mode `0o644`, owned by
+    /// uid 0 / gid 0.
+    ///
+    /// Parent directories are not created. The fake keeps a flat map of
+    /// paths, so an op that stats or lists a parent needs it planted with
+    /// [`with_dir`](Self::with_dir) as well.
     pub fn with_file(self, p: impl Into<PathBuf>, content: impl AsRef<[u8]>) -> Self {
         self.with_file_mode(p, content, 0o644)
     }
 
+    /// [`with_file`](Self::with_file) with the mode spelled out, for an op
+    /// that asserts on permissions: `0o600` on a key, `0o440` on a sudoers
+    /// drop-in.
     pub fn with_file_mode(
         self,
         p: impl Into<PathBuf>,
@@ -62,6 +77,12 @@ impl Fake {
         self
     }
 
+    /// Plant a directory, mode `0o755`, owned by uid 0 / gid 0.
+    ///
+    /// Only the one directory: parents are not implied, and neither are
+    /// children. [`Backend::read_dir`] and [`Backend::stat`] look the path
+    /// up directly, so a directory nobody planted is absent even when files
+    /// beneath it are there.
     pub fn with_dir(self, p: impl Into<PathBuf>) -> Self {
         self.files.lock().unwrap().insert(
             p.into(),
@@ -117,10 +138,18 @@ impl Fake {
         self
     }
 
+    /// The planted entry at `p`, or `None` when nothing is there.
+    ///
+    /// The path is taken literally: symlinks are not followed, so a link
+    /// comes back as itself with its target held in its bytes. This is the
+    /// assertion side of the fake, and it never runs an op's logic.
     pub fn file(&self, p: impl AsRef<Path>) -> Option<FakeFile> {
         self.files.lock().unwrap().get(p.as_ref()).cloned()
     }
 
+    /// What is stored at `p` as text, lossily, for asserting on what an op
+    /// wrote. `None` when the path is absent; a directory reads as the empty
+    /// string, because a planted directory holds no bytes.
     pub fn content(&self, p: impl AsRef<Path>) -> Option<String> {
         self.file(p)
             .map(|f| String::from_utf8_lossy(&f.bytes).into_owned())

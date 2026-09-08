@@ -17,7 +17,10 @@ use rustible_sdk::prelude::*;
 /// `user::Membership::in_group` takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
+    /// The group name, field one of the `/etc/group` line.
     pub name: String,
+    /// Numeric group id, field three. Field two, the password, is not read:
+    /// on any modern system it is an `x` pointing at `/etc/gshadow`.
     pub gid: u32,
     /// Users listed in the group's member field, in file order. A user's
     /// primary group does not list them here.
@@ -176,9 +179,14 @@ struct Inspection {
 
 /// Ensure a group exists. `ansible.builtin.group` with `state: present`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::{group, user};
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
+/// # let account = ctx.step("Look up rustible", user::Existing::named("rustible"))?;
 /// let docker = ctx.step("Ensure group docker", group::Present::new("docker"))?;
 /// ctx.step("Add rustible to docker", user::Membership::of(&account).in_group(&docker))?;
+/// # Ok(()) }
 /// ```
 ///
 /// Without `gid`, an existing group is left alone whatever its gid, and a
@@ -200,6 +208,12 @@ pub struct Present {
 }
 
 impl Present {
+    /// Ensure a group called `name` exists. No gid is demanded, so a group
+    /// that is already there is accepted whatever its number and a new one
+    /// takes the number `groupadd` (or BusyBox `addgroup`) picks; call
+    /// [`Present::gid`] to pin it. Not a system group unless
+    /// [`Present::system`] says so. The name is validated at `check`, not
+    /// here, so building the op never fails.
     pub fn new(name: impl Into<String>) -> Self {
         Present {
             name: name.into(),
@@ -367,6 +381,7 @@ impl Op for Present {
 /// Output of [`Absent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
+    /// The group name the op was given, whether or not it existed.
     pub name: String,
     /// The gid the group had; `None` when it did not exist.
     pub gid: Option<u32>,
@@ -375,8 +390,12 @@ pub struct Removed {
 /// Ensure a group does not exist. `ansible.builtin.group` with
 /// `state: absent`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::group;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// ctx.step("Remove group games", group::Absent::new("games"))?;
+/// # Ok(()) }
 /// ```
 ///
 /// A group that is some user's primary group cannot be removed (`groupdel`
@@ -388,6 +407,10 @@ pub struct Absent {
 }
 
 impl Absent {
+    /// Ensure no group called `name` exists. The op takes no options: a
+    /// group that is some user's primary group is refused at `check`,
+    /// naming that user, rather than left to fail inside `groupdel`, and a
+    /// group that was never there is simply `ok`.
     pub fn new(name: impl Into<String>) -> Self {
         Absent { name: name.into() }
     }

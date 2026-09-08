@@ -8,6 +8,19 @@ use crate::diff::Diff;
 use crate::error::Result;
 use crate::system::System;
 
+/// One unit of work a playbook hands to `ctx.step`: a typed value whose
+/// fields are the desired state, plus the two halves of reconciling it.
+///
+/// Splitting [`Op::check`] from [`Op::apply`] is what makes `--check` a real
+/// dry run rather than a simulation: the runtime calls `check` and stops.
+/// `check` must not touch the system, and `System` enforces that for the
+/// writes it mediates by raising
+/// [`MutationDuringCheck`](crate::error::MutationDuringCheck) while a step
+/// is checking.
+///
+/// Idempotence is not a property an op declares; it falls out of `check`
+/// returning [`Plan::Satisfied`] the second time round. An op that cannot
+/// tell (a command, a restart) says so with [`Op::always_changes`].
 pub trait Op {
     /// Typed result the playbook gets back.
     type Output;
@@ -38,6 +51,9 @@ pub trait Op {
     }
 }
 
+/// What [`Op::check`] concluded. `Satisfied` finishes the step as `ok`
+/// without calling [`Op::apply`]; `Change` is the only route to `apply`, and
+/// in check mode it finishes the step as `would change` instead.
 #[derive(Debug)]
 pub enum Plan<T> {
     /// Already in desired state. Carries the output so `step` returns it without applying.
@@ -46,6 +62,9 @@ pub enum Plan<T> {
     Change(Change<T>),
 }
 
+/// The payload of [`Plan::Change`]: what `check` found, handed straight to
+/// [`Op::apply`] so the work of deciding is not repeated. Ops that predict
+/// commonly return `predicted` as `apply`'s own output.
 #[derive(Debug)]
 pub struct Change<T> {
     /// What the report shows.
@@ -56,6 +75,10 @@ pub struct Change<T> {
 }
 
 impl<T> Plan<T> {
+    /// A change with no predicted output. A later step that reads this
+    /// step's output gets
+    /// [`OutputUnavailable`](crate::error::OutputUnavailable) in check mode,
+    /// which is the honest answer when the value only exists after `apply`.
     pub fn change(diff: Diff) -> Self {
         Plan::Change(Change {
             diff,
@@ -63,6 +86,10 @@ impl<T> Plan<T> {
         })
     }
 
+    /// A change carrying the output `apply` would produce, so a check-mode
+    /// run can keep walking through steps that read it. The value is
+    /// returned to the playbook as if it were real, flagged by
+    /// [`Applied::predicted`], so predict only what the op is certain of.
     pub fn change_predicting(diff: Diff, predicted: T) -> Self {
         Plan::Change(Change {
             diff,
@@ -70,6 +97,8 @@ impl<T> Plan<T> {
         })
     }
 
+    /// True for [`Plan::Change`], predicting or not. Mostly useful to op
+    /// authors testing their own `check` without running a step.
     pub fn is_change(&self) -> bool {
         matches!(self, Plan::Change(_))
     }
@@ -80,10 +109,17 @@ impl<T> Plan<T> {
 pub struct Applied<T> {
     step: String,
     value: Option<T>,
+    /// Whether the system was, or in check mode would be, altered. False
+    /// also for a step that ran and reported nothing changed through
+    /// [`Op::changed_by_apply`].
     pub changed: bool,
     /// True if `value` is a prediction (check mode with an op that predicted).
     pub predicted: bool,
+    /// What `check` reported, `None` when the step was already satisfied.
+    /// Kept even when the step is reported `ok`, so `-v` still shows what ran.
     pub diff: Option<Diff>,
+    /// Wall time of the whole step, `check` and `apply` together, as measured
+    /// by `ctx.step`.
     pub elapsed: Duration,
 }
 
@@ -117,12 +153,17 @@ impl<T> Applied<T> {
         })
     }
 
+    /// [`Applied::output`] by value, for handing the result to the next step
+    /// instead of borrowing it.
     pub fn into_output(self) -> Result<T> {
         let step = self.step;
         self.value
             .ok_or_else(|| crate::error::OutputUnavailable { step }.into())
     }
 
+    /// Whether an output is there to read: false exactly when
+    /// [`Applied::output`] would fail and `Deref` would panic. A playbook
+    /// that wants to keep going in check mode branches on this.
     pub fn is_available(&self) -> bool {
         self.value.is_some()
     }

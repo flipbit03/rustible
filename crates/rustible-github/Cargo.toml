@@ -20,3 +20,9 @@ ureq.workspace = true
 # No crypto entry of its own: the provider and its CPU pre-flight come from
 # `rustible_std::tls`, which this crate already depends on, so the two agree by
 # construction. Nothing here names a `rustls::` path either.
+
+[dev-dependencies]
+# Only so the module-header doctest can show a real `#[rustible::playbook]`.
+# Path-only on purpose: cargo strips a path-only dev-dependency at publish, the
+# same reason rustible-std and rustible-macros carry it this way.
+rustible = { path = "../rustible" }

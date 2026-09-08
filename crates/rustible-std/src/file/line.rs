@@ -9,6 +9,34 @@ use super::Insert;
 
 /// Ensure a line is present in a file, replacing the line matched by `matching`
 /// if any. Ansible's `lineinfile` with `state: present`.
+///
+/// ```no_run
+/// # use rustible_std::file;
+/// let op = file::Line::in_path("/etc/ssh/sshd_config")
+///     .matching(r"^#?\s*PasswordAuthentication\b")
+///     .set("PasswordAuthentication no");
+/// ```
+///
+/// **Idempotence rests entirely on `matching`.** With a regex, the *first*
+/// matching line is the one rewritten, and the step is `ok` once that line
+/// reads exactly like the argument to [`LineBuilder::set`]. Later lines that
+/// also match are left where they are, so a file with two
+/// `PasswordAuthentication` lines keeps the second one and sshd goes on
+/// reading it. Without a regex the match is whole-line equality with `set`
+/// itself, which means a run whose value differs from the last run's finds
+/// nothing to replace and appends a second line; that is Ansible's behaviour
+/// too, and it is the usual reason a config file grows a run at a time. Give
+/// `matching` a regex that also matches the *old* value.
+///
+/// [`Insert`] decides where a line that matched nothing goes; the default is
+/// [`Insert::Append`]. The file's own line ending is kept (a file containing
+/// any CRLF is rewritten with CRLF) and the result always ends with one.
+///
+/// A symbolic link is refused rather than followed, since the atomic rewrite
+/// would replace the link with a regular file, and so is a directory. A
+/// missing file is an error unless `.create(true)`. `check` predicts its
+/// [`LineReport`], so a check-mode run can read `line_no` off a step that
+/// only *would* change.
 #[derive(Debug, Clone)]
 pub struct Line {
     path: PathBuf,
@@ -19,14 +47,23 @@ pub struct Line {
     create: bool,
 }
 
+/// Output of [`Line`]: where the line ended up, and the backup if one was
+/// taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineReport {
     /// 1-based line number where the line now sits.
     pub line_no: usize,
+    /// The copy taken before the rewrite, set only when `.backup(true)` and
+    /// `apply` actually wrote. Always `None` on a satisfied step and on the
+    /// prediction `check` returns, because no copy exists until the write.
     pub backup_path: Option<PathBuf>,
 }
 
 impl Line {
+    /// Start a [`Line`] op on this file; [`LineBuilder::set`] supplies the
+    /// line and finishes it. Everything else starts off: no `matching`
+    /// regex (so the match is whole-line equality with the line itself), no
+    /// backup, [`Insert::Append`], and no file creation.
     pub fn in_path(path: impl Into<PathBuf>) -> LineBuilder {
         LineBuilder {
             path: path.into(),
@@ -38,6 +75,8 @@ impl Line {
     }
 }
 
+/// A [`Line`] whose path and options are set but whose content is not;
+/// [`LineBuilder::set`] supplies the line and produces the op.
 pub struct LineBuilder {
     path: PathBuf,
     matching: Option<Regex>,
@@ -53,11 +92,18 @@ impl LineBuilder {
         self
     }
 
+    /// Save the file's previous content next to it
+    /// (`<name>.~rustible.<unix-ts>`) before rewriting, and report the path
+    /// as [`LineReport::backup_path`]. Off by default. A step that turns out
+    /// to be satisfied never writes, and so never makes a backup either.
     pub fn backup(mut self, on: bool) -> Self {
         self.backup = on;
         self
     }
 
+    /// Where to put the line when nothing matched. The default is
+    /// [`Insert::Append`]. A line that *does* match is rewritten in place,
+    /// so this is not consulted then and cannot be used to move a line.
     pub fn insert(mut self, at: Insert) -> Self {
         self.insert = at;
         self

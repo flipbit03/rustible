@@ -11,6 +11,9 @@ use std::path::PathBuf;
 /// The one error type. Wraps `anyhow::Error`; converts from anything.
 pub struct Error(anyhow::Error);
 
+/// The result type every SDK, op, and playbook signature uses. Fixing the
+/// error side to [`Error`] is what makes `?` accept a foreign error without
+/// a conversion written by hand.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
@@ -67,7 +70,14 @@ where
 
 /// `.context(..)` and `.with_context(..)` on results and options.
 pub trait Context<T> {
+    /// Wrap the error in one more layer, e.g. `"installing nginx"`. The
+    /// message is built whether or not there is an error, so keep it a
+    /// constant or something cheap. On an `Option` there is no inner error
+    /// to wrap and the message becomes the whole error.
     fn context<C: fmt::Display + fmt::Debug + Send + Sync + 'static>(self, c: C) -> Result<T>;
+    /// [`Context::context`] with the message built only on the error path.
+    /// Use this whenever the message needs a `format!`, which is most of the
+    /// time, since a useful layer names the path or host it was working on.
     fn with_context<C: fmt::Display + fmt::Debug + Send + Sync + 'static, F: FnOnce() -> C>(
         self,
         f: F,
@@ -104,6 +114,9 @@ impl<T> Context<T> for Option<T> {
 #[derive(Debug, thiserror::Error)]
 #[error("op attempted to mutate `{path}` during check(); mutations belong in apply()")]
 pub struct MutationDuringCheck {
+    /// The path the write was aimed at. `System` raises this from its phase
+    /// guard, which sees the path and nothing else, so the op and the call
+    /// have to be identified from the step name in the surrounding chain.
     pub path: PathBuf,
 }
 
@@ -111,6 +124,8 @@ pub struct MutationDuringCheck {
 #[derive(Debug, thiserror::Error)]
 #[error("step `{step}` would have changed; its output is unavailable in check mode")]
 pub struct OutputUnavailable {
+    /// The name passed to `ctx.step`, so the message names the playbook line
+    /// whose output was read rather than the one that would have produced it.
     pub step: String,
 }
 
@@ -120,8 +135,15 @@ pub struct OutputUnavailable {
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[error("`{}` exited {status}", argv.join(" "))]
 pub struct CmdFailed {
+    /// Program first, then its arguments, exactly as spawned. The message
+    /// joins them with spaces and does not quote, so an argument containing
+    /// a space reads ambiguously there; the field itself is exact.
     pub argv: Vec<String>,
+    /// The exit code, or `-1` when the process was killed by a signal and
+    /// so has no code of its own.
     pub status: i32,
+    /// Everything the command wrote to stderr, decoded lossily as UTF-8 and
+    /// not truncated. Absent from the `Display` message on purpose.
     pub stderr: String,
 }
 
@@ -129,7 +151,11 @@ pub struct CmdFailed {
 #[derive(Debug, thiserror::Error)]
 #[error("{path}: {source}")]
 pub struct IoAt {
+    /// The path as the caller gave it, never canonicalized: a failure on a
+    /// relative path should still read the way the playbook wrote it.
     pub path: PathBuf,
+    /// The underlying `std::io::Error`, kept as the `source` so its kind
+    /// survives a `downcast_ref` further up the chain.
     #[source]
     pub source: std::io::Error,
 }
@@ -138,7 +164,10 @@ pub struct IoAt {
 #[derive(Debug, thiserror::Error)]
 #[error("could not spawn `{program}`: {source}")]
 pub struct SpawnFailed {
+    /// The program as named by the op, before any `PATH` lookup.
     pub program: String,
+    /// Almost always `NotFound` or `PermissionDenied`. A program that did
+    /// start and then exited non-zero produces a [`CmdFailed`], not this.
     #[source]
     pub source: std::io::Error,
 }

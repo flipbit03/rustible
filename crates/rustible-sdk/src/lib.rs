@@ -1,5 +1,7 @@
 //! Rustible SDK: everything a playbook or an operation crate needs.
 
+#![deny(missing_docs)]
+
 pub mod backend;
 pub mod channel;
 pub mod ctx;
@@ -35,6 +37,9 @@ pub use op::{Applied, Change, Op, Plan};
 pub use secret::Secret;
 pub use system::{Cmd, Planned, System};
 
+/// What a playbook file imports. Everything needed to write steps and to
+/// implement an [`Op`], and nothing from the runtime, protocol, backend or
+/// channel modules, which a playbook never names.
 pub mod prelude {
     pub use crate::ctx::Ctx;
     pub use crate::diff::{AttrChange, Diff};

@@ -27,12 +27,19 @@ pub struct Attrs {
     owner: Option<Owner>,
 }
 
+/// Output of [`Attrs`]. It carries only the path: the op sets exactly what
+/// it was told to set, so there is nothing to learn from the result that the
+/// op does not already say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrsReport {
+    /// The path whose attributes were checked, as given to [`Attrs::at`].
     pub path: PathBuf,
 }
 
 impl Attrs {
+    /// Start an `Attrs` op on a path that must already exist. With neither
+    /// `.mode()` nor `.owner()` added, the op asserts that the path exists
+    /// and is not a symbolic link, and reports `ok`.
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Attrs {
             path: path.into(),
@@ -41,6 +48,10 @@ impl Attrs {
         }
     }
 
+    /// Permission bits as an octal literal (`0o600`). Only the low twelve
+    /// bits are compared and set, so the file type bits of a value read out
+    /// of a `stat` do not matter. Left unset, the mode is neither checked
+    /// nor changed.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
         self

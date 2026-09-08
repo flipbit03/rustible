@@ -54,11 +54,14 @@ pub struct CopyBuilder {
     source: CopySource,
 }
 
+/// Output of [`struct@Copy`]. `check` predicts all of it except
+/// `backup_path`, which cannot exist before `apply` has taken the copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyReport {
     /// Whether the bytes were (or would be) rewritten, as opposed to an
     /// attributes-only change.
     pub content_changed: bool,
+    /// The destination, as given to `.to(..)`.
     pub path: PathBuf,
     /// Set only when `.backup(true)` and a previous version was saved.
     pub backup_path: Option<PathBuf>,
@@ -91,6 +94,10 @@ impl Copy {
         }
     }
 
+    /// Permission bits as an octal literal (`0o644`). Only the low twelve
+    /// bits are compared and set. Left unset, the mode is neither checked
+    /// nor changed: an existing file keeps its own, and a file this op
+    /// creates keeps whatever the write gave it.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
         self

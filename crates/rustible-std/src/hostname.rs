@@ -31,6 +31,9 @@ pub struct Is {
 }
 
 impl Is {
+    /// Ensure the machine is called `name`. The name is checked against
+    /// [`validate_hostname`] at `check`, not here, so building the op never
+    /// fails however malformed the argument is.
     pub fn new(name: impl Into<String>) -> Self {
         Is { name: name.into() }
     }

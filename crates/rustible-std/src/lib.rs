@@ -1,6 +1,8 @@
 //! Rustible standard operations. A consumer of `rustible-sdk` like any other
 //! collection.
 
+#![deny(missing_docs)]
+
 pub mod apt;
 pub mod archive;
 pub mod file;

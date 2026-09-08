@@ -17,8 +17,15 @@ pub use crate::protocol::CHUNK_SIZE;
 /// One piece of a streamed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// Byte offset of `bytes` within the whole file. Chunks of one request
+    /// arrive in order, so a consumer that keeps a running total can reject
+    /// a gap; [`write_chunks`] does exactly that.
     pub offset: u64,
+    /// Up to [`CHUNK_SIZE`] bytes, and fewer only in the last chunk.
     pub bytes: Vec<u8>,
+    /// The final chunk of this file. Exactly one chunk of a stream carries
+    /// it, and a receiver uses it rather than a byte count to know the file
+    /// is complete.
     pub last: bool,
 }
 
@@ -64,6 +71,10 @@ pub fn run_dir_name(run_id: &str) -> String {
     }
 }
 
+/// Wrap any reader in the [`Chunks`] iterator. An interrupted read is
+/// retried; any other read error is yielded once and ends the iteration
+/// without a `last` chunk, so a truncated source can never be mistaken for
+/// a complete file.
 pub fn chunks<R: Read>(r: R) -> Chunks<R> {
     Chunks {
         r,
@@ -122,6 +133,10 @@ impl WorkspaceFiles {
         })
     }
 
+    /// The canonicalized root, which is what every confinement check
+    /// compares against. It is the resolved path, not the one handed to
+    /// [`WorkspaceFiles::new`], so a workspace reached through a symlink
+    /// still matches the paths `canonicalize` returns for files inside it.
     pub fn root(&self) -> &Path {
         &self.root
     }

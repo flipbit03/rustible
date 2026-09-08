@@ -30,13 +30,22 @@ pub struct SymlinkBuilder {
     link: PathBuf,
 }
 
+/// Output of [`Symlink`]: the desired state echoed back, which is why
+/// `check` can predict it in full and `apply` returns the prediction
+/// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymlinkReport {
+    /// The link itself, as given to [`Symlink::at`].
     pub link: PathBuf,
+    /// What the link now points at, verbatim as given: a relative target
+    /// stays relative and is never resolved against the link's directory.
     pub target: PathBuf,
 }
 
 impl Symlink {
+    /// Start a symlink op at this path; [`SymlinkBuilder::pointing_to`]
+    /// supplies the target and finishes it. `force` starts off, so anything
+    /// already sitting at `link` that is not a symlink is an error.
     pub fn at(link: impl Into<PathBuf>) -> SymlinkBuilder {
         SymlinkBuilder { link: link.into() }
     }

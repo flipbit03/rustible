@@ -15,8 +15,12 @@ use serde_json::Value;
 
 use super::model::{VarBag, bag_to_json};
 
+/// Whether a [`VarError`] stops the run. Only [`Severity::Error`] does;
+/// [`format_vars_report`] filters warnings out entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
+    /// A var the playbook cannot run with: required and missing, of the
+    /// wrong type, or an object where the schema wants a flat value.
     Error,
     /// An undeclared var: the bag is shared by every playbook targeting the
     /// host, so this is not a failure.
@@ -26,12 +30,19 @@ pub enum Severity {
 /// One problem with one var on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarError {
+    /// The var this is about. For a warning that is the key found in the
+    /// bag, which by definition the schema does not declare.
     pub var: String,
+    /// Whether this fails the host or only informs.
     pub severity: Severity,
+    /// The whole sentence shown to the user, already naming the var. The
+    /// [`Display`](fmt::Display) of this type writes exactly this.
     pub message: String,
 }
 
 impl VarError {
+    /// True for [`Severity::Error`]. A host fails when any of its
+    /// [`VarError`]s answers true.
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
     }

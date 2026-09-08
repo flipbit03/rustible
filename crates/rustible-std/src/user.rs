@@ -31,11 +31,18 @@ use crate::group::{
 /// `ssh::authorized_keys::Present::for_user` will take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
+    /// Login name, the first field of the account's `/etc/passwd` line.
     pub name: String,
+    /// The uid `/etc/passwd` records, not the one that was asked for: when
+    /// [`Present`] left the choice to `useradd`, this is what it allocated.
     pub uid: u32,
     /// Primary group id.
     pub gid: u32,
+    /// Home directory as `/etc/passwd` records it. The directory itself may
+    /// not exist; nothing here repairs a missing home after creation.
     pub home: PathBuf,
+    /// Login shell as `/etc/passwd` records it, the distro tool's default
+    /// when [`Present`] was not given one.
     pub shell: PathBuf,
     /// Supplementary groups: every group in `/etc/group` whose member field
     /// lists the user, sorted by name. The primary group appears only if it
@@ -46,12 +53,18 @@ pub struct Account {
 /// One well-formed line of `/etc/passwd`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswdEntry {
+    /// Field 1, never empty: [`parse_passwd`] drops a line without a name.
     pub name: String,
+    /// Field 3, decimal. A line whose uid does not parse is dropped too.
     pub uid: u32,
+    /// Field 4, the primary group's id. Turning it into a name needs
+    /// `/etc/group`, which is a separate read.
     pub gid: u32,
     /// The GECOS field, Ansible's `comment`.
     pub comment: String,
+    /// Field 6, verbatim. Whether the directory exists is not checked here.
     pub home: PathBuf,
+    /// Field 7, verbatim; empty when the line ends on its colon.
     pub shell: PathBuf,
 }
 
@@ -127,7 +140,14 @@ fn read_account(sys: &System, name: &str) -> Result<Option<Account>> {
 /// `.gid("docker")` and `.gid(&group)` all work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupId {
+    /// A numeric gid, from `.gid(1000)` or from a `group::Group` an earlier
+    /// step returned. `check` still looks it up in `/etc/group` and fails
+    /// when no group carries it.
     Id(u32),
+    /// A group name, from `.gid("docker")`. Resolved against `/etc/group` at
+    /// `check`. In check mode a group an earlier `group::Present` step would
+    /// create is accepted, but unless that step named a gid there is no gid
+    /// to predict the account with.
     Name(String),
 }
 
@@ -169,15 +189,25 @@ struct Primary {
 /// nothing: every attribute `None`, no groups, `append` on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Desired {
+    /// Uid to hold the account at. `None` leaves whatever `/etc/passwd` says.
     pub uid: Option<u32>,
+    /// Primary group, already resolved from a [`GroupId`] to a gid by
+    /// `check`, so [`plan_modify`] never has to read `/etc/group` again.
     pub gid: Option<u32>,
+    /// Home path to record. Only the `/etc/passwd` field is compared and
+    /// changed; an existing directory is not moved.
     pub home: Option<PathBuf>,
+    /// Login shell to record. Not checked against `/etc/shells`.
     pub shell: Option<PathBuf>,
+    /// GECOS field to record, Ansible's `comment`.
     pub comment: Option<String>,
     /// Supplementary groups to have (`append`) or to have exactly. `None`
     /// leaves memberships alone whatever `append` says, like Ansible's
     /// omitted `groups`.
     pub groups: Option<Vec<String>>,
+    /// `true` adds `groups` to the memberships the account already has;
+    /// `false` makes `groups` the complete list, so anything else is left.
+    /// Read only when `groups` is `Some`.
     pub append: bool,
 }
 
@@ -202,18 +232,32 @@ impl Default for Desired {
 /// `apply` executes it (vision 6.2) without inspecting the system again.
 #[derive(Debug, Clone, Default)]
 pub struct Delta {
+    /// Uid to set (`usermod -u`). Files the old uid owns are not chowned.
     pub uid: Option<u32>,
+    /// Primary gid to set (`usermod -g`).
     pub gid: Option<u32>,
+    /// Home path to set (`usermod -d`, never `-m`: the old directory stays
+    /// where it is and keeps its contents).
     pub home: Option<PathBuf>,
+    /// Login shell to set (`usermod -s`).
     pub shell: Option<PathBuf>,
+    /// GECOS field to set (`usermod -c`).
     pub comment: Option<String>,
+    /// Groups to join, already narrowed to the ones the account is not in.
     pub add_groups: Vec<String>,
+    /// Groups to leave, only ever non-empty when an exact list was asked for
+    /// with `append: false`. BusyBox runs one `delgroup` per entry; shadow's
+    /// `usermod` is instead handed the whole new list as `-G`.
     pub remove_groups: Vec<String>,
     /// The diff to report, one entry per attribute above.
     pub changes: Vec<AttrChange>,
 }
 
 impl Delta {
+    /// True when the account already matches: [`Present`] reports the step
+    /// satisfied and never runs a tool. Judged on `changes`, so a `Delta`
+    /// assembled by hand without them looks empty whatever its other fields
+    /// hold.
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
@@ -420,7 +464,10 @@ struct Inspection {
 /// Ensure a user account exists with the given attributes.
 /// `ansible.builtin.user` with `state: present`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::{file, user};
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// let account = ctx.step(
 ///     "Ensure rustible user exists",
 ///     user::Present::new("rustible")
@@ -430,6 +477,7 @@ struct Inspection {
 /// )?;
 /// ctx.step("Ensure ~/.ssh exists",
 ///     file::Directory::at(account.home.join(".ssh")).mode(0o700))?;
+/// # Ok(()) }
 /// ```
 ///
 /// Attributes not asked for are never touched on an existing account, and
@@ -469,6 +517,10 @@ pub struct Present {
 }
 
 impl Present {
+    /// Ensure the account `name` exists. Nothing else is asked for yet: the
+    /// distro tool picks the uid, the primary group and the shell, and only
+    /// [`Present::create_home`] starts out on. An account that already exists
+    /// is left exactly as it is until a builder method names an attribute.
     pub fn new(name: impl Into<String>) -> Self {
         Present {
             name: name.into(),
@@ -484,6 +536,11 @@ impl Present {
         }
     }
 
+    /// Numeric uid. Unset by default, which lets the tool allocate one.
+    /// Enforced on an existing account too, and that only rewrites
+    /// `/etc/passwd`: files owned by the old uid are not chowned. Giving it
+    /// is also one of the conditions for predicting a new account's
+    /// [`Account`] in check mode.
     pub fn uid(mut self, uid: u32) -> Self {
         self.uid = Some(uid);
         self
@@ -988,6 +1045,8 @@ impl Op for Present {
 /// Output of [`Absent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
+    /// The account, as named to [`Absent::new`]. Reported whether the step
+    /// deleted it or found it already gone.
     pub name: String,
     /// The home directory this step deleted (`remove_home`); `None` when the
     /// home was kept or the account did not exist.
@@ -997,8 +1056,12 @@ pub struct Removed {
 /// Ensure a user account does not exist. `ansible.builtin.user` with
 /// `state: absent`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::user;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// ctx.step("Remove old deploy user", user::Absent::new("deploy").remove_home(true))?;
+/// # Ok(()) }
 /// ```
 ///
 /// `remove_home` is Ansible's `remove: yes`: `userdel -r` (or BusyBox
@@ -1014,10 +1077,14 @@ pub struct Removed {
 /// same-named group as the primary group rather than failing, so this
 /// sequence removes a group no step asked to remove:
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::{group, user};
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// ctx.step("group", group::Present::new("app"))?;   // creates group `app`
 /// ctx.step("user", user::Present::new("app"))?;     // adopts it as primary
 /// ctx.step("gone", user::Absent::new("app"))?;      // takes group `app` too
+/// # Ok(()) }
 /// ```
 ///
 /// Give the group a member other than the account, or a name of its own, if
@@ -1032,6 +1099,9 @@ pub struct Absent {
 }
 
 impl Absent {
+    /// Remove the account `name`, keeping its home directory;
+    /// [`Absent::remove_home`] deletes that too. An account that is not there
+    /// is satisfied, not an error.
     pub fn new(name: impl Into<String>) -> Self {
         Absent {
             name: name.into(),
@@ -1111,8 +1181,13 @@ impl Op for Absent {
 /// never reports `changed`, fails the run if the user is missing. Ansible's
 /// `getent` plus `register`.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::user;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
 /// let account = ctx.step("Look up rustible user", user::Existing::named("rustible"))?;
+/// # let _ = account;
+/// # Ok(()) }
 /// ```
 ///
 /// Needs no root: it only reads `/etc/passwd` and `/etc/group`.
@@ -1122,6 +1197,10 @@ pub struct Existing {
 }
 
 impl Existing {
+    /// Read the account `name` out of `/etc/passwd` and `/etc/group`. There
+    /// is no "missing is fine" variant: a step that hands its [`Account`] to
+    /// later steps has nothing to hand them if the user is not there, so a
+    /// missing account fails the run.
     pub fn named(name: impl Into<String>) -> Self {
         Existing { name: name.into() }
     }
@@ -1150,7 +1229,10 @@ impl Op for Existing {
 /// Output of [`Membership`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
+    /// The account, as [`Membership::of`] named it.
     pub user: String,
+    /// The group it belongs to now, whether this step added it or found it
+    /// there (a primary group counts as membership).
     pub group: String,
 }
 
@@ -1159,11 +1241,16 @@ pub struct Member {
 /// `user` with `groups: [g]` and `append: yes`, one group per step so the
 /// report says which membership changed.
 ///
-/// ```ignore
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::{group, user};
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
+/// # let account = ctx.step("Look up rustible", user::Existing::named("rustible"))?;
 /// for name in ["docker", "adm"] {
 ///     let grp = ctx.step(format!("Ensure group {name} exists"), group::Present::new(name))?;
 ///     ctx.step(format!("Add rustible to {name}"), user::Membership::of(&account).in_group(&grp))?;
 /// }
+/// # Ok(()) }
 /// ```
 ///
 /// Satisfied when the group's member field lists the user or the group is

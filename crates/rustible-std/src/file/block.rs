@@ -24,6 +24,32 @@ pub const DEFAULT_MARKER: &str = "# {mark} MANAGED BY RUSTIBLE";
 /// already there is replaced in place; a missing one is inserted where
 /// `.insert(..)` says (append by default). Setting an empty block removes
 /// the managed block, as in Ansible's `state: absent`.
+///
+/// **The markers are the identity of the block, and they are matched by
+/// whole-line equality**, not by a substring or a regex. The op takes the
+/// first line equal to the BEGIN marker and the first line equal to the END
+/// marker *after* it. Three consequences are worth knowing before a run:
+///
+/// - A BEGIN with no END after it counts as no block at all, so a file
+///   whose end marker someone deleted by hand gets a second, complete block
+///   appended rather than a repair of the first.
+/// - Changing `.marker(..)` between runs changes the identity. The block
+///   under the old marker is not found, not removed and not updated; it is
+///   orphaned, and a new one appears. Remove the old block (set it empty
+///   under the old marker) before switching.
+/// - Indentation and trailing whitespace are part of the line, so a marker
+///   that a formatter or a template has re-indented no longer matches.
+///
+/// `check` refuses a marker without `{mark}`, and refuses a body line equal
+/// to either marker: such a line would make the next run find a shorter
+/// block and the file would grow forever. Idempotence is otherwise exact,
+/// since the body between the markers is compared line by line against the
+/// argument to [`BlockBuilder::set`].
+///
+/// A symbolic link is refused rather than followed (the atomic rewrite would
+/// replace the link), and so is a directory; a missing file is an error
+/// unless `.create(true)`. The file's own line ending is kept and `check`
+/// predicts its [`BlockReport`].
 #[derive(Debug, Clone)]
 pub struct Block {
     path: PathBuf,
@@ -34,6 +60,8 @@ pub struct Block {
     create: bool,
 }
 
+/// A [`Block`] whose path and options are set but whose body is not;
+/// [`BlockBuilder::set`] supplies the text and produces the op.
 pub struct BlockBuilder {
     path: PathBuf,
     marker: String,
@@ -42,16 +70,26 @@ pub struct BlockBuilder {
     create: bool,
 }
 
+/// Output of [`Block`]: where the block sits, and the backup if one was
+/// taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockReport {
+    /// The file, as given to [`Block::in_path`].
     pub path: PathBuf,
     /// 1-based line number of the BEGIN marker; 0 when there is no block
     /// (an empty block that was, or is now, absent).
     pub line_no: usize,
+    /// The copy taken before the rewrite, set only when `.backup(true)` and
+    /// `apply` actually wrote. Always `None` on a satisfied step and on the
+    /// prediction `check` returns, because no copy exists until the write.
     pub backup_path: Option<PathBuf>,
 }
 
 impl Block {
+    /// Start a [`Block`] op on this file; [`BlockBuilder::set`] supplies the
+    /// body and finishes it. The marker is `DEFAULT_MARKER`
+    /// (`# {mark} MANAGED BY RUSTIBLE`), the block is appended, and neither
+    /// backup nor file creation is on.
     pub fn in_path(path: impl Into<PathBuf>) -> BlockBuilder {
         BlockBuilder {
             path: path.into(),
@@ -77,11 +115,19 @@ impl BlockBuilder {
         self
     }
 
+    /// Where to put the block when the markers are not in the file yet. The
+    /// default is [`Insert::Append`]. A block that is already there is
+    /// rewritten between its own markers, so this is not consulted then and
+    /// cannot be used to move an existing block.
     pub fn insert(mut self, at: Insert) -> Self {
         self.insert = at;
         self
     }
 
+    /// Save the file's previous content next to it
+    /// (`<name>.~rustible.<unix-ts>`) before rewriting, and report the path
+    /// as [`BlockReport::backup_path`]. Off by default. A step that turns
+    /// out to be satisfied never writes, and so never makes a backup either.
     pub fn backup(mut self, on: bool) -> Self {
         self.backup = on;
         self

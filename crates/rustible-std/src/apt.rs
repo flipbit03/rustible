@@ -35,14 +35,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustible_sdk::prelude::*;
 
+/// One package and the version dpkg has for it. Every report in this module
+/// is built out of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
+    /// The binary package name, as the op was given it and as `dpkg-query`
+    /// keys on. Nothing is resolved here: a virtual package or an alias is
+    /// whatever apt makes of it, and the name is reported unchanged.
     pub name: String,
     /// Empty when predicted in check mode and apt has not resolved it yet
     /// (`Present`); `Absent` and `Latest` always know the version.
     pub version: String,
 }
 
+/// Output of [`Present`]. The two lists together name every package the op
+/// was given, so `installed` empty means the step was `ok`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstallReport {
     /// Packages this step installed.
@@ -248,6 +255,11 @@ pub struct Present {
 }
 
 impl Present {
+    /// Ensure every one of `names` is installed, leaving the version to apt:
+    /// a package that is already there is `ok` however old it is (that is
+    /// [`Latest`]'s job). Nothing else is on. There is no cache refresh
+    /// until [`Present::update_cache`] asks for one, and recommends are off,
+    /// so `apt-get install --no-install-recommends` is what runs.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -268,6 +280,10 @@ impl Present {
         self
     }
 
+    /// Pull in each package's `Recommends:` as well. Off by default, which
+    /// is what puts `--no-install-recommends` on the `apt-get install` line
+    /// and is the opposite of apt's own default. It bears only on packages
+    /// this step installs; one that is already there is not revisited.
     pub fn install_recommends(mut self, on: bool) -> Self {
         self.install_recommends = on;
         self
@@ -370,6 +386,10 @@ pub struct Absent {
 }
 
 impl Absent {
+    /// Ensure none of `names` is installed. Plain removal: configuration
+    /// files stay unless [`Absent::purge`], and no dependencies are swept up
+    /// unless [`Absent::autoremove`]. Names dpkg has never heard of are
+    /// reported in `not_present` rather than failing the step.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -484,6 +504,11 @@ pub struct Latest {
 }
 
 impl Latest {
+    /// Ensure every one of `names` is installed at the candidate version
+    /// apt currently knows. No cache refresh until
+    /// [`Latest::update_cache`] asks for one, so by default the candidates
+    /// come from whatever `/var/lib/apt/lists` already holds and a dry run
+    /// writes nothing at all. Recommends are off, as with [`Present`].
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,

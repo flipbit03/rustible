@@ -148,6 +148,12 @@ pub struct Channel {
 pub struct Feeder(Arc<Channel>);
 
 impl Feeder {
+    /// Hand one down frame to the channel. [`Down::Cancel`] flips the cancel
+    /// flag; a second [`Down::Start`] is dropped, since the runtime consumed
+    /// the run's `Start` before this thread existed; file frames go to the
+    /// inbox, keyed by request id. Blocks while the inbox is full, which is
+    /// how backpressure reaches the pipe instead of the whole file reaching
+    /// memory.
     pub fn feed(&self, frame: Down) {
         match frame {
             Down::Cancel => self.0.cancel("cancelled by the orchestrator"),
@@ -201,6 +207,11 @@ impl Channel {
         Self::with_source(Source::None)
     }
 
+    /// Ask the run to stop. Nothing is interrupted: the flag is sticky and
+    /// `Ctx::step` reads it between phases, so no op is torn off mid-apply.
+    /// The first `reason` wins and later calls only re-set the flag, because
+    /// the orchestrator's `Cancel` is immediately followed by the EOF that
+    /// would otherwise overwrite it with a less useful message.
     pub fn cancel(&self, reason: impl Into<String>) {
         let mut r = self.cancel_reason.lock().unwrap();
         if r.is_none() {
@@ -209,6 +220,9 @@ impl Channel {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
+    /// Whether [`Channel::cancel`] has been called. Once true it never goes
+    /// back. Use [`Channel::check_cancelled`] where an error is wanted; this
+    /// is for a long-running op that wants to bail out of its own loop.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -317,6 +331,12 @@ impl Channel {
         }
     }
 
+    /// Take the next request id, counting from 1. Ids come from the same
+    /// counter [`Channel::stream_file`] draws from, so a fetch can never
+    /// collide with an in-flight file request. `ctx.fetch` takes one id and
+    /// reuses it for every chunk of the file; `ctx.local_file` takes one to
+    /// name a fresh subdirectory of the run's temp directory, so two
+    /// downloads of files with the same basename do not overwrite each other.
     pub fn next_req(&self) -> u32 {
         self.next_req.fetch_add(1, Ordering::SeqCst)
     }
