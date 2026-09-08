@@ -100,36 +100,62 @@ Pure functions with their own tests: `detect_format`, `validate_entry_path`,
 
 ## Verification
 
-`main` was merged twice while this branch was being finished: first for M7's
-CI workflows, then again for M3 (the real playbook run) and the README, which
-also removed `crates/spike-playbook`. The Cargo.lock and DECISIONS.md
-conflicts of the second merge were resolved keeping both sides; `cargo
-metadata --locked` then accepted the lock unchanged.
+`main` was merged three times while this branch was being finished, and every
+gate was re-run after each merge:
 
-The table below is the run on the final tree at merge commit `c37d128`. Full
-output is in `docs/plan/logs/M6-net-archive-done.txt`, which has three
-UTC-stamped sections: the pre-merge run at `01623e5`, the first re-run at
-`85d6a62`, and this one.
+1. M7's CI workflows.
+2. M3 (the real playbook run) and the README, which also removed
+   `crates/spike-playbook`. Conflicts in `Cargo.lock` and `DECISIONS.md`,
+   both sides kept.
+3. The `rustible-github` collection (PR 14). See "Converging the network
+   dependencies" below.
+
+The table is the run on the final tree at merge commit `506f809`. Full output
+is in `docs/plan/logs/M6-net-archive-done.txt`, which has four UTC-stamped
+sections: the pre-merge run at `01623e5` and one after each merge.
 
 | command | result | wall |
 |---|---|---|
-| `cargo fmt --all --check` | pass | 0.18s |
-| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 3.06s |
-| `cargo test --workspace` | pass | 13.94s |
-| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 1.79s |
-| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 2.79s |
-| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 2.17s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 41.77s |
+| `cargo fmt --all --check` | pass | 0.17s |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 1.86s |
+| `cargo test --workspace` | pass | 4.90s |
+| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 0.71s |
+| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 0.24s |
+| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 0.52s |
+| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 33.66s |
+| `cargo test -p rustible-github` (shares the merged `ureq` entry) | pass | 1.21s |
 
-Times are with a warm `target/`. At `85d6a62`, before the second merge, the
-two new container tests were also run on their own: `it_http_download` in
-5.84s and `it_archive_extracted` in 2.97s, and the `#[ignore]`d TLS test
-`https_download_from_github_with_rustcrypto_tls` passed in 0.46s. All are in
-the log.
+Times are with a warm `target/`, so they measure the gates and not the build;
+the first run of the same set on a cold tree took roughly four times as long.
+At `85d6a62` the two new container tests were also run on their own,
+`it_http_download` in 5.84s and `it_archive_extracted` in 2.97s, and the
+`#[ignore]`d TLS test `https_download_from_github_with_rustcrypto_tls` passed
+in 0.46s. All are in the log.
+
+CI on GitHub was green on all four jobs (format/clippy/test, MSRV 1.88,
+example workspace, Docker harness) at `33cf1ff`, the head before the third
+merge.
 
 Counts: `rustible-std` has 298 unit tests passing, one
 ignored (the network TLS test, run separately above); 16 of them are
 `http::`, 15 are `archive::`. Both new ops have a compiled doctest.
+
+### Converging the network dependencies
+
+The `rustible-github` collection landed on `main` first and had already added
+`ureq`, `rustls` and `rustls-rustcrypto` to `[workspace.dependencies]`, with
+the same reasoning about `ring` being C. The merge left two identical blocks.
+They were converged on one, keeping the github branch's entries, because both
+sides agreed byte for byte: `ureq` with `default-features = false` plus
+`rustls-no-provider` and `rustls-webpki-roots`, `rustls` with
+`default-features = false` plus `std` and `tls12`, and
+`rustls-rustcrypto = "0.0.2-alpha"`. The comment above them now names both
+consumers. The archive-only crates (`sha2`, `tar`, `flate2`, `lzma-rust2`,
+`ruzstd`) stay in their own block. `Cargo.lock` was taken from `main` and
+re-resolved by cargo; the only packages it gains over `main` are the archive
+decoders and their transitive dependencies, and `cargo metadata --locked`
+accepts the result. `cargo test -p rustible-github` passes on the merged
+tree, so the shared entry works for both crates.
 
 Every job in `.github/workflows/ci.yml` was reproduced locally: the
 fmt/clippy/test/rustdoc gate, the 1.88 MSRV check (the toolchain was installed
@@ -194,7 +220,7 @@ in memory by design (see Decisions).
 
 ## Decisions
 
-Eighteen `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
+Nineteen `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
 "Reverse:" clause. The ones worth a look:
 
 - **TLS provider.** `rustls-rustcrypto` 0.0.2-alpha, via `ureq`'s
@@ -208,8 +234,10 @@ Eighteen `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
   the Raspberry Pi 4 — not an assumption a fleet tool can make. The `alpha`
   label is on the rustls glue; the primitives underneath are RustCrypto's
   `aes-gcm`, `chacha20poly1305`, `p256`, `x25519-dalek`, `rsa` and `sha2`.
-  Reverse is a one-line change in `http::tls_provider()`.
-  **This is the decision I would most like reviewed.**
+  Reverse is a one-line change in `http::tls_provider()`. The same question is
+  recorded once for Cadu as the `[M6-gh]` proposed amendment in
+  `DECISIONS.md`, raised by the `rustible-github` collection; it covers
+  `http::Download` too, and this branch does not restate it.
 - **Both ops hold their payload in memory.** `Backend::write` takes `&[u8]`
   and there is no streaming write primitive, so `Download` buffers the body
   before `write_atomic` and `Extracted` buffers the archive (and, for zstd,
