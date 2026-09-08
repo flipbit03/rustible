@@ -290,3 +290,97 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
         _ => Ok(()),
     }
 }
+
+/// Marks a Docker integration test (vision doc section 8, tier 3).
+///
+/// ```ignore
+/// #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+/// fn line_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
+///     changed_then_ok(ctx, "add line", || Line::in_path("/etc/x").create(true).set("hi"))?;
+///     Ok(())
+/// }
+/// ```
+///
+/// Expands to a `#[test]` that calls `rustible::sdk::testing::run`: skipped
+/// unless `RUSTIBLE_INTEGRATION=1` and docker work; otherwise the test binary
+/// is built for musl and the body runs inside each image as root over the
+/// real `Local` backend. `images` is required and non-empty. The function
+/// takes exactly `ctx: &mut Ctx` and returns `Result<()>`.
+#[proc_macro_attribute]
+pub fn integration_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match integration_test_impl(attr.into(), item.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn integration_test_impl(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut images: Vec<LitStr> = Vec::new();
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("images") {
+            let arr: syn::ExprArray = meta.value()?.parse()?;
+            for elem in arr.elems {
+                match elem {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(s),
+                        ..
+                    }) => images.push(s),
+                    other => {
+                        return Err(Error::new_spanned(
+                            other,
+                            "`images` takes string literals like \"debian:12\"",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(meta.error("unknown option; expected `images = [\"debian:12\", ...]`"))
+        }
+    });
+    parser.parse2(attr)?;
+    if images.is_empty() {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[rustible::integration_test]` needs `images = [\"debian:12\", ...]`",
+        ));
+    }
+
+    let mut f: ItemFn = syn::parse2(item)?;
+    let bad_signature = f.sig.inputs.len() != 1
+        || matches!(f.sig.inputs.first(), Some(FnArg::Receiver(_)))
+        || f.sig.output == syn::ReturnType::Default;
+    if bad_signature {
+        return Err(Error::new_spanned(
+            &f.sig,
+            "expected `fn name(ctx: &mut Ctx) -> Result<()>`",
+        ));
+    }
+
+    let name = f.sig.ident.clone();
+    let inner = format_ident!("__rustible_integration_{}", name);
+    f.sig.ident = inner.clone();
+    f.attrs
+        .push(syn::parse_quote!(#[allow(clippy::needless_pass_by_ref_mut)]));
+
+    Ok(quote! {
+        #f
+
+        #[::core::prelude::v1::test]
+        fn #name() {
+            ::rustible::sdk::testing::run(
+                &::rustible::sdk::testing::Spec {
+                    name: stringify!(#name),
+                    module_path: module_path!(),
+                    crate_name: env!("CARGO_CRATE_NAME"),
+                    manifest_dir: env!("CARGO_MANIFEST_DIR"),
+                    images: &[#(#images),*],
+                },
+                #inner,
+            )
+        }
+    })
+}

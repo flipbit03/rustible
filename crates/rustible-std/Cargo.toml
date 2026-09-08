@@ -14,3 +14,7 @@ readme = "../../README.md"
 rustible-sdk.workspace = true
 regex.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+# For `#[rustible::integration_test]` in tests/ (dev-only cycle, like rustible-macros).
+rustible.workspace = true
