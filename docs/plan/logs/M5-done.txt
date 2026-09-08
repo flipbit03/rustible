@@ -1,0 +1,1412 @@
+# M5 done-when, 2026-09-08T10:23:40Z, hosts: local
+# rustible 1d30932
+
+## 1. cadu/escalation without escalate=true (twice: changed, then ok)
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host local -v
+[local]  connected in 1.30µs, probed x86_64-unknown-linux-musl in 1.47ms
+   Compiling rustible-build v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-build)
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+    Finished `dist` profile [optimized] target(s) in 7.57s
+built x86_64-unknown-linux-musl in 7.59s
+x86_64-unknown-linux-musl: 2026888 bytes, sha256 f5ccea0970ec472b
+[local]  binary already cached in 1.10ms
+[local]  hello: protocol 3, playbook cadu/escalation, 2.94ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]    debug: wrote /etc/rustible-m5-test (46 bytes)
+[local]  marker line present ........................ changed         +1 -0 lines   as root
+      | --- /etc/rustible-m5-test (before)
+      | +++ /etc/rustible-m5-test (after)
+      | @@ -0,0 +1 @@
+      | +rustible m5 escalation test on COGRAM-VM-2025
+[local]    commands run as cadu here and as root through the helper
+[local]    /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+
+local    ok=0 changed=1 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 2.94ms, total run 37.43ms
+
+total 7.66s
+[exit 0]
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host local -v
+[local]  connected in 1.33µs, probed x86_64-unknown-linux-musl in 1.55ms
+    Finished `dist` profile [optimized] target(s) in 0.02s
+built x86_64-unknown-linux-musl in 37.90ms
+x86_64-unknown-linux-musl: 2026888 bytes, sha256 f5ccea0970ec472b
+[local]  binary already cached in 929.46µs
+[local]  hello: protocol 3, playbook cadu/escalation, 1.01ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]  marker line present ........................ ok              as root
+[local]    commands run as cadu here and as root through the helper
+[local]    /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+
+local    ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 1.01ms, total run 29.84ms
+
+total 98.61ms
+[exit 0]
+[local] /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+root 600
+
+## 2. cadu/streaming: 50 MB local_file, local_secret in memory, fetch /etc/hostname to out/
+local sha256: 796352a6f15efd6345c4edb22c2088af4f6f3982e156b4fe10e0658c482a0424 files/big.bin
+local sha256: e55a68d138ae170fd414f4ce6a0085ae5fe831039ecb3d0cb19a3e17c52ed8c0 files/secret.txt
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/streaming --host local -v
+[local]  connected in 1.27µs, probed x86_64-unknown-linux-musl in 1.58ms
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+    Finished `dist` profile [optimized] target(s) in 4.07s
+built x86_64-unknown-linux-musl in 4.09s
+x86_64-unknown-linux-musl: 853608 bytes, sha256 caf8d2704dbda9ec
+[local]  binary already cached in 960.82µs
+[local]  hello: protocol 3, playbook cadu/streaming, 2.85ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]  sent `files/big.bin` (52428800 bytes) in 1.28s
+[local]    debug: files/big.bin: 52428800 bytes at /tmp/.rustible-WsCmkA/1/big.bin
+[local]    files/big.bin arrived at /tmp/.rustible-WsCmkA/1/big.bin sha256 796352a6f15efd6345c4edb22c2088af4f6f3982e156b4fe10e0658c482a0424
+[local]  sent `files/secret.txt` (23 bytes) in 498.02µs
+[local]    debug: files/secret.txt: 23 secret bytes in memory
+[local]    files/secret.txt: 23 bytes in memory, sha256 e55a68d138ae170fd414f4ce6a0085ae5fe831039ecb3d0cb19a3e17c52ed8c0
+[local]    files under the run's temp dir: /tmp/.rustible-WsCmkA/1/big.bin
+[local]  fetched `out/local/hostname` (15 bytes) to /home/cadu/w/cadu/rustible-m5/examples/workspace/out/local/hostname
+[local]    debug: fetched /etc/hostname (15 bytes) to out/local/hostname
+
+local    ok=0 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 2.85ms, total run 1.32s
+
+total 5.42s
+[exit 0]
+fetched:
+  examples/workspace/out/local/hostname: COGRAM-VM-2025
+[local] leftover run temp dirs: none
+
+## 3. ctrl-c during cadu/slow (30 s sleep step): cancelled within 10 s, no zombie, next step never ran
+[local] SIGINT to the orchestrator (pid 3672354)
+[local] orchestrator exited 2 after 10 s
+    [local]  connected in 1.33µs, probed x86_64-unknown-linux-musl in 1.29ms
+       Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+        Finished `dist` profile [optimized] target(s) in 3.80s
+    built x86_64-unknown-linux-musl in 3.82s
+    x86_64-unknown-linux-musl: 792104 bytes, sha256 3c9be83c98c9eadc
+    [local]  binary already cached in 1.10ms
+    [local]  hello: protocol 3, playbook cadu/slow, 2.10ms after exec
+    [local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+    
+    ctrl-c: cancelling; each host gets 10s to stop between steps
+    [local]  sending Cancel
+    [local]  cancelled: the running step did not finish within 10s, killing the binary
+    [local]  exit -1, hello after 2.10ms, total run 12.20s
+    [local]  FAILED
+    
+    total 16.03s
+[local] leftover processes: none
+[local] marker: ls: cannot access '/tmp/rustible-m5-next-step-ran': No such file or directory
+
+## 4. cargo test --workspace
+
+$ cargo test --workspace
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/rustible-45ebef773e6cd160)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+
+running 11 tests
+test tests::render_emits_path_modules_and_registry ... ok
+test tests::attribute_in_comment_or_string_is_ignored ... ok
+test tests::bare_playbook_attribute_counts ... ok
+test tests::finds_nested_marked_files_and_names_them ... ok
+test tests::syntax_error_names_file_line_col ... ok
+test tests::two_markers_in_one_file_is_an_error_naming_the_file ... ok
+test tests::symlinked_directories_are_skipped_not_followed ... ok
+test tests::selected_mode_ignores_a_broken_sibling ... ok
+test tests::selection_filters_and_unknown_lists_available ... ok
+test tests::module_idents_are_valid_and_collision_free ... ok
+test tests::select_one_unknown_lists_files_without_parsing ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustible-dbbb3f9c0d74fc0f)
+
+running 10 tests
+test create::tests::names_come_from_the_playbooks_dir ... ok
+test init::tests::crates_io_deps_use_the_cli_version ... ok
+test create::tests::skeleton_has_attribute_vars_and_log ... ok
+test init::tests::lib_doc_uses_the_crate_identifier ... ok
+test init::tests::shims_carry_the_header ... ok
+test init::tests::sanitizes_directory_names ... ok
+test init::tests::normalizes_lexically_via_workspace ... ok
+test init::tests::path_deps_point_at_the_checkout ... ok
+test init::tests::rejects_reserved_names ... ok
+test workspace::tests::normalizes_lexically ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/init.rs (target/debug/deps/init-b0e080c7340ca9ad)
+
+running 7 tests
+test path_deps_must_point_at_a_checkout ... ok
+test crates_io_versions_by_default_and_name_from_directory ... ok
+test regenerates_the_example_workspace ... ok
+test a_git_directory_counts_as_empty_and_gitignore_is_appended ... ok
+test refuses_a_non_empty_directory_without_force ... ok
+test refresh_rewrites_only_the_shims ... ok
+test playbook_create_writes_a_skeleton_and_prints_the_hint ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-6985d82f594aa24e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-da73373035d8fee0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui.rs (target/debug/deps/ui-21cbee9bf19df045)
+
+running 1 test
+   Compiling rustible-macros-tests v0.0.0 (/home/cadu/w/cadu/rustible-m5/target/tests/trybuild/rustible-macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+
+
+test [0m[1mtests/ui/pass_no_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_with_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_map_var.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_missing_hosts.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_not_main.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_unknown_option.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_vars_without_param.rs[0m [should fail to compile] ... [0m[32mok
+[0m
+
+test ui ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-132b6f90d155238e)
+
+running 33 tests
+test backend::elevated::tests::helper_argv_shapes ... ok
+test channel::tests::cancel_flag_is_sticky_and_keeps_first_reason ... ok
+test channel::tests::denial_and_eof_surface_as_errors ... ok
+test channel::tests::file_frames_are_matched_by_request_id_and_may_overlap ... ok
+test channel::tests::eof_on_the_channel_cancels ... ok
+test backend::elevated::tests::dead_helper_reports_exit_and_stderr ... ok
+test ctx::tests::cancel_during_check_skips_apply_and_fails_the_step ... ok
+test ctx::tests::cancelled_run_starts_no_further_step ... ok
+test channel::tests::local_source_serves_and_writes_under_the_root ... ok
+test error::tests::context_chains_outermost_first ... ok
+test error::tests::foreign_errors_convert_with_question_mark ... ok
+test error::tests::option_context ... ok
+test secret::tests::bytes_are_zeroized ... ok
+test protocol::tests::start_frame_password_is_optional_and_secret ... ok
+test protocol::tests::frames_round_trip_with_binary_chunks ... ok
+test vars::tests::missing_required_reads_well ... ok
+test secret::tests::debug_and_str_are_safe ... ok
+test vars::tests::null_means_no_vars ... ok
+test vars::tests::parse_var_coerces_json_else_string ... ok
+test ctx::tests::fetch_reads_through_sys_and_lands_under_host_name ... ok
+test ctx::tests::local_file_lands_in_a_temp_dir_and_secret_stays_in_memory ... ok
+test vars::tests::all_missing_vars_reported_at_once ... ok
+test secret::tests::serde_round_trip_as_json_string ... ok
+test vars::tests::enums_and_lists_are_flat ... ok
+test vars::tests::schema_marks_required ... ok
+test vars::tests::unknown_keys_warn_with_suggestion ... ok
+test vars::tests::nested_struct_is_a_flatness_violation ... ok
+test stream::tests::requests_outside_the_workspace_are_denied ... ok
+test stream::tests::fetch_destinations_are_confined_and_written_in_order ... ok
+test stream::tests::chunking_always_ends_with_last ... ok
+test backend::elevated::tests::helper_refuses_mutations_while_checking ... ok
+test backend::elevated::tests::primitives_round_trip_through_the_helper_loop ... ok
+test stream::tests::chunks_reassemble_through_write_chunks ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-ad0f2cb31065de2d)
+
+running 14 tests
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::satisfied_when_installed ... ok
+test file::tests::check_mode_output_unavailable_unless_predicted ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test file::tests::line_op_creates_when_asked ... ok
+test file::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::tests::mutation_during_check_is_refused ... ok
+test file::tests::plan_appends_when_absent ... ok
+test file::tests::plan_handles_missing_trailing_newline ... ok
+test file::tests::line_op_check_then_apply_on_fake ... ok
+test file::tests::plan_inserts_after_regex ... ok
+test file::tests::plan_is_satisfied_when_line_present ... ok
+test file::tests::plan_replaces_commented_line ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-aa57e19c9b49e1bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-b29d3b95f442b125)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_build
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_github
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_macros
+
+running 1 test
+test crates/rustible-macros/src/lib.rs - playbook (line 14) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.10s; merged doctests compilation took 0.10s
+   Doc-tests rustible_sdk
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_std
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[exit 0]
+
+## cleanup
+[local] removed /etc/rustible-m5-test and /tmp/rustible-m5-next-step-ran
+
+
+################################################################################
+# ARM VM leg, run 2026-09-08T14:45:27Z, hosts: cadu@cadu-cogram-vm-arm
+# rustible 1d30932 (branch before the merge with main). The VM came back after
+# being unreachable for the first run; this leg was run first, while the link
+# was up, on the code the local output above was produced with.
+################################################################################
+
+# M5 done-when, 2026-09-08T14:45:27Z, hosts: cadu@cadu-cogram-vm-arm
+# rustible 1d30932
+
+## 1. cadu/escalation without escalate=true (twice: changed, then ok)
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host cadu@cadu-cogram-vm-arm -v
+[cadu@cadu-cogram-vm-arm]  connected in 215.31ms, probed aarch64-unknown-linux-musl in 118.05ms
+   Compiling memchr v2.8.3
+   Compiling bitflags v2.13.1
+   Compiling itoa v1.0.18
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling zmij v1.0.23
+   Compiling rustix v1.1.4
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling getrandom v0.4.3
+   Compiling ref-cast v1.0.27
+   Compiling cfg-if v1.0.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling anyhow v1.0.104
+   Compiling thiserror v2.0.20
+   Compiling fastrand v2.5.0
+   Compiling dyn-clone v1.0.20
+   Compiling once_cell v1.21.4
+   Compiling regex-syntax v0.8.11
+   Compiling zeroize v1.9.0
+   Compiling similar v2.7.0
+   Compiling base64 v0.22.1
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+   Compiling aho-corasick v1.1.5
+   Compiling regex-automata v0.4.18
+   Compiling tempfile v3.27.0
+   Compiling schemars v1.2.2
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-sdk)
+   Compiling regex v1.13.1
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible)
+    Finished `dist` profile [optimized] target(s) in 12.02s
+built aarch64-unknown-linux-musl in 12.03s
+aarch64-unknown-linux-musl: 1643336 bytes, sha256 4a3fee0bf002e350
+[cadu@cadu-cogram-vm-arm]  binary uploaded in 5.23s
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/escalation, 133.64ms after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]    debug: wrote /etc/rustible-m5-test (45 bytes)
+[cadu@cadu-cogram-vm-arm]  marker line present ........................ changed         +1 -0 lines   as root
+      | --- /etc/rustible-m5-test (before)
+      | +++ /etc/rustible-m5-test (after)
+      | @@ -0,0 +1 @@
+      | +rustible m5 escalation test on cogram-vm-arm
+[cadu@cadu-cogram-vm-arm]    commands run as cadu here and as root through the helper
+[cadu@cadu-cogram-vm-arm]    /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+
+cadu@cadu-cogram-vm-arm ok=0 changed=1 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 133.64ms, total run 165.48ms
+
+total 17.78s
+[exit 0]
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host cadu@cadu-cogram-vm-arm -v
+[cadu@cadu-cogram-vm-arm]  connected in 234.32ms, probed aarch64-unknown-linux-musl in 214.68ms
+    Finished `dist` profile [optimized] target(s) in 0.02s
+built aarch64-unknown-linux-musl in 39.33ms
+aarch64-unknown-linux-musl: 1643336 bytes, sha256 4a3fee0bf002e350
+[cadu@cadu-cogram-vm-arm]  binary already cached in 14.10ms
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/escalation, 27.27ms after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]  marker line present ........................ ok              as root
+[cadu@cadu-cogram-vm-arm]    commands run as cadu here and as root through the helper
+[cadu@cadu-cogram-vm-arm]    /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+
+cadu@cadu-cogram-vm-arm ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 27.27ms, total run 50.37ms
+
+total 576.80ms
+[exit 0]
+[cadu@cadu-cogram-vm-arm] /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+root 600
+
+## 2. cadu/streaming: 50 MB local_file, local_secret in memory, fetch /etc/hostname to out/
+local sha256: c9b1a7a0c30fef0f23c30baaaa8b11154a6f23a56fb96fb032b4273dab65fe31 files/big.bin
+local sha256: ed0d111362cf2f78a0772f74b9510ee97b4e137c761495156439b56a19e1eb58 files/secret.txt
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/streaming --host cadu@cadu-cogram-vm-arm -v
+[cadu@cadu-cogram-vm-arm]  connected in 275.14ms, probed aarch64-unknown-linux-musl in 147.18ms
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+    Finished `dist` profile [optimized] target(s) in 4.67s
+built aarch64-unknown-linux-musl in 4.69s
+aarch64-unknown-linux-musl: 749808 bytes, sha256 58795e1a8067bed7
+[cadu@cadu-cogram-vm-arm]  binary uploaded in 2.51s
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/streaming, 30.64ms after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]  sent `files/big.bin` (52428800 bytes) in 306.12s
+[cadu@cadu-cogram-vm-arm]    debug: files/big.bin: 52428800 bytes at /tmp/.rustible-f0EKLu/1/big.bin
+[cadu@cadu-cogram-vm-arm]    files/big.bin arrived at /tmp/.rustible-f0EKLu/1/big.bin sha256 c9b1a7a0c30fef0f23c30baaaa8b11154a6f23a56fb96fb032b4273dab65fe31
+[cadu@cadu-cogram-vm-arm]  sent `files/secret.txt` (23 bytes) in 109.58µs
+[cadu@cadu-cogram-vm-arm]    debug: files/secret.txt: 23 secret bytes in memory
+[cadu@cadu-cogram-vm-arm]    files/secret.txt: 23 bytes in memory, sha256 ed0d111362cf2f78a0772f74b9510ee97b4e137c761495156439b56a19e1eb58
+[cadu@cadu-cogram-vm-arm]    files under the run's temp dir: /tmp/.rustible-f0EKLu/1/big.bin
+[cadu@cadu-cogram-vm-arm]  fetched `out/cadu@cadu-cogram-vm-arm/hostname` (14 bytes) to /home/cadu/w/cadu/rustible-m5/examples/workspace/out/cadu@cadu-cogram-vm-arm/hostname
+[cadu@cadu-cogram-vm-arm]    debug: fetched /etc/hostname (14 bytes) to out/cadu@cadu-cogram-vm-arm/hostname
+
+cadu@cadu-cogram-vm-arm ok=0 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 30.64ms, total run 313.24s
+
+total 320.88s
+[exit 0]
+fetched:
+  examples/workspace/out/cadu@cadu-cogram-vm-arm/hostname: cogram-vm-arm
+zsh:1: no matches found: /tmp/.rustible-*
+[cadu@cadu-cogram-vm-arm] leftover run temp dirs: none
+
+## 3. ctrl-c during cadu/slow (30 s sleep step): cancelled within 10 s, no zombie, next step never ran
+[cadu@cadu-cogram-vm-arm] SIGINT to the orchestrator (pid 174761)
+[cadu@cadu-cogram-vm-arm] orchestrator exited 2 after 11 s
+    [cadu@cadu-cogram-vm-arm]  connected in 279.15ms, probed aarch64-unknown-linux-musl in 133.33ms
+       Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+        Finished `dist` profile [optimized] target(s) in 4.22s
+    built aarch64-unknown-linux-musl in 4.24s
+    aarch64-unknown-linux-musl: 698704 bytes, sha256 cbd047a1b8a34fab
+    [cadu@cadu-cogram-vm-arm]  binary uploaded in 1.51s
+    [cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/slow, 40.23ms after exec
+    [cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+    
+    ctrl-c: cancelling; each host gets 10s to stop between steps
+    [cadu@cadu-cogram-vm-arm]  sending Cancel
+    [cadu@cadu-cogram-vm-arm]  cancelled: the running step did not finish within 10s, killing the binary
+    [cadu@cadu-cogram-vm-arm]  stderr: Killed
+    [cadu@cadu-cogram-vm-arm]  exit 137, hello after 40.23ms, total run 12.61s
+    [cadu@cadu-cogram-vm-arm]  FAILED
+    
+    total 18.78s
+[cadu@cadu-cogram-vm-arm] leftover processes: none
+[cadu@cadu-cogram-vm-arm] marker: ls: cannot access '/tmp/rustible-m5-next-step-ran': No such file or directory
+
+## 4. cargo test --workspace
+
+$ cargo test --workspace
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/rustible-45ebef773e6cd160)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+
+running 11 tests
+test tests::module_idents_are_valid_and_collision_free ... ok
+test tests::render_emits_path_modules_and_registry ... ok
+test tests::attribute_in_comment_or_string_is_ignored ... ok
+test tests::bare_playbook_attribute_counts ... ok
+test tests::select_one_unknown_lists_files_without_parsing ... ok
+test tests::finds_nested_marked_files_and_names_them ... ok
+test tests::syntax_error_names_file_line_col ... ok
+test tests::selection_filters_and_unknown_lists_available ... ok
+test tests::symlinked_directories_are_skipped_not_followed ... ok
+test tests::selected_mode_ignores_a_broken_sibling ... ok
+test tests::two_markers_in_one_file_is_an_error_naming_the_file ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustible-dbbb3f9c0d74fc0f)
+
+running 10 tests
+test create::tests::skeleton_has_attribute_vars_and_log ... ok
+test create::tests::names_come_from_the_playbooks_dir ... ok
+test init::tests::normalizes_lexically_via_workspace ... ok
+test init::tests::lib_doc_uses_the_crate_identifier ... ok
+test init::tests::crates_io_deps_use_the_cli_version ... ok
+test init::tests::path_deps_point_at_the_checkout ... ok
+test init::tests::rejects_reserved_names ... ok
+test init::tests::sanitizes_directory_names ... ok
+test init::tests::shims_carry_the_header ... ok
+test workspace::tests::normalizes_lexically ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/init.rs (target/debug/deps/init-b0e080c7340ca9ad)
+
+running 7 tests
+test path_deps_must_point_at_a_checkout ... ok
+test crates_io_versions_by_default_and_name_from_directory ... ok
+test regenerates_the_example_workspace ... ok
+test a_git_directory_counts_as_empty_and_gitignore_is_appended ... ok
+test refuses_a_non_empty_directory_without_force ... ok
+test refresh_rewrites_only_the_shims ... ok
+test playbook_create_writes_a_skeleton_and_prints_the_hint ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-6985d82f594aa24e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-da73373035d8fee0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui.rs (target/debug/deps/ui-21cbee9bf19df045)
+
+running 1 test
+   Compiling rustible-macros-tests v0.0.0 (/home/cadu/w/cadu/rustible-m5/target/tests/trybuild/rustible-macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+
+
+test [0m[1mtests/ui/pass_no_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_with_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_map_var.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_missing_hosts.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_not_main.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_unknown_option.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_vars_without_param.rs[0m [should fail to compile] ... [0m[32mok
+[0m
+
+test ui ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-132b6f90d155238e)
+
+running 33 tests
+test backend::elevated::tests::helper_argv_shapes ... ok
+test channel::tests::denial_and_eof_surface_as_errors ... ok
+test channel::tests::eof_on_the_channel_cancels ... ok
+test channel::tests::file_frames_are_matched_by_request_id_and_may_overlap ... ok
+test backend::elevated::tests::dead_helper_reports_exit_and_stderr ... ok
+test ctx::tests::cancel_during_check_skips_apply_and_fails_the_step ... ok
+test ctx::tests::cancelled_run_starts_no_further_step ... ok
+test channel::tests::local_source_serves_and_writes_under_the_root ... ok
+test channel::tests::cancel_flag_is_sticky_and_keeps_first_reason ... ok
+test error::tests::context_chains_outermost_first ... ok
+test error::tests::foreign_errors_convert_with_question_mark ... ok
+test error::tests::option_context ... ok
+test protocol::tests::start_frame_password_is_optional_and_secret ... ok
+test secret::tests::bytes_are_zeroized ... ok
+test secret::tests::debug_and_str_are_safe ... ok
+test ctx::tests::fetch_reads_through_sys_and_lands_under_host_name ... ok
+test protocol::tests::frames_round_trip_with_binary_chunks ... ok
+test vars::tests::all_missing_vars_reported_at_once ... ok
+test vars::tests::nested_struct_is_a_flatness_violation ... ok
+test ctx::tests::local_file_lands_in_a_temp_dir_and_secret_stays_in_memory ... ok
+test stream::tests::requests_outside_the_workspace_are_denied ... ok
+test vars::tests::null_means_no_vars ... ok
+test vars::tests::schema_marks_required ... ok
+test vars::tests::unknown_keys_warn_with_suggestion ... ok
+test secret::tests::serde_round_trip_as_json_string ... ok
+test vars::tests::enums_and_lists_are_flat ... ok
+test vars::tests::parse_var_coerces_json_else_string ... ok
+test vars::tests::missing_required_reads_well ... ok
+test stream::tests::fetch_destinations_are_confined_and_written_in_order ... ok
+test stream::tests::chunking_always_ends_with_last ... ok
+test backend::elevated::tests::helper_refuses_mutations_while_checking ... ok
+test backend::elevated::tests::primitives_round_trip_through_the_helper_loop ... ok
+test stream::tests::chunks_reassemble_through_write_chunks ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-ad0f2cb31065de2d)
+
+running 14 tests
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::satisfied_when_installed ... ok
+test file::tests::check_mode_output_unavailable_unless_predicted ... ok
+test file::tests::line_op_creates_when_asked ... ok
+test file::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::tests::line_op_check_then_apply_on_fake ... ok
+test file::tests::mutation_during_check_is_refused ... ok
+test file::tests::plan_appends_when_absent ... ok
+test file::tests::plan_handles_missing_trailing_newline ... ok
+test file::tests::plan_is_satisfied_when_line_present ... ok
+test file::tests::plan_inserts_after_regex ... ok
+test file::tests::plan_replaces_commented_line ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-aa57e19c9b49e1bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-b29d3b95f442b125)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_build
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_github
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_macros
+
+running 1 test
+test crates/rustible-macros/src/lib.rs - playbook (line 14) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.10s; merged doctests compilation took 0.10s
+   Doc-tests rustible_sdk
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_std
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[exit 0]
+
+## cleanup
+[cadu@cadu-cogram-vm-arm] removed /etc/rustible-m5-test and /tmp/rustible-m5-next-step-ran
+
+
+################################################################################
+# Final run, 2026-09-08T15:01:30Z, hosts: local cadu@cadu-cogram-vm-arm
+# rustible 1352e50 (main eca57dd..cdaa085 merged: M2 inventory, M4 init, M6
+# harness/file/user/group/authorized_keys/systemd/small ops; Elevated proxies
+# the seven Backend primitives main added). Both hosts in one invocation.
+################################################################################
+
+# M5 done-when, 2026-09-08T15:01:30Z, hosts: local cadu@cadu-cogram-vm-arm
+# rustible 1352e50
+
+## 1. cadu/escalation without escalate=true (twice: changed, then ok)
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host local --host cadu@cadu-cogram-vm-arm -v
+[local]  connected in 1.48µs, probed x86_64-unknown-linux-musl in 1.73ms
+[cadu@cadu-cogram-vm-arm]  connected in 478.42ms, probed aarch64-unknown-linux-musl in 245.16ms
+   Compiling rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-macros)
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m5/crates/rustible)
+    Finished `dist` profile [optimized] target(s) in 12.56s
+built aarch64-unknown-linux-musl, x86_64-unknown-linux-musl in 12.59s
+aarch64-unknown-linux-musl: 1665536 bytes, sha256 2cf0c044085843a9
+x86_64-unknown-linux-musl: 2057480 bytes, sha256 501845dd53d4517a
+[local]  binary uploaded in 11.41ms
+[local]  hello: protocol 3, playbook cadu/escalation, 1.08ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]    debug: wrote /etc/rustible-m5-test (46 bytes)
+[local]  marker line present ........................ changed         +1 -0 lines   as root
+      | --- /etc/rustible-m5-test (before)
+      | +++ /etc/rustible-m5-test (after)
+      | @@ -0,0 +1 @@
+      | +rustible m5 escalation test on COGRAM-VM-2025
+[local]    commands run as cadu here and as root through the helper
+[local]    /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+
+local    ok=0 changed=1 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 1.08ms, total run 34.56ms
+[cadu@cadu-cogram-vm-arm]  binary uploaded in 43.51s
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/escalation, 39.33ms after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]    debug: wrote /etc/rustible-m5-test (45 bytes)
+[cadu@cadu-cogram-vm-arm]  marker line present ........................ changed         +1 -0 lines   as root
+      | --- /etc/rustible-m5-test (before)
+      | +++ /etc/rustible-m5-test (after)
+      | @@ -0,0 +1 @@
+      | +rustible m5 escalation test on cogram-vm-arm
+[cadu@cadu-cogram-vm-arm]    commands run as cadu here and as root through the helper
+[cadu@cadu-cogram-vm-arm]    /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+
+cadu@cadu-cogram-vm-arm ok=0 changed=1 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 39.33ms, total run 188.50ms
+
+total 57.06s
+[exit 0]
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/escalation --host local --host cadu@cadu-cogram-vm-arm -v
+[local]  connected in 1.48µs, probed x86_64-unknown-linux-musl in 1.89ms
+[cadu@cadu-cogram-vm-arm]  connected in 763.21ms, probed aarch64-unknown-linux-musl in 511.45ms
+    Finished `dist` profile [optimized] target(s) in 0.04s
+built aarch64-unknown-linux-musl, x86_64-unknown-linux-musl in 62.90ms
+aarch64-unknown-linux-musl: 1665536 bytes, sha256 2cf0c044085843a9
+x86_64-unknown-linux-musl: 2057480 bytes, sha256 501845dd53d4517a
+[local]  binary already cached in 1.20ms
+[local]  hello: protocol 3, playbook cadu/escalation, 1.44ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]  marker line present ........................ ok              as root
+[local]    commands run as cadu here and as root through the helper
+[local]    /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+
+local    ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 1.44ms, total run 31.14ms
+[cadu@cadu-cogram-vm-arm]  binary already cached in 55.84ms
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/escalation, 282.30ms after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]  marker line present ........................ ok              as root
+[cadu@cadu-cogram-vm-arm]    commands run as cadu here and as root through the helper
+[cadu@cadu-cogram-vm-arm]    /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+
+cadu@cadu-cogram-vm-arm ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 282.30ms, total run 426.66ms
+
+total 1.87s
+[exit 0]
+[local] /etc/rustible-m5-test: rustible m5 escalation test on COGRAM-VM-2025
+root 644
+[cadu@cadu-cogram-vm-arm] /etc/rustible-m5-test: rustible m5 escalation test on cogram-vm-arm
+root 644
+
+## 2. cadu/streaming: 50 MB local_file, local_secret in memory, fetch /etc/hostname to out/
+local sha256: fe7bb4a3ebd806a9a2deec0c94acd8b0e2b6fea9126f914aaafad50db73f9a58 files/big.bin
+local sha256: b1ff0b34f35d23b40ae31bd9c3f879946677df159eb1c245c6c61321711b8a88 files/secret.txt
+
+$ cargo run -q -p rustible-cli -- run --playbook cadu/streaming --host local --host cadu@cadu-cogram-vm-arm -v
+[local]  connected in 990.00ns, probed x86_64-unknown-linux-musl in 1.74ms
+[cadu@cadu-cogram-vm-arm]  connected in 550.19ms, probed aarch64-unknown-linux-musl in 166.53ms
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+    Finished `dist` profile [optimized] target(s) in 5.11s
+built aarch64-unknown-linux-musl, x86_64-unknown-linux-musl in 5.13s
+aarch64-unknown-linux-musl: 771016 bytes, sha256 16a1f05583ea0536
+x86_64-unknown-linux-musl: 882088 bytes, sha256 5a54587879e4a30c
+[local]  binary uploaded in 7.52ms
+[local]  hello: protocol 3, playbook cadu/streaming, 912.41µs after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+[local]  sent `files/big.bin` (52428800 bytes) in 1.29s
+[local]    debug: files/big.bin: 52428800 bytes at /tmp/.rustible-OZCcC6/1/big.bin
+[local]    files/big.bin arrived at /tmp/.rustible-OZCcC6/1/big.bin sha256 fe7bb4a3ebd806a9a2deec0c94acd8b0e2b6fea9126f914aaafad50db73f9a58
+[local]  sent `files/secret.txt` (23 bytes) in 418.00µs
+[local]    debug: files/secret.txt: 23 secret bytes in memory
+[local]    files/secret.txt: 23 bytes in memory, sha256 b1ff0b34f35d23b40ae31bd9c3f879946677df159eb1c245c6c61321711b8a88
+[local]    files under the run's temp dir: /tmp/.rustible-OZCcC6/1/big.bin
+[local]  fetched `out/local/hostname` (15 bytes) to /home/cadu/w/cadu/rustible-m5/examples/workspace/out/local/hostname
+[local]    debug: fetched /etc/hostname (15 bytes) to out/local/hostname
+
+local    ok=0 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after 911.52µs, total run 1.33s
+[cadu@cadu-cogram-vm-arm]  binary uploaded in 27.20s
+[cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/streaming, 2.05s after exec
+[cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+[cadu@cadu-cogram-vm-arm]  sent `files/big.bin` (52428800 bytes) in 455.08s
+[cadu@cadu-cogram-vm-arm]    debug: files/big.bin: 52428800 bytes at /tmp/.rustible-CE9SU7/1/big.bin
+[cadu@cadu-cogram-vm-arm]    files/big.bin arrived at /tmp/.rustible-CE9SU7/1/big.bin sha256 fe7bb4a3ebd806a9a2deec0c94acd8b0e2b6fea9126f914aaafad50db73f9a58
+[cadu@cadu-cogram-vm-arm]  sent `files/secret.txt` (23 bytes) in 1.06ms
+[cadu@cadu-cogram-vm-arm]    debug: files/secret.txt: 23 secret bytes in memory
+[cadu@cadu-cogram-vm-arm]    files/secret.txt: 23 bytes in memory, sha256 b1ff0b34f35d23b40ae31bd9c3f879946677df159eb1c245c6c61321711b8a88
+[cadu@cadu-cogram-vm-arm]    files under the run's temp dir: /tmp/.rustible-CE9SU7/1/big.bin
+[cadu@cadu-cogram-vm-arm]  fetched `out/cadu@cadu-cogram-vm-arm/hostname` (14 bytes) to /home/cadu/w/cadu/rustible-m5/examples/workspace/out/cadu@cadu-cogram-vm-arm/hostname
+[cadu@cadu-cogram-vm-arm]    debug: fetched /etc/hostname (14 bytes) to out/cadu@cadu-cogram-vm-arm/hostname
+
+cadu@cadu-cogram-vm-arm ok=0 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[cadu@cadu-cogram-vm-arm]  exit 0, hello after 2.05s, total run 472.32s
+
+total 505.40s
+[exit 0]
+fetched:
+  examples/workspace/out/cadu@cadu-cogram-vm-arm/hostname: cogram-vm-arm
+  examples/workspace/out/local/hostname: COGRAM-VM-2025
+[local] leftover run temp dirs: none
+zsh:1: no matches found: /tmp/.rustible-*
+[cadu@cadu-cogram-vm-arm] leftover run temp dirs: none
+
+## 3. ctrl-c during cadu/slow (30 s sleep step): cancelled within 10 s, no zombie, next step never ran
+[local] SIGINT to the orchestrator (pid 279515)
+[local] orchestrator exited 2 after 10 s
+    [local]  connected in 1.22µs, probed x86_64-unknown-linux-musl in 1.24ms
+       Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+        Finished `dist` profile [optimized] target(s) in 4.09s
+    built x86_64-unknown-linux-musl in 4.11s
+    x86_64-unknown-linux-musl: 817928 bytes, sha256 9f529e46aa5c664b
+    [local]  binary uploaded in 7.83ms
+    [local]  hello: protocol 3, playbook cadu/slow, 902.91µs after exec
+    [local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=cadu
+    
+    ctrl-c: cancelling; each host gets 10s to stop between steps
+    [local]  sending Cancel
+    [local]  cancelled: the running step did not finish within 10s, killing the binary
+    [local]  exit -1, hello after 901.68µs, total run 12.40s
+    [local]  FAILED
+    
+    total 16.53s
+[local] leftover processes: none
+[local] marker: ls: cannot access '/tmp/rustible-m5-next-step-ran': No such file or directory
+[cadu@cadu-cogram-vm-arm] SIGINT to the orchestrator (pid 280394)
+[cadu@cadu-cogram-vm-arm] orchestrator exited 2 after 11 s
+    [cadu@cadu-cogram-vm-arm]  connected in 355.61ms, probed aarch64-unknown-linux-musl in 101.63ms
+       Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m5/examples/workspace)
+        Finished `dist` profile [optimized] target(s) in 4.29s
+    built aarch64-unknown-linux-musl in 4.31s
+    aarch64-unknown-linux-musl: 717576 bytes, sha256 f098307a69d993b2
+    [cadu@cadu-cogram-vm-arm]  binary uploaded in 2.79s
+    [cadu@cadu-cogram-vm-arm]  hello: protocol 3, playbook cadu/slow, 32.91ms after exec
+    [cadu@cadu-cogram-vm-arm]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=cadu
+    
+    ctrl-c: cancelling; each host gets 10s to stop between steps
+    [cadu@cadu-cogram-vm-arm]  sending Cancel
+    [cadu@cadu-cogram-vm-arm]  cancelled: the running step did not finish within 10s, killing the binary
+    [cadu@cadu-cogram-vm-arm]  exit 137, hello after 32.91ms, total run 12.99s
+    [cadu@cadu-cogram-vm-arm]  FAILED
+    
+    total 20.56s
+[cadu@cadu-cogram-vm-arm] leftover processes: none
+[cadu@cadu-cogram-vm-arm] marker: ls: cannot access '/tmp/rustible-m5-next-step-ran': No such file or directory
+
+## 4. cargo test --workspace
+
+$ cargo test --workspace
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/rustible-45ebef773e6cd160)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+
+running 11 tests
+test tests::module_idents_are_valid_and_collision_free ... ok
+test tests::render_emits_path_modules_and_registry ... ok
+test tests::attribute_in_comment_or_string_is_ignored ... ok
+test tests::bare_playbook_attribute_counts ... ok
+test tests::select_one_unknown_lists_files_without_parsing ... ok
+test tests::finds_nested_marked_files_and_names_them ... ok
+test tests::selection_filters_and_unknown_lists_available ... ok
+test tests::syntax_error_names_file_line_col ... ok
+test tests::symlinked_directories_are_skipped_not_followed ... ok
+test tests::selected_mode_ignores_a_broken_sibling ... ok
+test tests::two_markers_in_one_file_is_an_error_naming_the_file ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_cli-7eaa4a49c99cf6c5)
+
+running 27 tests
+test inventory::tests::load_reports_unreadable_file ... ok
+test inventory::tests::positions_count_characters_not_bytes ... ok
+test inventory::tests::both_vars_forms_and_scalars ... ok
+test inventory::tests::group_distance_is_shortest_path ... ok
+test inventory::tests::no_conflict_when_only_one_sibling_sets_the_key ... ok
+test inventory::tests::sibling_conflict_on_a_parameter ... ok
+test inventory::tests::parameter_precedence_host_group_defaults_builtin ... ok
+test inventory::tests::errors_are_collected_not_first_only ... ok
+test inventory::tests::ssh_args_child_node_and_property ... ok
+test inventory::tests::sibling_conflict_is_a_load_error_naming_both_groups_and_host ... ok
+test inventory::tests::error_unknown_parameter_with_did_you_mean ... ok
+test inventory::tests::vars_report_single_host_and_multiple_errors ... ok
+test inventory::tests::vars_validation_kinds ... ok
+test inventory::tests::vars_validation_lists_and_enums ... ok
+test inventory::tests::error_structure ... ok
+test inventory::tests::sibling_conflict_resolved_by_host_override ... ok
+test inventory::tests::sibling_conflict_resolved_by_nearer_group ... ok
+test inventory::tests::vars_validation_report_matches_vision ... ok
+test inventory::tests::var_precedence_all_outer_inner_host ... ok
+test inventory::tests::review_fixes_lists_floats_bigints_groups_and_conflicts ... ok
+test inventory::tests::select_group_host_or_error ... ok
+test inventory::tests::vision_show_layout ... ok
+test inventory::tests::vision_web2_resolves_with_sources ... ok
+test inventory::tests::example_workspace_inventory_loads ... ok
+test inventory::tests::vision_example_loads ... ok
+test inventory::tests::vision_other_hosts ... ok
+test inventory::tests::slash_dash_disables_a_host_with_its_children ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/rustible-b113ada6cea938bb)
+
+running 10 tests
+test create::tests::skeleton_has_attribute_vars_and_log ... ok
+test init::tests::crates_io_deps_use_the_cli_version ... ok
+test init::tests::lib_doc_uses_the_crate_identifier ... ok
+test create::tests::names_come_from_the_playbooks_dir ... ok
+test init::tests::path_deps_point_at_the_checkout ... ok
+test init::tests::normalizes_lexically_via_workspace ... ok
+test init::tests::rejects_reserved_names ... ok
+test init::tests::sanitizes_directory_names ... ok
+test init::tests::shims_carry_the_header ... ok
+test workspace::tests::normalizes_lexically ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/init.rs (target/debug/deps/init-47cbda427e6526e1)
+
+running 7 tests
+test path_deps_must_point_at_a_checkout ... ok
+test crates_io_versions_by_default_and_name_from_directory ... ok
+test regenerates_the_example_workspace ... ok
+test refuses_a_non_empty_directory_without_force ... ok
+test a_git_directory_counts_as_empty_and_gitignore_is_appended ... ok
+test refresh_rewrites_only_the_shims ... ok
+test playbook_create_writes_a_skeleton_and_prints_the_hint ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-6985d82f594aa24e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-da73373035d8fee0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui.rs (target/debug/deps/ui-21cbee9bf19df045)
+
+running 1 test
+   Compiling rustible-macros-tests v0.0.0 (/home/cadu/w/cadu/rustible-m5/target/tests/trybuild/rustible-macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+
+
+test [0m[1mtests/ui/pass_integration_test.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_integration_test_systemd.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_no_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_with_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_integration_test_no_images.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_integration_test_signature.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_map_var.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_missing_hosts.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_not_main.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_unknown_option.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_vars_without_param.rs[0m [should fail to compile] ... [0m[32mok
+[0m
+
+test ui ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-132b6f90d155238e)
+
+running 51 tests
+test backend::elevated::tests::helper_argv_shapes ... ok
+test backend::fake::tests::read_dir_lists_direct_children_only ... ok
+test backend::fake::tests::rename_moves_entries_and_replaces_the_target ... ok
+test backend::fake::tests::remove_is_not_recursive_but_remove_all_is ... ok
+test backend::elevated::tests::dead_helper_reports_exit_and_stderr ... ok
+test backend::fake::tests::symlink_read_link_and_stat_kind ... ok
+test backend::fake::tests::symlinks_are_followed_by_read_and_stat_follow_but_not_stat ... ok
+test channel::tests::cancel_flag_is_sticky_and_keeps_first_reason ... ok
+test backend::fake::tests::read_link_on_non_symlink_fails ... ok
+test backend::local::tests::symlink_read_link_read_dir_on_real_fs ... ok
+test channel::tests::denial_and_eof_surface_as_errors ... ok
+test channel::tests::eof_on_the_channel_cancels ... ok
+test channel::tests::file_frames_are_matched_by_request_id_and_may_overlap ... ok
+test ctx::tests::cancel_during_check_skips_apply_and_fails_the_step ... ok
+test error::tests::context_chains_outermost_first ... ok
+test error::tests::foreign_errors_convert_with_question_mark ... ok
+test error::tests::option_context ... ok
+test channel::tests::local_source_serves_and_writes_under_the_root ... ok
+test protocol::tests::start_frame_password_is_optional_and_secret ... ok
+test secret::tests::bytes_are_zeroized ... ok
+test secret::tests::debug_and_str_are_safe ... ok
+test secret::tests::serde_round_trip_as_json_string ... ok
+test protocol::tests::frames_round_trip_with_binary_chunks ... ok
+test system::tests::symlink_is_refused_during_check ... ok
+test testing::tests::parse_report_reads_the_last_report_line ... ok
+test ctx::tests::local_file_lands_in_a_temp_dir_and_secret_stays_in_memory ... ok
+test ctx::tests::cancelled_run_starts_no_further_step ... ok
+test stream::tests::requests_outside_the_workspace_are_denied ... ok
+test stream::tests::fetch_destinations_are_confined_and_written_in_order ... ok
+test testing::tests::test_artifact_matches_the_exact_target_name_only ... ok
+test testing::tests::test_path_at_crate_root_is_the_name ... ok
+test testing::tests::test_artifact_picks_the_test_target_by_name ... ok
+test vars::tests::did_you_mean_picks_the_closest_within_two_edits ... ok
+test testing::tests::image_result_passes_only_with_a_clean_report ... ok
+test vars::tests::missing_required_names_every_gap ... ok
+test testing::tests::test_path_inside_a_module_keeps_the_module ... ok
+test backend::elevated::tests::helper_refuses_mutations_while_checking ... ok
+test vars::tests::missing_required_reads_well ... ok
+test vars::tests::nested_struct_is_a_flatness_violation ... ok
+test ctx::tests::fetch_reads_through_sys_and_lands_under_host_name ... ok
+test vars::tests::all_missing_vars_reported_at_once ... ok
+test vars::tests::null_means_no_vars ... ok
+test vars::tests::type_mismatches_follow_the_schema ... ok
+test vars::tests::parse_var_coerces_json_else_string ... ok
+test vars::tests::enums_and_lists_are_flat ... ok
+test vars::tests::schema_marks_required ... ok
+test vars::tests::scalar_for_a_list_field_becomes_a_one_element_list ... ok
+test vars::tests::unknown_keys_warn_with_suggestion ... ok
+test stream::tests::chunking_always_ends_with_last ... ok
+test backend::elevated::tests::primitives_round_trip_through_the_helper_loop ... ok
+test stream::tests::chunks_reassemble_through_write_chunks ... ok
+
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-3d539c88587b001d)
+
+running 268 tests
+test apt::tests::absent_apply_without_prediction_is_refused ... ok
+test apt::tests::absent_autoremove_without_purge ... ok
+test apt::tests::absent_change_and_apply_runs_apt_get_remove ... ok
+test apt::tests::absent_check_mode_runs_only_dpkg_query_and_predicts ... ok
+test apt::tests::absent_config_files_count_as_present_only_when_purging ... ok
+test apt::tests::absent_purge_uses_apt_get_purge_and_autoremove_purge ... ok
+test apt::tests::absent_refuses_half_configured_package ... ok
+test apt::tests::absent_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::absent_satisfied_when_not_installed ... ok
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::latest_installs_missing_packages ... ok
+test apt::tests::latest_check_mode_runs_only_read_only_commands ... ok
+test apt::tests::latest_refuses_unknown_package ... ok
+test apt::tests::latest_mixed_install_upgrade_current ... ok
+test apt::tests::latest_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::latest_satisfied_when_at_candidate ... ok
+test apt::tests::latest_update_cache_runs_before_install ... ok
+test apt::tests::latest_upgrades_with_only_upgrade ... ok
+test apt::tests::parse_dpkg_status_variants ... ok
+test apt::tests::parse_policy_installed_and_candidate ... ok
+test apt::tests::parse_policy_unknown_package_has_no_candidate ... ok
+test apt::tests::parse_policy_none_means_not_installed ... ok
+test apt::tests::present_apply_refuses_a_plan_with_no_packages ... ok
+test apt::tests::present_refuses_without_root ... ok
+test apt::tests::present_does_not_predict_when_the_lists_have_no_candidate ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::present_predicts_the_candidate_version_when_the_lists_know_it ... ok
+test apt::tests::update_cache_runs_apt_get_update_when_lists_are_stale ... ok
+test apt::tests::update_cache_zero_always_updates_without_stat ... ok
+test apt::tests::satisfied_when_installed ... ok
+test file::absent::tests::absent_in_check_mode_predicts_and_removes_nothing ... ok
+test file::absent::tests::absent_removes_a_file_and_a_symlink ... ok
+test apt::tests::update_cache_skips_update_when_lists_are_fresh ... ok
+test apt::tests::parse_stat_mtime_reads_seconds ... ok
+test apt::tests::present_apply_installs_what_the_plan_named_and_rereads_versions ... ok
+test file::absent::tests::absent_is_satisfied_when_missing ... ok
+test file::attrs::tests::attrs_changes_mode_and_owner_then_is_satisfied ... ok
+test file::attrs::tests::attrs_only_touches_what_was_asked ... ok
+test file::absent::tests::absent_removes_an_empty_directory_without_recursive ... ok
+test file::block::tests::block_in_check_mode_predicts_and_writes_nothing ... ok
+test apt::tests::update_cache_falls_back_to_pkgcache_then_updates_when_unknown ... ok
+test file::absent::tests::non_recursive_apply_refuses_a_directory_populated_after_check ... ok
+test file::block::tests::block_op_default_marker_and_create ... ok
+test file::block::tests::block_op_rejects_marker_without_mark ... ok
+test file::block::tests::block_op_check_apply_then_satisfied ... ok
+test file::block::tests::body_line_equal_to_a_marker_is_refused ... ok
+test file::block::tests::crlf_files_keep_their_line_endings ... ok
+test file::attrs::tests::attrs_fails_on_missing_path_and_on_symlink ... ok
+test file::attrs::tests::attrs_in_check_mode_predicts_and_changes_nothing ... ok
+test file::block::tests::plan_block_identical_is_satisfied ... ok
+test file::block::tests::symlinked_file_is_refused_not_replaced ... ok
+test file::absent::tests::absent_refuses_non_empty_directory_unless_recursive ... ok
+test file::copy::tests::copy_attrs_only_change_does_not_rewrite ... ok
+test file::copy::tests::copy_backup_is_taken_before_rewrite ... ok
+test file::block::tests::plan_block_appends_when_absent ... ok
+test file::copy::tests::copy_binary_content_produces_summary_diff ... ok
+test file::copy::tests::copy_creates_missing_file_with_mode ... ok
+test file::attrs::tests::attrs_is_satisfied_when_matching_or_nothing_asked ... ok
+test file::copy::tests::copy_fails_when_dest_is_a_directory_or_link ... ok
+test file::block::tests::plan_block_empty_removes_managed_block ... ok
+test file::block::tests::plan_block_orphan_begin_marker_counts_as_absent ... ok
+test file::block::tests::plan_block_replaces_existing_in_place ... ok
+test file::copy::tests::copy_large_text_falls_back_to_summary ... ok
+test file::copy::tests::copy_from_local_path_reads_source_through_sys ... ok
+test file::block::tests::plan_block_trailing_newline_edge_cases ... ok
+test file::copy::tests::copy_rewrite_preserves_existing_mode_when_none_given ... ok
+test file::copy::tests::copy_in_check_mode_predicts_and_writes_nothing ... ok
+test file::block::tests::plan_block_inserts_after_and_before_regex ... ok
+test file::copy::tests::copy_text_change_has_unified_diff_and_predicts ... ok
+test file::directory::tests::directory_is_created_with_mode_and_owner ... ok
+test file::directory::tests::a_symlink_to_a_directory_counts_as_the_directory ... ok
+test file::directory::tests::directory_owner_change_on_existing_dir ... ok
+test file::line::tests::check_mode_output_unavailable_unless_predicted ... ok
+test file::directory::tests::directory_fails_on_file_in_the_way ... ok
+test file::copy::tests::copy_is_satisfied_when_bytes_and_attrs_match ... ok
+test file::symlink::tests::replacing_a_link_is_atomic_and_leaves_no_temp_link ... ok
+test file::line::tests::plan_inserts_after_regex ... ok
+test file::symlink::tests::symlink_is_created_when_missing ... ok
+test file::symlink::tests::symlink_never_replaces_a_directory ... ok
+test file::line::tests::plan_replaces_commented_line ... ok
+test file::line::tests::line_op_creates_when_asked ... ok
+test file::line::tests::plan_is_satisfied_when_line_present ... ok
+test file::line::tests::line_op_check_then_apply_on_fake ... ok
+test file::line::tests::mutation_during_check_is_refused ... ok
+test file::symlink::tests::symlink_over_file_needs_force ... ok
+test file::line::tests::plan_appends_when_absent ... ok
+test file::symlink::tests::symlink_with_wrong_target_is_replaced ... ok
+test file::tests::plan_attrs_ignores_file_type_bits ... ok
+test file::tests::plan_attrs_nothing_wanted_or_all_equal_is_empty ... ok
+test file::tests::plan_attrs_on_missing_path_renders_dash ... ok
+test file::tests::plan_attrs_reports_mode_and_owner_changes ... ok
+test group::tests::absent_is_satisfied_when_missing ... ok
+test file::tests::insert_positions ... ok
+test file::line::tests::plan_handles_missing_trailing_newline ... ok
+test file::line::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::symlink::tests::symlink_in_check_mode_predicts_and_creates_nothing ... ok
+test group::tests::absent_needs_root ... ok
+test group::tests::absent_on_alpine_uses_delgroup ... ok
+test group::tests::absent_refuses_a_primary_group ... ok
+test group::tests::absent_removes_with_groupdel ... ok
+test group::tests::lookups_by_name_and_gid ... ok
+test group::tests::present_changes_gid_with_groupmod ... ok
+test group::tests::groups_of_user_are_sorted_supplementary_groups ... ok
+test group::tests::present_creates_with_groupadd_and_rereads ... ok
+test group::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test group::tests::present_is_satisfied_when_group_exists ... ok
+test group::tests::present_needs_root ... ok
+test group::tests::present_missing_binary_names_the_tool_family ... ok
+test group::tests::present_on_alpine_cannot_change_gid ... ok
+test group::tests::check_mode_through_ctx_runs_nothing_and_predicts ... ok
+test group::tests::tools_probe_binaries_before_the_distro_name ... ok
+test hostname::tests::apply_creates_etc_hostname_when_missing ... ok
+test group::tests::present_on_alpine_uses_addgroup_flags ... ok
+test hostname::tests::apply_on_systemd_uses_hostnamectl ... ok
+test hostname::tests::check_mode_predicts_and_runs_nothing ... ok
+test hostname::tests::invalid_hostnames ... ok
+test group::tests::present_refuses_a_taken_gid ... ok
+test group::tests::present_rejects_bad_names ... ok
+test hostname::tests::kernel_falls_back_to_facts_when_proc_is_unreadable ... ok
+test group::tests::parses_members_and_skips_malformed_lines ... ok
+test group::tests::present_without_gid_does_not_predict ... ok
+test hostname::tests::apply_without_prediction_is_refused ... ok
+test hostname::tests::apply_without_systemd_writes_file_and_runs_hostname ... ok
+test hostname::tests::refuses_without_root ... ok
+test hostname::tests::change_when_only_the_kernel_differs ... ok
+test hostname::tests::valid_hostnames ... ok
+test hostname::tests::missing_etc_hostname_reads_as_absent ... ok
+test hostname::tests::change_when_only_the_file_differs ... ok
+test ssh::authorized_keys::tests::absent_of_missing_key_is_satisfied ... ok
+test hostname::tests::refuses_invalid_name_before_touching_anything ... ok
+test ssh::authorized_keys::tests::absent_on_empty_text_is_satisfied ... ok
+test ssh::authorized_keys::tests::absent_on_missing_file_is_satisfied_and_creates_nothing ... ok
+test ssh::authorized_keys::tests::absent_removes_every_duplicate_line_of_a_key ... ok
+test ssh::authorized_keys::tests::absent_removes_matching_lines_only ... ok
+test ssh::authorized_keys::tests::absent_removes_exactly_one_of_three ... ok
+test hostname::tests::satisfied_when_file_and_kernel_match ... ok
+test ssh::authorized_keys::tests::check_mode_predicts_and_writes_nothing ... ok
+test ssh::authorized_keys::tests::create_path_through_ctx_passes_the_mutation_guard ... ok
+test ssh::authorized_keys::tests::in_file_form_refuses_missing_parent ... ok
+test ssh::authorized_keys::tests::comment_and_options_do_not_affect_identity ... ok
+test ssh::authorized_keys::tests::in_file_form_writes_the_given_path_without_owner ... ok
+test ssh::authorized_keys::tests::invalid_key_line_is_an_error ... ok
+test ssh::authorized_keys::tests::non_keys_do_not_parse ... ok
+test hostname::tests::step_is_ok_on_second_run_after_apply ... ok
+test ssh::authorized_keys::tests::parses_cert_and_sk_types ... ok
+test ssh::authorized_keys::tests::crlf_files_keep_their_line_endings ... ok
+test ssh::authorized_keys::tests::parses_key_without_comment_and_with_extra_spaces ... ok
+test ssh::authorized_keys::tests::parses_options_field_with_quoted_spaces ... ok
+test ssh::authorized_keys::tests::exclusive_through_ctx_is_changed_then_ok ... ok
+test ssh::authorized_keys::tests::existing_file_and_dir_keep_their_attributes ... ok
+test ssh::authorized_keys::tests::for_account_form_does_no_lookup ... ok
+test ssh::authorized_keys::tests::present_lacking_trailing_newline_alone_is_satisfied ... ok
+test ssh::authorized_keys::tests::parses_plain_key_with_comment ... ok
+test ssh::authorized_keys::tests::present_matches_ignoring_comment_and_keeps_existing_line ... ok
+test ssh::authorized_keys::tests::present_non_exclusive_leaves_strangers ... ok
+test ssh::authorized_keys::tests::present_on_empty_file_appends ... ok
+test ssh::authorized_keys::tests::present_preserves_comments_blank_lines_and_options ... ok
+test ssh::authorized_keys::tests::for_user_chains_from_user_existing ... ok
+test ssh::authorized_keys::tests::relative_or_empty_home_is_refused ... ok
+test ssh::authorized_keys::tests::requested_key_with_embedded_newline_is_refused ... ok
+test ssh::authorized_keys::tests::present_dedupes_requested_keys ... ok
+test ssh::authorized_keys::tests::unknown_user_is_an_error ... ok
+test ssh::authorized_keys::tests::present_exclusive_is_satisfied_when_exact ... ok
+test ssh::authorized_keys::tests::present_adds_missing_trailing_newline_when_writing ... ok
+test ssh::authorized_keys::tests::present_exclusive_removes_strangers_and_keeps_comments ... ok
+test sysctl::tests::apply_now_false_only_persists ... ok
+test sysctl::tests::change_when_only_the_file_differs_and_apply_writes_without_sysctl ... ok
+test sysctl::tests::check_mode_predicts_writes_nothing_and_runs_nothing ... ok
+test ssh::authorized_keys::tests::user_form_creates_file_with_mode_and_owner_inside_existing_ssh_dir ... ok
+test sysctl::tests::key_validation ... ok
+test sysctl::tests::custom_file_is_used ... ok
+test sysctl::tests::missing_directory_is_refused ... ok
+test ssh::authorized_keys::tests::user_form_refuses_missing_ssh_dir_naming_file_directory ... ok
+test ssh::authorized_keys::tests::present_is_satisfied_when_all_there ... ok
+test sysctl::tests::missing_proc_key_is_refused_unless_persist_only ... ok
+test sysctl::tests::apply_without_prediction_is_refused ... ok
+test sysctl::tests::multi_value_keys_compare_token_wise ... ok
+test sysctl::tests::parse_line_handles_spacing_comments_and_ignore_marker ... ok
+test sysctl::tests::change_when_only_live_differs_and_apply_runs_sysctl_w ... ok
+test sysctl::tests::proc_path_maps_dots_to_slashes ... ok
+test sysctl::tests::plan_appends_to_empty_and_existing_text ... ok
+test sysctl::tests::refuses_bad_key_newline_value_and_non_root ... ok
+test sysctl::tests::satisfied_when_file_and_live_match ... ok
+test sysctl::tests::change_when_both_differ ... ok
+test systemd::tests::active_state_classification ... ok
+test sysctl::tests::step_changed_then_ok_when_live_follows ... ok
+test systemd::tests::check_mode_through_ctx_runs_only_probes_and_predicts_state_ops ... ok
+test systemd::tests::disabled_now_stops_and_fails_with_journal_if_still_running ... ok
+test sysctl::tests::plan_collapses_duplicates_onto_the_first_line ... ok
+test systemd::tests::disabled_plans_and_applies_disable ... ok
+test systemd::tests::disabled_refuses_static_generated_transient ... ok
+test sysctl::tests::plan_does_not_match_a_key_prefix_or_comment ... ok
+test sysctl::tests::plan_is_satisfied_regardless_of_spacing ... ok
+test systemd::tests::enabled_apply_runs_enable_then_reads_both_probes ... ok
+test systemd::tests::enabled_refuses_masked_and_missing_units ... ok
+test systemd::tests::disabled_satisfied_on_disabled_masked_and_linked ... ok
+test sysctl::tests::plan_replaces_in_place_and_keeps_the_rest ... ok
+test systemd::tests::enabled_satisfied_and_only_probes_ran ... ok
+test systemd::tests::enabled_state_classification ... ok
+test systemd::tests::enabled_satisfied_on_static_alias_indirect_even_when_inactive ... ok
+test systemd::tests::enabled_surfaces_systemctl_failure ... ok
+test systemd::tests::enabled_now_adds_active_change_and_the_flag ... ok
+test systemd::tests::every_op_refuses_a_non_systemd_init_without_running_anything ... ok
+test systemd::tests::enabled_fails_when_still_disabled_after_enable ... ok
+test systemd::tests::every_op_refuses_without_root_and_names_the_user ... ok
+test systemd::tests::every_op_rejects_a_bad_unit_name ... ok
+test systemd::tests::enabled_now_fails_with_journal_when_unit_does_not_come_up ... ok
+test systemd::tests::parse_is_active_exit_codes_and_unknowns ... ok
+test systemd::tests::parse_is_active_every_documented_word ... ok
+test systemd::tests::reload_uses_reload_and_or_restart_switches_verb ... ok
+test systemd::tests::restart_always_changes_and_check_runs_nothing ... ok
+test systemd::tests::enabled_plans_change_with_diff_and_prediction ... ok
+test systemd::tests::restart_apply_daemon_reloads_restarts_and_verifies ... ok
+test systemd::tests::restart_fails_with_journal_when_unit_stays_down ... ok
+test systemd::tests::parse_is_enabled_every_documented_word ... ok
+test systemd::tests::restart_through_ctx_passes_the_mutation_guard_and_reports_changed ... ok
+test systemd::tests::parse_is_enabled_nonzero_exit_with_meaningful_stdout ... ok
+test systemd::tests::running_apply_starts_then_verifies ... ok
+test systemd::tests::running_refuses_masked_and_missing_units ... ok
+test systemd::tests::running_satisfied_on_active_and_transitional_states ... ok
+test systemd::tests::stopped_fails_when_still_running_after_stop ... ok
+test systemd::tests::running_fails_with_journal_when_failed_after_start ... ok
+test systemd::tests::stopped_plans_and_applies_stop ... ok
+test systemd::tests::stopped_satisfied_on_inactive_and_failed ... ok
+test user::tests::absent_removes_with_userdel_and_reports_home ... ok
+test systemd::tests::running_failure_message_survives_a_missing_journal ... ok
+test systemd::tests::running_plans_change_from_failed_with_prediction ... ok
+test systemd::tests::reload_surfaces_systemctl_failure_on_inactive_unit ... ok
+test systemd::tests::validate_unit_rejects_unusable_names ... ok
+test systemd::tests::user_mode_adds_the_flag_everywhere_and_needs_no_root ... ok
+test user::tests::absent_is_satisfied_when_missing ... ok
+test user::tests::absent_on_alpine_uses_deluser ... ok
+test user::tests::check_mode_through_ctx_runs_nothing_and_chains_from_predictions ... ok
+test user::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test user::tests::absent_needs_root ... ok
+test user::tests::malformed_passwd_line_for_the_user_fails_instead_of_creating ... ok
+test user::tests::membership_adds_with_usermod_ag ... ok
+test user::tests::delta_round_trips_through_its_changes ... ok
+test user::tests::membership_is_satisfied_for_members_and_primary_group ... ok
+test user::tests::membership_on_alpine_uses_addgroup ... ok
+test user::tests::membership_refuses_missing_user_group_and_non_root ... ok
+test user::tests::modify_exact_groups_adds_and_removes ... ok
+test user::tests::existing_looks_up_without_root_and_fails_when_missing ... ok
+test user::tests::membership_through_ctx_is_changed_then_ok ... ok
+test user::tests::modify_ids_home_and_comment ... ok
+test user::tests::modify_shell_and_append_groups ... ok
+test user::tests::present_create_without_uid_does_not_predict ... ok
+test user::tests::lookups_and_account_assembly ... ok
+test user::tests::modify_nothing_asked_is_empty ... ok
+test user::tests::present_is_satisfied_when_attributes_match ... ok
+test user::tests::present_exact_groups_uses_usermod_capital_g ... ok
+test user::tests::present_creates_with_useradd_predicts_and_rereads ... ok
+test user::tests::present_missing_binary_names_the_tool_family ... ok
+test user::tests::modify_without_groups_leaves_memberships_alone ... ok
+test user::tests::parses_entries_and_skips_malformed_lines ... ok
+test user::tests::present_needs_root_and_a_valid_name ... ok
+test user::tests::present_modifies_with_usermod_append ... ok
+test user::tests::present_modifies_ids_home_and_comment_in_one_usermod ... ok
+test user::tests::present_create_predicts_only_with_an_explicit_primary_group ... ok
+test user::tests::present_reads_defaults_from_etc_default_useradd ... ok
+test user::tests::present_on_alpine_changes_groups_but_not_attributes ... ok
+test user::tests::present_on_alpine_system_user_without_shell_does_not_predict ... ok
+test user::tests::present_create_takes_gid_by_name_id_or_group_and_system_flags ... ok
+test user::tests::present_refuses_a_uid_owned_by_another_account_even_when_modifying ... ok
+test user::tests::present_on_alpine_uses_adduser_and_addgroup ... ok
+test user::tests::present_refuses_a_relative_home ... ok
+test user::tests::present_refuses_missing_groups_and_taken_uid ... ok
+
+test result: ok. 268 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-3348cbf6a3c3bf21)
+
+running 1 test
+test absent_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-707286a579b39ea4)
+
+running 1 test
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-fa48056b72eed7e6)
+
+running 1 test
+test line_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-76823d57f2252c21)
+
+running 1 test
+test present_persist_only_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-9038fff452dbfd96)
+
+running 1 test
+test unit_lifecycle_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-a34ee9a39498c011)
+
+running 1 test
+test systemd_is_pid1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-aa57e19c9b49e1bb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-b29d3b95f442b125)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_build
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_cli
+
+running 1 test
+test crates/rustible-cli/src/inventory/mod.rs - inventory (line 4) - compile ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.24s; merged doctests compilation took 0.23s
+   Doc-tests rustible_github
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_macros
+
+running 2 tests
+test crates/rustible-macros/src/lib.rs - integration_test (line 296) ... ignored
+test crates/rustible-macros/src/lib.rs - playbook (line 14) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.10s; merged doctests compilation took 0.10s
+   Doc-tests rustible_sdk
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_std
+
+running 14 tests
+test crates/rustible-std/src/file/absent.rs - file::absent::Absent (line 13) - compile ... ok
+test crates/rustible-std/src/file/block.rs - file::block::Block (line 15) - compile ... ok
+test crates/rustible-std/src/file/attrs.rs - file::attrs::Attrs (line 16) - compile ... ok
+test crates/rustible-std/src/group.rs - group::Absent (line 372) ... ignored
+test crates/rustible-std/src/group.rs - group::Present (line 179) ... ignored
+test crates/rustible-std/src/ssh/authorized_keys.rs - ssh::authorized_keys::Absent (line 590) ... ignored
+test crates/rustible-std/src/ssh/authorized_keys.rs - ssh::authorized_keys::Present (line 460) ... ignored
+test crates/rustible-std/src/file/copy.rs - file::copy::Copy (line 30) - compile ... ok
+test crates/rustible-std/src/file/symlink.rs - file::symlink::Symlink (line 11) - compile ... ok
+test crates/rustible-std/src/user.rs - user::Absent (line 899) ... ignored
+test crates/rustible-std/src/user.rs - user::Existing (line 993) ... ignored
+test crates/rustible-std/src/user.rs - user::Membership (line 1041) ... ignored
+test crates/rustible-std/src/user.rs - user::Present (line 406) ... ignored
+test crates/rustible-std/src/systemd.rs - systemd (line 16) - compile ... ok
+
+test result: ok. 6 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.24s; merged doctests compilation took 0.23s
+[exit 0]
+
+## cleanup
+[local] removed /etc/rustible-m5-test and /tmp/rustible-m5-next-step-ran
+[cadu@cadu-cogram-vm-arm] removed /etc/rustible-m5-test and /tmp/rustible-m5-next-step-ran
