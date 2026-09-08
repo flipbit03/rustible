@@ -6,3 +6,4 @@ pub mod file;
 pub mod hostname;
 pub mod shell;
 pub mod ssh;
+pub mod sysctl;
