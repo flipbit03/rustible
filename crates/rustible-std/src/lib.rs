@@ -8,4 +8,5 @@ pub mod hostname;
 pub mod shell;
 pub mod ssh;
 pub mod sysctl;
+pub mod systemd;
 pub mod user;
