@@ -178,7 +178,7 @@ run. `--var package=htop` overrides the inventory.
 | `file` | `Copy`, `Directory`, `Symlink`, `Absent`, `Attrs`, `Line`, `Block` |
 | `user`, `group` | `Present`, `Absent`, `Membership` |
 | `ssh::authorized_keys` | `Present` (with `exclusive`), `Absent` |
-| `systemd` | `Enabled`, `Disabled`, `Running`, `Stopped`, `Restart`, `Reload` |
+| `systemd` | `Enabled`, `Disabled`, `Running`, `Stopped`, `Restart`, `Reload`, `DaemonReload` |
 | `hostname`, `sysctl` | `Is`, `Present` |
 | `shell` | `Command` |
 
