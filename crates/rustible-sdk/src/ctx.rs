@@ -17,6 +17,32 @@ use crate::system::{Phase, System};
 pub struct HostInfo {
     pub name: String,
     pub groups: Vec<String>,
+    /// The inventory's privileged account for this host (default `root`);
+    /// what `escalate = true` launches as and `as_escalated()` switches to.
+    #[serde(default = "default_escalate_user")]
+    pub escalate_user: String,
+    /// `"ssh"` or `"local"`.
+    #[serde(default = "default_connection")]
+    pub connection: String,
+}
+
+fn default_escalate_user() -> String {
+    "root".into()
+}
+
+fn default_connection() -> String {
+    "local".into()
+}
+
+impl HostInfo {
+    pub fn local() -> Self {
+        HostInfo {
+            name: "local".into(),
+            groups: vec![],
+            escalate_user: default_escalate_user(),
+            connection: default_connection(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -225,8 +251,15 @@ impl Ctx {
         }
     }
 
+    /// Literally root. Never follows the inventory (vision 11.3).
     pub fn as_root(&self) -> Ctx {
         self.as_user("root")
+    }
+
+    /// The inventory's privileged account for this host (`escalate_user`).
+    pub fn as_escalated(&self) -> Ctx {
+        let user = self.host.escalate_user.clone();
+        self.as_user(&user)
     }
 
     // ---- internals ----

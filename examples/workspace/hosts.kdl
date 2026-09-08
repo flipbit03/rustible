@@ -1,0 +1,8 @@
+// Inventory (KDL 2.0). Parsed from M2 on; until then the spike orchestrator
+// takes hosts on the command line.
+host "local" connection="local"
+
+group "lab" {
+    host "local" connection="local"
+    host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
+}

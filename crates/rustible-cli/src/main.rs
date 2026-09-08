@@ -21,12 +21,16 @@ use transport::Transport;
 #[derive(Parser, Debug)]
 #[command(name = "rustible", about = "Rustible orchestrator (spike)")]
 struct Cli {
-    /// Cargo package containing the playbook bin.
-    #[arg(long, default_value = "spike-playbook")]
-    package: String,
-    /// Playbook bin name.
-    #[arg(long)]
+    /// Rustible workspace directory (a Cargo package generated like
+    /// `examples/workspace`).
+    #[arg(long, default_value = "examples/workspace")]
+    workspace: PathBuf,
+    /// The workspace's bin name (its package name).
+    #[arg(long, default_value = "workspace")]
     bin: String,
+    /// Playbook name inside the workspace, e.g. `cadu/mc`.
+    #[arg(long)]
+    playbook: String,
     /// Hosts: `local` or `user@addr`. Repeatable.
     #[arg(long = "host", required = true)]
     hosts: Vec<String>,
@@ -76,16 +80,18 @@ async fn main() -> Result<()> {
         v
     };
     let t0 = Instant::now();
+    let manifest = cli.workspace.join("Cargo.toml");
     let mut cmd = tokio::process::Command::new("cargo");
     cmd.args([
         "build",
         "--profile",
         "dist",
-        "-p",
-        &cli.package,
-        "--bin",
-        &cli.bin,
-    ]);
+        "--features",
+        "selected",
+        "--manifest-path",
+    ])
+    .arg(&manifest)
+    .env("RUSTIBLE_PLAYBOOK", &cli.playbook);
     for t in &triples {
         cmd.args(["--target", t]);
     }
@@ -97,7 +103,12 @@ async fn main() -> Result<()> {
 
     let mut artifacts: BTreeMap<String, (Vec<u8>, String)> = BTreeMap::new();
     for t in &triples {
-        let p = PathBuf::from("target").join(t).join("dist").join(&cli.bin);
+        let p = cli
+            .workspace
+            .join("target")
+            .join(t)
+            .join("dist")
+            .join(&cli.bin);
         let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
         let hash = hex(&Sha256::digest(&bytes));
         eprintln!("{t}: {} bytes, sha256 {}", bytes.len(), &hash[..16]);
@@ -110,10 +121,11 @@ async fn main() -> Result<()> {
     for (name, tr, triple) in hosts {
         let artifacts = artifacts.clone();
         let bin = cli.bin.clone();
+        let playbook = cli.playbook.clone();
         let (escalate, check, verbosity) = (cli.escalate, cli.check, cli.verbose);
         runs.push(tokio::spawn(async move {
             let (bytes, hash) = &artifacts[&triple];
-            let remote_path = format!(".cache/rustible/bin/{bin}-{hash}");
+            let remote_path = format!(".cache/rustible/bin/{bin}-{}-{hash}", playbook.replace('/', "_"));
 
             let t0 = Instant::now();
             let cached = tr.exists(&remote_path).await?;
@@ -138,9 +150,12 @@ async fn main() -> Result<()> {
 
             let start = Down::Start {
                 run_id: format!("{:x}", t_exec.elapsed().as_nanos()),
+                playbook: playbook.clone(),
                 host: HostInfo {
                     name: name.clone(),
                     groups: vec![],
+                    escalate_user: "root".into(),
+                    connection: if name == "local" { "local".into() } else { "ssh".into() },
                 },
                 vars: serde_json::Value::Null,
                 check_mode: check,

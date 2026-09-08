@@ -445,6 +445,11 @@ dependencies = [
 [[package]]
 name = "rustible-build"
 version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
+ "tempfile",
+]
 
 [[package]]
 name = "rustible-cli"

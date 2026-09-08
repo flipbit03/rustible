@@ -1,0 +1,2 @@
+# Rustible workspace settings. Read from M3 on.
+inventory = "hosts.kdl"

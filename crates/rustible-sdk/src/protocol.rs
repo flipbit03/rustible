@@ -17,6 +17,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum Down {
     Start {
         run_id: String,
+        /// Registry name of the playbook to run (`cadu/mc`). A shipped binary
+        /// holds one playbook, but an IDE-style build holds them all.
+        playbook: String,
         host: HostInfo,
         /// Merged inventory vars for this host. The macro will deserialize
         /// this into the playbook's typed struct.
