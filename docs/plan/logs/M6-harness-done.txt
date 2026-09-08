@@ -1,0 +1,329 @@
+# M6 harness done-when log, 2026-09-08T10:26Z, branch m6-harness @ b4b0277 (+ uncommitted SystemdImage work, committed right after)
+
+$ cargo fmt --all --check
+exit=0
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+exit=0
+
+$ cargo test --workspace
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rustible-9b3428ddd10b8556)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+
+running 11 tests
+test tests::module_idents_are_valid_and_collision_free ... ok
+test tests::render_emits_path_modules_and_registry ... ok
+test tests::attribute_in_comment_or_string_is_ignored ... ok
+test tests::bare_playbook_attribute_counts ... ok
+test tests::select_one_unknown_lists_files_without_parsing ... ok
+test tests::finds_nested_marked_files_and_names_them ... ok
+test tests::selected_mode_ignores_a_broken_sibling ... ok
+test tests::syntax_error_names_file_line_col ... ok
+test tests::symlinked_directories_are_skipped_not_followed ... ok
+test tests::two_markers_in_one_file_is_an_error_naming_the_file ... ok
+test tests::selection_filters_and_unknown_lists_available ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/rustible-551586cd5ccdf598)
+
+running 10 tests
+test create::tests::skeleton_has_attribute_vars_and_log ... ok
+test init::tests::lib_doc_uses_the_crate_identifier ... ok
+test create::tests::names_come_from_the_playbooks_dir ... ok
+test init::tests::normalizes_lexically_via_workspace ... ok
+test init::tests::crates_io_deps_use_the_cli_version ... ok
+test init::tests::path_deps_point_at_the_checkout ... ok
+test init::tests::sanitizes_directory_names ... ok
+test init::tests::rejects_reserved_names ... ok
+test init::tests::shims_carry_the_header ... ok
+test workspace::tests::normalizes_lexically ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/init.rs (target/debug/deps/init-0dce131f005de34a)
+
+running 7 tests
+test path_deps_must_point_at_a_checkout ... ok
+test crates_io_versions_by_default_and_name_from_directory ... ok
+test regenerates_the_example_workspace ... ok
+test a_git_directory_counts_as_empty_and_gitignore_is_appended ... ok
+test refuses_a_non_empty_directory_without_force ... ok
+test refresh_rewrites_only_the_shims ... ok
+test playbook_create_writes_a_skeleton_and_prints_the_hint ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-f4bd8a732f3fe82b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-3c628cdf2feaa5e1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui.rs (target/debug/deps/ui-03e2bf62c6153ec4)
+
+running 1 test
+   Compiling rustible-macros-tests v0.0.0 (/home/cadu/w/cadu/rustible-m6h/target/tests/trybuild/rustible-macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+
+
+test [0m[1mtests/ui/pass_integration_test.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_integration_test_systemd.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_no_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/pass_with_vars.rs[0m [should pass] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_integration_test_no_images.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_integration_test_signature.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_map_var.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_missing_hosts.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_not_main.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_unknown_option.rs[0m [should fail to compile] ... [0m[32mok
+[0mtest [0m[1mtests/ui/fail_vars_without_param.rs[0m [should fail to compile] ... [0m[32mok
+[0m
+
+test ui ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
+
+running 17 tests
+test error::tests::foreign_errors_convert_with_question_mark ... ok
+test error::tests::context_chains_outermost_first ... ok
+test testing::tests::image_result_passes_only_with_a_clean_report ... ok
+test error::tests::option_context ... ok
+test testing::tests::parse_report_reads_the_last_report_line ... ok
+test testing::tests::test_artifact_matches_hyphenated_target_names ... ok
+test testing::tests::test_path_at_crate_root_is_the_name ... ok
+test testing::tests::test_artifact_picks_the_test_target_by_name ... ok
+test testing::tests::test_path_inside_a_module_keeps_the_module ... ok
+test vars::tests::all_missing_vars_reported_at_once ... ok
+test vars::tests::enums_and_lists_are_flat ... ok
+test vars::tests::missing_required_reads_well ... ok
+test vars::tests::null_means_no_vars ... ok
+test vars::tests::nested_struct_is_a_flatness_violation ... ok
+test vars::tests::parse_var_coerces_json_else_string ... ok
+test vars::tests::schema_marks_required ... ok
+test vars::tests::unknown_keys_warn_with_suggestion ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-0a2825b78f02d0c5)
+
+running 14 tests
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test file::tests::check_mode_output_unavailable_unless_predicted ... ok
+test apt::tests::satisfied_when_installed ... ok
+test file::tests::line_op_creates_when_asked ... ok
+test file::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::tests::mutation_during_check_is_refused ... ok
+test file::tests::plan_appends_when_absent ... ok
+test file::tests::line_op_check_then_apply_on_fake ... ok
+test file::tests::plan_handles_missing_trailing_newline ... ok
+test file::tests::plan_is_satisfied_when_line_present ... ok
+test file::tests::plan_inserts_after_regex ... ok
+test file::tests::plan_replaces_commented_line ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-0840839c1953ad7d)
+
+running 1 test
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-3b9d9e63bef216ca)
+
+running 1 test
+test line_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-0f16aca6a335b691)
+
+running 1 test
+test systemd_is_pid1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-f66f4918ce89550d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-0ea54633e4475fe6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_build
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_github
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_macros
+
+running 2 tests
+test crates/rustible-macros/src/lib.rs - integration_test (line 296) ... ignored
+test crates/rustible-macros/src/lib.rs - playbook (line 14) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.10s; merged doctests compilation took 0.09s
+   Doc-tests rustible_sdk
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rustible_std
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+exit=0
+
+$ env RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line -- --nocapture
+   Compiling rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-macros)
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.12s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-2996363f7dd91def)
+
+running 1 test
+integration: building test target `it_file_line` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-macros)
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible)
+    Finished `release` profile [optimized] target(s) in 1.79s
+integration: built /home/cadu/w/cadu/rustible-m6h/target/x86_64-unknown-linux-musl/release/deps/it_file_line-31de893d10d12cd2 in 1.8s
+  [debian:12]    debug: wrote /etc/rustible-test/motd (20 bytes)
+  [debian:12]  add greeting ............................... changed         +1 -0 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -0,0 +1 @@
+        | +hello from rustible
+  [debian:12]  add greeting (again) ....................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/motd (12 bytes)
+  [debian:12]  replace greeting ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -1 +1 @@
+        | -hello from rustible
+        | +hello again
+  [debian:12]  replace greeting (again) ................... ok           
+[debian:12] ok in 0.9s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/motd (20 bytes)
+  [ubuntu:24.04]  add greeting ............................... changed         +1 -0 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -0,0 +1 @@
+        | +hello from rustible
+  [ubuntu:24.04]  add greeting (again) ....................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/motd (12 bytes)
+  [ubuntu:24.04]  replace greeting ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -1 +1 @@
+        | -hello from rustible
+        | +hello again
+  [ubuntu:24.04]  replace greeting (again) ................... ok           
+[ubuntu:24.04] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+test line_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+exit=0
+
+$ env RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-1e0b34b8ba04f13a)
+
+running 1 test
+integration: building test target `it_apt_present` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.27s
+integration: built /home/cadu/w/cadu/rustible-m6h/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.3s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get update (as self, exit 0, 1204ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 778ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl (again) ......................... ok           
+[debian:12] ok in 2.3s  install sl: changed, install sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 6191ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 2816ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl (again) ......................... ok           
+[ubuntu:24.04] ok in 9.3s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.92s
+
+exit=0
+
+$ env RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image -- --nocapture
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-3188b37632ee022e)
+
+running 1 test
+integration: building test target `it_systemd_image` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6h/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.31s
+integration: built /home/cadu/w/cadu/rustible-m6h/target/x86_64-unknown-linux-musl/release/deps/it_systemd_image-ea7b0b9c809a71d9 in 0.3s
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  journald is active ......................... changed         $ systemctl is-active systemd-journald   action
+        | $ systemctl is-active systemd-journald
+[jrei/systemd-debian:12] ok in 0.6s  journald is active: changed
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  journald is active ......................... changed         $ systemctl is-active systemd-journald   action
+        | $ systemctl is-active systemd-journald
+[jrei/systemd-ubuntu:24.04] ok in 0.6s  journald is active: changed
+test systemd_is_pid1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.64s
+
+exit=0
