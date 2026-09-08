@@ -139,7 +139,12 @@ pub fn plan_attrs(
 
 /// Apply the attributes an op was given. Unconditional: `chmod`/`chown`
 /// are idempotent and `check` already decided a change is due.
-fn apply_attrs(sys: &System, path: &Path, mode: Option<u32>, owner: Option<Owner>) -> Result<()> {
+pub(crate) fn apply_attrs(
+    sys: &System,
+    path: &Path,
+    mode: Option<u32>,
+    owner: Option<Owner>,
+) -> Result<()> {
     if let Some(mode) = mode {
         sys.set_mode(path, mode & 0o7777)?;
     }
