@@ -1,13 +1,5 @@
 error: expected `fn main(ctx: &mut Ctx, vars: <Vars>) -> Result<()>`, found 1 parameter(s)
- --> tests/ui/fail_vars_without_param.rs:9:13
-  |
-9 |     fn main(_ctx: &mut Ctx) -> Result<()> {
-  |             ^^^^^^^^^^^^^^
-
-warning: unused import: `rustible::prelude::*`
- --> tests/ui/fail_vars_without_param.rs:3:9
-  |
-3 |     use rustible::prelude::*;
-  |         ^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+  --> tests/ui/fail_vars_without_param.rs:10:13
+   |
+10 |     fn main(_ctx: &mut Ctx) -> Result<()> {
+   |             ^^^^^^^^^^^^^^

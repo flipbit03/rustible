@@ -1,10 +1,9 @@
 //! Spike playbook: runs on the local machine against a scratch copy of an
 //! sshd_config, to exercise the SDK end to end without SSH or cross-compiling.
 //!
-//! Usage: cargo run -p spike-playbook -- [--check] [-v|-vv] [--json]
+//! Usage: cargo run -p spike-playbook -- spike [--check] [-v|-vv] [--json]
 
 use rustible_sdk::prelude::*;
-use rustible_sdk::runtime::{RunOptions, run};
 use rustible_std::{file, shell};
 
 const SAMPLE: &str = "\
@@ -90,6 +89,17 @@ fn playbook(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+// The spike predates the `#[rustible::playbook]` macro: it registers by hand.
+static PB: rustible_sdk::registry::Playbook = rustible_sdk::registry::Playbook {
+    hosts: "local",
+    escalate: false,
+    schema: rustible_sdk::vars::no_schema,
+    entry: |ctx, _| playbook(ctx),
+};
+
 fn main() -> std::process::ExitCode {
-    run(RunOptions::from_args(), playbook)
+    rustible_sdk::runtime::main(&[rustible_sdk::registry::Named {
+        name: "spike",
+        playbook: &PB,
+    }])
 }

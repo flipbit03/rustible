@@ -91,7 +91,6 @@ impl std::error::Error for DiscoverError {}
 /// Entry point for a workspace's `build.rs`. Prints cargo directives, and on
 /// error prints the message and exits non-zero so cargo shows it.
 pub fn discover() {
-    println!("cargo:rerun-if-changed=playbooks");
     println!("cargo:rerun-if-env-changed=RUSTIBLE_PLAYBOOK");
     if let Err(e) = discover_inner() {
         eprintln!("error: {e}");
@@ -111,20 +110,89 @@ fn discover_inner() -> Result<(), DiscoverError> {
     }
 
     let dir = root.join("playbooks");
-    let found = if dir.is_dir() {
-        scan(&dir)?
-    } else {
-        println!(
-            "cargo:warning=no `playbooks/` directory in {}; zero playbooks registered",
-            root.display()
-        );
-        Vec::new()
+    let chosen = match selected.as_deref() {
+        // Selected mode touches only the one file: a sibling with a syntax
+        // error cannot block the run, and saving a sibling does not rebuild.
+        Some(name) => {
+            let d = select_one(&dir, name)?;
+            println!("cargo:rerun-if-changed={}", d.path.display());
+            vec![d]
+        }
+        None => {
+            println!("cargo:rerun-if-changed=playbooks");
+            if dir.is_dir() {
+                scan(&dir)?
+            } else {
+                println!(
+                    "cargo:warning=no `playbooks/` directory in {}; zero playbooks registered",
+                    root.display()
+                );
+                Vec::new()
+            }
+        }
     };
-    let chosen = select(found, selected.as_deref())?;
     let code = render(&chosen);
     std::fs::write(out_dir.join("playbooks.rs"), code)
         .map_err(|e| DiscoverError::Io(out_dir.clone(), e))?;
     Ok(())
+}
+
+/// Resolve one playbook by name without parsing its siblings. An unknown
+/// name lists the `.rs` files that exist (by name, unparsed).
+pub fn select_one(dir: &Path, name: &str) -> Result<Discovered, DiscoverError> {
+    let path = dir.join(format!("{name}.rs"));
+    if !path.is_file() {
+        let mut files = Vec::new();
+        if dir.is_dir() {
+            walk(dir, &mut files)?;
+        }
+        files.sort();
+        let available = files.iter().map(|p| name_of(dir, p)).collect();
+        return Err(DiscoverError::UnknownSelection {
+            wanted: name.to_string(),
+            available,
+        });
+    }
+    let marked = parse_one(&path)?;
+    match marked.len() {
+        1 => Ok(Discovered {
+            name: name.to_string(),
+            path,
+        }),
+        0 => Err(DiscoverError::UnknownSelection {
+            wanted: name.to_string(),
+            available: vec![format!(
+                "({name}.rs exists but has no #[rustible::playbook] function)"
+            )],
+        }),
+        _ => Err(DiscoverError::TwoMarkers { path, fns: marked }),
+    }
+}
+
+fn name_of(dir: &Path, path: &Path) -> String {
+    path.strip_prefix(dir)
+        .unwrap_or(path)
+        .with_extension("")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Parse one file and return the names of its marked functions.
+fn parse_one(path: &Path) -> Result<Vec<String>, DiscoverError> {
+    let src =
+        std::fs::read_to_string(path).map_err(|e| DiscoverError::Io(path.to_path_buf(), e))?;
+    let file = syn::parse_file(&src).map_err(|e| {
+        let span = e.span().start();
+        DiscoverError::Parse {
+            path: path.to_path_buf(),
+            line: span.line,
+            col: span.column + 1,
+            msg: e.to_string(),
+        }
+    })?;
+    Ok(marked_fns(&file))
 }
 
 /// Walk `dir` recursively and return every playbook file, sorted by name.
@@ -134,34 +202,13 @@ pub fn scan(dir: &Path) -> Result<Vec<Discovered>, DiscoverError> {
     files.sort();
     let mut found = Vec::new();
     for path in files {
-        let src = std::fs::read_to_string(&path).map_err(|e| DiscoverError::Io(path.clone(), e))?;
-        let file = syn::parse_file(&src).map_err(|e| {
-            let span = e.span().start();
-            DiscoverError::Parse {
-                path: path.clone(),
-                line: span.line,
-                col: span.column + 1,
-                msg: e.to_string(),
-            }
-        })?;
-        let marked = marked_fns(&file);
+        let marked = parse_one(&path)?;
         match marked.len() {
             0 => {}
-            1 => {
-                let rel = path
-                    .strip_prefix(dir)
-                    .expect("under dir")
-                    .with_extension("");
-                let name = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                found.push(Discovered {
-                    name,
-                    path: path.clone(),
-                });
-            }
+            1 => found.push(Discovered {
+                name: name_of(dir, &path),
+                path: path.clone(),
+            }),
             _ => return Err(DiscoverError::TwoMarkers { path, fns: marked }),
         }
     }
@@ -173,7 +220,18 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), DiscoverError> {
     for entry in entries {
         let entry = entry.map_err(|e| DiscoverError::Io(dir.to_path_buf(), e))?;
         let path = entry.path();
-        if path.is_dir() {
+        // Never follow symlinks: a link to an ancestor would recurse forever,
+        // and a link outside `playbooks/` would register foreign files.
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|e| DiscoverError::Io(path.clone(), e))?;
+        if meta.file_type().is_symlink() {
+            println!(
+                "cargo:warning=ignoring symlink {} under playbooks/",
+                path.display()
+            );
+            continue;
+        }
+        if meta.is_dir() {
             walk(&path, out)?;
         } else if path.extension().is_some_and(|x| x == "rs") {
             out.push(path);
@@ -235,7 +293,7 @@ pub fn render(found: &[Discovered]) -> String {
         "#[allow(clippy::type_complexity)]\npub static PLAYBOOKS: &[::rustible::registry::Named] = &[\n",
     );
     for d in found {
-        let ident = format!("__pb_{}", d.name.replace(['/', '-', '.'], "_"));
+        let ident = module_ident(&d.name);
         code.push_str(&format!(
             "#[allow(non_snake_case, dead_code, clippy::all)]\n#[path = {:?}]\npub mod {ident};\n",
             d.path.display()
@@ -247,6 +305,22 @@ pub fn render(found: &[Discovered]) -> String {
     }
     registry.push_str("];\n");
     code + &registry
+}
+
+/// A valid, collision-free module identifier for a playbook name: every
+/// non-identifier character becomes `_`, and a short hash of the exact name
+/// is appended so `a-b` and `a_b`, or `a/b` and `a_b`, never share a module.
+pub fn module_ident(name: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("__pb_{sanitized}_{:06x}", h & 0xff_ffff)
 }
 
 #[cfg(test)]
@@ -335,11 +409,59 @@ mod tests {
             path: "/abs/playbooks/cadu/mc.rs".into(),
         };
         let code = render(&[d]);
-        assert!(code.contains("#[path = \"/abs/playbooks/cadu/mc.rs\"]\npub mod __pb_cadu_mc;"));
+        let ident = module_ident("cadu/mc");
         assert!(
-            code.contains(
-                "Named { name: \"cadu/mc\", playbook: &__pb_cadu_mc::__RUSTIBLE_PLAYBOOK }"
-            )
+            code.contains(&format!(
+                "#[path = \"/abs/playbooks/cadu/mc.rs\"]\npub mod {ident};"
+            )),
+            "{code}"
         );
+        assert!(
+            code.contains(&format!(
+                "Named {{ name: \"cadu/mc\", playbook: &{ident}::__RUSTIBLE_PLAYBOOK }}"
+            )),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn module_idents_are_valid_and_collision_free() {
+        for n in ["a-b", "a_b", "a/b", "my playbook", "deploy@prod", "x.y"] {
+            let id = module_ident(n);
+            assert!(
+                id.starts_with("__pb_")
+                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{id}"
+            );
+        }
+        assert_ne!(module_ident("a-b"), module_ident("a_b"));
+        assert_ne!(module_ident("a/b"), module_ident("a_b"));
+    }
+
+    #[test]
+    fn selected_mode_ignores_a_broken_sibling() {
+        let t = tree(&[
+            ("cadu/a.rs", PB),
+            ("ops/wip.rs", "fn main() {\n    let x = ;\n"),
+        ]);
+        assert!(scan(t.path()).is_err(), "full scan sees the syntax error");
+        let d = select_one(t.path(), "cadu/a").unwrap();
+        assert_eq!(d.name, "cadu/a");
+    }
+
+    #[test]
+    fn select_one_unknown_lists_files_without_parsing() {
+        let t = tree(&[("a.rs", PB), ("ops/wip.rs", "fn main() {\n    let x = ;\n")]);
+        let e = select_one(t.path(), "nope").unwrap_err().to_string();
+        assert!(e.contains("available: a, ops/wip"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_skipped_not_followed() {
+        let t = tree(&[("a.rs", PB)]);
+        std::os::unix::fs::symlink(t.path(), t.path().join("loop")).unwrap();
+        let found = scan(t.path()).unwrap();
+        assert_eq!(found.len(), 1);
     }
 }

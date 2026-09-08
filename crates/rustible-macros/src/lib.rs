@@ -206,10 +206,11 @@ fn vars_impl(
                 let fn_ident = format_ident!("__rustible_default_{}_{}", struct_ident, ident);
                 let fn_name = fn_ident.to_string();
                 let ty = &field.ty;
+                let body = default_body(&expr, ty);
                 default_fns.push(quote! {
                     #[doc(hidden)]
-                    #[allow(non_snake_case)]
-                    fn #fn_ident() -> #ty { #expr }
+                    #[allow(non_snake_case, clippy::useless_conversion, clippy::unnecessary_literal_unwrap)]
+                    fn #fn_ident() -> #ty { #body }
                 });
                 kept.push(syn::parse_quote!(#[serde(default = #fn_name)]));
             } else {
@@ -232,6 +233,30 @@ fn vars_impl(
         #st
         #(#default_fns)*
     })
+}
+
+/// Make `#[default = <literal>]` do what people expect: a string literal
+/// becomes an owned `String` via `Into`, and a bare value for an `Option<T>`
+/// field is wrapped in `Some`. Anything else is spliced as written.
+fn default_body(expr: &syn::Expr, ty: &Type) -> proc_macro2::TokenStream {
+    let is_str_lit = matches!(expr, syn::Expr::Lit(l) if matches!(l.lit, syn::Lit::Str(_)));
+    let inner = if is_str_lit {
+        quote! { ::core::convert::Into::into(#expr) }
+    } else {
+        quote! { #expr }
+    };
+    let is_option =
+        matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Option"));
+    let already_wrapped = match expr {
+        syn::Expr::Path(p) => p.path.is_ident("None"),
+        syn::Expr::Call(c) => matches!(&*c.func, syn::Expr::Path(p) if p.path.is_ident("Some")),
+        _ => false,
+    };
+    if is_option && !already_wrapped {
+        quote! { ::core::option::Option::Some(#inner) }
+    } else {
+        inner
+    }
 }
 
 /// Vars are one level deep. Maps and tuples cannot be expressed in an

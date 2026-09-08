@@ -19,12 +19,6 @@ impl Error {
         Error(anyhow::Error::msg(m))
     }
 
-    /// Wrap an existing `anyhow::Error` (not a `From` impl: coherence forbids
-    /// it next to the blanket conversion below).
-    pub fn from_anyhow(e: anyhow::Error) -> Self {
-        Error(e)
-    }
-
     /// Wrap with a context layer: "installing nginx: <inner>".
     pub fn context(self, c: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
         Error(self.0.context(c))
@@ -32,7 +26,7 @@ impl Error {
 
     /// The whole chain rendered on one line, outermost first.
     pub fn chain(&self) -> String {
-        format!("{:#}", self.0)
+        format!("{self:#}")
     }
 
     /// Look for a typed signal anywhere in the chain.
@@ -44,20 +38,13 @@ impl Error {
     pub fn cmd_failed(&self) -> Option<&CmdFailed> {
         self.downcast_ref::<CmdFailed>()
     }
-
-    pub fn inner(&self) -> &anyhow::Error {
-        &self.0
-    }
 }
 
 impl fmt::Display for Error {
+    /// `{}` prints the outermost message, `{:#}` the whole chain (anyhow's
+    /// own convention).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Alternate form prints the chain; that is what a step report wants.
-        if f.alternate() {
-            write!(f, "{:#}", self.0)
-        } else {
-            write!(f, "{}", self.0)
-        }
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -75,12 +62,6 @@ where
 {
     fn from(e: E) -> Self {
         Error(anyhow::Error::new(e))
-    }
-}
-
-impl From<Error> for anyhow::Error {
-    fn from(e: Error) -> Self {
-        e.0
     }
 }
 
@@ -133,9 +114,11 @@ pub struct OutputUnavailable {
     pub step: String,
 }
 
-/// A command exited non-zero. Rendered specially at `-v`.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("`{}` exited {status}{}", argv.join(" "), if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) })]
+/// A command exited non-zero. The message names the command and status;
+/// stderr travels in the struct and is rendered once, at `-v`, from the
+/// `Failed` event rather than being repeated in every chain that quotes it.
+#[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("`{}` exited {status}", argv.join(" "))]
 pub struct CmdFailed {
     pub argv: Vec<String>,
     pub status: i32,
@@ -208,10 +191,15 @@ mod tests {
             .context("web tier");
         assert_eq!(
             e.chain(),
-            "web tier: installing nginx: `apt-get install` exited 100: E: nope"
+            "web tier: installing nginx: `apt-get install` exited 100"
+        );
+        assert_eq!(
+            e.to_string(),
+            "web tier",
+            "`{{}}` is the outermost layer only"
         );
         let cf = e.cmd_failed().expect("typed value survives the chain");
-        assert_eq!(cf.status, 100);
+        assert_eq!((cf.status, cf.stderr.as_str()), (100, "E: nope"));
     }
 
     #[test]

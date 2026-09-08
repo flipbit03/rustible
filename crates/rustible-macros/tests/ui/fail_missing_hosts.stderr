@@ -1,15 +1,7 @@
 error: `#[rustible::playbook]` needs `hosts = "<host or group>"`
- --> tests/ui/fail_missing_hosts.rs:5:5
+ --> tests/ui/fail_missing_hosts.rs:6:5
   |
-5 |     #[rustible::playbook(escalate = true)]
+6 |     #[rustible::playbook(escalate = true)]
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `rustible::playbook` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-warning: unused import: `rustible::prelude::*`
- --> tests/ui/fail_missing_hosts.rs:3:9
-  |
-3 |     use rustible::prelude::*;
-  |         ^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

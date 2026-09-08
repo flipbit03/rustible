@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use crate::ctx::{Ctx, HostInfo};
-use crate::error::Result;
-use crate::event::{Event, EventSink, JsonLines, Pretty};
+use crate::event::{Event, EventSink, stdout_sink};
 use crate::protocol::{self, Down, FrameSink, Up};
 use crate::registry::{Named, describe_all};
 use crate::system::System;
+use crate::vars;
 
 /// Exit codes: 0 ok, 2 a step or the playbook failed, 3 the binary was
 /// misused (bad flags, unknown playbook, bad `Start` frame).
@@ -30,7 +30,10 @@ const EXIT_USAGE: u8 = 3;
 /// The generated `src/main.rs` calls this.
 pub fn main(playbooks: &[Named]) -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let mode = args
+        .iter()
+        .find(|a| matches!(a.as_str(), "--describe" | "--remote" | "--helper"));
+    match mode.map(String::as_str) {
         Some("--describe") => {
             println!(
                 "{}",
@@ -129,7 +132,16 @@ fn local(playbooks: &[Named], args: &[String]) -> ExitCode {
                 print_usage(playbooks);
                 return ExitCode::from(EXIT_USAGE);
             }
-            other => name = Some(other.to_string()),
+            other => {
+                if let Some(first) = &name {
+                    eprintln!(
+                        "rustible: got two playbook names, `{first}` and `{other}`; give one"
+                    );
+                    print_usage(playbooks);
+                    return ExitCode::from(EXIT_USAGE);
+                }
+                name = Some(other.to_string());
+            }
         }
     }
     let named = match (name, playbooks) {
@@ -148,11 +160,7 @@ fn local(playbooks: &[Named], args: &[String]) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    let sink: Arc<dyn EventSink> = if json {
-        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
-    } else {
-        Arc::new(Pretty::new(std::io::stdout(), "local", verbosity))
-    };
+    let sink = stdout_sink(json, "local", verbosity);
     execute(
         named,
         HostInfo::local(),
@@ -191,6 +199,15 @@ fn execute(
 ) -> ExitCode {
     let sys = System::local(check_mode, sink.clone());
     sink.emit(Event::Facts(sys.facts().clone()));
+    // A host's var bag is shared by every playbook that targets it, so keys
+    // this playbook does not declare are legitimate; still, a near-miss of a
+    // declared name is almost always a typo, so say so (vision 10.3).
+    for w in vars::unknown_key_warnings(&(named.playbook.schema)(), &vars) {
+        sink.emit(Event::Log {
+            level: crate::event::Level::Warn,
+            msg: w,
+        });
+    }
     let mut ctx = Ctx::new(sys, host);
     let entry = named.playbook.entry;
 
@@ -226,77 +243,4 @@ fn execute(
     } else {
         ExitCode::SUCCESS
     }
-}
-
-// ---- compatibility with the spike playbook (deleted in M3) ----
-
-/// Options for [`run`], the pre-macro entry point kept for `spike-playbook`.
-pub struct RunOptions {
-    pub check_mode: bool,
-    pub verbosity: u8,
-    pub json: bool,
-    pub remote: bool,
-    pub host: HostInfo,
-    pub playbook_name: String,
-}
-
-impl RunOptions {
-    pub fn from_args() -> Self {
-        let mut o = RunOptions {
-            check_mode: false,
-            verbosity: 0,
-            json: false,
-            remote: false,
-            host: HostInfo::local(),
-            playbook_name: "spike".into(),
-        };
-        for a in std::env::args().skip(1) {
-            match a.as_str() {
-                "--check" => o.check_mode = true,
-                "-v" => o.verbosity = 1,
-                "-vv" => o.verbosity = 2,
-                "--json" => o.json = true,
-                "--remote" => o.remote = true,
-                _ => {}
-            }
-        }
-        o
-    }
-}
-
-/// Pre-macro entry point. Wraps a plain function as a one-playbook registry.
-pub fn run(opts: RunOptions, main_fn: impl FnOnce(&mut Ctx) -> Result<()> + 'static) -> ExitCode {
-    // The registry wants a fn pointer; stash the closure in a thread-local.
-    type MainFn = Box<dyn FnOnce(&mut Ctx) -> Result<()>>;
-    thread_local! {
-        static MAIN: std::cell::RefCell<Option<MainFn>> = const { std::cell::RefCell::new(None) };
-    }
-    MAIN.with(|m| *m.borrow_mut() = Some(Box::new(main_fn)));
-    fn entry(ctx: &mut Ctx, _: Value) -> Result<()> {
-        let f = MAIN.with(|m| m.borrow_mut().take()).expect("main set");
-        f(ctx)
-    }
-    static PB: crate::registry::Playbook = crate::registry::Playbook {
-        hosts: "local",
-        escalate: false,
-        schema: crate::vars::no_schema,
-        entry,
-    };
-    let named = Named {
-        name: "spike",
-        playbook: &PB,
-    };
-    if opts.remote {
-        return remote(std::slice::from_ref(&named));
-    }
-    let sink: Arc<dyn EventSink> = if opts.json {
-        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
-    } else {
-        Arc::new(Pretty::new(
-            std::io::stdout(),
-            opts.host.name.clone(),
-            opts.verbosity,
-        ))
-    };
-    execute(&named, opts.host, Value::Null, opts.check_mode, sink)
 }

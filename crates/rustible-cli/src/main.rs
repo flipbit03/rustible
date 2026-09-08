@@ -167,9 +167,8 @@ async fn main() -> Result<()> {
                 playbook: playbook.clone(),
                 host: HostInfo {
                     name: name.clone(),
-                    groups: vec![],
-                    escalate_user: "root".into(),
                     connection: if name == "local" { "local".into() } else { "ssh".into() },
+                    ..HostInfo::local()
                 },
                 vars: vars_json,
                 check_mode: check,
@@ -185,9 +184,18 @@ async fn main() -> Result<()> {
                     break;
                 };
                 match up {
-                    Up::Hello { protocol, playbook } => {
+                    Up::Hello { protocol, playbook: announced } => {
                         t_hello = Some(t_exec.elapsed());
-                        eprintln!("[{name}]  hello: protocol {protocol}, playbook {playbook}, {:.2?} after exec", t_exec.elapsed());
+                        if protocol != rustible_sdk::protocol::PROTOCOL_VERSION {
+                            bail!(
+                                "protocol mismatch: orchestrator speaks {}, binary speaks {protocol}; rebuild the workspace against this rustible",
+                                rustible_sdk::protocol::PROTOCOL_VERSION
+                            );
+                        }
+                        if announced != playbook {
+                            bail!("asked for playbook `{playbook}`, binary answered with `{announced}`");
+                        }
+                        eprintln!("[{name}]  hello: protocol {protocol}, playbook {announced}, {:.2?} after exec", t_exec.elapsed());
                     }
                     Up::Event(ev) => {
                         if let Event::Finished(s) = &ev {

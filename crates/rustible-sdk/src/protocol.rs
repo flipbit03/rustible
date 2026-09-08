@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::ctx::HostInfo;
 use crate::event::Event;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped on every incompatible frame change. 2: `Start.playbook`, `Failed.cmd`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Orchestrator -> binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +19,9 @@ pub enum Down {
     Start {
         run_id: String,
         /// Registry name of the playbook to run (`cadu/mc`). A shipped binary
-        /// holds one playbook, but an IDE-style build holds them all.
+        /// holds one playbook, but an IDE-style build holds them all. Empty
+        /// (older orchestrators) means "the only playbook in this binary".
+        #[serde(default)]
         playbook: String,
         host: HostInfo,
         /// Merged inventory vars for this host. The macro will deserialize

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::Diff;
+use crate::error::CmdFailed;
 use crate::facts::Facts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,27 +68,11 @@ pub enum Event {
         /// The rendered context chain, outermost first.
         error: String,
         /// Present when a command failure is in the chain (rendered at -v).
-        cmd: Option<FailedCmd>,
+        /// Additive field: absent from older binaries' frames.
+        #[serde(default)]
+        cmd: Option<CmdFailed>,
     },
     Finished(Summary),
-}
-
-/// Serializable mirror of `error::CmdFailed` for the wire.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailedCmd {
-    pub argv: Vec<String>,
-    pub status: i32,
-    pub stderr: String,
-}
-
-impl From<&crate::error::CmdFailed> for FailedCmd {
-    fn from(c: &crate::error::CmdFailed) -> Self {
-        FailedCmd {
-            argv: c.argv.clone(),
-            status: c.status,
-            stderr: c.stderr.clone(),
-        }
-    }
 }
 
 impl Event {
@@ -96,7 +81,7 @@ impl Event {
         Event::Failed {
             step,
             error: e.chain(),
-            cmd: e.cmd_failed().map(FailedCmd::from),
+            cmd: e.cmd_failed().cloned(),
         }
     }
 }
@@ -150,6 +135,15 @@ impl EventSink for Collect {
 impl Collect {
     pub fn events(&self) -> Vec<Event> {
         self.0.lock().unwrap().clone()
+    }
+}
+
+/// The sink a local run writes to: JSON lines or the pretty renderer.
+pub fn stdout_sink(json: bool, host: &str, verbosity: u8) -> SharedSink {
+    if json {
+        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
+    } else {
+        Arc::new(Pretty::new(std::io::stdout(), host, verbosity))
     }
 }
 

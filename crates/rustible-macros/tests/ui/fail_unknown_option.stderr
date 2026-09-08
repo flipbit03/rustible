@@ -1,13 +1,5 @@
 error: unknown playbook option `become`; expected `hosts`, `vars`, or `escalate`
- --> tests/ui/fail_unknown_option.rs:5:43
+ --> tests/ui/fail_unknown_option.rs:6:43
   |
-5 |     #[rustible::playbook(hosts = "local", become = true)]
+6 |     #[rustible::playbook(hosts = "local", become = true)]
   |                                           ^^^^^^
-
-warning: unused import: `rustible::prelude::*`
- --> tests/ui/fail_unknown_option.rs:3:9
-  |
-3 |     use rustible::prelude::*;
-  |         ^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
