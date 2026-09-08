@@ -149,6 +149,26 @@ grows by about a third, presumably because graviola carries large unrolled
 code. Half a megabyte per playbook binary is a real cost worth knowing, though
 it is not obviously a reason to revisit the decision.
 
+### The dependency graph
+
+The workspace lock goes from **217 crates to 165**, a net 52 fewer. Graviola
+brings `graviola` and `rustls-graviola` (plus `wasip2` and `wit-bindgen`, which
+are `getrandom`'s wasi-target entries and are never compiled for a Linux
+target). Leaving are the whole RustCrypto stack and its `rand`/`zeroize`/`der`
+supporting cast: `aead`, `aes`, `aes-gcm`, `chacha20`, `chacha20poly1305`,
+`crypto-bigint`, `curve25519-dalek`, `ecdsa`, `ed25519-dalek`,
+`elliptic-curve`, `ghash`, `hmac`, `p256`, `p384`, `pkcs1`, `pkcs8`,
+`poly1305`, `primeorder`, `rsa`, `sec1`, `spki`, `x25519-dalek` and thirty
+more.
+
+Two of those matter beyond the count. **`rsa` 0.9.10 leaves the graph**, and
+with it RUSTSEC-2023-0071 (the Marvin timing attack, unpatched, no fixed
+version available) that the research report flagged. And the unaudited
+`p256`/`p384` field arithmetic that sat on the ECDHE and certificate-verify hot
+path is replaced by s2n-bignum code with machine-checked proofs. Whatever else
+this change costs, the trust story for the path from a network response to a
+user's `authorized_keys` is materially better.
+
 ## What did not go as the research predicted
 
 1. **MSRV.** `graviola` 0.4.1 declares `rust-version = "1.89"`, so
