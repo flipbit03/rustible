@@ -930,3 +930,762 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 finished 2026-09-08T12:20:04-03:00
 DONE
+
+# M6 shell-tests done-when, re-run after `git merge main` (M3 CLI + M7 CI), 2026-09-08T15:29:29Z, 71d25c0
+
+$ cargo fmt --all --check
+fmt: clean
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s
+
+$ cargo test --workspace
+     Running unittests src/lib.rs (target/debug/deps/rustible-9b3428ddd10b8556)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/rustible_cli-6afc562d7adfdc0c)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+     Running unittests src/main.rs (target/debug/deps/rustible-e0aa6feb8e0abac5)
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/init.rs (target/debug/deps/init-7244e24ef3aa9289)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-f4bd8a732f3fe82b)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-3c628cdf2feaa5e1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ui.rs (target/debug/deps/ui-03e2bf62c6153ec4)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.78s
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-0a2825b78f02d0c5)
+test result: ok. 281 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-c157cba9be5d117a)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-0840839c1953ad7d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-184d60059bdfac0e)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-3b9d9e63bef216ca)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-27ffb110d0ffc73c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-a61e76ea13272c7c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-df2d5540edca2de6)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-3057a3766aab0b62)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-0f16aca6a335b691)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-cacccd2b8bfc9626)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_build
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_cli
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_github
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_macros
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_sdk
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_std
+test result: ok. 6 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+ Documenting rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+ Documenting rustible-github v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-github)
+ Documenting rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.04s
+   Generated /home/cadu/w/cadu/rustible-m6sh/target/doc/rustible/index.html and 6 other files
+
+## container tests (RUSTIBLE_INTEGRATION=1), 2026-09-08T15:30:03Z
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command -- --nocapture    # 2026-09-08T15:30:03Z
+   Compiling rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-macros)
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.37s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-27bf3f21b96a0bb3)
+
+running 1 test
+integration: building test target `it_shell_command` for x86_64-unknown-linux-musl (release)
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-macros)
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible)
+    Finished `release` profile [optimized] target(s) in 5.03s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_shell_command-be21dcac9a21384a in 5.0s
+      | $ /bin/sh -c echo hi; echo $LANG; echo err >&2
+      | $ /bin/sh -c echo hi
+      | $ touch /etc/rustible-test/marker
+      | $ rm /etc/rustible-test/marker
+      | $ cat
+      | $ wc -c
+      | $ /bin/sh -c echo $RUSTIBLE_TEST_VAR
+      | $ pwd
+      | $ /bin/sh -c echo Updating 1..2
+[debian:12] ok in 0.8s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+      | $ /bin/sh -c echo hi; echo $LANG; echo err >&2
+      | $ /bin/sh -c echo hi
+      | $ touch /etc/rustible-test/marker
+      | $ rm /etc/rustible-test/marker
+      | $ cat
+      | $ wc -c
+      | $ /bin/sh -c echo $RUSTIBLE_TEST_VAR
+      | $ pwd
+      | $ /bin/sh -c echo Updating 1..2
+[ubuntu:24.04] ok in 0.4s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+test command_options_against_a_real_shell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.29s
+
+  wall: 9s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_ops -- --nocapture    # 2026-09-08T15:30:12Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-682102f8c33b49ba)
+
+running 1 test
+integration: building test target `it_file_ops` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.63s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_ops-0c89fe80270eed57 in 0.6s
+      | /etc/rustible-test/files:
+      |   exists: no -> yes
+      |   mode: - -> 0750
+      |   owner: - -> 0:0
+      | /etc/rustible-test/files:
+      |   mode: 0755 -> 0750
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -0,0 +1 @@
+      | +port = 80
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1 @@
+      | -port = 80
+      | +port = 8080
+      | /etc/rustible-test/files/app.conf:
+      |   mode: 0640 -> 0600
+      | /etc/rustible-test/files/app.conf:
+      |   mode: 0600 -> 0644
+      |   owner: 0:0 -> 1:1
+      | /etc/rustible-test/files/app.link:
+      |   target: - -> /etc/rustible-test/files/app.conf
+      | /etc/rustible-test/files/app.link:
+      |   target: /etc/rustible-test/files/app.conf -> /etc/rustible-test/files
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1 @@
+      | -port = 8080
+      | +port = 9090
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1,2 @@
+      |  port = 9090
+      | +workers = 4
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -0,0 +1,4 @@
+      | +# BEGIN MANAGED BY RUSTIBLE
+      | +a = 1
+      | +b = 2
+      | +# END MANAGED BY RUSTIBLE
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -1,4 +1,3 @@
+      |  # BEGIN MANAGED BY RUSTIBLE
+      | -a = 1
+      | -b = 2
+      | +a = 2
+      |  # END MANAGED BY RUSTIBLE
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -1,3 +0,0 @@
+      | -# BEGIN MANAGED BY RUSTIBLE
+      | -a = 2
+      | -# END MANAGED BY RUSTIBLE
+      | /etc/rustible-test/files/app.link:
+      |   exists: yes (symlink) -> no
+      | /etc/rustible-test/files:
+      |   exists: yes (dir) -> no
+      |   entries: 4 -> 0
+[debian:12] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+      | /etc/rustible-test/files:
+      |   exists: no -> yes
+      |   mode: - -> 0750
+      |   owner: - -> 0:0
+      | /etc/rustible-test/files:
+      |   mode: 0755 -> 0750
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -0,0 +1 @@
+      | +port = 80
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1 @@
+      | -port = 80
+      | +port = 8080
+      | /etc/rustible-test/files/app.conf:
+      |   mode: 0640 -> 0600
+      | /etc/rustible-test/files/app.conf:
+      |   mode: 0600 -> 0644
+      |   owner: 0:0 -> 1:1
+      | /etc/rustible-test/files/app.link:
+      |   target: - -> /etc/rustible-test/files/app.conf
+      | /etc/rustible-test/files/app.link:
+      |   target: /etc/rustible-test/files/app.conf -> /etc/rustible-test/files
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1 @@
+      | -port = 8080
+      | +port = 9090
+      | --- /etc/rustible-test/files/app.conf (before)
+      | +++ /etc/rustible-test/files/app.conf (after)
+      | @@ -1 +1,2 @@
+      |  port = 9090
+      | +workers = 4
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -0,0 +1,4 @@
+      | +# BEGIN MANAGED BY RUSTIBLE
+      | +a = 1
+      | +b = 2
+      | +# END MANAGED BY RUSTIBLE
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -1,4 +1,3 @@
+      |  # BEGIN MANAGED BY RUSTIBLE
+      | -a = 1
+      | -b = 2
+      | +a = 2
+      |  # END MANAGED BY RUSTIBLE
+      | --- /etc/rustible-test/files/managed.cfg (before)
+      | +++ /etc/rustible-test/files/managed.cfg (after)
+      | @@ -1,3 +0,0 @@
+      | -# BEGIN MANAGED BY RUSTIBLE
+      | -a = 2
+      | -# END MANAGED BY RUSTIBLE
+      | /etc/rustible-test/files/app.link:
+      |   exists: yes (symlink) -> no
+      | /etc/rustible-test/files:
+      |   exists: yes (dir) -> no
+      |   entries: 4 -> 0
+[ubuntu:24.04] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+test file_family_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+  wall: 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group -- --nocapture    # 2026-09-08T15:30:14Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-07ad3b67a182122d)
+
+running 1 test
+integration: building test target `it_user_group` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.51s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_user_group-1e6485567a0d1941 in 0.5s
+      | group rustible-grp:
+      |   exists: no -> yes
+      | user rustible-usr:
+      |   exists: no -> yes
+      |   home: - -> /home/rustible-usr
+      |   shell: - -> /bin/bash
+      |   comment: - -> Rustible test
+      |   groups: - -> rustible-grp
+      | user rustible-usr:
+      |   shell: /bin/bash -> /bin/sh
+      |   comment: Rustible test -> Rustible
+      | group rustible-grp2:
+      |   exists: no -> yes
+      |   gid: - -> 4242
+      | user rustible-usr:
+      |   groups: rustible-grp -> rustible-grp,rustible-grp2
+      | group rustible-same:
+      |   exists: no -> yes
+      | user rustible-same:
+      |   exists: no -> yes
+      |   gid: - -> 4243
+      |   home: - -> /home/rustible-same
+      |   shell: - -> /bin/sh
+      | user rustible-same:
+      |   exists: yes -> no
+      |   home: /home/rustible-same -> removed
+      | user rustible-usr:
+      |   exists: yes -> no
+      |   home: /home/rustible-usr -> removed
+      | group rustible-grp:
+      |   exists: yes -> no
+      | group rustible-grp2:
+      |   exists: yes -> no
+[debian:12] ok in 0.6s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+      | group rustible-grp:
+      |   exists: no -> yes
+      | user rustible-usr:
+      |   exists: no -> yes
+      |   home: - -> /home/rustible-usr
+      |   shell: - -> /bin/bash
+      |   comment: - -> Rustible test
+      |   groups: - -> rustible-grp
+      | user rustible-usr:
+      |   shell: /bin/bash -> /bin/sh
+      |   comment: Rustible test -> Rustible
+      | group rustible-grp2:
+      |   exists: no -> yes
+      |   gid: - -> 4242
+      | user rustible-usr:
+      |   groups: rustible-grp -> rustible-grp,rustible-grp2
+      | group rustible-same:
+      |   exists: no -> yes
+      | user rustible-same:
+      |   exists: no -> yes
+      |   gid: - -> 4243
+      |   home: - -> /home/rustible-same
+      |   shell: - -> /bin/sh
+      | user rustible-same:
+      |   exists: yes -> no
+      |   home: /home/rustible-same -> removed
+      | user rustible-usr:
+      |   exists: yes -> no
+      |   home: /home/rustible-usr -> removed
+      | group rustible-grp:
+      |   exists: yes -> no
+      | group rustible-grp2:
+      |   exists: yes -> no
+[ubuntu:24.04] ok in 0.6s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+test users_and_groups_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+
+  wall: 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys -- --nocapture    # 2026-09-08T15:30:16Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-3fddbfa7159a22c2)
+
+running 1 test
+integration: building test target `it_authorized_keys` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.70s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_authorized_keys-d7c22cf8877e52ed in 0.7s
+      | user rustible-ak:
+      |   exists: no -> yes
+      |   home: - -> /home/rustible-ak
+      |   shell: - -> /bin/bash
+      | /home/rustible-ak/.ssh:
+      |   exists: no -> yes
+      |   mode: - -> 0700
+      |   owner: - -> 1000:1000
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -0,0 +1,2 @@
+      | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -1,3 +1,2 @@
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -1,2 +1 @@
+      | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+[debian:12] ok in 0.7s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+      | user rustible-ak:
+      |   exists: no -> yes
+      |   home: - -> /home/rustible-ak
+      |   shell: - -> /bin/bash
+      | /home/rustible-ak/.ssh:
+      |   exists: no -> yes
+      |   mode: - -> 0700
+      |   owner: - -> 1001:1001
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -0,0 +1,2 @@
+      | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -1,3 +1,2 @@
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+      | --- /home/rustible-ak/.ssh/authorized_keys (before)
+      | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+      | @@ -1,2 +1 @@
+      | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+      |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+[ubuntu:24.04] ok in 0.6s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+test authorized_keys_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+
+  wall: 3s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line -- --nocapture    # 2026-09-08T15:30:19Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-2996363f7dd91def)
+
+running 1 test
+integration: building test target `it_file_line` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.57s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_line-31de893d10d12cd2 in 0.6s
+      | --- /etc/rustible-test/motd (before)
+      | +++ /etc/rustible-test/motd (after)
+      | @@ -0,0 +1 @@
+      | +hello from rustible
+      | --- /etc/rustible-test/motd (before)
+      | +++ /etc/rustible-test/motd (after)
+      | @@ -1 +1 @@
+      | -hello from rustible
+      | +hello again
+[debian:12] ok in 0.5s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+      | --- /etc/rustible-test/motd (before)
+      | +++ /etc/rustible-test/motd (after)
+      | @@ -0,0 +1 @@
+      | +hello from rustible
+      | --- /etc/rustible-test/motd (before)
+      | +++ /etc/rustible-test/motd (after)
+      | @@ -1 +1 @@
+      | -hello from rustible
+      | +hello again
+[ubuntu:24.04] ok in 0.4s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+test line_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+  wall: 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture    # 2026-09-08T15:30:21Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-1e0b34b8ba04f13a)
+
+running 1 test
+integration: building test target `it_apt_present` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.37s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.4s
+      | apt packages:
+      |   sl: absent -> installed
+[debian:12] ok in 2.6s  install sl: changed, install sl (again): ok
+      | apt packages:
+      |   sl: absent -> installed
+[ubuntu:24.04] ok in 9.4s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.50s
+
+  wall: 13s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture    # 2026-09-08T15:30:34Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-2e508c473cc03407)
+
+running 1 test
+integration: building test target `it_apt_absent` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.31s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_absent-bda802958248f8c3 in 0.3s
+      | apt packages:
+      |   sl: absent -> installed
+      | apt packages:
+      |   sl: installed -> purged
+[debian:12] ok in 3.7s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+      | apt packages:
+      |   sl: absent -> installed
+      | apt packages:
+      |   sl: installed -> purged
+[ubuntu:24.04] ok in 10.8s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.89s
+
+  wall: 15s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture    # 2026-09-08T15:30:49Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-02eba764aa70600e)
+
+running 1 test
+integration: building test target `it_sysctl_present` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.32s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_sysctl_present-8d91a699c9dce57a in 0.3s
+      | sysctl net.ipv4.ip_forward:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+      | sysctl vm.swappiness:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+      | sysctl net.ipv4.ip_forward:
+      |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+      | sysctl net.rustible.nope:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+      | sysctl net.ipv4.ip_forward:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+      | sysctl vm.swappiness:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+      | sysctl net.ipv4.ip_forward:
+      |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+      | sysctl net.rustible.nope:
+      |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+  wall: 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image -- --nocapture    # 2026-09-08T15:30:51Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-3188b37632ee022e)
+
+running 1 test
+integration: building test target `it_systemd_image` for x86_64-unknown-linux-musl (release)
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 1.77s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd_image-ea7b0b9c809a71d9 in 1.8s
+      | $ systemctl is-active systemd-journald
+[jrei/systemd-debian:12] ok in 0.7s  journald is active: changed
+[jrei/systemd-ubuntu:24.04] FAILED in 0.4s  
+
+thread 'systemd_is_pid1' (435876) panicked at crates/rustible-sdk/src/testing.rs:257:9:
+integration test `systemd_is_pid1` failed in 1 of 2 image(s):
+[jrei/systemd-ubuntu:24.04] no report line found; docker exit status -1
+--- container output ---
+systemd did not reach `running` in 60s (last state: `offline`)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test systemd_is_pid1 ... FAILED
+
+failures:
+
+failures:
+    systemd_is_pid1
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+
+error: test failed, to rerun pass `-p rustible-std --test it_systemd_image`
+  wall: 3s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd -- --nocapture    # 2026-09-08T15:30:54Z
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-f53739c7bb4c3e88)
+
+running 1 test
+integration: building test target `it_systemd` for x86_64-unknown-linux-musl (release)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6sh/crates/rustible-std)
+    Finished `release` profile [optimized] target(s) in 0.43s
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd-779748bb14a01da0 in 0.4s
+      | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+      | rustible-test:
+      |   enabled: disabled -> enabled
+      |   active: inactive -> active
+      | systemctl restart rustible-test
+      | rustible-test:
+      |   active: active -> inactive
+      | rustible-test:
+      |   active: inactive -> active
+      | rustible-test:
+      |   enabled: enabled -> disabled
+      |   active: active -> inactive
+[jrei/systemd-debian:12] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+      | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+      | rustible-test:
+      |   enabled: disabled -> enabled
+      |   active: inactive -> active
+      | systemctl restart rustible-test
+      | rustible-test:
+      |   active: active -> inactive
+      | rustible-test:
+      |   active: inactive -> active
+      | rustible-test:
+      |   enabled: enabled -> disabled
+      |   active: active -> inactive
+[jrei/systemd-ubuntu:24.04] ok in 1.1s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+test unit_lifecycle_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.60s
+
+  wall: 3s
+
+finished 2026-09-08T15:30:57Z  all four gates green; nine of ten container tests green,
+`it_systemd_image` failed once on jrei/systemd-ubuntu:24.04 with last state `offline`.
+Re-ran it three times (protocol section 5): passed each time, so the state is a boot race
+in `wait_for_systemd`, not a flake to shrug at. Fixed below, then everything re-run clean.
+
+# M6 shell-tests done-when, clean re-run after the wait_for_systemd fix, 2026-09-08T15:33:39Z, 71d25c0+wt
+
+$ cargo fmt --all --check
+fmt: clean
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+
+$ cargo test --workspace   (per-result tally)
+      7 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+      2 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.13s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.59s
+      1 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.01s
+      1 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 281 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+      1 test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 6 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+$ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+   Generated /home/cadu/w/cadu/rustible-m6sh/target/doc/rustible/index.html and 6 other files
+
+## container tests, RUSTIBLE_INTEGRATION=1; per-image timing is the harness's own "ok in Ns"
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command -- --nocapture    # 2026-09-08T15:34:15Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_shell_command-be21dcac9a21384a in 0.0s
+[debian:12] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+[ubuntu:24.04] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+test command_options_against_a_real_shell ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+  it_shell_command: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_ops -- --nocapture    # 2026-09-08T15:34:16Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_ops-0c89fe80270eed57 in 0.0s
+[debian:12] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+[ubuntu:24.04] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+test file_family_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+  it_file_ops: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group -- --nocapture    # 2026-09-08T15:34:17Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_user_group-1e6485567a0d1941 in 0.0s
+[debian:12] ok in 0.6s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+[ubuntu:24.04] ok in 0.5s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, same-named user absent: changed, same-named user absent (again): ok, same-named group absent: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+test users_and_groups_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+  it_user_group: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys -- --nocapture    # 2026-09-08T15:34:18Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_authorized_keys-d7c22cf8877e52ed in 0.0s
+[debian:12] ok in 0.3s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+[ubuntu:24.04] ok in 0.3s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+test authorized_keys_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+  it_authorized_keys: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line -- --nocapture    # 2026-09-08T15:34:19Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_line-31de893d10d12cd2 in 0.0s
+[debian:12] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+[ubuntu:24.04] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+test line_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+  it_file_line: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture    # 2026-09-08T15:34:20Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.0s
+[debian:12] ok in 2.3s  install sl: changed, install sl (again): ok
+[ubuntu:24.04] ok in 8.9s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.36s
+  it_apt_present: pass, wall 12s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture    # 2026-09-08T15:34:32Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_absent-bda802958248f8c3 in 0.0s
+[debian:12] ok in 3.9s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+[ubuntu:24.04] ok in 10.7s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.69s
+  it_apt_absent: pass, wall 17s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture    # 2026-09-08T15:34:49Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_sysctl_present-8d91a699c9dce57a in 0.0s
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  it_sysctl_present: pass, wall 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image -- --nocapture    # 2026-09-08T15:34:50Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd_image-ea7b0b9c809a71d9 in 0.0s
+[jrei/systemd-debian:12] ok in 0.7s  journald is active: changed
+[jrei/systemd-ubuntu:24.04] ok in 0.7s  journald is active: changed
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+  it_systemd_image: pass, wall 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd -- --nocapture    # 2026-09-08T15:34:52Z
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd-779748bb14a01da0 in 0.0s
+[jrei/systemd-debian:12] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+[jrei/systemd-ubuntu:24.04] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+test unit_lifecycle_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+  it_systemd: pass, wall 2s
+
+all four gates and all ten container tests green
+finished 2026-09-08T15:34:54Z
+DONE
+
+## it_user_busybox added afterwards: the BusyBox findings on a real BusyBox
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_busybox -- --nocapture
+[alpine:3.20] ok in 0.4s  user without a shell: changed, user without a shell (again): ok, adduser under SHELL=/bin/ash: changed, user with a shell: changed, user with a shell (again): ok, same-named group: changed, same-named group (again): ok, same-named user: changed, same-named user (again): ok, group: changed, group (again): ok, membership: changed, membership (again): ok, user with missing group: failed, modify an existing account: failed, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok
+test busybox_user_and_group ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+## the harness as CI runs it: every rustible-std test binary at once, containers in parallel
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests
+test result: ok. 281 passed; 0 failed  (unit)
+test absent_changed_then_ok ... ok                    it_apt_absent          14.78s
+test present_changed_then_ok ... ok                   it_apt_present         11.56s
+test authorized_keys_changed_then_ok ... ok           it_authorized_keys      0.77s
+test line_changed_then_ok ... ok                      it_file_line            0.66s
+test file_family_changed_then_ok ... ok               it_file_ops             0.72s
+test command_options_against_a_real_shell ... ok      it_shell_command        0.65s
+test present_persist_only_changed_then_ok ... ok      it_sysctl_present       0.66s
+test unit_lifecycle_changed_then_ok ... ok            it_systemd              2.31s
+test systemd_is_pid1 ... ok                           it_systemd_image        1.76s
+test busybox_user_and_group ... ok                    it_user_busybox         1.19s
+test users_and_groups_changed_then_ok ... ok          it_user_group           1.35s
+  wall: 38s, eleven test binaries, five images (debian:12, ubuntu:24.04,
+  alpine:3.20, jrei/systemd-debian:12, jrei/systemd-ubuntu:24.04)
+
+$ cargo fmt --all --check
+fmt: clean
+$ cargo clippy --workspace --all-targets -- -D warnings
+clean
+
+DONE

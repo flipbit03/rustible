@@ -660,6 +660,13 @@ fn container_running(id: &str) -> bool {
 /// `degraded` (some unit failed to start) is accepted: the test decides what
 /// it needs. Anything else after [`SYSTEMD_BOOT_TIMEOUT`] is an error naming
 /// the last state seen.
+///
+/// `offline` is *not* terminal: `systemctl` answers `offline` whenever it
+/// cannot reach the manager, which includes the first fraction of a second
+/// of the container's life, before pid 1 is listening on its private bus.
+/// A container that is genuinely dead is caught by [`container_running`]
+/// instead, so polling through `offline` costs nothing and removes a race
+/// that failed roughly one run in ten on `jrei/systemd-ubuntu:24.04`.
 fn wait_for_systemd(id: &str) -> std::result::Result<(), String> {
     let t0 = Instant::now();
     let mut last = String::from("(not started)");
@@ -680,8 +687,9 @@ fn wait_for_systemd(id: &str) -> std::result::Result<(), String> {
         }
         match last.as_str() {
             "running" | "degraded" => return Ok(()),
-            // Terminal states that will not improve.
-            "stopping" | "offline" | "maintenance" => break,
+            // Terminal states that will not improve. `offline` is absent
+            // on purpose: it is also what a not-yet-listening manager says.
+            "stopping" | "maintenance" => break,
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
