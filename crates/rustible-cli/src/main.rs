@@ -43,12 +43,25 @@ struct Cli {
     check: bool,
     #[arg(short, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Playbook vars, `key=value`; JSON-looking values are parsed as JSON.
+    #[arg(long = "var")]
+    vars: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let t_start = Instant::now();
+    let mut vars_map = serde_json::Map::new();
+    for kv in &cli.vars {
+        let Some((k, v)) = kv.split_once('=') else {
+            bail!("--var needs key=value, got `{kv}`");
+        };
+        let value = serde_json::from_str::<serde_json::Value>(v)
+            .unwrap_or(serde_json::Value::String(v.to_string()));
+        vars_map.insert(k.to_string(), value);
+    }
+    let vars_json = serde_json::Value::Object(vars_map);
 
     // 1. Connect to every host in parallel and probe its triple.
     let mut connects = vec![];
@@ -122,6 +135,7 @@ async fn main() -> Result<()> {
         let artifacts = artifacts.clone();
         let bin = cli.bin.clone();
         let playbook = cli.playbook.clone();
+        let vars_json = vars_json.clone();
         let (escalate, check, verbosity) = (cli.escalate, cli.check, cli.verbose);
         runs.push(tokio::spawn(async move {
             let (bytes, hash) = &artifacts[&triple];
@@ -157,7 +171,7 @@ async fn main() -> Result<()> {
                     escalate_user: "root".into(),
                     connection: if name == "local" { "local".into() } else { "ssh".into() },
                 },
-                vars: serde_json::Value::Null,
+                vars: vars_json,
                 check_mode: check,
                 verbosity,
             };

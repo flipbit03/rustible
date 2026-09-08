@@ -29,3 +29,12 @@ rustible-build = { path = "../../crates/rustible-build" }
 
 # Detach from the rustible repository's own workspace.
 [workspace]
+
+# Profile for binaries shipped to targets: small over fast-to-build. The
+# rustible CLI builds with `--profile dist`.
+[profile.dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
