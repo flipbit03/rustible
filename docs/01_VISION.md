@@ -205,6 +205,15 @@ Consequences accepted with remote-brain:
   over the channel without redesign. None of these are in the MVP.
 - Host-specific inputs (vars, secrets) must be sent over the channel after the
   binary starts, never baked into the binary (see 5.4).
+- **Lookups run on the target, not on the controller.** Ansible's
+  `lookup('url', ..)`, `lookup('file', ..)`, and friends execute on the machine
+  running `ansible-playbook`. In Rustible any op that fetches something (an
+  HTTP GET for a GitHub user's SSH keys, for instance) runs inside the binary
+  on the target, so the *target* needs the network access, not the operator's
+  laptop. This is a known semantic difference, first noticed while surveying
+  `my_infra` (section 6.9), where eleven `set_fact` tasks fetch
+  `https://github.com/<user>.keys`. Controller-side data reaches the target
+  only through the two file mechanisms in section 5.6.
 
 ### 5.2 Run pipeline (settled by spikes 1 and 2)
 
@@ -719,6 +728,67 @@ if sshd.changed {
 `check`). `Restart` is an action: `check` always returns `Change`; `apply` does
 optional `daemon-reload`, `restart`, then verifies `is-active`.
 
+### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED 2026-09-07)
+
+The first ops are chosen from real usage, not from Ansible's module index.
+Cadu's personal infrastructure repository, `/home/cadu/w/cadu/my_infra`
+(Ansible playbooks and roles for nine hosts: a home server, a storage server,
+a games box, a Home Assistant box, a Tailscale box, a Vultr VPS running
+Headscale, two family PCs, and a macOS laptop), was surveyed on 2026-09-07:
+39 playbook and role files, disabled ones excluded. Module usage:
+
+| Ansible module | Uses | Rustible op |
+|---|---|---|
+| `copy` (8 with `src`, 8 with inline `content`) | 16 | `file::Copy` |
+| `user` (shell, groups with append, create_home) | 16 | `user::Present` |
+| `service` + `systemd` (16 restarted, 5 started, 4 reloaded, 4 enabled) | 28 | `systemd::{Enabled, Running, Restart, Reload}` |
+| `authorized_key` | 14 | `ssh::authorized_keys::Present` |
+| `file` | 13 | `file::{Directory, Symlink, Absent, Attrs}` |
+| `apt` | 12 | `apt::{Present, Absent, Latest}` |
+| `set_fact` | 12 | not an op: `let`. Eleven of these fetch GitHub SSH keys, see below |
+| `hostname` | 9 | `hostname::Is` |
+| `include_role` | 7 | not an op: a role is a function in `src/lib.rs` taking `&mut Ctx` |
+| `lineinfile`, `blockinfile` | 4 + 4 | `file::Line` (exists), `file::Block` |
+| `get_url`, `unarchive` | 3 + 2 | `http::Download`, `archive::Extracted` |
+| `sysctl` | 3 | `sysctl::Present` |
+| `group` | 2 | `group::Present` |
+| `stat`, `acl`, `mount`, `iptables`, `replace`, `template`, `command`, `shell` | 1 or 2 each | tail |
+
+**Wave one of `rustible-std`** (M6), covering about 95 percent of that repo
+with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,
+`file::{Copy, Directory, Symlink, Absent, Attrs, Line, Block}`,
+`apt::{Present, Absent, Latest}`, `systemd::{Enabled, Disabled, Running,
+Stopped, Restart, Reload}`, `ssh::authorized_keys::{Present, Absent}`,
+`hostname::Is`, `sysctl::Present`, `http::Download`, `archive::Extracted`,
+`shell::Command`. **Wave two**, the tail: `file::Template` (used once, but
+generally important), `file::Replace`, `acl`, `mount`, `iptables`.
+
+**`rustible-github`, the first collection.** The GitHub-keys pattern
+(`lookup('url', 'https://github.com/<user>.keys')` combined into a list and
+looped into `authorized_key`) is not a `set_fact` problem and not a
+`rustible-std` problem. It is a small separate collection, `rustible-github`,
+with a read-only op `github::UserKeys::of("flipbit03")` returning the parsed
+keys, built on `ureq` with `rustls` (a synchronous pure-Rust HTTP client;
+`reqwest` was rejected because it brings tokio and, without careful feature
+selection, `native-tls` and therefore OpenSSL, which section 5.3 forbids).
+Published from this repository alongside the core crates, it is also the
+first collection written from the outside of the SDK, which tests the SDK
+itself. The `ssh_keys_from_github` role (two task files, a defaults file, and
+a `set_fact`/`combine`/`product` dance) becomes a fifteen-line function with
+typed arguments.
+
+**Dogfooding.** A Rustible workspace lives inside `my_infra` (a `rustible/`
+folder, created by `rustible init` once M4 exists, by hand before that), with
+path dependencies to the local Rustible checkout until the crates are
+published. The inventory maps directly: `ansible_host` becomes `addr`,
+`ansible_user` becomes `ssh_user`, `computer_hostname` becomes a var; the
+macOS laptop is out of MVP scope (section 5.3). Port order: `ourserver/00_basic`
+first (hostname, apt, sysctl; three ops, no roles), then the
+`ssh_keys_from_github` role as a lib function, then the user-setup subtask,
+then a whole host. Ansible and Rustible run side by side until parity, and
+every port is a test of an op against a real machine. Ansible's `notify:
+Restart avahi-daemon` becomes `if hostname.changed { .. }`.
+
 ## 7. The `System` handle
 
 `System` is the argument every op's `check` and `apply` receive. It is the op's
@@ -1036,9 +1106,18 @@ Networking and anything async are also off `System` for now.
     the build script itself stays a one-line shim.
   - `rustible-std`: the base operations mirroring Ansible builtins, itself just a
     consumer of `rustible-sdk`.
+  - `rustible-github`: the first collection (section 6.9), published from
+    this repository but structured exactly like a third-party one.
   - Third-party collections (`rustible-docker`, ...): plain crates on
     `rustible-sdk`, published to crates.io, added with `cargo add`. Because
     playbooks link them directly, no registration mechanism is needed.
+- **Publishing.** Seven crates ship from this repository: `rustible`,
+  `rustible-cli`, `rustible-sdk`, `rustible-macros`, `rustible-build`,
+  `rustible-std`, `rustible-github`. They are versioned in lockstep through
+  `workspace.package.version`, so one tag releases all of them. All six core
+  names were verified free on crates.io on 2026-09-07; reserving them with a
+  placeholder publish early is cheap insurance against squatting. The spike
+  playbook is never published and is deleted at M3.
   - The spike orchestrator currently at `crates/rustible` is renamed to
     `crates/rustible-cli` at M1, freeing the name for the facade.
 - **A playbook binary has four modes** (section 5.5): plain local run,
