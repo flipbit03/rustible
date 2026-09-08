@@ -12,7 +12,7 @@ pub use rustible_sdk as sdk;
 /// The standard operations, also available as the `rustible_std` crate.
 pub use rustible_std as std_ops;
 
-pub use rustible_macros::{playbook, vars};
+pub use rustible_macros::{integration_test, playbook, vars};
 pub use rustible_sdk::{registry, runtime};
 
 pub mod prelude {

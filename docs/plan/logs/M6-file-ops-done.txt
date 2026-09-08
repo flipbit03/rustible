@@ -1,0 +1,97 @@
+# M6 file ops: done-when
+# 2026-09-08T10:43Z on branch m6-file-ops at 4a3c16c
+
+$ cargo fmt --all --check
+(clean)
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
+
+$ cargo test -p rustible-std file
+
+running 63 tests
+test file::absent::tests::absent_is_satisfied_when_missing ... ok
+test file::absent::tests::absent_in_check_mode_predicts_and_removes_nothing ... ok
+test file::absent::tests::absent_removes_a_file_and_a_symlink ... ok
+test file::absent::tests::absent_refuses_non_empty_directory_unless_recursive ... ok
+test file::absent::tests::absent_removes_an_empty_directory_without_recursive ... ok
+test file::attrs::tests::attrs_changes_mode_and_owner_then_is_satisfied ... ok
+test file::attrs::tests::attrs_fails_on_missing_path_and_on_symlink ... ok
+test file::attrs::tests::attrs_in_check_mode_predicts_and_changes_nothing ... ok
+test file::attrs::tests::attrs_is_satisfied_when_matching_or_nothing_asked ... ok
+test file::attrs::tests::attrs_only_touches_what_was_asked ... ok
+test file::block::tests::block_in_check_mode_predicts_and_writes_nothing ... ok
+test file::block::tests::block_op_check_apply_then_satisfied ... ok
+test file::block::tests::block_op_default_marker_and_create ... ok
+test file::block::tests::block_op_rejects_marker_without_mark ... ok
+test file::block::tests::plan_block_appends_when_absent ... ok
+test file::block::tests::plan_block_empty_removes_managed_block ... ok
+test file::block::tests::plan_block_identical_is_satisfied ... ok
+test file::block::tests::plan_block_orphan_begin_marker_counts_as_absent ... ok
+test file::block::tests::plan_block_replaces_existing_in_place ... ok
+test file::block::tests::plan_block_trailing_newline_edge_cases ... ok
+test file::copy::tests::copy_attrs_only_change_does_not_rewrite ... ok
+test file::copy::tests::copy_backup_is_taken_before_rewrite ... ok
+test file::copy::tests::copy_binary_content_produces_summary_diff ... ok
+test file::copy::tests::copy_creates_missing_file_with_mode ... ok
+test file::copy::tests::copy_fails_when_dest_is_a_directory_or_link ... ok
+test file::copy::tests::copy_from_local_path_reads_source_through_sys ... ok
+test file::copy::tests::copy_in_check_mode_predicts_and_writes_nothing ... ok
+test file::block::tests::plan_block_inserts_after_and_before_regex ... ok
+test file::copy::tests::copy_is_satisfied_when_bytes_and_attrs_match ... ok
+test file::copy::tests::copy_large_text_falls_back_to_summary ... ok
+test file::copy::tests::copy_rewrite_preserves_existing_mode_when_none_given ... ok
+test file::copy::tests::copy_text_change_has_unified_diff_and_predicts ... ok
+test file::directory::tests::directory_fails_on_file_in_the_way ... ok
+test file::directory::tests::directory_is_created_with_mode_and_owner ... ok
+test file::directory::tests::directory_owner_change_on_existing_dir ... ok
+test file::line::tests::check_mode_output_unavailable_unless_predicted ... ok
+test file::line::tests::line_op_creates_when_asked ... ok
+test file::line::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::line::tests::mutation_during_check_is_refused ... ok
+test file::line::tests::plan_appends_when_absent ... ok
+test file::line::tests::plan_handles_missing_trailing_newline ... ok
+test file::line::tests::line_op_check_then_apply_on_fake ... ok
+test file::symlink::tests::symlink_in_check_mode_predicts_and_creates_nothing ... ok
+test file::symlink::tests::symlink_is_created_when_missing ... ok
+test file::symlink::tests::symlink_never_replaces_a_directory ... ok
+test file::line::tests::plan_is_satisfied_when_line_present ... ok
+test file::line::tests::plan_inserts_after_regex ... ok
+test file::line::tests::plan_replaces_commented_line ... ok
+test file::symlink::tests::symlink_over_file_needs_force ... ok
+test file::symlink::tests::symlink_with_wrong_target_is_replaced ... ok
+test file::tests::plan_attrs_ignores_file_type_bits ... ok
+test file::tests::plan_attrs_nothing_wanted_or_all_equal_is_empty ... ok
+test file::tests::plan_attrs_on_missing_path_renders_dash ... ok
+test file::tests::plan_attrs_reports_mode_and_owner_changes ... ok
+test file::tests::insert_positions ... ok
+test ssh::authorized_keys::tests::absent_on_missing_file_is_satisfied_and_creates_nothing ... ok
+test ssh::authorized_keys::tests::crlf_files_keep_their_line_endings ... ok
+test ssh::authorized_keys::tests::in_file_form_refuses_missing_parent ... ok
+test ssh::authorized_keys::tests::existing_file_and_dir_keep_their_attributes ... ok
+test ssh::authorized_keys::tests::present_on_empty_file_appends ... ok
+test ssh::authorized_keys::tests::in_file_form_writes_the_given_path_without_owner ... ok
+test ssh::authorized_keys::tests::user_form_creates_file_with_mode_and_owner_inside_existing_ssh_dir ... ok
+test ssh::authorized_keys::tests::user_form_refuses_missing_ssh_dir_naming_file_directory ... ok
+
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+
+
+$ cargo test --workspace (summary lines)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s

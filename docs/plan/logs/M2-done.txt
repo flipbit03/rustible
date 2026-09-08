@@ -1,0 +1,125 @@
+# M2 done-when, run 2026-09-08 10:24 UTC on branch m2-inventory @ c605441 (after merging main @ 817c65c)
+
+$ cargo test -p rustible-cli inventory
+test inventory::tests::error_addr_on_group_or_defaults ... ok
+test inventory::tests::both_vars_forms_and_scalars ... ok
+test inventory::tests::error_membership_cycle ... ok
+test inventory::tests::error_kdl_syntax_has_position ... ok
+test inventory::tests::error_duplicate_host_or_group ... ok
+test inventory::tests::error_missing_addr_on_ssh_host ... ok
+test inventory::tests::error_unknown_member ... ok
+test inventory::tests::load_reports_unreadable_file ... ok
+test inventory::tests::error_unknown_parameter_with_did_you_mean ... ok
+test inventory::tests::positions_count_characters_not_bytes ... ok
+test inventory::tests::error_structure ... ok
+test inventory::tests::error_wrong_parameter_type ... ok
+test inventory::tests::group_distance_is_shortest_path ... ok
+test inventory::tests::no_conflict_when_only_one_sibling_sets_the_key ... ok
+test inventory::tests::errors_are_collected_not_first_only ... ok
+test inventory::tests::sibling_conflict_is_a_load_error_naming_both_groups_and_host ... ok
+test inventory::tests::parameter_precedence_host_group_defaults_builtin ... ok
+test inventory::tests::sibling_conflict_on_a_parameter ... ok
+test inventory::tests::ssh_args_child_node_and_property ... ok
+test inventory::tests::sibling_conflict_resolved_by_nearer_group ... ok
+test inventory::tests::sibling_conflict_resolved_by_host_override ... ok
+test inventory::tests::error_var_shapes ... ok
+test inventory::tests::vars_report_single_host_and_multiple_errors ... ok
+test inventory::tests::vars_validation_lists_and_enums ... ok
+test inventory::tests::vars_validation_kinds ... ok
+test inventory::tests::vars_validation_report_matches_vision ... ok
+test inventory::tests::var_precedence_all_outer_inner_host ... ok
+test inventory::tests::select_group_host_or_error ... ok
+test inventory::tests::example_workspace_inventory_loads ... ok
+test inventory::tests::slash_dash_disables_a_host_with_its_children ... ok
+test inventory::tests::vision_example_loads ... ok
+test inventory::tests::vision_other_hosts ... ok
+test inventory::tests::vision_show_layout ... ok
+test inventory::tests::vision_web2_resolves_with_sources ... ok
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+exit=0
+
+$ cd examples/workspace && rustible inventory show web2
+host web2  (groups: web, production)
+
+parameters
+  addr           "10.0.1.12"          host
+  connection     ssh                  built-in
+  ssh_user       "deploy"             group web
+  port           22                   defaults
+  escalate       sudo                 defaults
+  escalate_user  "root"               built-in
+  ssh_args       []                   built-in
+
+vars
+  allowed_ports  [22, 80, 443]        group web
+  env            "production"         group production
+  fruit          "banana"             all
+  nginx_workers  8                    host
+  timezone       "America/Sao_Paulo"  all
+  tls            #true                group web
+
+overridden
+  ssh_user       "cadu"               defaults
+  nginx_workers  4                    group web
+exit=0
+
+$ cd crates/rustible-cli/testdata/three-errors && rustible inventory check
+hosts.kdl:5:13: error: `addr` is not allowed on group `web`; addr is a host-only parameter
+hosts.kdl:7:34: error: unknown parameter `sshuser` on host `web2`; did you mean `ssh_user`?
+hosts.kdl:10:29: error: parameter `port` on host `db1` must be an integer, got "2222"
+hosts.kdl: 3 errors
+exit=1
+
+$ cd examples/workspace && rustible inventory check
+hosts.kdl: ok (7 hosts, 5 groups)
+exit=0
+
+$ cargo fmt --all --check
+exit=0
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+exit=0
+
+$ cargo test --workspace
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit=0
+
+$ cargo run -p rustible-cli -- run --playbook cadu/mc --host local --escalate --check --var package=mc
+[local]  connected in 1.31µs, probed x86_64-unknown-linux-musl in 1.54ms
+   Compiling rustible-build v0.0.1 (/home/cadu/w/cadu/rustible-m2/crates/rustible-build)
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-m2/examples/workspace)
+    Finished `dist` profile [optimized] target(s) in 3.85s
+built x86_64-unknown-linux-musl in 3.87s
+x86_64-unknown-linux-musl: 735616 bytes, sha256 3daa15254605b62a
+[local]  binary already cached in 990.66µs
+[local]  hello: protocol 2, playbook cadu/mc, 8.03ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=root
+[local]  mc present ................................. ok           
+[local]    already there: mc 3:4.8.30-1ubuntu0.1
+
+local    ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after "8.03ms", total run 21.28ms
+
+total 3.90s
+exit=0
