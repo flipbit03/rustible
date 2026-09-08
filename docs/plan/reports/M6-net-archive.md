@@ -375,3 +375,50 @@ Twenty-six `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
 
 Not run on this branch. The `code-review` skill pass is left to the lead on
 the PR, as with the other M6 op branches.
+
+### Self-review (lead, PR #15)
+
+Reviewed with the `code-review` skill: seven findings, all real, all fixed on
+the branch. Two were security bugs and the author re-verified both by putting
+the bug back and watching the container tests fail, which is the standard I
+want on this kind of fix.
+
+- **A tar header's `size` field sized the read buffer.** A crafted archive
+  claiming 2^62 bytes made `apply` reserve it, and Rust aborts the process on
+  allocation failure, so a malicious archive killed the run instead of
+  producing the honest refusal this module promises. The author's correction
+  to the reviewer is worth keeping: it is not reachable through `check`, which
+  hits the truncated stream and refuses first, but it is reachable through
+  `apply`, which re-reads the file, so an archive swapped between the two
+  phases gets there. The test does exactly that swap.
+- **chmod ran before chown**, and `chown(2)` clears setuid and setgid on
+  non-directories, so extracting a setuid binary with an owner silently
+  produced a plain mode while reporting success. The same ordering was in the
+  shared `file::apply_attrs`, which `http::Download` and every merged file op
+  use, so this was a bug in already-merged code that this branch surfaced. The
+  `Fake` cannot catch it, because it does not model chown clearing the bit;
+  the container was the only honest place to pin it, and PR #16's file-op
+  container tests now exercise the same helper independently.
+
+The rest: a download had no size ceiling and buffered the body before writing
+(there is `.max_bytes` with a 1 GiB default now, checking `Content-Length`
+when present and the read otherwise); `validate_url` measured `http://` against
+the length of `https://` and rejected a valid short URL; an archive containing
+a directory and then a symlink at the same path aborted partway and left a
+half-written tree (refused at check now); a doc claimed hard links counted
+toward `bytes` when their headers carry zero; and the destination was read and
+hashed on every check even with no checksum configured, so `sha256` is an
+`Option` filled lazily.
+
+Verified before merge on the fifth merge of main: fmt, clippy with warnings
+denied, 487 workspace tests, rustdoc under `-D warnings`, and the full
+container suite, 13 test files green across debian:12, ubuntu:24.04,
+alpine:3.20 and the two systemd images.
+
+Known limits, recorded rather than fixed: both ops buffer their payload in
+memory because `Backend::write` takes a slice and there is no streaming
+primitive; TLS in a container is untested because the harness cannot hand the
+op a CA certificate, so real TLS is covered only by the ignored live test;
+neither op has run on the ARM VM; and bzip2 and zip are refused with a message
+naming the supported formats.
+

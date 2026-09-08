@@ -8830,3 +8830,33 @@ test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
 
 all doctests ran in 0.38s; merged doctests compilation took 0.37s
 [exit 0, wall 1.17s]
+
+## Container suite re-run by the lead on the fifth merge (1e3d624), 2026-09-08T16:21Z
+13 container test files, all green; rustible-std 318 unit tests.
+test result: ok. 318 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.40s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-4308d83b4a73b842)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.63s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-6ecdfc29f2ca526f)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.16s
+     Running tests/it_archive_extracted.rs (target/debug/deps/it_archive_extracted-5f4b136c4604b72e)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-75bf77ec9e7b19ca)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-b8624839ab32da26)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-b77ad3fc60510fc8)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+     Running tests/it_http_download.rs (target/debug/deps/it_http_download-a89c9b38b2e327e1)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-fbc22e76165eb372)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-de25a0b1c05164b2)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-d7598407ff1f2809)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-e6f26ae1466d64a3)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+     Running tests/it_user_busybox.rs (target/debug/deps/it_user_busybox-fd019cd3a3122e82)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-935fefe0ec0de504)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
