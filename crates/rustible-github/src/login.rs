@@ -30,12 +30,9 @@ pub fn validate_login(login: &str) -> Result<()> {
     if login.is_empty() {
         bail!("GitHub login is empty");
     }
-    if login.len() > MAX_LEN {
-        bail!(
-            "GitHub login `{login}` is {} characters long; the maximum is {MAX_LEN}",
-            login.len()
-        );
-    }
+    // The character check comes first, and the length counts characters, so
+    // a login with a non-ASCII character is told about that character rather
+    // than about a byte count the author never typed.
     if let Some(c) = login
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || *c == '-'))
@@ -43,6 +40,10 @@ pub fn validate_login(login: &str) -> Result<()> {
         bail!(
             "GitHub login `{login}` contains {c:?}; only ASCII letters, digits, and hyphens are allowed"
         );
+    }
+    let len = login.chars().count();
+    if len > MAX_LEN {
+        bail!("GitHub login `{login}` is {len} characters long; the maximum is {MAX_LEN}");
     }
     if login.starts_with('-') || login.ends_with('-') {
         bail!("GitHub login `{login}` cannot begin or end with a hyphen");
@@ -56,6 +57,15 @@ pub fn validate_login(login: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_ascii_login_is_told_about_the_character_not_the_byte_count() {
+        // "cadú" repeated ten times is 40 characters and 50 bytes: the old
+        // order reported a length the author never typed.
+        let err = validate_login(&"cadú".repeat(10)).unwrap_err().to_string();
+        assert!(err.contains("contains"), "{err}");
+        assert!(!err.contains("50"), "{err}");
+    }
 
     #[test]
     fn accepts_real_logins() {
