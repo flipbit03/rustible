@@ -17,15 +17,16 @@ fn unit_lifecycle_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
           [Service]\nExecStart=/bin/sleep infinity\n\n\
           [Install]\nWantedBy=multi-user.target\n",
     )?;
-    // A fresh unit file needs daemon-reload before systemctl sees it; the
-    // action carries that flag and always changes.
-    let reloaded = ctx.step(
-        "journald reload-or-restart with daemon-reload",
-        systemd::Reload::new("systemd-journald")
-            .daemon_reload(true)
-            .or_restart(true),
-    )?;
-    assert!(reloaded.changed && reloaded.active);
+    // Make systemd re-read its unit files after writing a new one. Before
+    // `DaemonReload` existed this test had to reload an unrelated unit
+    // (`systemd-journald`) just to carry a `.daemon_reload(true)` flag; now it
+    // is one step that names no unit and returns nothing.
+    let reloaded = ctx.step("systemd re-reads its units", systemd::DaemonReload::new())?;
+    assert!(reloaded.changed);
+    assert_eq!(
+        reloaded.diff.as_ref().map(|d| d.render()),
+        Some("systemctl daemon-reload".to_string())
+    );
 
     let (first, second) = changed_then_ok(ctx, "unit enabled and started", || {
         systemd::Enabled::new(UNIT).now(true)

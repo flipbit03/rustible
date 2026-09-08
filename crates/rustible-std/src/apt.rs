@@ -4,16 +4,32 @@
 //! (`state=latest`).
 //!
 //! Every op refuses on a host whose package manager is not apt and when not
-//! running as root. `check` only runs read-only commands (`dpkg-query`,
-//! `apt-cache policy`, `stat`); `apt-get` runs in `apply` only.
+//! running as root. `check` reads with `dpkg-query`, `apt-cache policy` and
+//! `stat`, and runs no `apt-get` at all unless `.update_cache()` asked for a
+//! refresh on [`Latest`] (see below).
 //!
-//! **Cache refresh.** `Present` and `Latest` take `.update_cache(max_age)`:
-//! `apply` runs `apt-get update` first when the lists in `/var/lib/apt/lists`
-//! (or, failing that, `/var/cache/apt/pkgcache.bin`) are older than `max_age`;
-//! `Duration::ZERO` means always. Because the refresh happens in `apply`, a
-//! `Latest` whose `check` finds every package current against a stale cache
-//! reports `ok` and does not refresh; run `shell::Command::new("apt-get")
-//! .arg("update")` first when the box never refreshes on its own.
+//! **Cache refresh.** [`Present`] and [`Latest`] take `.update_cache(max_age)`:
+//! `apt-get update` runs when the lists in `/var/lib/apt/lists` (or, failing
+//! that, `/var/cache/apt/pkgcache.bin`) are older than `max_age`;
+//! `Duration::ZERO` means always. *Where* it runs differs, because the two ops
+//! need the lists at different moments:
+//!
+//! - [`Present`] only asks whether a package is installed, which dpkg answers
+//!   without the lists. It refreshes in `apply`, right before installing, and
+//!   never in `check`.
+//! - [`Latest`] compares installed versions against the *candidate* versions
+//!   the lists carry, so stale lists give a wrong answer. It refreshes in
+//!   `check`, before reading the candidates, exactly as Ansible's
+//!   `apt: state=latest` does.
+//!
+//! **A `Latest` dry run with `.update_cache()` therefore writes
+//! `/var/lib/apt/lists` on the target.** This is the one place in this module
+//! where `--check` is not read-only: `apt-get update` is a command, not a
+//! mutation through `sys`, so the check-mode guard does not stop it, and
+//! without it a dry run against month-old lists reports every package current
+//! and is simply wrong. The step logs a warning saying so whenever it happens
+//! in check mode. Leave `.update_cache()` off if a dry run must touch nothing;
+//! the plan is then computed against whatever the lists already say.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -186,16 +202,17 @@ fn cache_age(sys: &System) -> Result<Option<Duration>> {
 }
 
 /// Run `apt-get update` when the lists are older than `max_age` (or their age
-/// is unknown). `Duration::ZERO` always updates.
-fn update_cache_if_stale(sys: &System, max_age: Duration) -> Result<()> {
+/// is unknown). `Duration::ZERO` always updates. Returns whether it ran.
+fn update_cache_if_stale(sys: &System, max_age: Duration) -> Result<bool> {
     let stale = max_age.is_zero() || cache_age(sys)?.is_none_or(|age| age > max_age);
-    if stale {
-        sys.cmd("apt-get")
-            .arg("update")
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .run()?;
+    if !stale {
+        return Ok(false);
     }
-    Ok(())
+    sys.cmd("apt-get")
+        .arg("update")
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .run()?;
+    Ok(true)
 }
 
 /// Refuse early on a non-apt host or without root (vision 6.8).
@@ -452,8 +469,13 @@ impl Op for Absent {
 /// `check` compares the installed version (`dpkg-query`) with the candidate
 /// from `apt-cache policy`; a missing package is installed, an outdated one
 /// upgraded with `apt-get install --only-upgrade`. A name apt cannot resolve
-/// fails the step. See the module docs for what `.update_cache` does and
-/// does not do in `check`.
+/// fails the step.
+///
+/// With [`update_cache`](Latest::update_cache), the refresh happens in
+/// `check`, before the candidates are read, **including in check mode**: a
+/// dry run then writes `/var/lib/apt/lists` on the target and logs a warning
+/// saying it did. Without it, the comparison uses whatever the lists already
+/// say and a dry run touches nothing. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Latest {
     names: Vec<String>,
@@ -474,8 +496,15 @@ impl Latest {
         }
     }
 
-    /// Run `apt-get update` in `apply` if the apt lists are older than
-    /// `max_age`. `Duration::ZERO` always updates.
+    /// Run `apt-get update` in `check`, before the candidate versions are
+    /// read, if the apt lists are older than `max_age`. `Duration::ZERO`
+    /// always updates. Ansible's `update_cache` with `cache_valid_time`.
+    ///
+    /// This runs in check mode too, so **a dry run refreshes the package
+    /// lists on the target** and the step logs a warning when it does. That
+    /// is the point: candidates read from stale lists would make the dry run
+    /// report packages as current when they are not. Leave this off for a
+    /// dry run that must not write anything.
     pub fn update_cache(mut self, max_age: Duration) -> Self {
         self.update_cache = Some(max_age);
         self
@@ -486,6 +515,28 @@ impl Latest {
         self.install_recommends = on;
         self
     }
+
+    /// The `check`-time refresh: `apt-get update` when the caller asked for
+    /// it and the lists are stale. Says out loud when a dry run did it.
+    fn refresh_cache(&self, sys: &System) -> Result<()> {
+        let Some(max_age) = self.update_cache else {
+            return Ok(());
+        };
+        if !update_cache_if_stale(sys, max_age)? {
+            return Ok(());
+        }
+        let msg = "apt::Latest ran `apt-get update`: the lists were older than the \
+                   `.update_cache()` age, and the candidate versions come from them";
+        if sys.check_mode() {
+            sys.warn(format!(
+                "{msg}. A dry run does not otherwise change the target, but this \
+                 rewrote /var/lib/apt/lists"
+            ));
+        } else {
+            sys.debug(msg);
+        }
+        Ok(())
+    }
 }
 
 impl Op for Latest {
@@ -493,6 +544,9 @@ impl Op for Latest {
 
     fn check(&self, sys: &System) -> Result<Plan<UpgradeReport>> {
         require_apt_root(sys, "Latest")?;
+        // Before the candidates are read, not after: `apt-cache policy` can
+        // only answer from the lists on disk.
+        self.refresh_cache(sys)?;
         let mut report = UpgradeReport::default();
         let mut changes = vec![];
         for name in &self.names {
@@ -543,9 +597,8 @@ impl Op for Latest {
         let Some(mut report) = change.predicted else {
             bail!("apt::Latest::apply received a change without its prediction");
         };
-        if let Some(max_age) = self.update_cache {
-            update_cache_if_stale(sys, max_age)?;
-        }
+        // No refresh here: `check` always runs first (this plan came from it)
+        // and did it, so the candidates below are already the fresh ones.
         if !report.installed.is_empty() {
             let mut cmd = apt_get(sys).args(["install", "-y"]);
             if !self.install_recommends {
@@ -560,8 +613,8 @@ impl Op for Latest {
                 .args(report.upgraded.iter().map(|(p, _)| p.name.clone()))
                 .run()?;
         }
-        // Report what dpkg actually has now; the candidate may have moved
-        // if the cache was refreshed.
+        // Report what dpkg actually has now: apt may have landed on something
+        // other than the candidate (a hold, a dependency, a pinned version).
         for p in &mut report.installed {
             p.version = installed_version(sys, &p.name)?.unwrap_or(p.version.clone());
         }
@@ -1296,8 +1349,10 @@ mod tests {
         assert!(fake.argvs().is_empty());
     }
 
+    /// The refresh happens in `check`, before `apt-cache policy` is asked for
+    /// a candidate, and `apply` does not repeat it.
     #[test]
-    fn latest_update_cache_runs_before_install() {
+    fn latest_update_cache_runs_in_check_before_reading_candidates() {
         let fake = dpkg(Fake::new(), "sl", 1, "");
         let fake = Arc::new(
             policy_of(fake, "sl", "(none)", "5.02-1")
@@ -1309,20 +1364,57 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!()
         };
-        // check ran no apt-get at all
-        assert!(fake.argvs().iter().all(|a| a[0] != "apt-get"));
+        let after_check = fake.argvs();
+        let update = after_check
+            .iter()
+            .position(|a| a[..2] == ["apt-get", "update"])
+            .expect("check ran apt-get update");
+        let policy = after_check
+            .iter()
+            .position(|a| a[0] == "apt-cache")
+            .expect("check read the candidate");
+        assert!(update < policy, "{after_check:?}");
+
         op.apply(&s, c).unwrap();
         let apt: Vec<_> = fake
             .argvs()
             .into_iter()
             .filter(|a| a[0] == "apt-get")
             .collect();
-        assert_eq!(apt[0], ["apt-get", "update"]);
+        assert_eq!(apt.len(), 2, "apply does not update again: {apt:?}");
         assert_eq!(apt[1][..3], ["apt-get", "install", "-y"]);
     }
 
+    /// Fresh lists: no `apt-get` at all, in check or apply.
     #[test]
-    fn latest_check_mode_runs_only_read_only_commands() {
+    fn latest_update_cache_skips_a_fresh_cache() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fake = dpkg(
+            Fake::new(),
+            "openssl",
+            0,
+            "install ok installed\t3.0.16-1\n",
+        );
+        let fake = Arc::new(policy_of(fake, "openssl", "3.0.16-1", "3.0.16-1").with_cmd(
+            "stat",
+            None,
+            0,
+            &now.to_string(),
+        ));
+        let op = Latest::new(["openssl"]).update_cache(Duration::from_secs(3600));
+        let Plan::Satisfied(_) = op.check(&sys(&fake)).unwrap() else {
+            panic!("expected satisfied")
+        };
+        let argvs = fake.argvs();
+        assert!(argvs.iter().all(|a| a[0] != "apt-get"), "{argvs:?}");
+    }
+
+    /// Without `.update_cache()`, `check` stays read-only in check mode.
+    #[test]
+    fn latest_check_mode_runs_only_read_only_commands_without_update_cache() {
         let fake = dpkg(
             Fake::new(),
             "openssl",
@@ -1333,9 +1425,7 @@ mod tests {
             policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
         );
         let mut ctx = check_mode_ctx(&fake);
-        let r = ctx
-            .step("up", Latest::new(["openssl"]).update_cache(Duration::ZERO))
-            .unwrap();
+        let r = ctx.step("up", Latest::new(["openssl"])).unwrap();
         assert!(r.changed && r.predicted);
         assert_eq!(r.upgraded[0].0.version, "3.0.16-1");
         let argvs = fake.argvs();
@@ -1345,5 +1435,71 @@ mod tests {
                 .all(|a| a[0] == "dpkg-query" || a[0] == "apt-cache"),
             "{argvs:?}"
         );
+    }
+
+    /// With `.update_cache()`, a dry run does refresh the lists, and says so
+    /// out loud rather than doing it silently.
+    #[test]
+    fn latest_check_mode_refreshes_the_cache_and_warns() {
+        let fake = dpkg(
+            Fake::new(),
+            "openssl",
+            0,
+            "install ok installed\t3.0.15-1\n",
+        );
+        let fake = Arc::new(
+            policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
+        );
+        let sink = Arc::new(Collect::default());
+        let s = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
+        let op = Latest::new(["openssl"]).update_cache(Duration::ZERO);
+        let Plan::Change(_) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        let argvs = fake.argvs();
+        assert!(
+            argvs.iter().any(|a| a[..2] == ["apt-get", "update"]),
+            "{argvs:?}"
+        );
+        let warned = sink.events().iter().any(|e| {
+            matches!(
+                e,
+                rustible_sdk::event::Event::Log {
+                    level: rustible_sdk::event::Level::Warn,
+                    msg
+                } if msg.contains("rewrote /var/lib/apt/lists")
+            )
+        });
+        assert!(warned, "{:?}", sink.events());
+    }
+
+    /// Outside check mode the same refresh is unremarkable: debug, not warn.
+    #[test]
+    fn latest_cache_refresh_outside_check_mode_does_not_warn() {
+        let fake = dpkg(
+            Fake::new(),
+            "openssl",
+            0,
+            "install ok installed\t3.0.15-1\n",
+        );
+        let fake = Arc::new(
+            policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
+        );
+        let sink = Arc::new(Collect::default());
+        let s = System::fake(fake.clone(), sink.clone());
+        Latest::new(["openssl"])
+            .update_cache(Duration::ZERO)
+            .check(&s)
+            .unwrap();
+        let warned = sink.events().iter().any(|e| {
+            matches!(
+                e,
+                rustible_sdk::event::Event::Log {
+                    level: rustible_sdk::event::Level::Warn,
+                    ..
+                }
+            )
+        });
+        assert!(!warned, "{:?}", sink.events());
     }
 }

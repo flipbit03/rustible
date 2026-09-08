@@ -75,36 +75,54 @@ fn regenerates_the_example_workspace() {
     assert!(read(&dir, "src/lib.rs").contains("`workspace::helper()`"));
 }
 
+/// A fresh clone is not a conflict: `init` writes into it and leaves the
+/// files it did not generate alone, appending to an existing `.gitignore`.
 #[test]
-fn refuses_a_non_empty_directory_without_force() {
-    let tmp = tempfile::tempdir().unwrap();
-    fs::write(tmp.path().join("notes.txt"), "").unwrap();
-    let out = rustible(tmp.path(), &["init"]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("is not empty"), "{}", stderr(&out));
-    assert!(!tmp.path().join("Cargo.toml").exists());
-
-    let out = rustible(tmp.path(), &["init", "--force"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(tmp.path().join("Cargo.toml").exists());
-}
-
-#[test]
-fn a_git_directory_counts_as_empty_and_gitignore_is_appended() {
+fn a_cloned_repository_is_not_a_conflict() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir(tmp.path().join(".git")).unwrap();
+    fs::write(tmp.path().join("README.md"), "# my infra\n").unwrap();
+    fs::write(tmp.path().join("LICENSE"), "MIT\n").unwrap();
+    fs::write(tmp.path().join(".gitignore"), "*.log\n/target\n").unwrap();
+
     let out = rustible(tmp.path(), &["init"]);
     assert!(out.status.success(), "{}", stderr(&out));
-
-    // A second init with --force keeps an existing .gitignore and only adds
-    // what is missing.
-    fs::write(tmp.path().join(".gitignore"), "*.log\n/target\n").unwrap();
-    let out = rustible(tmp.path(), &["init", "--force"]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(tmp.path().join("Cargo.toml").exists());
+    assert_eq!(read(tmp.path(), "README.md"), "# my infra\n");
+    assert_eq!(read(tmp.path(), "LICENSE"), "MIT\n");
     assert_eq!(
         read(tmp.path(), ".gitignore"),
         "*.log\n/target\n/.rustible\n"
     );
+}
+
+/// Only a file `init` itself writes stops it, and the message names it.
+#[test]
+fn refuses_only_on_conflicting_files_and_names_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("notes.txt"), "").unwrap();
+    fs::write(tmp.path().join("hosts.kdl"), "// mine\n").unwrap();
+
+    let out = rustible(tmp.path(), &["init"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("already has hosts.kdl"), "{err}");
+    assert!(!err.contains("notes.txt"), "{err}");
+    assert!(!tmp.path().join("Cargo.toml").exists());
+
+    // --force adds the missing files and keeps the user-owned one.
+    let out = rustible(tmp.path(), &["init", "--force"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(tmp.path().join("Cargo.toml").exists());
+    assert_eq!(read(tmp.path(), "hosts.kdl"), "// mine\n");
+    assert_eq!(read(tmp.path(), "notes.txt"), "");
+
+    // A second run without --force now conflicts on everything it generated.
+    let out = rustible(tmp.path(), &["init"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("Cargo.toml, build.rs, src/main.rs"), "{err}");
+    assert!(err.contains("will not overwrite them"), "{err}");
 }
 
 #[test]

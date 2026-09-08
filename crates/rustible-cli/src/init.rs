@@ -24,6 +24,19 @@ const HOSTS_KDL: &str = include_str!("../templates/hosts.kdl");
 const RUSTIBLE_TOML: &str = include_str!("../templates/rustible.toml");
 const GITIGNORE: &str = include_str!("../templates/gitignore");
 
+/// The paths [`generate`] writes, in write order. Kept equal to `generate`'s
+/// own paths by a test; [`conflicts`] needs them before a package name or a
+/// dependency style has been decided.
+const GENERATED_PATHS: [&str; 7] = [
+    "Cargo.toml",
+    "build.rs",
+    "src/main.rs",
+    "src/lib.rs",
+    ".cargo/config.toml",
+    "hosts.kdl",
+    "rustible.toml",
+];
+
 /// The crates a workspace depends on, and the section each goes in.
 const DEPENDENCIES: [&str; 2] = ["rustible", "rustible-std"];
 const BUILD_DEPENDENCIES: [&str; 1] = ["rustible-build"];
@@ -33,15 +46,17 @@ const BUILD_DEPENDENCIES: [&str; 1] = ["rustible-build"];
 #[derive(Args, Debug)]
 pub struct InitArgs {
     /// Directory to create the workspace in (created if missing). Defaults to
-    /// the current directory, which must be empty.
+    /// the current directory. Other files in it are left alone; only a file
+    /// `init` would itself write is a conflict.
     #[arg(default_value = ".")]
     pub dir: PathBuf,
     /// Package name; defaults to the directory name, sanitized to a valid
     /// crate name.
     #[arg(long)]
     pub name: Option<String>,
-    /// Write into a non-empty directory. Files that already exist are kept
-    /// (only the two generated shims are rewritten); missing ones are added.
+    /// Write even when files `init` generates already exist. Those files are
+    /// kept (only the two generated shims are rewritten); missing ones are
+    /// added.
     #[arg(long, conflicts_with = "refresh")]
     pub force: bool,
     /// Rewrite only the two generated shims (`build.rs`, `src/main.rs`) of an
@@ -91,11 +106,18 @@ pub fn run(args: InitArgs) -> Result<()> {
             "{} exists and is not a directory",
             dir.display()
         );
-        if !args.force && !is_empty_dir(dir)? {
-            bail!(
-                "{} is not empty; use --force to add the missing files (existing files are kept, only the two shims are rewritten)",
-                dir.display()
-            );
+        if !args.force {
+            let clashes = conflicts(dir);
+            if !clashes.is_empty() {
+                bail!(
+                    "{} already has {}; `rustible init` will not overwrite {}. \
+                     Use --force to add only the missing files (existing files are kept, \
+                     only the two generated shims are rewritten)",
+                    dir.display(),
+                    clashes.join(", "),
+                    if clashes.len() == 1 { "it" } else { "them" }
+                );
+            }
         }
     }
 
@@ -273,16 +295,22 @@ fn ensure_gitkeep(dir: &Path) -> Result<()> {
     write_file(dir, "playbooks/.gitkeep", "")
 }
 
-/// A directory counts as empty when it holds nothing but `.git`, so
-/// `git init` before `rustible init` works.
-fn is_empty_dir(dir: &Path) -> Result<bool> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_name() != ".git" {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// The files already in `dir` that `init` would overwrite, in write order.
+///
+/// Cargo's rule (`cargo init`): a directory is not refused for being
+/// non-empty, only for holding a file the generator itself writes. A clone
+/// with a `README.md`, a `LICENSE` and its own `.gitignore` is therefore
+/// fine, and those files are never read or touched. `.gitignore` and
+/// `playbooks/.gitkeep` are not conflicts either: the first is appended to,
+/// the second only created when missing.
+///
+/// A dangling symlink counts, hence `symlink_metadata` rather than `exists`.
+pub fn conflicts(dir: &Path) -> Vec<&'static str> {
+    GENERATED_PATHS
+        .iter()
+        .copied()
+        .filter(|rel| dir.join(rel).symlink_metadata().is_ok())
+        .collect()
 }
 
 fn package_name_from_dir(dir: &Path) -> Result<String> {
@@ -490,6 +518,49 @@ mod tests {
             assert!(shim.contents.contains("`rustible init --refresh`"));
             assert!(shim.contents.contains("`playbooks/`"));
             assert!(shim.contents.contains("`src/lib.rs`"));
+        }
+    }
+
+    #[test]
+    fn generated_paths_match_what_generate_writes() {
+        let written: Vec<&str> = generate("rx", &Deps::CratesIo)
+            .iter()
+            .map(|g| g.path)
+            .collect();
+        assert_eq!(written, GENERATED_PATHS.to_vec());
+    }
+
+    #[test]
+    fn only_generated_files_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A freshly cloned repository: nothing here is ours.
+        fs::create_dir(dir.join(".git")).unwrap();
+        for rel in ["README.md", "LICENSE", ".gitignore", "notes.txt"] {
+            fs::write(dir.join(rel), "").unwrap();
+        }
+        fs::create_dir_all(dir.join("playbooks")).unwrap();
+        fs::write(dir.join("playbooks/.gitkeep"), "").unwrap();
+        assert!(conflicts(dir).is_empty(), "{:?}", conflicts(dir));
+
+        // One file we would write is enough, and it is named.
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/main.rs"), "").unwrap();
+        assert_eq!(conflicts(dir), vec!["src/main.rs"]);
+
+        // Reported in write order, not discovery order.
+        fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert_eq!(conflicts(dir), vec!["Cargo.toml", "src/main.rs"]);
+    }
+
+    #[test]
+    fn a_dangling_symlink_still_conflicts() {
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("nowhere", tmp.path().join("hosts.kdl")).unwrap();
+            assert!(!tmp.path().join("hosts.kdl").exists());
+            assert_eq!(conflicts(tmp.path()), vec!["hosts.kdl"]);
         }
     }
 

@@ -2,10 +2,12 @@
 //! `ansible.builtin.systemd` (and `ansible.builtin.service` on systemd hosts).
 //!
 //! One type per desired state (vision 6.3): [`Enabled`], [`Disabled`],
-//! [`Running`], [`Stopped`]; two actions (vision 6.4): [`Restart`], [`Reload`].
-//! Every op returns a [`UnitState`]. All of them go through `systemctl` via
-//! `sys.cmd`; `check` only runs the read-only probes `is-enabled` and
-//! `is-active`, and the actions run nothing at all in `check`.
+//! [`Running`], [`Stopped`], each returning a [`UnitState`]. Three actions
+//! (vision 6.4): [`Restart`] and [`Reload`], which also return a
+//! [`UnitState`], and [`DaemonReload`], which names no unit and so returns
+//! nothing. All of them go through `systemctl` via `sys.cmd`; `check` only
+//! runs the read-only probes `is-enabled` and `is-active`, and the actions
+//! run nothing at all in `check`.
 //!
 //! Every op refuses a host whose init is not systemd and, unless `.user(true)`
 //! selects the caller's own `systemctl --user` manager, refuses to run without
@@ -23,6 +25,10 @@
 //! }
 //! # Ok(()) }
 //! ```
+//!
+//! After writing a *new* unit file, systemd has to re-read it before any of
+//! these ops can find it. Use [`DaemonReload`] on its own, or
+//! `.daemon_reload(true)` on the [`Restart`] or [`Reload`] that follows.
 
 use rustible_sdk::prelude::*;
 use rustible_sdk::system::Cmd;
@@ -254,10 +260,26 @@ impl Unit {
         }
     }
 
+    /// A manager with no unit. [`DaemonReload`] talks to systemd itself, so
+    /// it carries the `--user` choice and an empty name; only `systemctl`,
+    /// `prefix` and `guard_manager` are meaningful on such a `Unit`.
+    fn manager() -> Self {
+        Unit {
+            name: String::new(),
+            user: false,
+        }
+    }
+
     /// The preconditions every op shares: a sane name, systemd as init, and
     /// root unless the caller's own manager is the target.
     fn guard(&self, sys: &System, op: &str) -> Result<()> {
         validate_unit(&self.name)?;
+        self.guard_manager(sys, op)
+    }
+
+    /// The half of [`Unit::guard`] that is about the host and the manager
+    /// rather than the unit: systemd as init, and root unless `--user`.
+    fn guard_manager(&self, sys: &System, op: &str) -> Result<()> {
         if sys.facts().init != Init::Systemd {
             bail!(
                 "systemd::{op} needs systemd, but this host's init is {}",
@@ -855,6 +877,85 @@ impl Op for Reload {
     }
 }
 
+/// Make systemd re-read its unit files. An action (vision 6.4):
+/// `ansible.builtin.systemd` with `daemon_reload: true` and no unit.
+/// `check` always reports a change and runs nothing; `apply` runs
+/// `systemctl daemon-reload` (or `systemctl --user daemon-reload`).
+///
+/// The step after writing a unit file, when nothing is being restarted yet:
+/// until systemd re-reads its files, `systemctl enable rustible-test` on a
+/// brand new `rustible-test.service` fails with `not found`. [`Restart`] and
+/// [`Reload`] carry the same reload as a `.daemon_reload(true)` flag, for
+/// when a unit is being bounced anyway.
+///
+/// Refuses a host whose init is not systemd, and refuses to run without root
+/// unless `.user(true)` selects the caller's own manager, like every other op
+/// here.
+///
+/// Its output is `()`. The other ops here return a [`UnitState`], which needs
+/// a unit; this one names none, and the manager exposes nothing worth reading
+/// back after a reload. Echoing the `--user` flag as if it were a result
+/// would be an input dressed up as an output.
+///
+/// ```no_run
+/// # use rustible_sdk::prelude::*;
+/// # use rustible_std::systemd;
+/// # fn playbook(ctx: &mut Ctx) -> Result<()> {
+/// ctx.sys().write_atomic(
+///     "/etc/systemd/system/my-app.service",
+///     b"[Unit]\nDescription=my app\n\n[Service]\nExecStart=/usr/bin/my-app\n",
+/// )?;
+/// ctx.step("systemd re-reads its units", systemd::DaemonReload::new())?;
+/// ctx.step("my-app enabled", systemd::Enabled::new("my-app").now(true))?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+pub struct DaemonReload {
+    manager: Unit,
+}
+
+impl Default for DaemonReload {
+    fn default() -> Self {
+        DaemonReload::new()
+    }
+}
+
+impl DaemonReload {
+    pub fn new() -> Self {
+        DaemonReload {
+            manager: Unit::manager(),
+        }
+    }
+
+    /// Reload the calling user's own manager (`systemctl --user
+    /// daemon-reload`). Needs no root.
+    pub fn user(mut self, on: bool) -> Self {
+        self.manager.user = on;
+        self
+    }
+}
+
+impl Op for DaemonReload {
+    type Output = ();
+
+    fn check(&self, sys: &System) -> Result<Plan<()>> {
+        self.manager.guard_manager(sys, "DaemonReload")?;
+        Ok(Plan::change(Diff::summary(format!(
+            "{} daemon-reload",
+            self.manager.prefix()
+        ))))
+    }
+
+    fn apply(&self, sys: &System, _: Change<()>) -> Result<()> {
+        self.manager.systemctl(sys).arg("daemon-reload").run()?;
+        Ok(())
+    }
+
+    fn always_changes(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1097,7 +1198,7 @@ mod tests {
         c.predicted.clone().expect("state ops predict")
     }
 
-    fn change(plan: Plan<UnitState>) -> Change<UnitState> {
+    fn change<T: std::fmt::Debug>(plan: Plan<T>) -> Change<T> {
         match plan {
             Plan::Change(c) => c,
             Plan::Satisfied(s) => panic!("expected change, got satisfied {s:?}"),
@@ -1615,6 +1716,76 @@ mod tests {
         assert_eq!(cf.argv, argv(&["systemctl", "reload", "nginx"]));
     }
 
+    // ---- DaemonReload ----
+
+    #[test]
+    fn daemon_reload_always_changes_names_no_unit_and_runs_nothing_in_check() {
+        let fake = Arc::new(Fake::new());
+        let op = DaemonReload::new();
+        assert!(op.always_changes());
+        let Plan::Change(c) = op.check(&sys(&fake)).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(c.diff.render(), "systemctl daemon-reload");
+        assert!(c.predicted.is_none(), "actions predict nothing");
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    #[test]
+    fn daemon_reload_apply_runs_exactly_one_command() {
+        let fake = Arc::new(with_ok(Fake::new(), &["daemon-reload"]));
+        let op = DaemonReload::new();
+        let plan = op.check(&sys(&fake)).unwrap();
+        op.apply(&sys(&fake), change(plan)).unwrap();
+        assert_eq!(fake.argvs(), vec![argv(&["systemctl", "daemon-reload"])]);
+    }
+
+    #[test]
+    fn daemon_reload_user_mode_needs_no_root_and_carries_the_flag() {
+        let fake = Arc::new(with_ok(Fake::new(), &["--user", "daemon-reload"]));
+        let s = not_root(sys(&fake));
+        let op = DaemonReload::new().user(true);
+        let plan = op.check(&s).unwrap();
+        assert_eq!(
+            change(op.check(&s).unwrap()).diff.render(),
+            "systemctl --user daemon-reload"
+        );
+        op.apply(&s, change(plan)).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![argv(&["systemctl", "--user", "daemon-reload"])]
+        );
+    }
+
+    /// `Default` exists only so clippy's `new_without_default` is satisfied;
+    /// it must not drift from `new`.
+    #[test]
+    fn daemon_reload_default_matches_new() {
+        let fake = Arc::new(Fake::new());
+        assert_eq!(
+            change(DaemonReload::default().check(&sys(&fake)).unwrap())
+                .diff
+                .render(),
+            change(DaemonReload::new().check(&sys(&fake)).unwrap())
+                .diff
+                .render()
+        );
+    }
+
+    #[test]
+    fn daemon_reload_through_ctx_in_check_mode_runs_nothing() {
+        let fake = Arc::new(Fake::new());
+        let s = sys(&fake).with_check_mode(true);
+        let mut ctx = Ctx::new(s, HostInfo::local());
+        let r = ctx
+            .step("systemd re-reads its units", DaemonReload::new())
+            .unwrap();
+        assert!(r.changed && !r.predicted);
+        assert!(!r.is_available(), "an action predicts nothing (vision 12)");
+        assert_eq!(r.diff.as_ref().unwrap().render(), "systemctl daemon-reload");
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
     // ---- shared guards ----
 
     fn all_ops_check(s: &System) -> Vec<(&'static str, Result<bool>)> {
@@ -1642,6 +1813,10 @@ mod tests {
             (
                 "Reload",
                 Reload::new("nginx").check(s).map(|p| p.is_change()),
+            ),
+            (
+                "DaemonReload",
+                DaemonReload::new().check(s).map(|p| p.is_change()),
             ),
         ]
     }
@@ -1696,6 +1871,7 @@ mod tests {
             assert!(Restart::new(bad).check(&s).is_err(), "{bad:?}");
             assert!(Reload::new(bad).check(&s).is_err(), "{bad:?}");
         }
+        // `DaemonReload` is absent on purpose: it takes no unit name.
         assert!(fake.argvs().is_empty());
     }
 
