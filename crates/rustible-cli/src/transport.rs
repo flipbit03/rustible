@@ -58,14 +58,25 @@ pub struct Proc {
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
     stderr: Pin<Box<dyn AsyncRead + Send>>,
     waiter: Waiter,
-    /// The executable `kill` hunts for on a remote host, absolute. `None`
-    /// for a process that is never a kill target (the upload shell).
-    ///
-    /// It is passed in rather than recovered from `argv`, because `argv`
-    /// does not reliably contain it in a recoverable position: behind
-    /// `sudo -n -u <someone-not-root>` the binary is the fifth word, not
-    /// the first non-flag one. See `run::exec_argv`'s test.
-    binary: Option<String>,
+    /// What `kill` needs if this process has to be stopped. `None` for a
+    /// process that is never a kill target (the upload shell).
+    kill: Option<KillTarget>,
+}
+
+/// What stopping a playbook binary takes, all of it decided by the caller
+/// rather than recovered from `argv`: behind `sudo -n -u <someone-not-root>`
+/// the binary is the fifth word, not the first non-flag one, and a killed
+/// process runs no destructor so its temp directory has to be named from
+/// outside. See `run::exec_argv`'s test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillTarget {
+    /// Absolute path of the executable to hunt for.
+    pub binary: String,
+    /// Basename of the run's temp directory, under the target's `TMPDIR`.
+    pub run_dir: String,
+    /// The escalation prefix the binary was launched with. The directory
+    /// belongs to whoever that is, so removing it needs the same prefix.
+    pub escalate: Vec<String>,
 }
 
 enum Waiter {
@@ -280,11 +291,10 @@ impl Transport {
 
     /// Spawn `argv` with piped stdio, no shell in between: paths are
     /// absolute by now and `openssh` quotes each argument for the remote
-    /// shell. `binary` is the executable `kill` should hunt on the target,
-    /// `None` when this process is never cancelled (the upload shell).
-    pub async fn spawn(&self, argv: &[String], binary: Option<&str>) -> Result<Proc> {
+    /// shell. `kill` describes how to stop this process later, `None` when
+    /// it is never cancelled (the upload shell).
+    pub async fn spawn(&self, argv: &[String], kill: Option<KillTarget>) -> Result<Proc> {
         let (prog, rest) = argv.split_first().context("empty argv")?;
-        let binary = binary.map(str::to_string);
         match self {
             Transport::Local => {
                 let mut child = tokio::process::Command::new(prog)
@@ -303,7 +313,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout.take().unwrap()),
                     stderr: Box::pin(child.stderr.take().unwrap()),
                     waiter: Waiter::Local(child),
-                    binary,
+                    kill,
                 })
             }
             Transport::Ssh { session, .. } => {
@@ -322,7 +332,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout().take().unwrap()),
                     stderr: Box::pin(child.stderr().take().unwrap()),
                     waiter: Waiter::Ssh(Some(child)),
-                    binary,
+                    kill,
                 })
             }
         }
@@ -333,7 +343,8 @@ impl Transport {
     /// every process running the binary's path is killed, since the mux
     /// channel cannot signal the remote process.
     pub async fn kill(&self, proc: &mut Proc) -> Result<()> {
-        match (&mut proc.waiter, self) {
+        let target = proc.kill.clone();
+        let killed = match (&mut proc.waiter, self) {
             (Waiter::Local(child), _) => {
                 if let Some(pid) = child.id() {
                     // Negative pid: the process group we created at spawn.
@@ -343,7 +354,7 @@ impl Transport {
                         .await;
                 }
                 child.start_kill().ok();
-                Ok(())
+                true
             }
             (Waiter::Ssh(_), Transport::Ssh { .. }) => {
                 // The mux channel cannot signal the remote process, so the
@@ -354,14 +365,24 @@ impl Transport {
                 // -f` loop kills the killer and whichever of the real
                 // targets it had not reached yet. `/proc/<pid>/exe` is the
                 // filter that tells the two apart.
-                let Some(bin) = &proc.binary else {
+                let Some(t) = &target else {
                     bail!("no kill target for this process");
                 };
-                self.sh(&kill_script(bin)).await?;
-                Ok(())
+                self.sh(&kill_script(&t.binary)).await?;
+                true
             }
-            _ => Ok(()),
+            _ => false,
+        };
+        // A killed process runs no destructor, so the run's temp directory
+        // and every streamed file in it stay behind. Nothing else ever
+        // collects them, so the side that did the killing clears up. Doing
+        // it after the kill, not before, means the binary cannot recreate
+        // it; `rm -rf` on a directory that is already gone is not an error,
+        // so a run that ended cleanly is unaffected.
+        if killed && let Some(t) = &target {
+            self.sh(&remove_run_dir_script(t)).await?;
         }
+        Ok(())
     }
 }
 
@@ -379,9 +400,72 @@ fn kill_script(bin: &str) -> String {
     )
 }
 
+/// Remove the run's temp directory on the target.
+///
+/// `${TMPDIR:-/tmp}` is resolved on the target, by the same session that
+/// launched the binary, so it matches what Rust's `env::temp_dir` chose
+/// there. The escalation prefix is the one the binary ran behind: an
+/// escalated run creates the directory as that user, and only that user
+/// can remove it.
+fn remove_run_dir_script(t: &KillTarget) -> String {
+    let dir = shell_quote(&t.run_dir);
+    let esc = if t.escalate.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", t.escalate.join(" "))
+    };
+    format!("{esc}rm -rf -- \"${{TMPDIR:-/tmp}}\"/{dir}; true")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_run_directory_is_removed_as_whoever_created_it() {
+        let unescalated = KillTarget {
+            binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a2b".into(),
+            escalate: vec![],
+        };
+        let script = remove_run_dir_script(&unescalated);
+        // TMPDIR is resolved on the target, by the session that launched
+        // the binary, so it matches what `env::temp_dir` chose there.
+        assert!(
+            script.contains("\"${TMPDIR:-/tmp}\"/'.rustible-1a2b'"),
+            "{script}"
+        );
+        assert!(!script.contains("sudo"), "{script}");
+
+        // Escalated, the directory belongs to the escalated user and only
+        // that user can remove it.
+        let as_root = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into()],
+            ..unescalated.clone()
+        };
+        assert!(
+            remove_run_dir_script(&as_root).starts_with("sudo -n rm -rf --"),
+            "{}",
+            remove_run_dir_script(&as_root)
+        );
+        let as_admin = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into(), "-u".into(), "admin".into()],
+            ..unescalated.clone()
+        };
+        assert!(
+            remove_run_dir_script(&as_admin).starts_with("sudo -n -u admin rm -rf --"),
+            "{}",
+            remove_run_dir_script(&as_admin)
+        );
+
+        // The name arrives over the wire; it cannot close the quoting.
+        let nasty = KillTarget {
+            run_dir: "x'; rm -rf /; '".into(),
+            ..unescalated
+        };
+        let script = remove_run_dir_script(&nasty);
+        assert!(!script.contains("x'; rm -rf /"), "{script}");
+    }
 
     #[test]
     fn kill_script_only_signals_processes_running_the_binary() {

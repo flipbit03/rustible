@@ -53,7 +53,8 @@ for h in "${HOSTS[@]}"; do
   echo "[$h] leftover run temp dirs: $(remote_sh "$h" 'ls -d /tmp/.rustible-* 2>/dev/null || echo none')"
 done
 
-echo; echo "## 3. ctrl-c during cadu/slow (30 s sleep step): cancelled within 10 s, no zombie, next step never ran"
+echo; echo "## 3. ctrl-c during cadu/slow (streams a file, then a 30 s sleep step):"
+echo "## cancelled within 10 s, no zombie, next step never ran, run temp dir removed"
 for h in "${HOSTS[@]}"; do
   remote_sh "$h" 'rm -f /tmp/rustible-m5-next-step-ran'
   LOG=$(mktemp)
@@ -86,6 +87,9 @@ for h in "${HOSTS[@]}"; do
   sleep 1
   echo "[$h] leftover of those pids ($PIDS): $(remote_sh "$h" "ps -o pid=,cmd= -p $PIDLIST || echo none")"
   echo "[$h] marker: $(remote_sh "$h" 'ls /tmp/rustible-m5-next-step-ran 2>&1 || true')"
+  # The binary was SIGKILLed, so it ran no destructor: the run's temp
+  # directory is the orchestrator's to remove, by the name it gave it.
+  echo "[$h] run temp dir after the kill: $(remote_sh "$h" 'ls -d /tmp/.rustible-* 2>/dev/null || echo none')"
 done
 
 echo; echo "## 4. ctrl-c DURING the 50 MB transfer: answered inside the transfer, not after it"

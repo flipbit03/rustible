@@ -28,14 +28,14 @@ use rustible_sdk::event::Event;
 use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use rustible_sdk::secret::Secret;
-use rustible_sdk::stream::{WorkspaceFiles, chunks};
+use rustible_sdk::stream::{WorkspaceFiles, chunks, run_dir_name};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::describe::{self, Cargo, Describe};
 use crate::render::Renderer;
-use crate::transport::{Probe, SshTarget, Transport};
+use crate::transport::{KillTarget, Probe, SshTarget, Transport};
 use crate::usage;
 use crate::workspace::Workspace;
 
@@ -141,20 +141,40 @@ pub fn merged_vars(resolved: &Resolved, cli: &serde_json::Map<String, Value>) ->
 /// <someone-not-root>`. Anything that needs the path (`Transport::kill`)
 /// takes it as `remote_path` gave it, never by scanning this.
 pub fn exec_argv(bin: &str, escalate: bool, method: Escalate, escalate_user: &str) -> Vec<String> {
+    let mut argv = escalate_prefix(escalate, method, escalate_user);
+    argv.push(bin.to_string());
+    argv.push("--remote".to_string());
+    argv
+}
+
+/// The escalation words the binary is launched behind, empty when it runs
+/// as the login user. Whatever the binary creates on the target belongs to
+/// that identity, so removing it later takes the same prefix.
+pub fn escalate_prefix(escalate: bool, method: Escalate, escalate_user: &str) -> Vec<String> {
     let mut argv = vec![];
     if escalate {
         match method {
             Escalate::Sudo => argv.extend(["sudo".to_string(), "-n".to_string()]),
             Escalate::Doas => argv.extend(["doas".to_string(), "-n".to_string()]),
-            Escalate::None => {}
+            Escalate::None => return argv,
         }
-        if method != Escalate::None && escalate_user != "root" {
+        if escalate_user != "root" {
             argv.extend(["-u".to_string(), escalate_user.to_string()]);
         }
     }
-    argv.push(bin.to_string());
-    argv.push("--remote".to_string());
     argv
+}
+
+/// A run id, unique per host run: the orchestrator sends it in `Start` and
+/// it names the run's temp directory on the target.
+fn new_run_id() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
 }
 
 /// `<home>/.cache/rustible/bin/<playbook with / as _>-<sha256>` (vision 5.2
@@ -641,13 +661,27 @@ async fn drive(
         r.params.escalate,
         &r.params.escalate_user,
     );
-    let mut proc = tr.spawn(&argv, Some(path.as_str())).await?;
+    let run_id = new_run_id();
+    let mut proc = tr
+        .spawn(
+            &argv,
+            Some(KillTarget {
+                binary: path.clone(),
+                run_dir: run_dir_name(&run_id),
+                escalate: escalate_prefix(
+                    plan.escalate,
+                    r.params.escalate,
+                    &r.params.escalate_user,
+                ),
+            }),
+        )
+        .await?;
     // From here on the child owns the failure story: `sudo -n` refusing, a
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
     // is caught and told with what the child said.
     let killed = match drive_frames(
-        tr, &mut proc, plan, r, probe, vars, out, host, name, cancel_rx,
+        tr, &mut proc, plan, r, probe, vars, out, host, name, cancel_rx, &run_id,
     )
     .await
     {
@@ -704,16 +738,11 @@ async fn drive_frames(
     host: &str,
     name: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    run_id: &str,
 ) -> Result<bool> {
     let _ = probe;
     let start = Down::Start {
-        run_id: format!(
-            "{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ),
+        run_id: run_id.to_string(),
         playbook: name.to_string(),
         host: HostInfo {
             name: host.to_string(),

@@ -237,6 +237,7 @@ fn remote(playbooks: &[Named]) -> ExitCode {
         }
     };
     let Some(Down::Start {
+        run_id,
         playbook,
         host,
         vars,
@@ -279,6 +280,7 @@ fn remote(playbooks: &[Named]) -> ExitCode {
         sink,
         channel,
         escalate_password,
+        run_id,
     )
 }
 
@@ -385,6 +387,9 @@ fn local(playbooks: &[Named], args: &[String]) -> ExitCode {
         sink,
         channel,
         None,
+        // No orchestrator, so no run id: unique among live runs on this
+        // host, which is all the temp directory's name needs.
+        format!("pid{}", std::process::id()),
     )
 }
 
@@ -411,6 +416,7 @@ fn print_usage(playbooks: &[Named]) {
 
 /// Gather facts, build the context, run the entry, report, and map the
 /// outcome to an exit code. Shared by every mode.
+#[allow(clippy::too_many_arguments)]
 fn execute(
     named: &Named,
     host: HostInfo,
@@ -419,6 +425,7 @@ fn execute(
     sink: Arc<dyn EventSink>,
     channel: Arc<Channel>,
     escalate_password: Option<Secret>,
+    run_id: String,
 ) -> ExitCode {
     let sys = System::local(check_mode, sink.clone())
         .with_escalation(&host.escalate_method, escalate_password);
@@ -432,7 +439,7 @@ fn execute(
             msg: w,
         });
     }
-    let mut ctx = Ctx::with_channel(sys, host, channel);
+    let mut ctx = Ctx::for_run(sys, host, channel, run_id);
     let entry = named.playbook.entry;
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry(&mut ctx, vars)));

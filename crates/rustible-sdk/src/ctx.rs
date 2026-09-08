@@ -67,19 +67,42 @@ pub(crate) struct Shared {
     pub(crate) step_counter: Cell<u32>,
     pub(crate) summary: RefCell<Summary>,
     channel: Arc<Channel>,
-    tempdir: OnceCell<tempfile::TempDir>,
+    run_id: String,
+    tempdir: OnceCell<RunDir>,
+}
+
+/// The run's temp directory, removed when the run's last `Ctx` drops.
+///
+/// Named `.rustible-<run id>` rather than randomly, so that an orchestrator
+/// that has to kill this process can remove it too: SIGKILL runs no
+/// destructor, and a random name is known only here.
+struct RunDir(PathBuf);
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Shared {
     fn tempdir(&self) -> Result<&Path> {
         if let Some(d) = self.tempdir.get() {
-            return Ok(d.path());
+            return Ok(&d.0);
         }
-        let dir = tempfile::Builder::new()
-            .prefix(".rustible-")
-            .tempdir()
-            .context("creating the run's temp directory")?;
-        Ok(self.tempdir.get_or_init(|| dir).path())
+        let path = std::env::temp_dir().join(crate::stream::run_dir_name(&self.run_id));
+        // `create_dir`, not `create_dir_all`: it fails on anything already
+        // at that path instead of following it. The name is derived from
+        // the run id, which is predictable enough to squat in a
+        // world-writable /tmp, and this run's files are not for sharing.
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating the run's temp directory {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", path.display()))?;
+        }
+        Ok(&self.tempdir.get_or_init(|| RunDir(path)).0)
     }
 }
 
@@ -97,7 +120,21 @@ impl Ctx {
         Self::with_channel(sys, host, Channel::detached())
     }
 
+    /// A run with no id from an orchestrator: the temp directory is named
+    /// from the process id, which is unique among live runs on this host.
     pub fn with_channel(sys: System, host: HostInfo, channel: Arc<Channel>) -> Self {
+        Self::for_run(sys, host, channel, format!("pid{}", std::process::id()))
+    }
+
+    /// The orchestrator-driven form. `run_id` comes from `Start` and names
+    /// the run's temp directory, so the orchestrator can remove it after
+    /// killing a binary that ignored `Cancel`.
+    pub fn for_run(
+        sys: System,
+        host: HostInfo,
+        channel: Arc<Channel>,
+        run_id: impl Into<String>,
+    ) -> Self {
         Ctx {
             sys,
             host,
@@ -105,6 +142,7 @@ impl Ctx {
                 step_counter: Cell::new(0),
                 summary: RefCell::new(Summary::default()),
                 channel,
+                run_id: run_id.into(),
                 tempdir: OnceCell::new(),
             }),
             depth: 0,

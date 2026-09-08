@@ -31,6 +31,32 @@ pub struct Chunks<R: Read> {
     done: bool,
 }
 
+/// The basename of a run's temp directory, `.rustible-<run id>`.
+///
+/// Both sides compute it from `Start.run_id`: the binary to create the
+/// directory, the orchestrator to remove it after killing a binary that
+/// ignored `Cancel`. A random name (what `tempfile` gives) is only ever
+/// known to the binary, and SIGKILL runs no destructor, so a cancelled run
+/// used to leave the directory and every streamed file in it behind with
+/// nothing to collect it.
+///
+/// The id is reduced to characters that cannot escape the temp directory or
+/// confuse a shell, because it arrives over the wire. An id that survives
+/// nothing keeps a fixed name rather than a random one: two such runs then
+/// collide loudly at `create_dir` instead of quietly sharing a directory.
+pub fn run_dir_name(run_id: &str) -> String {
+    let safe: String = run_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    if safe.is_empty() {
+        ".rustible-unnamed".to_string()
+    } else {
+        format!(".rustible-{safe}")
+    }
+}
+
 pub fn chunks<R: Read>(r: R) -> Chunks<R> {
     Chunks {
         r,
@@ -245,6 +271,18 @@ mod tests {
 
     fn collect(bytes: &[u8]) -> Vec<Chunk> {
         chunks(bytes).map(|c| c.unwrap()).collect()
+    }
+
+    #[test]
+    fn run_dir_names_cannot_escape_the_temp_directory() {
+        assert_eq!(run_dir_name("1a2b3c"), ".rustible-1a2b3c");
+        // A run id is orchestrator-supplied and arrives over the wire.
+        assert_eq!(run_dir_name("../../etc/cron.d/x"), ".rustible-etccrondx");
+        assert_eq!(run_dir_name("a/../b"), ".rustible-ab");
+        assert_eq!(run_dir_name("; rm -rf /"), ".rustible-rm-rf");
+        assert_eq!(run_dir_name(""), ".rustible-unnamed");
+        assert_eq!(run_dir_name("/////"), ".rustible-unnamed");
+        assert!(run_dir_name(&"x".repeat(500)).len() <= 80);
     }
 
     #[test]
