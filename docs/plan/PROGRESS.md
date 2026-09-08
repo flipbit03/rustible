@@ -10,7 +10,7 @@ Updated by whoever is working; read first on every resume.
 | M3 real run | in-progress (m3-run) | subagent, started after M2 merged |
 | M4 init | merged | PR #2, 2026-09-08; review: 10 findings, 9 fixed, 1 recorded as proposed amendment |
 | M5 elevated/cancel/streaming | in-progress (m5-elevated-streaming) | subagent, unattended run 1; ARM VM may be down |
-| M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` pr-open (#6, review running); `file` family merged (PR #7); `systemd` and apt-Absent/Latest+hostname+sysctl in progress (subagents); http::Download, archive::Extracted, shell extras todo |
+| M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` merged (PR #6); `file` family merged (PR #7); `systemd` pr-open (#8), apt-Absent/Latest+hostname+sysctl pr-open (#9), both awaiting review; http::Download, archive::Extracted, shell extras todo |
 | M6 rustible-github | todo | |
 | M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
@@ -32,3 +32,4 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 11:50 UTC  M6  file ops PR #7 opened (63 tests; SDK symlink/read_link/read_dir primitives); small-ops agent started (apt Absent/Latest, hostname, sysctl)
 - 2026-09-08 12:20 UTC  M6  file ops merged as PR #7 after review (10 fixes incl. SDK remove/remove_all/rename and fake symlink semantics)
 - 2026-09-08 12:45 UTC  M6  Docker harness merged as PR #5 (container-side marker, Drop guard, timeout, fail-not-skip when enabled; verified on debian/ubuntu and jrei systemd images)
+- 2026-09-08 11:08 UTC  M6  user/group merged as PR #6 after review (optional groups, uid-taken guard on existing accounts, private-gid guess dropped, useradd HOME= default, tool probing, absolute-home check); PRs #8 systemd and #9 small-ops open for review

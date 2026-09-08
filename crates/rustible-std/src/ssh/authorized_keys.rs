@@ -328,35 +328,17 @@ struct Resolved {
     owner: Option<(u32, u32)>,
 }
 
-/// Pure: uid, gid, and home of `name` from `/etc/passwd` text. `Ok(None)`
-/// when the user has no entry; an error when the entry exists but is
-/// malformed, so the caller never says "does not exist" about a user that does.
-fn passwd_entry(passwd: &str, name: &str) -> Result<Option<(u32, u32, PathBuf)>> {
-    for line in passwd.lines() {
-        let f: Vec<&str> = line.split(':').collect();
-        if f.first() != Some(&name) {
-            continue;
-        }
-        if f.len() < 7 {
-            return Err(Error::msg(format!(
-                "malformed /etc/passwd entry for `{name}`: expected 7 fields"
-            )));
-        }
-        let uid = f[2].parse().map_err(|_| {
-            Error::msg(format!(
-                "malformed /etc/passwd entry for `{name}`: uid `{}`",
-                f[2]
-            ))
-        })?;
-        let gid = f[3].parse().map_err(|_| {
-            Error::msg(format!(
-                "malformed /etc/passwd entry for `{name}`: gid `{}`",
-                f[3]
-            ))
-        })?;
-        return Ok(Some((uid, gid, PathBuf::from(f[5]))));
+/// A relative or empty home (legal in `/etc/passwd`; login treats empty as
+/// `/`) would resolve `.ssh` against the process cwd, which for an escalated
+/// binary is root's home: a key would land in the wrong account's file.
+fn ensure_absolute_home(home: &Path) -> Result<()> {
+    if !home.is_absolute() {
+        bail!(
+            "home directory {:?} is not an absolute path; refusing to guess where authorized_keys is",
+            home.display().to_string()
+        );
     }
-    Ok(None)
+    Ok(())
 }
 
 impl Target {
@@ -368,6 +350,7 @@ impl Target {
                 owner: None,
             }),
             Target::Account { home, uid, gid } => {
+                ensure_absolute_home(home)?;
                 let ssh_dir = home.join(".ssh");
                 Ok(Resolved {
                     path: ssh_dir.join("authorized_keys"),
@@ -380,12 +363,14 @@ impl Target {
                 // it); NSS-only accounts (LDAP, SSSD, homed) are a known limit,
                 // recorded in DECISIONS.md.
                 let passwd = sys.read_to_string("/etc/passwd")?;
-                let Some((uid, gid, home)) = passwd_entry(&passwd, name)? else {
+                let Some(entry) = crate::user::lookup_user(&passwd, name)? else {
                     bail!(
                         "user `{name}` does not exist in /etc/passwd; \
                          ssh::authorized_keys does not create users, use user::Present first"
                     );
                 };
+                let (uid, gid, home) = (entry.uid, entry.gid, entry.home);
+                ensure_absolute_home(&home)?;
                 let ssh_dir = home.join(".ssh");
                 Ok(Resolved {
                     path: ssh_dir.join("authorized_keys"),
@@ -479,8 +464,8 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 /// ```
 ///
 /// The user-name form reads `/etc/passwd` for home, uid, and gid; the
-/// `for_account` form takes them directly (from `user::Present` or
-/// `user::Existing`) with no lookup. Both create `authorized_keys` (0600,
+/// `for_user(&account)` and `for_account(home, uid, gid)` forms take them
+/// directly (from `user::Present` or `user::Existing`) with no lookup. Both create `authorized_keys` (0600,
 /// owned by the user) when missing and never touch the attributes of one
 /// that exists; `~/.ssh` must already exist (vision 6.7: ensure it with
 /// `file::Directory` first). The `in_file` form writes an explicit path and
@@ -513,6 +498,12 @@ impl Present {
             },
             exclusive: false,
         }
+    }
+
+    /// Keys for a `user::Account` (vision 6.1): `for_account` with the
+    /// account's home, uid, and gid. No lookup.
+    pub fn for_user(account: &crate::user::Account) -> PresentBuilder {
+        Self::for_account(&account.home, account.uid, account.gid)
     }
 
     /// Keys in an explicit file. No ownership handling.
@@ -627,6 +618,12 @@ impl Absent {
                 gid,
             },
         }
+    }
+
+    /// Keys for a `user::Account`: `for_account` with the account's home,
+    /// uid, and gid. No lookup.
+    pub fn for_user(account: &crate::user::Account) -> AbsentBuilder {
+        Self::for_account(&account.home, account.uid, account.gid)
     }
 
     /// Keys in an explicit file.
@@ -912,22 +909,6 @@ mod tests {
     }
 
     #[test]
-    fn passwd_lookup() {
-        let passwd =
-            "root:x:0:0:root:/root:/bin/bash\ncadu:x:1000:1001:Cadu:/home/cadu:/bin/zsh\nbroken\n";
-        assert_eq!(
-            passwd_entry(passwd, "cadu").unwrap(),
-            Some((1000, 1001, PathBuf::from("/home/cadu")))
-        );
-        assert_eq!(passwd_entry(passwd, "nobody").unwrap(), None);
-        // A present but malformed entry is an error, never "does not exist".
-        let e = passwd_entry("bad:x:abc:1000::/home/bad:/bin/sh\n", "bad")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("malformed") && e.contains("uid `abc`"), "{e}");
-    }
-
-    #[test]
     fn requested_key_with_embedded_newline_is_refused() {
         let fake = fake_with_user_and_ssh_dir();
         let sys = fake_sys(&fake);
@@ -958,6 +939,34 @@ mod tests {
         op.apply(&sys, c).unwrap();
         let f = fake.file("/srv/home/.ssh/authorized_keys").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o600, 42, 43));
+    }
+
+    #[test]
+    fn for_user_chains_from_user_existing() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", PASSWD)
+                .with_file("/etc/group", "root:x:0:\ncadu:x:1001:\n")
+                .with_dir("/home/cadu")
+                .with_dir("/home/cadu/.ssh"),
+        );
+        let sys = fake_sys(&fake);
+        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let account = ctx
+            .step("lookup", crate::user::Existing::named("cadu"))
+            .unwrap();
+        let r = ctx
+            .step("keys", Present::for_user(&account).keys([K1]))
+            .unwrap();
+        assert!(r.changed);
+        assert_eq!(r.path, PathBuf::from("/home/cadu/.ssh/authorized_keys"));
+        let f = fake.file("/home/cadu/.ssh/authorized_keys").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o600, 1000, 1001));
+        let r = ctx
+            .step("revoke", Absent::for_user(&account).keys([K1]))
+            .unwrap();
+        assert!(r.changed);
+        assert_eq!(fake.content("/home/cadu/.ssh/authorized_keys").unwrap(), "");
     }
 
     // ---- Fake backend ----
@@ -1226,5 +1235,26 @@ mod tests {
         };
         assert_eq!(r.not_present, vec![key(K1)]);
         assert!(fake.file("/home/cadu/.ssh").is_none());
+    }
+
+    #[test]
+    fn relative_or_empty_home_is_refused() {
+        let fake = Arc::new(Fake::new().with_dir("/root/.ssh"));
+        let sys = fake_sys(&fake);
+        let e = Present::for_account("", 900, 900)
+            .keys([K1])
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not an absolute path"), "{e}");
+        let fake =
+            Arc::new(Fake::new().with_file("/etc/passwd", "svc:x:900:900:::/usr/sbin/nologin\n"));
+        let sys = fake_sys(&fake);
+        let e = Present::for_user_name("svc")
+            .keys([K1])
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not an absolute path"), "{e}");
     }
 }
