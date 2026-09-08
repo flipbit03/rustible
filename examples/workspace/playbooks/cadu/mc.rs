@@ -12,6 +12,7 @@ mod helpers; // sibling file: playbooks/cadu/helpers.rs (vision doc section 9)
 struct Vars {
     /// The apt package to ensure.
     package: String,
+    /// Run `apt-get update` first (always, not by list age) when installing.
     #[default = false]
     update_cache: bool,
 }
@@ -23,13 +24,13 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     ensure!(f.is_root, "this playbook needs root (escalate)");
 
     let name = format!("{} present", vars.package);
-    let mut op = apt::Present::new([vars.package.as_str()]);
+    let mut present = apt::Present::new([vars.package.as_str()]);
     if vars.update_cache {
         // `update_cache` takes the age at which the apt lists count as stale;
         // ZERO means "always refresh before installing".
-        op = op.update_cache(Duration::ZERO);
+        present = present.update_cache(Duration::ZERO);
     }
-    let pkg = ctx.step(name, op)?;
+    let pkg = ctx.step(name, present)?;
     ctx.log(helpers::describe(&pkg));
     Ok(())
 }

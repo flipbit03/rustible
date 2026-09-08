@@ -19,6 +19,10 @@ pub struct Playbook {
     pub schema: fn() -> Value,
     /// Deserializes the vars and runs the playbook's `main`.
     pub entry: fn(&mut Ctx, Value) -> Result<()>,
+    /// Deserializes the vars into the typed struct and stops there: the
+    /// orchestrator's pre-check (`--check-vars`) runs serde without running
+    /// the playbook, so both sides validate with the same code.
+    pub check_vars: fn(Value) -> Result<()>,
 }
 
 /// A playbook with the name the build script derived from its path

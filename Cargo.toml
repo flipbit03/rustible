@@ -8,7 +8,6 @@ members = [
     "crates/rustible-build",
     "crates/rustible-std",
     "crates/rustible-github",
-    "crates/spike-playbook",
 ]
 exclude = ["examples/workspace"]
 

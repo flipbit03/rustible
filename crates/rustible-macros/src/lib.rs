@@ -110,13 +110,16 @@ fn playbook_impl(
     f.attrs
         .push(syn::parse_quote!(#[allow(clippy::needless_pass_by_ref_mut)]));
 
-    let (entry_body, schema_fn) = match &args.vars {
+    let (entry_body, schema_fn, check_body) = match &args.vars {
         Some(ty) => (
             quote! {
                 let vars: #ty = ::rustible::sdk::vars::from_value::<#ty>(raw)?;
                 #user_fn(ctx, vars)
             },
             quote! { ::rustible::sdk::vars::schema_for::<#ty> },
+            quote! {
+                ::rustible::sdk::vars::from_value::<#ty>(raw).map(|_| ())
+            },
         ),
         None => (
             quote! {
@@ -124,6 +127,10 @@ fn playbook_impl(
                 #user_fn(ctx)
             },
             quote! { ::rustible::sdk::vars::no_schema },
+            quote! {
+                let _ = raw;
+                Ok(())
+            },
         ),
     };
 
@@ -139,11 +146,19 @@ fn playbook_impl(
         }
 
         #[doc(hidden)]
+        pub fn __rustible_check_vars(
+            raw: ::rustible::sdk::__private::serde_json::Value,
+        ) -> ::rustible::sdk::Result<()> {
+            #check_body
+        }
+
+        #[doc(hidden)]
         pub static __RUSTIBLE_PLAYBOOK: ::rustible::sdk::registry::Playbook = ::rustible::sdk::registry::Playbook {
             hosts: #hosts,
             escalate: #escalate,
             schema: #schema_fn,
             entry: __rustible_entry,
+            check_vars: __rustible_check_vars,
         };
     })
 }
