@@ -169,6 +169,8 @@ impl Backend for Local {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -207,27 +209,50 @@ mod tests {
 
     #[test]
     fn stdin_reaches_the_child_and_a_large_input_does_not_deadlock() {
-        let out = Local
-            .spawn(&spec("cat", &[], Some(b"hello stdin".to_vec())))
-            .unwrap();
-        assert_eq!(out.status, 0);
-        assert_eq!(out.stdout, b"hello stdin");
+        // Bounded on purpose. The bug this pins is a deadlock, so an
+        // unbounded assertion would hang instead of failing, and in CI it
+        // would hold the job until the workflow timeout rather than telling
+        // anyone what broke. The work runs on a thread and the test fails if
+        // it has not finished in time.
+        let done = within(Duration::from_secs(30), || {
+            let out = Local
+                .spawn(&spec("cat", &[], Some(b"hello stdin".to_vec())))
+                .unwrap();
+            assert_eq!(out.status, 0);
+            assert_eq!(out.stdout, b"hello stdin");
 
-        // Larger than any pipe buffer (64 KiB on Linux), echoed back in
-        // full: the child writes while we are still feeding it.
-        let big = vec![b'x'; 4 * 1024 * 1024];
-        let out = Local.spawn(&spec("cat", &[], Some(big.clone()))).unwrap();
-        assert_eq!(out.stdout.len(), big.len());
+            // Larger than any pipe buffer (64 KiB on Linux), echoed back in
+            // full: the child writes while we are still feeding it.
+            let big = vec![b'x'; 4 * 1024 * 1024];
+            let out = Local.spawn(&spec("cat", &[], Some(big.clone()))).unwrap();
+            assert_eq!(out.stdout.len(), big.len());
 
-        // Without stdin the child sees EOF at once, not our terminal.
-        let out = Local.spawn(&spec("cat", &[], None)).unwrap();
-        assert_eq!(out.status, 0);
-        assert!(out.stdout.is_empty());
+            // Without stdin the child sees EOF at once, not our terminal.
+            let out = Local.spawn(&spec("cat", &[], None)).unwrap();
+            assert_eq!(out.status, 0);
+            assert!(out.stdout.is_empty());
 
-        // A child that never reads its input still exits cleanly.
-        let out = Local
-            .spawn(&spec("true", &[], Some(vec![b'y'; 1024 * 1024])))
-            .unwrap();
-        assert_eq!(out.status, 0);
+            // A child that never reads its input still exits cleanly.
+            let out = Local
+                .spawn(&spec("true", &[], Some(vec![b'y'; 1024 * 1024])))
+                .unwrap();
+            assert_eq!(out.status, 0);
+        });
+        assert!(
+            done,
+            "spawn with stdin did not finish in 30s: the feeder is blocking \
+             again, so a child that writes before reading deadlocks"
+        );
+    }
+
+    /// Run `f` on a thread and report whether it finished within `limit`.
+    /// A test that hangs tells nobody anything; a test that fails does.
+    fn within(limit: Duration, f: impl FnOnce() + Send + 'static) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(limit).is_ok()
     }
 }
