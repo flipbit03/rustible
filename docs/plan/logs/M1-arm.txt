@@ -1,0 +1,14 @@
+# M1 ARM VM leg: DEFERRED
+
+cadu@cadu-cogram-vm-arm answered a probe at ~01:05 UTC (20 s cold connect), then timed out on every attempt:
+ARM unreachable, attempt 1 (01:08:24)
+ARM unreachable, attempt 2 (01:18:45)
+ARM unreachable, attempt 3 (01:29:05)
+ARM unreachable, attempt 4 (01:39:25)
+ARM unreachable, attempt 5 (01:49:45)
+ARM unreachable, attempt 6 (02:00:05)
+
+Protocol section 5: retried every 10 minutes for an hour, then deferred. The commands that remain to run when the VM is back:
+  cargo run -p rustible-cli -- --playbook cadu/mc --host local --host cadu@cadu-cogram-vm-arm --escalate --check --var package=mc
+  cargo run -p rustible-cli -- --playbook cadu/mc --host local --host cadu@cadu-cogram-vm-arm --escalate -v --var package=mc
+The aarch64 build of the same binary is exercised by the orchestrator's multi-target cargo invocation only when an aarch64 host is present, so cross-compilation of the M1 binary is also unverified until then (spike 1 verified the toolchain path itself).

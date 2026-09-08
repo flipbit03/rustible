@@ -1,9 +1,8 @@
 //! Playbook: on an apt-based host, ensure Midnight Commander is installed.
-//! Needs root (escalate). Run locally with `sudo target/debug/mc`, or through
-//! the orchestrator with `--escalate`.
+//! Needs root (escalate). Run locally with `sudo target/debug/mc mc`. The
+//! orchestrator drives `examples/workspace` now, not this crate (M1 item 7).
 
 use rustible_sdk::prelude::*;
-use rustible_sdk::runtime::{RunOptions, run};
 use rustible_std::apt;
 
 fn playbook(ctx: &mut Ctx) -> Result<()> {
@@ -34,6 +33,17 @@ fn playbook(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+// The spike predates the `#[rustible::playbook]` macro: it registers by hand.
+static PB: rustible_sdk::registry::Playbook = rustible_sdk::registry::Playbook {
+    hosts: "local",
+    escalate: false,
+    schema: rustible_sdk::vars::no_schema,
+    entry: |ctx, _| playbook(ctx),
+};
+
 fn main() -> std::process::ExitCode {
-    run(RunOptions::from_args(), playbook)
+    rustible_sdk::runtime::main(&[rustible_sdk::registry::Named {
+        name: "mc",
+        playbook: &PB,
+    }])
 }

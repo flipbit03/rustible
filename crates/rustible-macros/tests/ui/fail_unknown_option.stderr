@@ -1,0 +1,5 @@
+error: unknown playbook option `become`; expected `hosts`, `vars`, or `escalate`
+ --> tests/ui/fail_unknown_option.rs:6:43
+  |
+6 |     #[rustible::playbook(hosts = "local", become = true)]
+  |                                           ^^^^^^

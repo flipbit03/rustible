@@ -97,16 +97,18 @@ impl<T> Applied<T> {
     /// The output, or a clear error if unavailable (check mode, would change,
     /// op did not predict).
     pub fn output(&self) -> Result<&T> {
-        self.value
-            .as_ref()
-            .ok_or_else(|| crate::Error::OutputUnavailable {
+        self.value.as_ref().ok_or_else(|| {
+            crate::error::OutputUnavailable {
                 step: self.step.clone(),
-            })
+            }
+            .into()
+        })
     }
 
     pub fn into_output(self) -> Result<T> {
         let step = self.step;
-        self.value.ok_or(crate::Error::OutputUnavailable { step })
+        self.value
+            .ok_or_else(|| crate::error::OutputUnavailable { step }.into())
     }
 
     pub fn is_available(&self) -> bool {

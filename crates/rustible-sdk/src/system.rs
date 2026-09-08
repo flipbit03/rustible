@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use crate::backend::{Backend, CmdSpec, Fake, Local, Output, Stat};
-use crate::error::{Error, Result};
+use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
 
@@ -143,17 +143,21 @@ impl System {
 
     fn guard_mutation(&self, p: &Path) -> Result<()> {
         if self.phase() == Phase::Checking {
-            return Err(Error::MutationDuringCheck {
+            return Err(MutationDuringCheck {
                 path: p.to_path_buf(),
-            });
+            }
+            .into());
         }
         Ok(())
     }
 
     fn io(p: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
-        move |source| Error::Io {
-            path: p.to_path_buf(),
-            source,
+        move |source| {
+            IoAt {
+                path: p.to_path_buf(),
+                source,
+            }
+            .into()
         }
     }
 
@@ -319,7 +323,7 @@ impl Cmd {
             .sys
             .backend
             .spawn(&self.spec)
-            .map_err(|source| Error::Spawn {
+            .map_err(|source| SpawnFailed {
                 program: self.spec.program.clone(),
                 source,
             })?;
@@ -330,11 +334,12 @@ impl Cmd {
             elapsed_ms: t0.elapsed().as_millis() as u64,
         });
         if !out.success() && !self.allow_failure {
-            return Err(Error::Cmd {
-                argv: self.spec.argv().join(" "),
+            return Err(CmdFailed {
+                argv: self.spec.argv(),
                 status: out.status,
                 stderr: out.stderr_str(),
-            });
+            }
+            .into());
         }
         Ok(out)
     }

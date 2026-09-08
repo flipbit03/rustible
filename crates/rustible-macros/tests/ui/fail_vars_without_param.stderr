@@ -1,0 +1,5 @@
+error: expected `fn main(ctx: &mut Ctx, vars: <Vars>) -> Result<()>`, found 1 parameter(s)
+  --> tests/ui/fail_vars_without_param.rs:10:13
+   |
+10 |     fn main(_ctx: &mut Ctx) -> Result<()> {
+   |             ^^^^^^^^^^^^^^

@@ -10,6 +10,7 @@ members = [
     "crates/rustible-github",
     "crates/spike-playbook",
 ]
+exclude = ["examples/workspace"]
 
 [workspace.package]
 edition = "2024"
@@ -18,7 +19,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipbit03/rustible"
 homepage = "https://github.com/flipbit03/rustible"
 authors = ["Carlos Eduardo <cadu@cadu.dev>"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 rustible = { path = "crates/rustible", version = "0.0.1" }

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::Diff;
+use crate::error::CmdFailed;
 use crate::facts::Facts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,9 +65,25 @@ pub enum Event {
     },
     Failed {
         step: Option<String>,
+        /// The rendered context chain, outermost first.
         error: String,
+        /// Present when a command failure is in the chain (rendered at -v).
+        /// Additive field: absent from older binaries' frames.
+        #[serde(default)]
+        cmd: Option<CmdFailed>,
     },
     Finished(Summary),
+}
+
+impl Event {
+    /// Build a `Failed` event from an error, extracting the command if any.
+    pub fn failed(step: Option<String>, e: &crate::Error) -> Event {
+        Event::Failed {
+            step,
+            error: e.chain(),
+            cmd: e.cmd_failed().cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +135,15 @@ impl EventSink for Collect {
 impl Collect {
     pub fn events(&self) -> Vec<Event> {
         self.0.lock().unwrap().clone()
+    }
+}
+
+/// The sink a local run writes to: JSON lines or the pretty renderer.
+pub fn stdout_sink(json: bool, host: &str, verbosity: u8) -> SharedSink {
+    if json {
+        Arc::new(JsonLines(Mutex::new(std::io::stdout())))
+    } else {
+        Arc::new(Pretty::new(std::io::stdout(), host, verbosity))
     }
 }
 
@@ -224,10 +250,21 @@ impl<W: Write + Send> EventSink for Pretty<W> {
                     Ok(())
                 }
             }
-            Event::Failed { step, error } => match step {
-                Some(s) => writeln!(w, "[{host}]  FAILED at `{s}`: {error}"),
-                None => writeln!(w, "[{host}]  FAILED: {error}"),
-            },
+            Event::Failed { step, error, cmd } => {
+                let r = match step {
+                    Some(s) => writeln!(w, "[{host}]  FAILED at `{s}`: {error}"),
+                    None => writeln!(w, "[{host}]  FAILED: {error}"),
+                };
+                if self.verbosity >= 1
+                    && let Some(c) = cmd
+                {
+                    let _ = writeln!(w, "[{host}]    $ {} (exit {})", c.argv.join(" "), c.status);
+                    for line in c.stderr.lines() {
+                        let _ = writeln!(w, "[{host}]      {line}");
+                    }
+                }
+                r
+            }
             Event::Finished(s) => writeln!(
                 w,
                 "\n{host:<8} ok={} changed={} would_change={} skipped={} failed={} warnings={}",

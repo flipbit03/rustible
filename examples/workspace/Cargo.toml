@@ -1,0 +1,40 @@
+# A Rustible workspace, as `rustible init` will generate it (this copy uses
+# path dependencies to the checkout; a real one uses crates.io versions).
+[package]
+name = "workspace"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[[bin]]
+name = "workspace"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# Enabled only by `rustible playbook run` together with RUSTIBLE_PLAYBOOK, so
+# a selected build gets its own build-script output directory and never
+# clobbers the editor's registry. Nothing may depend on it. (vision doc 9)
+[features]
+selected = []
+
+[dependencies]
+rustible = { path = "../../crates/rustible" }
+rustible-std = { path = "../../crates/rustible-std" }
+
+[build-dependencies]
+rustible-build = { path = "../../crates/rustible-build" }
+
+# Detach from the rustible repository's own workspace.
+[workspace]
+
+# Profile for binaries shipped to targets: small over fast-to-build. The
+# rustible CLI builds with `--profile dist`.
+[profile.dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"

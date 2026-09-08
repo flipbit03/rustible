@@ -1,0 +1,5 @@
+error: `#[rustible::playbook]` goes on `fn main`
+ --> tests/ui/fail_not_main.rs:7:8
+  |
+7 |     fn run(_ctx: &mut Ctx) -> Result<()> {
+  |        ^^^

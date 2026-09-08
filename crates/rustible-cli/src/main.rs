@@ -21,12 +21,16 @@ use transport::Transport;
 #[derive(Parser, Debug)]
 #[command(name = "rustible", about = "Rustible orchestrator (spike)")]
 struct Cli {
-    /// Cargo package containing the playbook bin.
-    #[arg(long, default_value = "spike-playbook")]
-    package: String,
-    /// Playbook bin name.
-    #[arg(long)]
+    /// Rustible workspace directory (a Cargo package generated like
+    /// `examples/workspace`).
+    #[arg(long, default_value = "examples/workspace")]
+    workspace: PathBuf,
+    /// The workspace's bin name (its package name).
+    #[arg(long, default_value = "workspace")]
     bin: String,
+    /// Playbook name inside the workspace, e.g. `cadu/mc`.
+    #[arg(long)]
+    playbook: String,
     /// Hosts: `local` or `user@addr`. Repeatable.
     #[arg(long = "host", required = true)]
     hosts: Vec<String>,
@@ -39,12 +43,25 @@ struct Cli {
     check: bool,
     #[arg(short, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Playbook vars, `key=value`; JSON-looking values are parsed as JSON.
+    #[arg(long = "var")]
+    vars: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let t_start = Instant::now();
+    let mut vars_map = serde_json::Map::new();
+    for kv in &cli.vars {
+        let Some((k, v)) = kv.split_once('=') else {
+            bail!("--var needs key=value, got `{kv}`");
+        };
+        let value = serde_json::from_str::<serde_json::Value>(v)
+            .unwrap_or(serde_json::Value::String(v.to_string()));
+        vars_map.insert(k.to_string(), value);
+    }
+    let vars_json = serde_json::Value::Object(vars_map);
 
     // 1. Connect to every host in parallel and probe its triple.
     let mut connects = vec![];
@@ -76,16 +93,18 @@ async fn main() -> Result<()> {
         v
     };
     let t0 = Instant::now();
+    let manifest = cli.workspace.join("Cargo.toml");
     let mut cmd = tokio::process::Command::new("cargo");
     cmd.args([
         "build",
         "--profile",
         "dist",
-        "-p",
-        &cli.package,
-        "--bin",
-        &cli.bin,
-    ]);
+        "--features",
+        "selected",
+        "--manifest-path",
+    ])
+    .arg(&manifest)
+    .env("RUSTIBLE_PLAYBOOK", &cli.playbook);
     for t in &triples {
         cmd.args(["--target", t]);
     }
@@ -97,7 +116,12 @@ async fn main() -> Result<()> {
 
     let mut artifacts: BTreeMap<String, (Vec<u8>, String)> = BTreeMap::new();
     for t in &triples {
-        let p = PathBuf::from("target").join(t).join("dist").join(&cli.bin);
+        let p = cli
+            .workspace
+            .join("target")
+            .join(t)
+            .join("dist")
+            .join(&cli.bin);
         let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
         let hash = hex(&Sha256::digest(&bytes));
         eprintln!("{t}: {} bytes, sha256 {}", bytes.len(), &hash[..16]);
@@ -110,10 +134,12 @@ async fn main() -> Result<()> {
     for (name, tr, triple) in hosts {
         let artifacts = artifacts.clone();
         let bin = cli.bin.clone();
+        let playbook = cli.playbook.clone();
+        let vars_json = vars_json.clone();
         let (escalate, check, verbosity) = (cli.escalate, cli.check, cli.verbose);
         runs.push(tokio::spawn(async move {
             let (bytes, hash) = &artifacts[&triple];
-            let remote_path = format!(".cache/rustible/bin/{bin}-{hash}");
+            let remote_path = format!(".cache/rustible/bin/{bin}-{}-{hash}", playbook.replace('/', "_"));
 
             let t0 = Instant::now();
             let cached = tr.exists(&remote_path).await?;
@@ -138,11 +164,13 @@ async fn main() -> Result<()> {
 
             let start = Down::Start {
                 run_id: format!("{:x}", t_exec.elapsed().as_nanos()),
+                playbook: playbook.clone(),
                 host: HostInfo {
                     name: name.clone(),
-                    groups: vec![],
+                    connection: if name == "local" { "local".into() } else { "ssh".into() },
+                    ..HostInfo::local()
                 },
-                vars: serde_json::Value::Null,
+                vars: vars_json,
                 check_mode: check,
                 verbosity,
             };
@@ -156,9 +184,18 @@ async fn main() -> Result<()> {
                     break;
                 };
                 match up {
-                    Up::Hello { protocol, playbook } => {
+                    Up::Hello { protocol, playbook: announced } => {
                         t_hello = Some(t_exec.elapsed());
-                        eprintln!("[{name}]  hello: protocol {protocol}, playbook {playbook}, {:.2?} after exec", t_exec.elapsed());
+                        if protocol != rustible_sdk::protocol::PROTOCOL_VERSION {
+                            bail!(
+                                "protocol mismatch: orchestrator speaks {}, binary speaks {protocol}; rebuild the workspace against this rustible",
+                                rustible_sdk::protocol::PROTOCOL_VERSION
+                            );
+                        }
+                        if announced != playbook {
+                            bail!("asked for playbook `{playbook}`, binary answered with `{announced}`");
+                        }
+                        eprintln!("[{name}]  hello: protocol {protocol}, playbook {announced}, {:.2?} after exec", t_exec.elapsed());
                     }
                     Up::Event(ev) => {
                         if let Event::Finished(s) = &ev {

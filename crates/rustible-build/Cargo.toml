@@ -9,3 +9,10 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[dev-dependencies]
+tempfile.workspace = true
