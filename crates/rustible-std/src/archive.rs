@@ -20,6 +20,12 @@ use rustible_sdk::prelude::*;
 
 use crate::file::Owner;
 
+/// Ceiling on the buffer capacity reserved from a tar header's `size`
+/// field before a member is read. The field is attacker-controlled and
+/// unbounded, so it is a hint, not an allocation: `read_to_end` grows the
+/// buffer against the real stream from here.
+const READ_CAPACITY_CEILING: u64 = 1 << 20;
+
 /// A supported archive format, as detected from the first bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -174,7 +180,11 @@ pub struct ExtractReport {
     pub files: usize,
     pub dirs: usize,
     pub symlinks: usize,
-    /// Bytes of regular-file content (hard links counted again).
+    /// Bytes of regular-file content, as the archive's headers declare it.
+    /// A hard link's header carries `size == 0`, so a hard link raises
+    /// `files` but adds nothing here, even though `apply` writes it as a
+    /// full copy of its target: this counts what the archive holds, not
+    /// what lands on disk. Saturating, since the headers are untrusted.
     pub bytes: u64,
     /// Members dropped by `.strip_components` (fewer components than
     /// stripped) or with an empty path such as `./`.
@@ -412,7 +422,10 @@ impl Extracted {
             match m.kind {
                 Kind::File | Kind::Hardlink(_) => {
                     r.files += 1;
-                    r.bytes += m.size;
+                    // The sizes come from the archive's headers and are not
+                    // bounded, so a crafted set can overflow the sum, which
+                    // panics in debug builds.
+                    r.bytes = r.bytes.saturating_add(m.size);
                 }
                 Kind::Dir => r.dirs += 1,
                 Kind::Symlink(_) => r.symlinks += 1,
@@ -423,21 +436,32 @@ impl Extracted {
 
     fn write_member(&self, sys: &System, m: &Member, data: &mut dyn Read) -> Result<()> {
         let full = self.dest.join(&m.path);
+        // `chown(2)` clears setuid/setgid on non-directories, so every arm
+        // below defers `set_mode` to the tail and the owner is applied
+        // first. Writing the mode inline would drop the setuid bit of a
+        // member extracted with `.owner(..)`.
+        let mut mode = Some(m.mode);
         let mut chown = true;
         match &m.kind {
             Kind::Dir => {
                 sys.mkdir_all(&full)?;
-                sys.set_mode(&full, m.mode)?;
             }
             Kind::File => {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                let mut bytes = Vec::with_capacity(m.size as usize);
+                // The capacity is a hint from the archive's own header and
+                // nothing bounds it: a base-256 `size` of 2^62 would ask
+                // for an allocation the process cannot survive (Rust
+                // aborts on allocation failure), turning a malicious
+                // tarball into a killed run instead of a refusal. Reserve
+                // a small floor and let `read_to_end` grow it against the
+                // real stream.
+                let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
+                let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
                     .with_context(|| format!("reading member {}", m.path.display()))?;
                 sys.write_atomic(&full, &bytes)?;
-                sys.set_mode(&full, m.mode)?;
             }
             Kind::Hardlink(target) => {
                 if let Some(parent) = full.parent() {
@@ -445,7 +469,6 @@ impl Extracted {
                 }
                 let bytes = sys.read(self.dest.join(target))?;
                 sys.write_atomic(&full, &bytes)?;
-                sys.set_mode(&full, m.mode)?;
             }
             Kind::Symlink(target) => {
                 if let Some(parent) = full.parent() {
@@ -455,11 +478,17 @@ impl Extracted {
                     sys.remove(&full)?;
                 }
                 sys.symlink(target, &full)?;
+                // `set_mode` and `set_owner` follow links; neither is
+                // applied to a symlink member.
                 chown = false;
+                mode = None;
             }
         }
         if chown && let Some(o) = self.owner {
             sys.set_owner(&full, o.uid, o.gid)?;
+        }
+        if let Some(mode) = mode {
+            sys.set_mode(&full, mode)?;
         }
         Ok(())
     }
@@ -537,9 +566,24 @@ type Visit<'a> = dyn FnMut(Option<&Member>, &mut dyn Read) -> Result<()> + 'a;
 
 /// Walk every member in order, validating paths and link targets, and hand
 /// each to `visit` with its data. Errors name the member.
+/// What a member is, for a collision message.
+fn kind_label(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Dir => "directory",
+        Kind::File => "file",
+        Kind::Symlink(_) => "symlink",
+        Kind::Hardlink(_) => "hard link",
+    }
+}
+
 fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<'_>) -> Result<()> {
     let mut symlinks: Vec<PathBuf> = vec![];
     let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    // Every path the archive has claimed so far, and what it claimed it as.
+    // Two members can collide inside one archive without anything being on
+    // disk yet, which `check_destination` cannot see.
+    let mut claimed: std::collections::BTreeMap<PathBuf, &'static str> =
+        std::collections::BTreeMap::new();
     for entry in archive.entries().context("reading tar members")? {
         let mut entry = entry.context("reading tar member")?;
         let raw = entry
@@ -597,6 +641,38 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<
                 ty
             );
         };
+        let label = kind_label(&kind);
+        // The same path claimed twice as two different things. `apply`
+        // would try to replace one with the other and, for a populated
+        // directory, fail partway through the archive.
+        if let Some(earlier) = claimed.get(&path)
+            && *earlier != label
+        {
+            bail!(
+                "member `{}` is a {label} at a path the archive already used for a {earlier}",
+                raw.display()
+            );
+        }
+        // A non-directory member sitting on top of a path earlier members
+        // populate, whether or not the directory itself was a member:
+        // `apply` creates the directory for those, then cannot remove it.
+        if !matches!(kind, Kind::Dir)
+            && let Some(under) = claimed
+                .range((
+                    std::ops::Bound::Excluded(path.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(p, _)| p)
+                .filter(|p| p.starts_with(&path))
+        {
+            bail!(
+                "member `{}` is a {label} at a path the archive already populated as a directory (`{}`)",
+                raw.display(),
+                under.display()
+            );
+        }
+        claimed.insert(path.clone(), label);
         match &kind {
             Kind::File | Kind::Hardlink(_) => {
                 files.insert(path.clone());
@@ -1071,6 +1147,114 @@ mod tests {
 
         let err = check_err(&raw_tar(&[("dev/null", b'3', b"", "")]));
         assert!(err.contains("member `dev/null` is a special file"), "{err}");
+    }
+
+    #[test]
+    fn intra_archive_path_collisions_are_refused_at_check() {
+        // The reviewer's case: a directory, something inside it, then a
+        // symlink claiming the directory's own path. `apply` would create
+        // the directory, populate it, then fail to remove it, leaving a
+        // half-written tree. It has to be refused at check, where the
+        // other refusals are.
+        let err = check_err(&raw_tar(&[
+            ("d/", b'5', b"", ""),
+            ("d/f", b'0', b"data", ""),
+            ("d", b'2', b"", "elsewhere"),
+        ]));
+        assert!(
+            err.contains(
+                "member `d` is a symlink at a path the archive already used for a directory"
+            ),
+            "{err}"
+        );
+
+        // The same without an explicit directory member: `apply` creates
+        // `d` implicitly for `d/f`, so the symlink still lands on a
+        // populated directory.
+        let err = check_err(&raw_tar(&[
+            ("d/f", b'0', b"data", ""),
+            ("d", b'2', b"", "elsewhere"),
+        ]));
+        assert!(
+            err.contains("member `d` is a symlink at a path the archive already populated as a directory (`d/f`)"),
+            "{err}"
+        );
+
+        // A plain file over a populated directory is refused the same way.
+        let err = check_err(&raw_tar(&[
+            ("d/f", b'0', b"data", ""),
+            ("d", b'0', b"data", ""),
+        ]));
+        assert!(
+            err.contains(
+                "member `d` is a file at a path the archive already populated as a directory"
+            ),
+            "{err}"
+        );
+
+        // A file and a directory fighting over one path, in either order.
+        let err = check_err(&raw_tar(&[("x", b'0', b"data", ""), ("x/", b'5', b"", "")]));
+        assert!(
+            err.contains(
+                "member `x/` is a directory at a path the archive already used for a file"
+            ),
+            "{err}"
+        );
+
+        // Repeating the same path as the same kind is legal tar (the last
+        // one wins, as GNU tar does) and must keep working.
+        let (_, sys) = sys_with(&raw_tar(&[
+            ("f", b'0', b"one", ""),
+            ("f", b'0', b"two", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        assert_eq!(c.predicted.as_ref().unwrap().files, 2);
+    }
+
+    /// A tar holding one member whose header claims `size` bytes but
+    /// carries only one block, so the stream is short of the claim.
+    fn tar_claiming_size(name: &str, size: u64) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::new(b'0'));
+        h.set_mode(0o644);
+        h.set_size(size);
+        {
+            let g = h.as_gnu_mut().unwrap();
+            g.name[..name.len()].copy_from_slice(name.as_bytes());
+        }
+        h.set_cksum();
+        let mut out = h.as_bytes().to_vec();
+        out.extend_from_slice(&[b'x'; 512]);
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    #[test]
+    fn an_absurd_header_size_is_refused_at_check_without_aborting() {
+        // 2^62 asks for a 4.6 EB allocation, and Rust aborts the process on
+        // allocation failure. `check` never reaches an allocation because
+        // the stream is short of the claim, so it refuses; reaching the
+        // assertion at all is what this pins.
+        let err = check_err(&tar_claiming_size("big", 1u64 << 62));
+        assert!(err.contains("refusing to extract"), "{err}");
+        assert!(err.contains("EOF"), "{err}");
+    }
+
+    #[test]
+    fn an_absurd_header_size_does_not_abort_apply_either() {
+        // `apply` walks the archive again, and `write_member` reserves from
+        // the header before reading. An archive swapped between check and
+        // apply reaches that reservation with an unvalidated size, so the
+        // capacity is a clamped hint, not the claim. Without the clamp
+        // this test does not fail, it aborts the whole test binary.
+        let (_, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("big", 1u64 << 62))
+            .unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("EOF") || err.contains("reading"), "{err}");
     }
 
     #[test]

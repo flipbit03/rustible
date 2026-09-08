@@ -18,8 +18,10 @@ No SDK changes.
 ### `http::Download` — Ansible `ansible.builtin.get_url`
 
 `Download::get(url).to(dest)` with `.checksum("<alg>:<hex>")`, `.mode`,
-`.owner(uid, gid)`, `.force`, `.backup`, `.timeout`, `.header(name, value)`.
-Output is `DownloadReport { url, path, downloaded, bytes, sha256, backup_path }`.
+`.owner(uid, gid)`, `.force`, `.backup`, `.timeout`, `.max_bytes`,
+`.header(name, value)`. Output is `DownloadReport { url, path, downloaded,
+bytes, sha256, backup_path }`, where `sha256` is `Option<String>` and is
+`None` when no checksum was configured and the file was already in place.
 
 The transport is `ureq` 3.4 over `rustls` 0.23 with the `rustls-rustcrypto`
 crypto provider and Mozilla's bundled roots (`webpki-roots`). There is no
@@ -110,35 +112,36 @@ gate was re-run after each merge:
 3. The `rustible-github` collection (PR 14). See "Converging the network
    dependencies" below.
 
-The table is the run on the final tree at merge commit `506f809`. Full output
-is in `docs/plan/logs/M6-net-archive-done.txt`, which has four UTC-stamped
-sections: the pre-merge run at `01623e5` and one after each merge.
+The table is the last run, after the review fixes below. Full output is in
+`docs/plan/logs/M6-net-archive-done.txt`, which has five UTC-stamped
+sections: the pre-merge run at `01623e5`, one after each of the three merges,
+and one after the review fixes.
 
 | command | result | wall |
 |---|---|---|
-| `cargo fmt --all --check` | pass | 0.17s |
-| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 1.86s |
-| `cargo test --workspace` | pass | 4.90s |
-| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 0.71s |
-| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 0.24s |
-| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 0.52s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 33.66s |
-| `cargo test -p rustible-github` (shares the merged `ureq` entry) | pass | 1.21s |
+| `cargo fmt --all --check` | pass | 0.16s |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 0.12s |
+| `cargo test --workspace` | pass | 8.61s |
+| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 1.04s |
+| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 1.46s |
+| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 1.23s |
+| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 39.91s |
+| `cargo test -p rustible-github` (shares the merged `ureq` entry) | pass | 1.00s |
+| `cargo test -p rustible-std --lib -- --ignored https_download_from_github_with_rustcrypto_tls` | pass | 0.36s |
 
 Times are with a warm `target/`, so they measure the gates and not the build;
 the first run of the same set on a cold tree took roughly four times as long.
-At `85d6a62` the two new container tests were also run on their own,
-`it_http_download` in 5.84s and `it_archive_extracted` in 2.97s, and the
-`#[ignore]`d TLS test `https_download_from_github_with_rustcrypto_tls` passed
-in 0.46s. All are in the log.
+The two new container tests were also run on their own after each merge,
+`it_http_download` in about 3s and `it_archive_extracted` in about 1s. All
+are in the log.
 
 CI on GitHub was green on all four jobs (format/clippy/test, MSRV 1.88,
-example workspace, Docker harness) at `33cf1ff`, the head before the third
-merge.
+example workspace, Docker harness) at `33cf1ff` and again at `f65aa54`.
 
-Counts: `rustible-std` has 298 unit tests passing, one
-ignored (the network TLS test, run separately above); 16 of them are
-`http::`, 15 are `archive::`. Both new ops have a compiled doctest.
+Counts: `rustible-std` has 305 unit tests passing and one ignored (the
+network TLS test, run separately above), up from 298 before the review fixes
+added seven. Of the tests in that crate, 20 are `http::` (19 running plus the ignored TLS
+one) and 18 are `archive::`. Both new ops have a compiled doctest.
 
 ### Converging the network dependencies
 
@@ -205,6 +208,102 @@ about. Neither op has been exercised on the ARM VM at runtime.
 **No archive over ~a few hundred MB** was tested; both ops hold their payload
 in memory by design (see Decisions).
 
+## Review fixes
+
+The code review of PR 15 raised seven findings. All seven were accepted and
+fixed; none was disputed. Each is listed with the test that would fail if the
+fix were reverted.
+
+**1. Untrusted allocation from a tar header.** `write_member` reserved
+`Vec::with_capacity` from the header's `size`, which the archive controls and
+nothing bounds. A base-256 `size` of 2^62 asks for a 4.6 EB allocation, and
+Rust aborts the process on allocation failure, so a crafted tarball killed the
+run instead of drawing the op's refusal. The capacity is now clamped to
+`READ_CAPACITY_CEILING` (1 MiB) and `read_to_end` grows it against the real
+stream, and `report()` sums the same untrusted sizes with `saturating_add`,
+which would otherwise panic in a debug build. Worth noting for the reviewer:
+`check` alone never reaches the allocation, because its walk fails on the
+short stream first. `apply` does, because it re-reads the file from disk and
+`write_member` runs before the walk hits the truncation, so an archive swapped
+between check and apply gets there. Pinned by
+`archive::tests::an_absurd_header_size_does_not_abort_apply_either`, which
+does exactly that swap, and by
+`an_absurd_header_size_is_refused_at_check_without_aborting`. Both tests abort
+the whole test binary rather than failing if the clamp is removed.
+
+**2. chmod before chown drops setuid and setgid.** Linux's `chown(2)` clears
+`S_ISUID` and `S_ISGID` on anything that is not a directory, so
+`Download::mode(0o4755).owner(..)` and a setuid member of an archive both came
+out as plain 0755 while the step reported success. `file::apply_attrs` (shared
+with `file::Copy`, so the merged file ops were affected too) and
+`archive::Extracted::write_member` now chown first and chmod after; in the
+archive path every arm defers its `set_mode` to the tail rather than writing
+the mode inline. Pinned by two container cases, "download a setuid helper" and
+"extract a setuid member with an owner", which assert mode 0o4755 survives on
+both images. The `Fake` cannot catch this at all, since it does not model
+chown's bit-clearing, so the container was the only place to prove it. Both
+were checked by swapping the order back: each fails with mode 0o755, and each
+passes with the fix.
+
+**3. No ceiling on a download body.** ureq's 10 MB cap had been lifted with
+`.limit(u64::MAX)` and nothing put in its place, while the body is buffered in
+memory before the atomic write, so an endless or hostile response was an
+out-of-memory kill on the target. New `Download::max_bytes(u64)` builder,
+default `DEFAULT_MAX_BYTES` of 1 GiB, chosen because the op already buffers in
+memory and is documented for release tarballs. A `Content-Length` over the
+limit fails before the body is read; without one, ureq's `limit` is set one
+byte past the ceiling so the read itself stops. Both failures name the limit
+and the builder. Pinned by three unit tests
+(`a_body_over_max_bytes_is_refused_by_content_length`,
+`..._without_a_content_length`, `a_body_exactly_at_max_bytes_is_accepted`) and
+one container case. The unit test server grew an `X-Omit-Length` route so the
+no-`Content-Length` path is genuinely exercised.
+
+**4. `validate_url` rejected a valid short URL.** The length floor was
+`"https://".len()` for both schemes, so `http://x`, exactly eight characters,
+was refused. Single-label hosts are real: an `/etc/hosts` name, a container
+alias, a service on a LAN. It now measures against the scheme that matched.
+Pinned by additions to `http::tests::url_validation`.
+
+**5. Intra-archive collision between a directory and a later symlink.** For
+`d/`, then `d/f`, then `d` as a symlink, `apply` created and populated the
+directory and then could not remove it, aborting partway and leaving a
+half-written tree. `check_destination` cannot see it because nothing is on
+disk yet, and the existing guard only rejected members *under* an earlier
+symlink. `walk` now carries what each path has been claimed as and refuses two
+members colliding on one path with different kinds, plus a non-directory
+member at a path earlier members populated, which covers directories the
+archive never listed explicitly. Repeating a path as the same kind stays legal
+and last-one-wins, as GNU tar does. Pinned by
+`archive::tests::intra_archive_path_collisions_are_refused_at_check`, five
+cases including the legal one.
+
+**6. `ExtractReport::bytes` doc contradicted the code.** The doc claimed hard
+links were counted again; their headers carry `size == 0`, so they raise
+`files` and add nothing. I fixed the doc rather than the code. Resolving each
+hard link's target size would mean carrying the sizes of earlier members
+through the walk to report a number nothing depends on, and the field is more
+useful as what the archive declares than as what lands on disk. The doc now
+says so explicitly, and the existing test at `hard_links_are_copies_of_the_earlier_file`
+keeps locking the behaviour in.
+
+**7. Hashing on every check with no checksum asked for.** `content_state` read
+and SHA-256'd the whole destination on every check, check mode included, only
+to fill `DownloadReport::sha256`. That is a full read plus digest of a 500 MB
+tarball per run for a value that decided nothing. The read and the digest now
+happen only when a `.checksum` makes them decide something.
+`DownloadReport::sha256` became `Option<String>`, `None` in exactly that case
+and always `Some` after a download. This is a public type change, taken
+deliberately at 0.0.1 and recorded in DECISIONS with its reverse. Pinned by
+`http::tests::check_hashes_the_destination_only_when_a_checksum_asks_for_it`.
+
+On the TLS provider, the reviewer's note stands and is worth repeating here:
+`rustls-rustcrypto` is an alpha crate sitting on the security-critical path,
+which is a real cost of the pure-Rust constraint rather than an oversight. The
+question is recorded once for Cadu as the `[M6-gh]` proposed amendment in
+`DECISIONS.md`, raised by the `rustible-github` collection and covering
+`http::Download` too.
+
 ## Deviations from the brief
 
 - The brief's `archive` row says "tar (+gz/xz/zst)". That is what shipped.
@@ -220,7 +319,7 @@ in memory by design (see Decisions).
 
 ## Decisions
 
-Nineteen `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
+Twenty-six `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
 "Reverse:" clause. The ones worth a look:
 
 - **TLS provider.** `rustls-rustcrypto` 0.0.2-alpha, via `ureq`'s
@@ -241,9 +340,11 @@ Nineteen `[M6-na]` entries are in `docs/plan/DECISIONS.md`, each with a
 - **Both ops hold their payload in memory.** `Backend::write` takes `&[u8]`
   and there is no streaming write primitive, so `Download` buffers the body
   before `write_atomic` and `Extracted` buffers the archive (and, for zstd,
-  the decompressed stream). Documented as "release tarballs, not disk images".
-  Reverse: add `Backend::write_atomic_from(&mut dyn Read)`, an SDK change the
-  brief ruled out.
+  the decompressed stream). Documented as "release tarballs, not disk images",
+  and since the review a download is bounded by `.max_bytes` (1 GiB by
+  default) rather than trusted to be reasonable. Reverse: add
+  `Backend::write_atomic_from(&mut dyn Read)`, an SDK change the brief ruled
+  out.
 - **`check` walks the whole archive**, paying two decompressions on a changed
   run, so the counts are exact and the tar-slip refusals all fire before
   anything is written.

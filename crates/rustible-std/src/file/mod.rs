@@ -139,17 +139,22 @@ pub fn plan_attrs(
 
 /// Apply the attributes an op was given. Unconditional: `chmod`/`chown`
 /// are idempotent and `check` already decided a change is due.
+///
+/// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on anything
+/// that is not a directory, so the owner is set *first* and the mode after
+/// it. The other order silently drops the setuid bit of a
+/// `.mode(0o4755).owner(..)` op and still reports success.
 pub(crate) fn apply_attrs(
     sys: &System,
     path: &Path,
     mode: Option<u32>,
     owner: Option<Owner>,
 ) -> Result<()> {
-    if let Some(mode) = mode {
-        sys.set_mode(path, mode & 0o7777)?;
-    }
     if let Some(o) = owner {
         sys.set_owner(path, o.uid, o.gid)?;
+    }
+    if let Some(mode) = mode {
+        sys.set_mode(path, mode & 0o7777)?;
     }
     Ok(())
 }

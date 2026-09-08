@@ -23,6 +23,12 @@ use crate::file::{Owner, apply_attrs, plan_attrs, write_with_backup};
 /// Default connect and response-header timeout. Ansible's `timeout` is 10s.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default ceiling on a response body, raised or lowered with
+/// [`Download::max_bytes`]. The body is held in memory before the atomic
+/// write, so an unbounded download is an out-of-memory kill on the target,
+/// not a slow one. One gibibyte fits the release tarballs this op is for.
+pub const DEFAULT_MAX_BYTES: u64 = 1 << 30;
+
 /// A checksum algorithm the `.checksum("<algorithm>:<hex>")` option accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algorithm {
@@ -112,8 +118,18 @@ pub fn digest(algorithm: Algorithm, bytes: &[u8]) -> String {
 /// Why a URL cannot be downloaded. Pure. Only `http://` and `https://`.
 pub fn validate_url(url: &str) -> std::result::Result<(), String> {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        if url.len() <= "https://".len() || url.contains(char::is_whitespace) {
+    // Measure against the scheme that actually matched: using the longer
+    // one for both refuses `http://x`, and a single-label host is real
+    // (an `/etc/hosts` name, a container alias, a service on a LAN).
+    let scheme = if lower.starts_with("https://") {
+        Some("https://")
+    } else if lower.starts_with("http://") {
+        Some("http://")
+    } else {
+        None
+    };
+    if let Some(scheme) = scheme {
+        if url.len() <= scheme.len() || url.contains(char::is_whitespace) {
             return Err(format!("`{url}` is not a valid http(s) URL"));
         }
         return Ok(());
@@ -164,9 +180,11 @@ pub fn validate_url(url: &str) -> std::result::Result<(), String> {
 /// attributes-only change predicts.
 ///
 /// **Limits.** The body is held in memory before the atomic write, so this
-/// op is for files up to a few hundred megabytes, not disk images. Fails if
-/// `dest` exists and is not a regular file, or if its parent directory does
-/// not exist (vision 6.7: create it with [`crate::file::Directory`]).
+/// op is for release tarballs, not disk images, and a body over
+/// [`DEFAULT_MAX_BYTES`] fails rather than filling the target's memory.
+/// Raise or lower that with [`Download::max_bytes`]. Fails if `dest` exists
+/// and is not a regular file, or if its parent directory does not exist
+/// (vision 6.7: create it with [`crate::file::Directory`]).
 #[derive(Debug, Clone)]
 pub struct Download {
     url: String,
@@ -177,6 +195,7 @@ pub struct Download {
     force: bool,
     backup: bool,
     timeout: Duration,
+    max_bytes: u64,
     headers: Vec<(String, String)>,
 }
 
@@ -197,7 +216,13 @@ pub struct DownloadReport {
     /// Size of the file now at `path`.
     pub bytes: u64,
     /// SHA-256 of the file now at `path`, whatever `.checksum` asked for.
-    pub sha256: String,
+    ///
+    /// `None` when the op did not have to read the file: no `.checksum`
+    /// was configured and the file was already in place, so hashing it
+    /// would have decided nothing and cost a full read of, say, a 500 MB
+    /// tarball on every run, check mode included. Always `Some` after a
+    /// download.
+    pub sha256: Option<String>,
     /// Set only when `.backup(true)` and a previous version was saved.
     pub backup_path: Option<PathBuf>,
 }
@@ -248,6 +273,17 @@ impl Download {
         self
     }
 
+    /// Largest response body to accept, in bytes (default
+    /// [`DEFAULT_MAX_BYTES`]). The body is buffered in memory before the
+    /// atomic write, so this is what stands between a hostile or misbehaving
+    /// server and an out-of-memory kill on the target. A `Content-Length`
+    /// above it fails before the body is read; a response without one, or
+    /// one that lies, fails as soon as the read passes it.
+    pub fn max_bytes(mut self, n: u64) -> Self {
+        self.max_bytes = n;
+        self
+    }
+
     /// An extra request header, e.g. `("Authorization", "Bearer ...")`.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
@@ -287,17 +323,24 @@ impl Download {
                 stat.kind
             );
         }
-        let bytes = sys.read(&self.dest)?;
-        let sha256 = digest(Algorithm::Sha256, &bytes);
+        // The file is read and hashed only when a `.checksum` makes the
+        // digest decide something. Without one the answer is `ok` (or a
+        // re-download under `.force`) whatever the bytes are, so hashing
+        // would cost a full read of the destination on every run, check
+        // mode included, to fill a report field nobody asked for.
         let state = match checksum {
             Some(c) => {
+                let bytes = sys.read(&self.dest)?;
+                let sha256 = digest(Algorithm::Sha256, &bytes);
                 let actual = if c.algorithm == Algorithm::Sha256 {
                     sha256.clone()
                 } else {
                     digest(c.algorithm, &bytes)
                 };
                 if actual == c.hex {
-                    ContentState::Current { sha256 }
+                    ContentState::Current {
+                        sha256: Some(sha256),
+                    }
                 } else {
                     ContentState::Stale(format!(
                         "{} is {}..., want {}...",
@@ -308,7 +351,7 @@ impl Download {
                 }
             }
             None if self.force => ContentState::Stale("force".into()),
-            None => ContentState::Current { sha256 },
+            None => ContentState::Current { sha256: None },
         };
         Ok((Some(stat), state))
     }
@@ -326,11 +369,44 @@ impl Download {
         if !status.is_success() {
             bail!("GET {} returned {status}", self.url);
         }
-        resp.body_mut()
+        // Refuse before reading when the server declares a size over the
+        // ceiling. A missing or lying `Content-Length` is caught below.
+        if let Some(len) = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            && len > self.max_bytes
+        {
+            bail!(
+                "GET {}: Content-Length {len} exceeds the {} byte limit; raise it with .max_bytes()",
+                self.url,
+                self.max_bytes
+            );
+        }
+        // `limit` is the real guard: ureq stops the read past it and errors,
+        // so a chunked or mislabelled body cannot grow without bound. Read
+        // one byte past the ceiling to tell "exactly at the limit" from
+        // "over it".
+        let body = resp
+            .body_mut()
             .with_config()
-            .limit(u64::MAX)
+            .limit(self.max_bytes.saturating_add(1))
             .read_to_vec()
-            .map_err(|e| Error::msg(format!("GET {}: reading the body: {e}", self.url)))
+            .map_err(|e| {
+                Error::msg(format!(
+                    "GET {}: reading the body (limit {} bytes, raise it with .max_bytes()): {e}",
+                    self.url, self.max_bytes
+                ))
+            })?;
+        if body.len() as u64 > self.max_bytes {
+            bail!(
+                "GET {}: the body is larger than the {} byte limit; raise it with .max_bytes()",
+                self.url,
+                self.max_bytes
+            );
+        }
+        Ok(body)
     }
 }
 
@@ -346,6 +422,7 @@ impl DownloadBuilder {
             force: false,
             backup: false,
             timeout: DEFAULT_TIMEOUT,
+            max_bytes: DEFAULT_MAX_BYTES,
             headers: vec![],
         }
     }
@@ -353,9 +430,10 @@ impl DownloadBuilder {
 
 enum ContentState {
     Missing,
-    /// Present and acceptable; carries its digest for the report.
+    /// Present and acceptable; carries its digest for the report when one
+    /// had to be computed anyway.
     Current {
-        sha256: String,
+        sha256: Option<String>,
     },
     /// Present but to be replaced, with the one-line reason for the diff.
     Stale(String),
@@ -452,7 +530,7 @@ impl Op for Download {
             path: self.dest.clone(),
             downloaded: true,
             bytes: bytes.len() as u64,
-            sha256,
+            sha256: Some(sha256),
             backup_path,
         })
     }
@@ -516,11 +594,23 @@ mod tests {
                     500 => "Internal Server Error",
                     _ => "Whatever",
                 };
-                let mut out = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                    body.len()
-                );
+                // A route carrying `X-Omit-Length` answers without a
+                // `Content-Length`, so the body's size is unknown until it
+                // is read: that is the case `.max_bytes` has to catch at
+                // the read rather than from the header.
+                let omit_length = headers.iter().any(|(k, _)| *k == "X-Omit-Length");
+                let mut out = if omit_length {
+                    format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
+                } else {
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        body.len()
+                    )
+                };
                 for (k, v) in headers {
+                    if k == "X-Omit-Length" {
+                        continue;
+                    }
                     out.push_str(&format!("{k}: {v}\r\n"));
                 }
                 out.push_str("\r\n");
@@ -550,7 +640,7 @@ mod tests {
             path: "/opt/hello.txt".into(),
             downloaded,
             bytes: HELLO.len() as u64,
-            sha256: HELLO_SHA256.into(),
+            sha256: Some(HELLO_SHA256.into()),
             backup_path: None,
         }
     }
@@ -625,6 +715,12 @@ mod tests {
                 .unwrap_err()
                 .contains("not a valid")
         );
+        // The length floor is the scheme that matched, not the longer one:
+        // a single-label host is real (`/etc/hosts`, a container alias).
+        assert_eq!(validate_url("http://x"), Ok(()), "8 chars, but valid");
+        assert_eq!(validate_url("HTTP://x"), Ok(()));
+        assert_eq!(validate_url("https://x"), Ok(()));
+        assert!(validate_url("http://").unwrap_err().contains("not a valid"));
     }
 
     // ---- fake: check ----
@@ -708,15 +804,106 @@ mod tests {
             .owner(10, 20);
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff.short(), "mode=0755 owner=10:20");
+        // No `.checksum`, so the destination is never read or hashed and
+        // the report carries no digest: the whole point of the laziness.
         assert_eq!(
             c.predicted,
-            Some(report("http://nowhere.invalid/hello.txt", false))
+            Some(DownloadReport {
+                sha256: None,
+                ..report("http://nowhere.invalid/hello.txt", false)
+            })
         );
         let r = op.apply(&sys, c).unwrap();
         assert!(!r.downloaded);
+        assert_eq!(r.sha256, None);
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 10, 20));
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    #[test]
+    fn a_body_over_max_bytes_is_refused_by_content_length() {
+        let big = vec![b'x'; 4096];
+        let (base, hits) = serve(vec![("/big", 200, vec![], big)]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/big"))
+            .to("/opt/big.bin")
+            .max_bytes(100);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().to_string();
+        assert!(
+            err.contains("Content-Length 4096 exceeds the 100 byte limit"),
+            "{err}"
+        );
+        assert!(err.contains(".max_bytes()"), "{err}");
+        assert!(fake.file("/opt/big.bin").is_none(), "nothing written");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_body_over_max_bytes_is_refused_without_a_content_length() {
+        // No `Content-Length`, so the size is unknown until it is read and
+        // only ureq's `limit` can stop it: the guard that actually bounds
+        // memory, rather than trusting the server's header.
+        let big = vec![b'x'; 4096];
+        let (base, _) = serve(vec![(
+            "/big",
+            200,
+            vec![("X-Omit-Length", String::new())],
+            big,
+        )]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/big"))
+            .to("/opt/big.bin")
+            .max_bytes(100);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().to_string();
+        assert!(err.contains("limit 100 bytes"), "{err}");
+        assert!(err.contains(".max_bytes()"), "{err}");
+        assert!(fake.file("/opt/big.bin").is_none(), "nothing written");
+    }
+
+    #[test]
+    fn a_body_exactly_at_max_bytes_is_accepted() {
+        let (base, _) = serve(vec![("/hello.txt", 200, vec![], HELLO.to_vec())]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .max_bytes(HELLO.len() as u64);
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.bytes, HELLO.len() as u64);
+        assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
+    }
+
+    #[test]
+    fn check_hashes_the_destination_only_when_a_checksum_asks_for_it() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file("/opt/hello.txt", HELLO),
+        );
+        let sys = fake_sys(&fake);
+        // Present, no checksum, no force: nothing about the bytes can
+        // change the answer, so they are not read and there is no digest.
+        // `bytes` still comes from the stat.
+        let op = Download::get("http://nowhere.invalid/hello.txt").to("/opt/hello.txt");
+        let Plan::Satisfied(r) = op.check(&sys).unwrap() else {
+            panic!("expected Satisfied");
+        };
+        assert_eq!(r.sha256, None, "no checksum configured, so no digest");
+        assert_eq!(r.bytes, HELLO.len() as u64, "size comes from the stat");
+
+        // With a checksum the read has to happen anyway, so the digest it
+        // produces is reported.
+        let op = op.checksum(format!("sha256:{HELLO_SHA256}"));
+        let Plan::Satisfied(r) = op.check(&sys).unwrap() else {
+            panic!("expected Satisfied");
+        };
+        assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
     }
 
     #[test]
@@ -779,7 +966,7 @@ mod tests {
             .header("Accept", "application/octet-stream");
         let c = expect_change(&op, &sys);
         let r = op.apply(&sys, c).unwrap();
-        assert_eq!(r.sha256, HELLO_SHA256);
+        assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
         assert_eq!(hits.load(Ordering::SeqCst), 2, "redirect then target");
     }
 

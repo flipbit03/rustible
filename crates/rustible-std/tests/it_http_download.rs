@@ -78,9 +78,9 @@ fn download_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     })?;
     assert!(first.downloaded);
     assert_eq!(first.bytes, HELLO.len() as u64);
-    assert_eq!(first.sha256, HELLO_SHA256);
+    assert_eq!(first.sha256.as_deref(), Some(HELLO_SHA256));
     assert!(!second.downloaded);
-    assert_eq!(second.sha256, HELLO_SHA256);
+    assert_eq!(second.sha256.as_deref(), Some(HELLO_SHA256));
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
@@ -115,7 +115,7 @@ fn download_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
             .to("/opt/rustible-test/redirected.txt")
             .mode(0o755),
     )?;
-    assert_eq!(r.sha256, HELLO_SHA256);
+    assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
     assert_eq!(
         ctx.sys()
             .stat("/opt/rustible-test/redirected.txt")?
@@ -123,6 +123,40 @@ fn download_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
             .mode,
         0o755
     );
+
+    // A downloaded file keeps its setuid bit when `.owner` is also set.
+    // Linux's `chown(2)` clears setuid and setgid on non-directories, so
+    // this only holds if `apply_attrs` chowns before it chmods; with the
+    // two swapped the file comes out 0o755 and the step reports success.
+    let r = ctx.step(
+        "download a setuid helper",
+        Download::get(format!("{base}/hello.txt"))
+            .to("/opt/rustible-test/suid.bin")
+            .mode(0o4755)
+            .owner(65534, 65534),
+    )?;
+    assert!(r.changed);
+    let suid = ctx.sys().stat("/opt/rustible-test/suid.bin")?.unwrap();
+    assert_eq!(
+        (suid.mode, suid.uid, suid.gid),
+        (0o4755, 65534, 65534),
+        "chown must not have cleared the setuid bit"
+    );
+
+    // A body over `.max_bytes` is refused, naming the limit and the flag,
+    // and nothing is written.
+    let err = ctx
+        .step(
+            "download over the size limit",
+            Download::get(format!("{base}/hello.txt"))
+                .to("/opt/rustible-test/toobig.txt")
+                .max_bytes(4),
+        )
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("4 byte limit"), "{err}");
+    assert!(err.contains(".max_bytes()"), "{err}");
+    assert!(!ctx.sys().exists("/opt/rustible-test/toobig.txt")?);
 
     // Failures name the status and the URL, and write nothing.
     let url = format!("{base}/missing.txt");
