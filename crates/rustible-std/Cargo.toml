@@ -14,10 +14,11 @@ readme = "../../README.md"
 rustible-sdk.workspace = true
 regex.workspace = true
 serde.workspace = true
-# http::Download
+# http::Download, and the `tls` module both it and `rustible-github` use.
+# The direct `rustls` entry stays: `tls` names `rustls::crypto::CryptoProvider`.
 ureq.workspace = true
 rustls.workspace = true
-rustls-rustcrypto.workspace = true
+rustls-graviola.workspace = true
 sha2.workspace = true
 # archive::Extracted
 tar.workspace = true

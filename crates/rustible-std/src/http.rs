@@ -1,17 +1,22 @@
 //! Downloads over HTTP(S). Ansible's `ansible.builtin.get_url`.
 //!
 //! [`Download`] fetches a URL into a file on the target with `ureq` over
-//! `rustls`, pure Rust all the way down (vision 5.3): the TLS crypto
-//! provider is `rustls-rustcrypto`, because rustls's default providers
-//! (`ring`, `aws-lc-rs`) bundle C and do not cross-link with `rust-lld`.
-//! Certificates are checked against Mozilla's bundled roots
+//! `rustls`, pure Rust all the way down (vision 5.3): the TLS crypto provider
+//! is `rustls-graviola`, from [`crate::tls`], because rustls's default
+//! providers (`ring`, `aws-lc-rs`) bundle C and do not cross-link with
+//! `rust-lld`. Certificates are checked against Mozilla's bundled roots
 //! (`webpki-roots`); there is no `validate_certs: no`.
+//!
+//! Graviola asserts on the CPU extensions it needs, so `apply` runs
+//! [`tls::preflight`](crate::tls::preflight) first and fails the step with a
+//! readable error on a machine below the floor (pre-Broadwell x86_64,
+//! Raspberry Pi 4 and earlier). It never panics mid-run, and there is no
+//! fallback provider.
 //!
 //! `check` never touches the network. It decides from the file on disk
 //! whether a download is due, so a dry run is fast and honest (vision 12).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use rustible_sdk::backend::FileKind;
@@ -357,6 +362,10 @@ impl Download {
     }
 
     fn fetch(&self) -> Result<Vec<u8>> {
+        // Before anything reaches the handshake: graviola panics on a CPU
+        // without the extensions it needs, and a panic here would take the
+        // whole playbook down instead of failing this step.
+        crate::tls::preflight("http::Download")?;
         let agent = agent(self.timeout);
         let mut req = agent.get(&self.url);
         for (k, v) in &self.headers {
@@ -439,15 +448,9 @@ enum ContentState {
     Stale(String),
 }
 
-/// The TLS provider every request uses. One place, so swapping it (say for
-/// `rustls-graviola`) is a one-line change.
-fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls_rustcrypto::provider())
-}
-
 fn agent(timeout: Duration) -> ureq::Agent {
     let tls = ureq::tls::TlsConfig::builder()
-        .unversioned_rustls_crypto_provider(tls_provider())
+        .unversioned_rustls_crypto_provider(crate::tls::provider())
         .build();
     ureq::Agent::config_builder()
         .tls_config(tls)
@@ -1073,11 +1076,12 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
-    /// Real TLS through rustls-rustcrypto against a public host. Not part
-    /// of `cargo test`: run with `cargo test -p rustible-std https_ -- --ignored`.
+    /// Real TLS through rustls-graviola against a public host, which also
+    /// exercises the CPU pre-flight on the way in. Not part of `cargo test`:
+    /// run with `cargo test -p rustible-std https_ -- --ignored`.
     #[test]
     #[ignore = "needs network"]
-    fn https_download_from_github_with_rustcrypto_tls() {
+    fn https_download_from_github_with_graviola_tls() {
         let fake = Arc::new(Fake::new().with_dir("/opt"));
         let sys = fake_sys(&fake);
         let op =

@@ -54,9 +54,10 @@ jobs:
       - uses: actions/checkout@v4
 
       # Kept in step with `rust-version` in the workspace manifest. Let-chains
-      # need 1.88, so this is a real floor, not a guess.
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      # need 1.88 and `graviola` (the TLS provider, see rustible-std::tls)
+      # declares 1.89, so this is a real floor, not a guess.
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
 
       - run: cargo check --workspace --all-targets
 

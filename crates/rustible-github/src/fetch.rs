@@ -66,10 +66,17 @@ impl<F: Fetch + ?Sized> Fetch for Arc<F> {
 }
 
 /// The default [`Fetch`]: `ureq` over `rustls` with the pure-Rust
-/// `rustls-rustcrypto` crypto provider and the bundled `webpki-roots` trust
-/// store (vision 5.3: no C, no system certificate lookup). Follows redirects,
-/// caps the body at [`MAX_BODY_BYTES`], and sends a `rustible-github/<version>`
-/// user agent (GitHub rejects requests without one).
+/// `rustls-graviola` crypto provider from [`rustible_std::tls`] and the
+/// bundled `webpki-roots` trust store (vision 5.3: no C, no system certificate
+/// lookup). Follows redirects, caps the body at [`MAX_BODY_BYTES`], and sends a
+/// `rustible-github/<version>` user agent (GitHub rejects requests without
+/// one).
+///
+/// Graviola asserts on the CPU extensions it needs, so [`Https::get`] runs
+/// [`rustible_std::tls::preflight`] before the handshake and returns a
+/// readable error on a machine below the floor (pre-Broadwell x86_64,
+/// Raspberry Pi 4 and earlier) rather than panicking mid-playbook. There is no
+/// fallback provider.
 #[derive(Debug, Clone)]
 pub struct Https {
     /// Built once: every `Agent` carries its own connection pool and its own
@@ -94,7 +101,7 @@ impl Https {
 
     fn build_agent(timeout: Duration) -> ureq::Agent {
         let tls = ureq::tls::TlsConfig::builder()
-            .unversioned_rustls_crypto_provider(Arc::new(rustls_rustcrypto::provider()))
+            .unversioned_rustls_crypto_provider(rustible_std::tls::provider())
             .build();
         ureq::Agent::config_builder()
             .tls_config(tls)
@@ -116,6 +123,10 @@ impl Default for Https {
 
 impl Fetch for Https {
     fn get(&self, url: &str) -> Result<Response> {
+        // Before the handshake: graviola panics on a CPU without the
+        // extensions it needs, and a panic here would take the whole playbook
+        // down instead of failing this step.
+        rustible_std::tls::preflight("github::UserKeys")?;
         let mut resp = self
             .agent
             .get(url)
