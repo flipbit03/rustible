@@ -140,6 +140,95 @@ has no `usermod` at all, so modifying an existing account there fails with a
 message that names the reason; the Alpine test pins that error instead of
 trusting the `Fake`'s idea of it.
 
+## The SDK surface this branch touches, for the M5 handoff
+
+Short answer for `Elevated`: **nothing to mirror.** The `Backend` trait is
+untouched, `CmdSpec` is untouched, and `spawn` keeps its signature
+(`fn spawn(&self, spec: &CmdSpec) -> io::Result<Output>`). No `Backend`
+primitive was added, removed, or re-signed, so a backend that proxies every
+primitive over a pipe needs no change on the helper side.
+
+`.stdin(..)` needed no new plumbing because `CmdSpec` already carried
+`stdin: Option<Vec<u8>>` alongside `env`, `cwd` and `prefix`; the field was
+there and unused above the backend line. What changed is the *body* of
+`Local::spawn`: the input used to be written inline with a blocking
+`write_all` before `wait_with_output`, which deadlocks against a child that
+fills a pipe buffer with output before reading its input. It is now written
+from a thread that the parent joins after the child exits, with EPIPE ignored
+because a child that never reads its stdin is not an error of ours, and the
+exit status says what happened. A proxying backend must do the same thing on
+whichever side owns the child process, but that is a property of its own
+implementation, not a contract change here.
+
+The rest of the SDK diff, file by file:
+
+| file | change | breaks an impl? |
+|---|---|---|
+| `backend/local.rs` | `Local::spawn` body: stdin from a thread. Four unit tests, including `cat` with 4 MiB. | no |
+| `backend/` elsewhere | nothing | no |
+| `op.rs` | new `fn changed_by_apply(&self, &Self::Output) -> bool`, **defaulted to `true`** | no |
+| `ctx.rs` | one new match arm in `step`, ahead of the existing `Ok(out)` arm | no |
+| `system.rs` | new field `planned: Arc<Mutex<Vec<Planned>>>`; four public methods | no |
+| `lib.rs` | re-export `Planned` next to `Cmd`, `System` | no |
+| `testing.rs` | `wait_for_systemd` polls through `offline` | no |
+
+The four new `System` methods, which are the whole of the check-mode
+mechanism: `note_would_create(kind, name, id)`, `would_create(kind, name)`,
+`would_create_id(kind, id)`, `would_create_id_by_name(kind, name)`.
+
+Because `changed_by_apply` is defaulted, every existing `impl Op` compiles
+unchanged and keeps today's behaviour. `shell::Command` is the only op that
+overrides it.
+
+## How the check-mode planned-group fix works
+
+It was done cleanly; there is no amendment. In one sentence: in check mode an
+op may record what it *would* create, and a later op in the same run may treat
+that record as a satisfied prerequisite.
+
+**What is recorded.** Not `Ctx` but `System`, which is what ops already hold
+and what already carries `check_mode`. `System` gained
+`planned: Arc<Mutex<Vec<Planned>>>`, where `Planned` is `{ kind, name, id:
+Option<u32> }`. The `Arc` is shared by every clone the run makes (sections,
+`as_user`, an elevated identity), so one run has exactly one list, and it is
+in-process state on the clone graph, never anything that crosses a backend.
+
+**Who writes.** `group::Present::check`, when and only when it has decided it
+would create the group, calls `note_would_create("group", name, gid)` — with
+the gid when the playbook pinned one, `None` otherwise.
+
+**Who reads.** `user::Present` for its `groups` list and for `gid` given
+either by name or by number, and `user::Membership`. Each asks, and on a hit
+reports `would change` instead of failing.
+
+**Why it cannot accept a group that will not exist.** Three independent
+reasons, and the last is the one that matters.
+
+1. `would_create*` check `self.check_mode` first and answer `false` / `None`
+   when it is off. In a real run the mechanism does not exist.
+2. Only `check` writes to the list, and only for a change it has already
+   decided to make. A step that is satisfied, or that will fail, records
+   nothing.
+3. The record is not a promise about the world, it is a restatement of what
+   the run is about to do. If the group step would create the group, the real
+   run creates it before the user step looks; if the group step would fail,
+   the real run stops there and the user step never runs at all. In both cases
+   the dry run and the real run agree. The dry run is not trusting a guess, it
+   is trusting the step immediately above it, which is exactly what the real
+   run does.
+
+`it_user_group` pins the boundary rather than describing it: the same
+`user::Present` step that reports `would change` in the dry `Ctx` fails
+against the real machine with "group ... does not exist", and `/etc/group` is
+read afterwards to confirm neither planned group was created. The unit test
+`outside_check_mode_a_planned_group_is_not_accepted` pins the same thing at
+the `System` level.
+
+Prediction stays honest per vision 12. A planned group with no gid appears in
+the user's diff as `group=<name>` and blocks prediction, because the gid is
+genuinely unknown. With `group::Present::gid(4343)` the gid is known, so
+`.gid(&planned)` predicts and the test asserts the predicted value.
+
 ## Deviations from the brief
 
 The brief's container test says `Present::new("rustible-test")` for both the
@@ -170,21 +259,33 @@ Output in `docs/plan/logs/M6-shell-tests-done.txt`.
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib` | clean |
 
 Container suite as CI runs it, `RUSTIBLE_INTEGRATION=1 cargo test -p
-rustible-std --tests`: eleven test binaries, five images, 38s wall.
+rustible-std --tests`: eleven test binaries, five images, 34s wall on the
+second merge. Every one ran to completion on every image it names; none
+skipped. `it_user_busybox` runs against `alpine:3.20` and is not skipped,
+locally or in CI: the GitHub harness job sets `RUSTIBLE_INTEGRATION=1` and its
+log shows `test busybox_user_and_group ... ok` under
+`Running tests/it_user_busybox.rs`. Without that variable every tier-3 test
+skips itself, which is what keeps a plain `cargo test` offline and Docker-free.
 
-| test | images | time |
+| test | images, each run to completion | time |
 |---|---|---|
-| `it_shell_command` | debian:12, ubuntu:24.04 | 0.65s |
-| `it_file_ops` | debian:12, ubuntu:24.04 | 0.72s |
-| `it_user_group` | debian:12, ubuntu:24.04 | 1.35s |
-| `it_user_busybox` | alpine:3.20 | 1.19s |
-| `it_authorized_keys` | debian:12, ubuntu:24.04 | 0.77s |
+| `it_shell_command` | debian:12, ubuntu:24.04 | 0.72s |
+| `it_file_ops` | debian:12, ubuntu:24.04 | 0.71s |
+| `it_user_group` | debian:12, ubuntu:24.04 | 1.28s |
+| `it_user_busybox` | alpine:3.20 | 0.46s |
+| `it_authorized_keys` | debian:12, ubuntu:24.04 | 0.82s |
 | `it_file_line` | debian:12, ubuntu:24.04 | 0.66s |
-| `it_apt_present` | debian:12, ubuntu:24.04 | 11.56s |
-| `it_apt_absent` | debian:12, ubuntu:24.04 | 14.78s |
-| `it_sysctl_present` | debian:12, ubuntu:24.04 | 0.66s |
-| `it_systemd_image` | jrei/systemd-{debian:12,ubuntu:24.04} | 1.76s |
-| `it_systemd` | jrei/systemd-{debian:12,ubuntu:24.04} | 2.31s |
+| `it_apt_present` | debian:12, ubuntu:24.04 | 10.76s |
+| `it_apt_absent` | debian:12, ubuntu:24.04 | 14.97s |
+| `it_sysctl_present` | debian:12, ubuntu:24.04 | 0.69s |
+| `it_systemd_image` | jrei/systemd-debian:12, jrei/systemd-ubuntu:24.04 | 1.40s |
+| `it_systemd` | jrei/systemd-debian:12, jrei/systemd-ubuntu:24.04 | 2.05s |
+
+The four apt and systemd binaries are not this branch's work; they are in the
+table because the branch touches the harness they run on.
+
+All four GitHub checks pass on the head commit: format/clippy/test, MSRV 1.88,
+the `examples/workspace` build, and the Docker harness (1m25s).
 
 ## Not verified
 
