@@ -174,6 +174,20 @@ impl System {
                 .any(|p| p.kind == kind && p.name == name)
     }
 
+    /// In check mode: the planned resource of this kind and name, with the
+    /// id the planning step knew, if any. `None` outside check mode.
+    pub fn would_create_id_by_name(&self, kind: &str, name: &str) -> Option<Planned> {
+        if !self.check_mode {
+            return None;
+        }
+        self.planned
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.kind == kind && p.name == name)
+            .cloned()
+    }
+
     /// In check mode: the planned resource of this kind with this id, if an
     /// earlier step planned it with the id known. `None` outside check mode.
     pub fn would_create_id(&self, kind: &str, id: u32) -> Option<Planned> {

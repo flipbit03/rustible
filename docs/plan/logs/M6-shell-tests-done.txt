@@ -1,0 +1,892 @@
+# M6 shell-tests done-when, 2026-09-08T12:14:48-03:00, 300e3d1
+
+$ cargo fmt --all --check
+fmt: clean
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+
+$ cargo test --workspace
+     Running unittests src/lib.rs (target/debug/deps/rustible-9b3428ddd10b8556)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_cli-d38d885f9236faab)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/main.rs (target/debug/deps/rustible-f916215e11041cf8)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/init.rs (target/debug/deps/init-06bfb95df5a92ea6)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-f4bd8a732f3fe82b)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-3c628cdf2feaa5e1)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ui.rs (target/debug/deps/ui-03e2bf62c6153ec4)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-0a2825b78f02d0c5)
+test result: ok. 280 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-c157cba9be5d117a)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-0840839c1953ad7d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-184d60059bdfac0e)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-3b9d9e63bef216ca)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-27ffb110d0ffc73c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-a61e76ea13272c7c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-df2d5540edca2de6)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-3057a3766aab0b62)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-0f16aca6a335b691)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-cacccd2b8bfc9626)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/mc.rs (target/debug/deps/mc-f66f4918ce89550d)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/main.rs (target/debug/deps/spike_playbook-0ea54633e4475fe6)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_build
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_cli
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_github
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_macros
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_sdk
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_std
+test result: ok. 6 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command -- --nocapture    # 2026-09-08T12:14:50-03:00
+
+integration: building test target `it_shell_command` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_shell_command-be21dcac9a21384a in 0.1s
+  [debian:12]    $ /bin/sh -c echo hi; echo $LANG; echo err >&2 (as self, exit 0, 1ms)
+  [debian:12]  echo ....................................... changed         $ /bin/sh -c echo hi; echo $LANG; echo err >&2   action
+        | $ /bin/sh -c echo hi; echo $LANG; echo err >&2
+  [debian:12]    $ /bin/sh -c echo hi (as self, exit 0, 0ms)
+  [debian:12]  echo again ................................. changed         $ /bin/sh -c echo hi   action
+        | $ /bin/sh -c echo hi
+  [debian:12]    $ touch /etc/rustible-test/marker (as self, exit 0, 1ms)
+  [debian:12]  touch marker ............................... changed         $ touch /etc/rustible-test/marker
+        | $ touch /etc/rustible-test/marker
+  [debian:12]  touch marker (again) ....................... ok           
+  [debian:12]    $ rm /etc/rustible-test/marker (as self, exit 0, 1ms)
+  [debian:12]  rm marker .................................. changed         $ rm /etc/rustible-test/marker
+        | $ rm /etc/rustible-test/marker
+  [debian:12]  rm marker (again) .......................... ok           
+  [debian:12]    $ cat (as self, exit 0, 1ms)
+  [debian:12]  cat stdin .................................. changed         $ cat   action
+        | $ cat
+  [debian:12]    $ wc -c (as self, exit 0, 4ms)
+  [debian:12]  wc stdin ................................... changed         $ wc -c   action
+        | $ wc -c
+  [debian:12]    $ /bin/sh -c echo $RUSTIBLE_TEST_VAR (as self, exit 0, 0ms)
+  [debian:12]  env ........................................ changed         $ /bin/sh -c echo $RUSTIBLE_TEST_VAR   action
+        | $ /bin/sh -c echo $RUSTIBLE_TEST_VAR
+  [debian:12]    $ pwd (as self, exit 0, 1ms)
+  [debian:12]  cwd ........................................ changed         $ pwd   action
+        | $ pwd
+  [debian:12]    $ /bin/sh -c echo Already up to date. (as self, exit 0, 0ms)
+  [debian:12]  up to date ................................. ok              $ /bin/sh -c echo Already up to date.   ran, unchanged
+  [debian:12]    $ /bin/sh -c echo Updating 1..2 (as self, exit 0, 0ms)
+  [debian:12]  updated .................................... changed         $ /bin/sh -c echo Updating 1..2
+        | $ /bin/sh -c echo Updating 1..2
+  [debian:12]    $ /bin/sh -c echo boom >&2; exit 7 (as self, exit 7, 0ms)
+  [debian:12]  fails ...................................... FAILED          $ /bin/sh -c echo boom >&2; exit 7   `/bin/sh -c echo boom >&2; exit 7` exited 7
+  [debian:12]    $ false (as self, exit 1, 1ms)
+  [debian:12]  ignored .................................... FAILED          $ false   `false` exited 1
+[debian:12] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+  [ubuntu:24.04]    $ /bin/sh -c echo hi; echo $LANG; echo err >&2 (as self, exit 0, 1ms)
+  [ubuntu:24.04]  echo ....................................... changed         $ /bin/sh -c echo hi; echo $LANG; echo err >&2   action
+        | $ /bin/sh -c echo hi; echo $LANG; echo err >&2
+  [ubuntu:24.04]    $ /bin/sh -c echo hi (as self, exit 0, 0ms)
+  [ubuntu:24.04]  echo again ................................. changed         $ /bin/sh -c echo hi   action
+        | $ /bin/sh -c echo hi
+  [ubuntu:24.04]    $ touch /etc/rustible-test/marker (as self, exit 0, 1ms)
+  [ubuntu:24.04]  touch marker ............................... changed         $ touch /etc/rustible-test/marker
+        | $ touch /etc/rustible-test/marker
+  [ubuntu:24.04]  touch marker (again) ....................... ok           
+  [ubuntu:24.04]    $ rm /etc/rustible-test/marker (as self, exit 0, 1ms)
+  [ubuntu:24.04]  rm marker .................................. changed         $ rm /etc/rustible-test/marker
+        | $ rm /etc/rustible-test/marker
+  [ubuntu:24.04]  rm marker (again) .......................... ok           
+  [ubuntu:24.04]    $ cat (as self, exit 0, 1ms)
+  [ubuntu:24.04]  cat stdin .................................. changed         $ cat   action
+        | $ cat
+  [ubuntu:24.04]    $ wc -c (as self, exit 0, 4ms)
+  [ubuntu:24.04]  wc stdin ................................... changed         $ wc -c   action
+        | $ wc -c
+  [ubuntu:24.04]    $ /bin/sh -c echo $RUSTIBLE_TEST_VAR (as self, exit 0, 0ms)
+  [ubuntu:24.04]  env ........................................ changed         $ /bin/sh -c echo $RUSTIBLE_TEST_VAR   action
+        | $ /bin/sh -c echo $RUSTIBLE_TEST_VAR
+  [ubuntu:24.04]    $ pwd (as self, exit 0, 1ms)
+  [ubuntu:24.04]  cwd ........................................ changed         $ pwd   action
+        | $ pwd
+  [ubuntu:24.04]    $ /bin/sh -c echo Already up to date. (as self, exit 0, 0ms)
+  [ubuntu:24.04]  up to date ................................. ok              $ /bin/sh -c echo Already up to date.   ran, unchanged
+  [ubuntu:24.04]    $ /bin/sh -c echo Updating 1..2 (as self, exit 0, 0ms)
+  [ubuntu:24.04]  updated .................................... changed         $ /bin/sh -c echo Updating 1..2
+        | $ /bin/sh -c echo Updating 1..2
+  [ubuntu:24.04]    $ /bin/sh -c echo boom >&2; exit 7 (as self, exit 7, 0ms)
+  [ubuntu:24.04]  fails ...................................... FAILED          $ /bin/sh -c echo boom >&2; exit 7   `/bin/sh -c echo boom >&2; exit 7` exited 7
+  [ubuntu:24.04]    $ false (as self, exit 1, 1ms)
+  [ubuntu:24.04]  ignored .................................... FAILED          $ false   `false` exited 1
+[ubuntu:24.04] ok in 0.3s  echo: changed, echo again: changed, touch marker: changed, touch marker (again): ok, rm marker: changed, rm marker (again): ok, cat stdin: changed, wc stdin: changed, env: changed, cwd: changed, up to date: ok, updated: changed, fails: failed, ignored: failed
+test command_options_against_a_real_shell ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_ops -- --nocapture    # 2026-09-08T12:14:51-03:00
+
+integration: building test target `it_file_ops` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_ops-0c89fe80270eed57 in 0.0s
+  [debian:12]  directory .................................. changed         exists=yes mode=0750 owner=0:0
+        | /etc/rustible-test/files:
+        |   exists: no -> yes
+        |   mode: - -> 0750
+        |   owner: - -> 0:0
+  [debian:12]  directory (again) .......................... ok           
+  [debian:12]  directory mode ............................. changed         mode=0750
+        | /etc/rustible-test/files:
+        |   mode: 0755 -> 0750
+  [debian:12]  directory mode (again) ..................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/app.conf (10 bytes)
+  [debian:12]  copy ....................................... changed         +1 -0 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -0,0 +1 @@
+        | +port = 80
+  [debian:12]  copy (again) ............................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/app.conf (12 bytes)
+  [debian:12]  copy new content ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1 @@
+        | -port = 80
+        | +port = 8080
+  [debian:12]  copy new content (again) ................... ok           
+  [debian:12]  copy mode only ............................. changed         mode=0600
+        | /etc/rustible-test/files/app.conf:
+        |   mode: 0640 -> 0600
+  [debian:12]  copy mode only (again) ..................... ok           
+  [debian:12]  attrs ...................................... changed         mode=0644 owner=1:1
+        | /etc/rustible-test/files/app.conf:
+        |   mode: 0600 -> 0644
+        |   owner: 0:0 -> 1:1
+  [debian:12]  attrs (again) .............................. ok           
+  [debian:12]    debug: linked /etc/rustible-test/files/app.link -> /etc/rustible-test/files/app.conf
+  [debian:12]  symlink .................................... changed         target=/etc/rustible-test/files/app.conf
+        | /etc/rustible-test/files/app.link:
+        |   target: - -> /etc/rustible-test/files/app.conf
+  [debian:12]  symlink (again) ............................ ok           
+  [debian:12]    debug: linked /etc/rustible-test/files/app.link.rustible-tmp-7 -> /etc/rustible-test/files
+  [debian:12]  symlink repointed .......................... changed         target=/etc/rustible-test/files
+        | /etc/rustible-test/files/app.link:
+        |   target: /etc/rustible-test/files/app.conf -> /etc/rustible-test/files
+  [debian:12]  symlink repointed (again) .................. ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/app.conf (12 bytes)
+  [debian:12]  line ....................................... changed         +1 -1 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1 @@
+        | -port = 8080
+        | +port = 9090
+  [debian:12]  line (again) ............................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/app.conf (24 bytes)
+  [debian:12]  line appended .............................. changed         +1 -0 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1,2 @@
+        |  port = 9090
+        | +workers = 4
+  [debian:12]  line appended (again) ...................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/managed.cfg (66 bytes)
+  [debian:12]  block ...................................... changed         +4 -0 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -0,0 +1,4 @@
+        | +# BEGIN MANAGED BY RUSTIBLE
+        | +a = 1
+        | +b = 2
+        | +# END MANAGED BY RUSTIBLE
+  [debian:12]  block (again) .............................. ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/managed.cfg (60 bytes)
+  [debian:12]  block changed .............................. changed         +1 -2 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -1,4 +1,3 @@
+        |  # BEGIN MANAGED BY RUSTIBLE
+        | -a = 1
+        | -b = 2
+        | +a = 2
+        |  # END MANAGED BY RUSTIBLE
+  [debian:12]  block changed (again) ...................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/files/managed.cfg (0 bytes)
+  [debian:12]  block removed .............................. changed         +0 -3 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -1,3 +0,0 @@
+        | -# BEGIN MANAGED BY RUSTIBLE
+        | -a = 2
+        | -# END MANAGED BY RUSTIBLE
+  [debian:12]  block removed (again) ...................... ok           
+  [debian:12]  absent link ................................ changed         exists=no
+        | /etc/rustible-test/files/app.link:
+        |   exists: yes (symlink) -> no
+  [debian:12]  absent link (again) ........................ ok           
+  [debian:12]  absent populated dir ....................... FAILED          /etc/rustible-test/files is a directory with 4 entries; use .recursive(true) to remove it
+  [debian:12]    debug: removed tree /etc/rustible-test/files
+  [debian:12]  absent tree ................................ changed         exists=no entries=0
+        | /etc/rustible-test/files:
+        |   exists: yes (dir) -> no
+        |   entries: 4 -> 0
+  [debian:12]  absent tree (again) ........................ ok           
+[debian:12] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+  [ubuntu:24.04]  directory .................................. changed         exists=yes mode=0750 owner=0:0
+        | /etc/rustible-test/files:
+        |   exists: no -> yes
+        |   mode: - -> 0750
+        |   owner: - -> 0:0
+  [ubuntu:24.04]  directory (again) .......................... ok           
+  [ubuntu:24.04]  directory mode ............................. changed         mode=0750
+        | /etc/rustible-test/files:
+        |   mode: 0755 -> 0750
+  [ubuntu:24.04]  directory mode (again) ..................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/app.conf (10 bytes)
+  [ubuntu:24.04]  copy ....................................... changed         +1 -0 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -0,0 +1 @@
+        | +port = 80
+  [ubuntu:24.04]  copy (again) ............................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/app.conf (12 bytes)
+  [ubuntu:24.04]  copy new content ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1 @@
+        | -port = 80
+        | +port = 8080
+  [ubuntu:24.04]  copy new content (again) ................... ok           
+  [ubuntu:24.04]  copy mode only ............................. changed         mode=0600
+        | /etc/rustible-test/files/app.conf:
+        |   mode: 0640 -> 0600
+  [ubuntu:24.04]  copy mode only (again) ..................... ok           
+  [ubuntu:24.04]  attrs ...................................... changed         mode=0644 owner=1:1
+        | /etc/rustible-test/files/app.conf:
+        |   mode: 0600 -> 0644
+        |   owner: 0:0 -> 1:1
+  [ubuntu:24.04]  attrs (again) .............................. ok           
+  [ubuntu:24.04]    debug: linked /etc/rustible-test/files/app.link -> /etc/rustible-test/files/app.conf
+  [ubuntu:24.04]  symlink .................................... changed         target=/etc/rustible-test/files/app.conf
+        | /etc/rustible-test/files/app.link:
+        |   target: - -> /etc/rustible-test/files/app.conf
+  [ubuntu:24.04]  symlink (again) ............................ ok           
+  [ubuntu:24.04]    debug: linked /etc/rustible-test/files/app.link.rustible-tmp-7 -> /etc/rustible-test/files
+  [ubuntu:24.04]  symlink repointed .......................... changed         target=/etc/rustible-test/files
+        | /etc/rustible-test/files/app.link:
+        |   target: /etc/rustible-test/files/app.conf -> /etc/rustible-test/files
+  [ubuntu:24.04]  symlink repointed (again) .................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/app.conf (12 bytes)
+  [ubuntu:24.04]  line ....................................... changed         +1 -1 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1 @@
+        | -port = 8080
+        | +port = 9090
+  [ubuntu:24.04]  line (again) ............................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/app.conf (24 bytes)
+  [ubuntu:24.04]  line appended .............................. changed         +1 -0 lines
+        | --- /etc/rustible-test/files/app.conf (before)
+        | +++ /etc/rustible-test/files/app.conf (after)
+        | @@ -1 +1,2 @@
+        |  port = 9090
+        | +workers = 4
+  [ubuntu:24.04]  line appended (again) ...................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/managed.cfg (66 bytes)
+  [ubuntu:24.04]  block ...................................... changed         +4 -0 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -0,0 +1,4 @@
+        | +# BEGIN MANAGED BY RUSTIBLE
+        | +a = 1
+        | +b = 2
+        | +# END MANAGED BY RUSTIBLE
+  [ubuntu:24.04]  block (again) .............................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/managed.cfg (60 bytes)
+  [ubuntu:24.04]  block changed .............................. changed         +1 -2 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -1,4 +1,3 @@
+        |  # BEGIN MANAGED BY RUSTIBLE
+        | -a = 1
+        | -b = 2
+        | +a = 2
+        |  # END MANAGED BY RUSTIBLE
+  [ubuntu:24.04]  block changed (again) ...................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/files/managed.cfg (0 bytes)
+  [ubuntu:24.04]  block removed .............................. changed         +0 -3 lines
+        | --- /etc/rustible-test/files/managed.cfg (before)
+        | +++ /etc/rustible-test/files/managed.cfg (after)
+        | @@ -1,3 +0,0 @@
+        | -# BEGIN MANAGED BY RUSTIBLE
+        | -a = 2
+        | -# END MANAGED BY RUSTIBLE
+  [ubuntu:24.04]  block removed (again) ...................... ok           
+  [ubuntu:24.04]  absent link ................................ changed         exists=no
+        | /etc/rustible-test/files/app.link:
+        |   exists: yes (symlink) -> no
+  [ubuntu:24.04]  absent link (again) ........................ ok           
+  [ubuntu:24.04]  absent populated dir ....................... FAILED          /etc/rustible-test/files is a directory with 4 entries; use .recursive(true) to remove it
+  [ubuntu:24.04]    debug: removed tree /etc/rustible-test/files
+  [ubuntu:24.04]  absent tree ................................ changed         exists=no entries=0
+        | /etc/rustible-test/files:
+        |   exists: yes (dir) -> no
+        |   entries: 4 -> 0
+  [ubuntu:24.04]  absent tree (again) ........................ ok           
+[ubuntu:24.04] ok in 0.3s  directory: changed, directory (again): ok, directory mode: changed, directory mode (again): ok, copy: changed, copy (again): ok, copy new content: changed, copy new content (again): ok, copy mode only: changed, copy mode only (again): ok, attrs: changed, attrs (again): ok, symlink: changed, symlink (again): ok, symlink repointed: changed, symlink repointed (again): ok, line: changed, line (again): ok, line appended: changed, line appended (again): ok, block: changed, block (again): ok, block changed: changed, block changed (again): ok, block removed: changed, block removed (again): ok, absent link: changed, absent link (again): ok, absent populated dir: failed, absent tree: changed, absent tree (again): ok
+test file_family_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group -- --nocapture    # 2026-09-08T12:14:52-03:00
+
+integration: building test target `it_user_group` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_user_group-1e6485567a0d1941 in 0.0s
+  [debian:12]    $ groupadd rustible-grp (as self, exit 0, 27ms)
+  [debian:12]  group ...................................... changed         exists=yes
+        | group rustible-grp:
+        |   exists: no -> yes
+  [debian:12]  group (again) .............................. ok           
+  [debian:12]    $ useradd -G rustible-grp -s /bin/bash -c Rustible test -m rustible-usr (as self, exit 0, 54ms)
+  [debian:12]  user ....................................... changed         exists=yes home=/home/rustible-usr shell=/bin/bash comment=Rustible test groups=rustible-grp
+        | user rustible-usr:
+        |   exists: no -> yes
+        |   home: - -> /home/rustible-usr
+        |   shell: - -> /bin/bash
+        |   comment: - -> Rustible test
+        |   groups: - -> rustible-grp
+  [debian:12]  user (again) ............................... ok           
+  [debian:12]    $ usermod -s /bin/sh -c Rustible rustible-usr (as self, exit 0, 13ms)
+  [debian:12]  user modified .............................. changed         shell=/bin/sh comment=Rustible
+        | user rustible-usr:
+        |   shell: /bin/bash -> /bin/sh
+        |   comment: Rustible test -> Rustible
+  [debian:12]  user modified (again) ...................... ok           
+  [debian:12]    $ groupadd -g 4242 rustible-grp2 (as self, exit 0, 16ms)
+  [debian:12]  group with gid ............................. changed         exists=yes gid=4242
+        | group rustible-grp2:
+        |   exists: no -> yes
+        |   gid: - -> 4242
+  [debian:12]  group with gid (again) ..................... ok           
+  [debian:12]    $ usermod -aG rustible-grp2 rustible-usr (as self, exit 0, 20ms)
+  [debian:12]  membership ................................. changed         groups=rustible-grp,rustible-grp2
+        | user rustible-usr:
+        |   groups: rustible-grp -> rustible-grp,rustible-grp2
+  [debian:12]  membership (again) ......................... ok           
+  [debian:12]  existing ................................... ok           
+  [debian:12]  user with missing group .................... FAILED          group `rustible-missing` does not exist; user::Present does not create groups, use group::Present first
+  [debian:12]  real user in planned-only group ............ FAILED          group `rustible-dry` does not exist; user::Present does not create groups, use group::Present first
+  [debian:12]    $ userdel -r rustible-usr (as self, exit 0, 43ms)
+  [debian:12]  user absent ................................ changed         exists=no home=removed
+        | user rustible-usr:
+        |   exists: yes -> no
+        |   home: /home/rustible-usr -> removed
+  [debian:12]  user absent (again) ........................ ok           
+  [debian:12]    $ groupdel rustible-grp (as self, exit 0, 18ms)
+  [debian:12]  group absent ............................... changed         exists=no
+        | group rustible-grp:
+        |   exists: yes -> no
+  [debian:12]  group absent (again) ....................... ok           
+  [debian:12]    $ groupdel rustible-grp2 (as self, exit 0, 16ms)
+  [debian:12]  group absent ............................... changed         exists=no
+        | group rustible-grp2:
+        |   exists: yes -> no
+  [debian:12]  group absent (again) ....................... ok           
+[debian:12] ok in 0.5s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+  [ubuntu:24.04]    $ groupadd rustible-grp (as self, exit 0, 27ms)
+  [ubuntu:24.04]  group ...................................... changed         exists=yes
+        | group rustible-grp:
+        |   exists: no -> yes
+  [ubuntu:24.04]  group (again) .............................. ok           
+  [ubuntu:24.04]    $ useradd -G rustible-grp -s /bin/bash -c Rustible test -m rustible-usr (as self, exit 0, 62ms)
+  [ubuntu:24.04]  user ....................................... changed         exists=yes home=/home/rustible-usr shell=/bin/bash comment=Rustible test groups=rustible-grp
+        | user rustible-usr:
+        |   exists: no -> yes
+        |   home: - -> /home/rustible-usr
+        |   shell: - -> /bin/bash
+        |   comment: - -> Rustible test
+        |   groups: - -> rustible-grp
+  [ubuntu:24.04]  user (again) ............................... ok           
+  [ubuntu:24.04]    $ usermod -s /bin/sh -c Rustible rustible-usr (as self, exit 0, 13ms)
+  [ubuntu:24.04]  user modified .............................. changed         shell=/bin/sh comment=Rustible
+        | user rustible-usr:
+        |   shell: /bin/bash -> /bin/sh
+        |   comment: Rustible test -> Rustible
+  [ubuntu:24.04]  user modified (again) ...................... ok           
+  [ubuntu:24.04]    $ groupadd -g 4242 rustible-grp2 (as self, exit 0, 17ms)
+  [ubuntu:24.04]  group with gid ............................. changed         exists=yes gid=4242
+        | group rustible-grp2:
+        |   exists: no -> yes
+        |   gid: - -> 4242
+  [ubuntu:24.04]  group with gid (again) ..................... ok           
+  [ubuntu:24.04]    $ usermod -aG rustible-grp2 rustible-usr (as self, exit 0, 19ms)
+  [ubuntu:24.04]  membership ................................. changed         groups=rustible-grp,rustible-grp2
+        | user rustible-usr:
+        |   groups: rustible-grp -> rustible-grp,rustible-grp2
+  [ubuntu:24.04]  membership (again) ......................... ok           
+  [ubuntu:24.04]  existing ................................... ok           
+  [ubuntu:24.04]  user with missing group .................... FAILED          group `rustible-missing` does not exist; user::Present does not create groups, use group::Present first
+  [ubuntu:24.04]  real user in planned-only group ............ FAILED          group `rustible-dry` does not exist; user::Present does not create groups, use group::Present first
+  [ubuntu:24.04]    $ userdel -r rustible-usr (as self, exit 0, 45ms)
+  [ubuntu:24.04]  user absent ................................ changed         exists=no home=removed
+        | user rustible-usr:
+        |   exists: yes -> no
+        |   home: /home/rustible-usr -> removed
+  [ubuntu:24.04]  user absent (again) ........................ ok           
+  [ubuntu:24.04]    $ groupdel rustible-grp (as self, exit 0, 16ms)
+  [ubuntu:24.04]  group absent ............................... changed         exists=no
+        | group rustible-grp:
+        |   exists: yes -> no
+  [ubuntu:24.04]  group absent (again) ....................... ok           
+  [ubuntu:24.04]    $ groupdel rustible-grp2 (as self, exit 0, 16ms)
+  [ubuntu:24.04]  group absent ............................... changed         exists=no
+        | group rustible-grp2:
+        |   exists: yes -> no
+  [ubuntu:24.04]  group absent (again) ....................... ok           
+[ubuntu:24.04] ok in 0.5s  group: changed, group (again): ok, user: changed, user (again): ok, user modified: changed, user modified (again): ok, group with gid: changed, group with gid (again): ok, membership: changed, membership (again): ok, existing: ok, user with missing group: failed, real user in planned-only group: failed, user absent: changed, user absent (again): ok, group absent: changed, group absent (again): ok, group absent: changed, group absent (again): ok
+test users_and_groups_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys -- --nocapture    # 2026-09-08T12:14:53-03:00
+
+integration: building test target `it_authorized_keys` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_authorized_keys-d7c22cf8877e52ed in 0.0s
+  [debian:12]    $ useradd -s /bin/bash -m rustible-ak (as self, exit 0, 47ms)
+  [debian:12]  user ....................................... changed         exists=yes home=/home/rustible-ak shell=/bin/bash
+        | user rustible-ak:
+        |   exists: no -> yes
+        |   home: - -> /home/rustible-ak
+        |   shell: - -> /bin/bash
+  [debian:12]  keys without ~/.ssh ........................ FAILED          /home/rustible-ak/.ssh does not exist; ssh::authorized_keys does not create it (vision 6.7), ensure it first with file::Directory::at(..).mode(0o700).owner(..)
+  [debian:12]  ~/.ssh ..................................... changed         exists=yes mode=0700 owner=1000:1000
+        | /home/rustible-ak/.ssh:
+        |   exists: no -> yes
+        |   mode: - -> 0700
+        |   owner: - -> 1000:1000
+  [debian:12]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (100 bytes)
+  [debian:12]  install keys ............................... changed         +2 -0 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -0,0 +1,2 @@
+        | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [debian:12]  install keys (again) ....................... ok           
+  [debian:12]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (154 bytes)
+  [debian:12]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (100 bytes)
+  [debian:12]  exactly these keys ......................... changed         +0 -1 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -1,3 +1,2 @@
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [debian:12]  exactly these keys (again) ................. ok           
+  [debian:12]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (50 bytes)
+  [debian:12]  revoke a key ............................... changed         +0 -1 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -1,2 +1 @@
+        | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [debian:12]  revoke a key (again) ....................... ok           
+  [debian:12]  by user name ............................... ok           
+[debian:12] ok in 0.3s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+  [ubuntu:24.04]    $ useradd -s /bin/bash -m rustible-ak (as self, exit 0, 55ms)
+  [ubuntu:24.04]  user ....................................... changed         exists=yes home=/home/rustible-ak shell=/bin/bash
+        | user rustible-ak:
+        |   exists: no -> yes
+        |   home: - -> /home/rustible-ak
+        |   shell: - -> /bin/bash
+  [ubuntu:24.04]  keys without ~/.ssh ........................ FAILED          /home/rustible-ak/.ssh does not exist; ssh::authorized_keys does not create it (vision 6.7), ensure it first with file::Directory::at(..).mode(0o700).owner(..)
+  [ubuntu:24.04]  ~/.ssh ..................................... changed         exists=yes mode=0700 owner=1001:1001
+        | /home/rustible-ak/.ssh:
+        |   exists: no -> yes
+        |   mode: - -> 0700
+        |   owner: - -> 1001:1001
+  [ubuntu:24.04]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (100 bytes)
+  [ubuntu:24.04]  install keys ............................... changed         +2 -0 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -0,0 +1,2 @@
+        | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        | +ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [ubuntu:24.04]  install keys (again) ....................... ok           
+  [ubuntu:24.04]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (154 bytes)
+  [ubuntu:24.04]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (100 bytes)
+  [ubuntu:24.04]  exactly these keys ......................... changed         +0 -1 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -1,3 +1,2 @@
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [ubuntu:24.04]  exactly these keys (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /home/rustible-ak/.ssh/authorized_keys (50 bytes)
+  [ubuntu:24.04]  revoke a key ............................... changed         +0 -1 lines
+        | --- /home/rustible-ak/.ssh/authorized_keys (before)
+        | +++ /home/rustible-ak/.ssh/authorized_keys (after)
+        | @@ -1,2 +1 @@
+        | -ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE cadu@x86
+        |  ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITWO cadu@arm
+  [ubuntu:24.04]  revoke a key (again) ....................... ok           
+  [ubuntu:24.04]  by user name ............................... ok           
+[ubuntu:24.04] ok in 0.4s  user: changed, keys without ~/.ssh: failed, ~/.ssh: changed, install keys: changed, install keys (again): ok, exactly these keys: changed, exactly these keys (again): ok, revoke a key: changed, revoke a key (again): ok, by user name: ok
+test authorized_keys_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line -- --nocapture    # 2026-09-08T12:14:54-03:00
+
+integration: building test target `it_file_line` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_file_line-31de893d10d12cd2 in 0.3s
+  [debian:12]    debug: wrote /etc/rustible-test/motd (20 bytes)
+  [debian:12]  add greeting ............................... changed         +1 -0 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -0,0 +1 @@
+        | +hello from rustible
+  [debian:12]  add greeting (again) ....................... ok           
+  [debian:12]    debug: wrote /etc/rustible-test/motd (12 bytes)
+  [debian:12]  replace greeting ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -1 +1 @@
+        | -hello from rustible
+        | +hello again
+  [debian:12]  replace greeting (again) ................... ok           
+[debian:12] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/motd (20 bytes)
+  [ubuntu:24.04]  add greeting ............................... changed         +1 -0 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -0,0 +1 @@
+        | +hello from rustible
+  [ubuntu:24.04]  add greeting (again) ....................... ok           
+  [ubuntu:24.04]    debug: wrote /etc/rustible-test/motd (12 bytes)
+  [ubuntu:24.04]  replace greeting ........................... changed         +1 -1 lines
+        | --- /etc/rustible-test/motd (before)
+        | +++ /etc/rustible-test/motd (after)
+        | @@ -1 +1 @@
+        | -hello from rustible
+        | +hello again
+  [ubuntu:24.04]  replace greeting (again) ................... ok           
+[ubuntu:24.04] ok in 0.3s  add greeting: changed, add greeting (again): ok, replace greeting: changed, replace greeting (again): ok
+test line_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture    # 2026-09-08T12:14:55-03:00
+
+integration: building test target `it_apt_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.3s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-cache policy sl (as self, exit 0, 38ms)
+  [debian:12]    $ apt-get update (as self, exit 0, 1204ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 862ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl (again) ......................... ok           
+[debian:12] ok in 2.4s  install sl: changed, install sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-cache policy sl (as self, exit 0, 40ms)
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 4653ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 5967ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl (again) ......................... ok           
+[ubuntu:24.04] ok in 11.0s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.80s
+  wall: 14s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture    # 2026-09-08T12:15:09-03:00
+
+integration: building test target `it_apt_absent` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_apt_absent-bda802958248f8c3 in 0.4s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (not installed) .................. ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-cache policy sl (as self, exit 0, 11ms)
+  [debian:12]    $ apt-get update (as self, exit 0, 1049ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 796ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get purge -y sl (as self, exit 0, 673ms)
+  [debian:12]    $ apt-get autoremove -y --purge (as self, exit 0, 714ms)
+  [debian:12]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (again) .......................... ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}
+[debian:12] ok in 3.6s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (not installed) .................. ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-cache policy sl (as self, exit 0, 13ms)
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 5182ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 3756ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get purge -y sl (as self, exit 0, 1118ms)
+  [ubuntu:24.04]    $ apt-get autoremove -y --purge (as self, exit 0, 1111ms)
+  [ubuntu:24.04]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (again) .......................... ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}
+[ubuntu:24.04] ok in 11.5s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.49s
+  wall: 16s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture    # 2026-09-08T12:15:25-03:00
+
+integration: building test target `it_sysctl_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_sysctl_present-8d91a699c9dce57a in 0.3s
+  [debian:12]  persist without the directory .............. FAILED          /etc/sysctl.d does not exist; sysctl::Present creates the file but not its directory (use file::Directory)
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [debian:12]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [debian:12]  persist ip_forward (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [debian:12]  persist swappiness (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [debian:12]  flip ip_forward (again) .................... ok           
+  [debian:12]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [debian:12]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [ubuntu:24.04]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [ubuntu:24.04]  persist ip_forward (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [ubuntu:24.04]  persist swappiness (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [ubuntu:24.04]  flip ip_forward (again) .................... ok           
+  [ubuntu:24.04]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [ubuntu:24.04]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+  wall: 1s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image -- --nocapture    # 2026-09-08T12:15:26-03:00
+
+integration: building test target `it_systemd_image` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd_image-ea7b0b9c809a71d9 in 0.3s
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  journald is active ......................... changed         $ systemctl is-active systemd-journald   action
+        | $ systemctl is-active systemd-journald
+[jrei/systemd-debian:12] ok in 0.7s  journald is active: changed
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  journald is active ......................... changed         $ systemctl is-active systemd-journald   action
+        | $ systemctl is-active systemd-journald
+[jrei/systemd-ubuntu:24.04] ok in 0.7s  journald is active: changed
+test systemd_is_pid1 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+  wall: 2s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd -- --nocapture    # 2026-09-08T12:15:28-03:00
+
+integration: building test target `it_systemd` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6sh/target/x86_64-unknown-linux-musl/release/deps/it_systemd-779748bb14a01da0 in 0.4s
+  [jrei/systemd-debian:12]    debug: wrote /etc/systemd/system/rustible-test.service (124 bytes)
+  [jrei/systemd-debian:12]    $ systemctl daemon-reload (as self, exit 0, 28ms)
+  [jrei/systemd-debian:12]    $ systemctl reload-or-restart systemd-journald (as self, exit 0, 33ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled systemd-journald (as self, exit 0, 7ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  journald reload-or-restart with daemon-reload  changed         systemctl daemon-reload && systemctl reload-or-restart systemd-journald   action
+        | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl enable --now rustible-test (as self, exit 0, 35ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit enabled and started ................... changed         enabled=enabled active=active
+        | rustible-test:
+        |   enabled: disabled -> enabled
+        |   active: inactive -> active
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit enabled and started (again) ........... ok           
+  [jrei/systemd-debian:12]    $ systemctl restart rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit restarted ............................. changed         systemctl restart rustible-test   action
+        | systemctl restart rustible-test
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl stop rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  unit stopped ............................... changed         active=inactive
+        | rustible-test:
+        |   active: active -> inactive
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  unit stopped (again) ....................... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl start rustible-test (as self, exit 0, 11ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit running ............................... changed         active=active
+        | rustible-test:
+        |   active: inactive -> active
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  unit running (again) ....................... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl disable --now rustible-test (as self, exit 0, 30ms)
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  unit disabled and stopped .................. changed         enabled=disabled active=inactive
+        | rustible-test:
+        |   enabled: enabled -> disabled
+        |   active: active -> inactive
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-test (as self, exit 1, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  unit disabled and stopped (again) .......... ok           
+  [jrei/systemd-debian:12]    $ systemctl is-enabled systemd-journald (as self, exit 0, 5ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-debian:12]  static unit cannot be disabled ............. FAILED          systemd::Disabled: unit `systemd-journald` is static: it has no [Install] section, so it cannot be disabled; mask it (`systemctl mask systemd-journald`) or stop it instead
+  [jrei/systemd-debian:12]    $ systemctl is-enabled rustible-nope (as self, exit 1, 3ms)
+  [jrei/systemd-debian:12]    $ systemctl is-active rustible-nope (as self, exit 3, 3ms)
+  [jrei/systemd-debian:12]  missing unit ............................... FAILED          systemd::Enabled: unit `rustible-nope` not found by `systemctl is-enabled`
+[jrei/systemd-debian:12] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+  [jrei/systemd-ubuntu:24.04]    debug: wrote /etc/systemd/system/rustible-test.service (124 bytes)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl daemon-reload (as self, exit 0, 35ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl reload-or-restart systemd-journald (as self, exit 0, 29ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled systemd-journald (as self, exit 0, 6ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  journald reload-or-restart with daemon-reload  changed         systemctl daemon-reload && systemctl reload-or-restart systemd-journald   action
+        | systemctl daemon-reload && systemctl reload-or-restart systemd-journald
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl enable --now rustible-test (as self, exit 0, 44ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit enabled and started ................... changed         enabled=enabled active=active
+        | rustible-test:
+        |   enabled: disabled -> enabled
+        |   active: inactive -> active
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit enabled and started (again) ........... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl restart rustible-test (as self, exit 0, 5ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit restarted ............................. changed         systemctl restart rustible-test   action
+        | systemctl restart rustible-test
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 2ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl stop rustible-test (as self, exit 0, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 2ms)
+  [jrei/systemd-ubuntu:24.04]  unit stopped ............................... changed         active=inactive
+        | rustible-test:
+        |   active: active -> inactive
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit stopped (again) ....................... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl start rustible-test (as self, exit 0, 16ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit running ............................... changed         active=active
+        | rustible-test:
+        |   active: inactive -> active
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit running (again) ....................... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 0, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 0, 2ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl disable --now rustible-test (as self, exit 0, 45ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 5ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit disabled and stopped .................. changed         enabled=disabled active=inactive
+        | rustible-test:
+        |   enabled: enabled -> disabled
+        |   active: active -> inactive
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-test (as self, exit 1, 4ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-test (as self, exit 3, 3ms)
+  [jrei/systemd-ubuntu:24.04]  unit disabled and stopped (again) .......... ok           
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled systemd-journald (as self, exit 0, 5ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active systemd-journald (as self, exit 0, 2ms)
+  [jrei/systemd-ubuntu:24.04]  static unit cannot be disabled ............. FAILED          systemd::Disabled: unit `systemd-journald` is static: it has no [Install] section, so it cannot be disabled; mask it (`systemctl mask systemd-journald`) or stop it instead
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-enabled rustible-nope (as self, exit 4, 3ms)
+  [jrei/systemd-ubuntu:24.04]    $ systemctl is-active rustible-nope (as self, exit 4, 3ms)
+  [jrei/systemd-ubuntu:24.04]  missing unit ............................... FAILED          systemd::Enabled: unit `rustible-nope` not found by `systemctl is-enabled`
+[jrei/systemd-ubuntu:24.04] ok in 1.0s  journald reload-or-restart with daemon-reload: changed, unit enabled and started: changed, unit enabled and started (again): ok, unit restarted: changed, unit stopped: changed, unit stopped (again): ok, unit running: changed, unit running (again): ok, unit disabled and stopped: changed, unit disabled and stopped (again): ok, static unit cannot be disabled: failed, missing unit: failed
+test unit_lifecycle_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.44s
+  wall: 3s
+
+finished 2026-09-08T12:15:31-03:00
+DONE

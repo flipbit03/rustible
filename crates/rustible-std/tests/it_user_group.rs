@@ -99,6 +99,28 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(!looked_up.changed);
     assert_eq!(looked_up.groups, vec![GRP, GRP2]);
 
+    // The vision 6.1 shape with a group of the same name first: useradd
+    // refuses to create the private group, so the op uses the existing one.
+    let (same_grp, _) = changed_then_ok(ctx, "same-named group", || {
+        group::Present::new("rustible-same")
+    })?;
+    let (same, _) = changed_then_ok(ctx, "same-named user", || {
+        user::Present::new("rustible-same").shell("/bin/sh")
+    })?;
+    assert_eq!(same.gid, same_grp.gid);
+    changed_then_ok(ctx, "same-named user absent", || {
+        user::Absent::new("rustible-same").remove_home(true)
+    })?;
+    // userdel takes the primary group with the account when it has the
+    // account's name and no other member (USERGROUPS_ENAB), so nothing is
+    // left for group::Absent to do.
+    let gone = ctx.step(
+        "same-named group absent",
+        group::Absent::new("rustible-same"),
+    )?;
+    assert!(!gone.changed && gone.gid.is_none());
+    assert!(line_of(&ctx.sys().read_to_string("/etc/group")?, "rustible-same").is_none());
+
     // Vision 6.7 against the real tools: a missing group is refused, not created.
     let err = ctx
         .step(

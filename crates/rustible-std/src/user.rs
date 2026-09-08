@@ -435,7 +435,10 @@ struct Inspection {
 /// Attributes not asked for are never touched on an existing account, and
 /// `create_home`/`system` only matter on creation, as in Ansible. Groups
 /// named in `groups` and the primary group from `gid` must already exist
-/// (vision 6.7). On Alpine, where BusyBox has no `usermod`, changing the
+/// (vision 6.7). Without `gid`, a new account whose name is already a
+/// group's name gets that group as its primary group (`useradd -g`), where
+/// the tools would otherwise refuse to create the private group; Ansible
+/// passes `-N` instead and lands the account in the default group. On Alpine, where BusyBox has no `usermod`, changing the
 /// uid, gid, home, shell or comment of an existing account fails clearly;
 /// group membership still works through `addgroup`/`delgroup`.
 ///
@@ -584,6 +587,26 @@ impl Present {
         })
     }
 
+    /// The primary group for a new account when `gid` was not given: the
+    /// group named after the user, if one exists (or, in check mode, is
+    /// planned), because `useradd`/`adduser` would otherwise fail trying to
+    /// create the private group. `None` lets the tool create it.
+    fn same_named_group(&self, sys: &System, group_text: &str) -> Result<Option<Primary>> {
+        Ok(match lookup_group(group_text, &self.name)? {
+            Some(g) => Some(Primary {
+                name: g.name,
+                gid: Some(g.gid),
+            }),
+            None if sys.would_create("group", &self.name) => Some(Primary {
+                name: self.name.clone(),
+                gid: sys
+                    .would_create_id_by_name("group", &self.name)
+                    .and_then(|p| p.id),
+            }),
+            None => None,
+        })
+    }
+
     fn inspect(&self, sys: &System) -> Result<Inspection> {
         validate_name("user", &self.name)?;
         if let Some(home) = &self.home {
@@ -617,9 +640,11 @@ impl Present {
                 );
             }
         }
-        let primary = self.resolve_primary(sys, &group_text)?;
-
         let current = lookup_user(&passwd, &self.name)?;
+        let mut primary = self.resolve_primary(sys, &group_text)?;
+        if primary.is_none() && current.is_none() {
+            primary = self.same_named_group(sys, &group_text)?;
+        }
         if let Some(uid) = self.uid
             && let Some(taken) = passwd_by_uid(&passwd, uid)
             && taken.name != self.name
@@ -936,7 +961,11 @@ impl Op for Present {
         };
         let tools = Tools::of(sys);
         if changes.iter().any(|c| c.name == "exists") {
-            let primary = self.resolve_primary(sys, &sys.read_to_string("/etc/group")?)?;
+            let group_text = sys.read_to_string("/etc/group")?;
+            let mut primary = self.resolve_primary(sys, &group_text)?;
+            if primary.is_none() {
+                primary = self.same_named_group(sys, &group_text)?;
+            }
             self.create(sys, tools, primary)?;
         } else {
             self.modify(sys, tools, &Delta::from_changes(changes)?)?;
@@ -1582,8 +1611,10 @@ mod tests {
         assert!(c.predicted.is_none());
         let c = change(Present::new("rustible").uid(4).check(&sys).unwrap());
         assert!(c.predicted.is_none());
+        // A group named after the new user becomes its primary group (the
+        // tool would refuse to create the private group), so the gid is known.
         let c = change(Present::new("docker").uid(1500).check(&sys).unwrap());
-        assert!(c.predicted.is_none());
+        assert_eq!(c.predicted.unwrap().gid, 998);
         // With an explicit primary group the gid is known.
         let c = change(
             Present::new("rustible")
@@ -1882,6 +1913,92 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/sh"));
+    }
+
+    #[test]
+    fn a_group_named_after_a_new_user_becomes_its_primary_group() {
+        // `group::Present::new("svc")` then `user::Present::new("svc")`:
+        // useradd would refuse to create the private group `svc`.
+        let group_text = format!("{GROUP}svc:x:4000:\n");
+        let fake = Arc::new(
+            base()
+                .with_file("/etc/group", &group_text)
+                .with_cmd("useradd", None, 0, ""),
+        );
+        let sys = fake_sys(&fake);
+        let op = Present::new("svc").uid(4000).shell("/bin/sh");
+        let c = change(op.check(&sys).unwrap());
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes uid=4000 gid=4000 home=/home/svc shell=/bin/sh"
+        );
+        assert_eq!(c.predicted.as_ref().unwrap().gid, 4000, "gid is known");
+        write(
+            &fake,
+            "/etc/passwd",
+            &format!("{PASSWD}svc:x:4000:4000::/home/svc:/bin/sh\n"),
+        );
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                "useradd", "-u", "4000", "-g", "4000", "-s", "/bin/sh", "-m", "svc"
+            ]]
+        );
+
+        // BusyBox: `-G svc`.
+        let fake = Arc::new(
+            base()
+                .with_file("/etc/group", &group_text)
+                .with_cmd("adduser", None, 0, ""),
+        );
+        let sys = alpine(fake_sys(&fake));
+        let op = Present::new("svc").uid(4000).shell("/bin/ash");
+        let c = change(op.check(&sys).unwrap());
+        write(
+            &fake,
+            "/etc/passwd",
+            &format!("{PASSWD}svc:x:4000:4000::/home/svc:/bin/ash\n"),
+        );
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                "adduser", "-D", "-u", "4000", "-G", "svc", "-s", "/bin/ash", "svc"
+            ]]
+        );
+
+        // An explicit `gid` wins over the same-named group.
+        let fake = Arc::new(base().with_file("/etc/group", &group_text));
+        let c = change(
+            Present::new("svc")
+                .uid(4000)
+                .gid("docker")
+                .check(&fake_sys(&fake))
+                .unwrap(),
+        );
+        assert_eq!(c.predicted.unwrap().gid, 998);
+
+        // In check mode the same-named group may itself be planned.
+        let fake = Arc::new(base());
+        let sys = fake_sys(&fake).with_check_mode(true);
+        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        ctx.step("group", crate::group::Present::new("svc"))
+            .unwrap();
+        let u = ctx.step("user", Present::new("svc").uid(4000)).unwrap();
+        assert!(u.changed && !u.is_available());
+        assert!(u.diff.as_ref().unwrap().short().contains("group=svc"));
+        let mut ctx = Ctx::new(
+            fake_sys(&fake).with_check_mode(true),
+            rustible_sdk::HostInfo::local(),
+        );
+        ctx.step("group", crate::group::Present::new("svc").gid(4000))
+            .unwrap();
+        let u = ctx
+            .step("user", Present::new("svc").uid(4000).shell("/bin/sh"))
+            .unwrap();
+        assert!(u.predicted);
+        assert_eq!(u.gid, 4000);
     }
 
     #[test]
