@@ -12,7 +12,7 @@ Updated by whoever is working; read first on every resume.
 | M5 elevated/cancel/streaming | in-progress (m5-elevated-streaming) | subagent, unattended run 1; ARM VM may be down |
 | M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` pr-open (#6, review running); `file` family merged (PR #7); `systemd` and apt-Absent/Latest+hostname+sysctl in progress (subagents); http::Download, archive::Extracted, shell extras todo |
 | M6 rustible-github | todo | |
-| M6 docker harness | pr-open (#5) | review queued behind #3 and #4 |
+| M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
 | M7 release prep | todo | workflow + dry run only; publishing is Cadu's |
 
@@ -31,3 +31,4 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 11:45 UTC  M6  user/group PR #6 opened (55 tests + for_user wrapper); systemd agent started; PR #5 harness review in finder phase
 - 2026-09-08 11:50 UTC  M6  file ops PR #7 opened (63 tests; SDK symlink/read_link/read_dir primitives); small-ops agent started (apt Absent/Latest, hostname, sysctl)
 - 2026-09-08 12:20 UTC  M6  file ops merged as PR #7 after review (10 fixes incl. SDK remove/remove_all/rename and fake symlink semantics)
+- 2026-09-08 12:45 UTC  M6  Docker harness merged as PR #5 (container-side marker, Drop guard, timeout, fail-not-skip when enabled; verified on debian/ubuntu and jrei systemd images)
