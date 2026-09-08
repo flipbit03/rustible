@@ -462,3 +462,77 @@ test result: ok. 5 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; fini
 
 $ cargo fmt --all --check
 [exit 0]
+
+################################################################################
+## Fourth pass: after the lead's review fixes, merged with main (2026-09-08T15:25Z)
+################################################################################
+
+Six review fixes applied (unique upload temp name, frame-size cap, the child's
+stderr kept on early failures, bin-target selection, the inventory file named in
+the vars report, `--workspace` honoured by `playbook create` and refused by
+`init`), then main merged (conflict in examples/workspace/playbooks/cadu/mc.rs
+only: both branches had fixed the apt `update_cache(Duration)` change; kept one
+version). `.rustible/` wiped first, CLI reinstalled to /tmp/rustible-m3-bin.
+
+$ rustible inventory check
+hosts.kdl: ok (7 hosts, 5 groups)
+warning: playbooks/cadu/mc.rs on host `local`: var `fruit` is not declared by this playbook (ignored)
+warning: playbooks/cadu/mc.rs on host `local`: var `timezone` is not declared by this playbook (ignored)
+warning: playbooks/cadu/mc.rs on host `arm`: var `fruit` is not declared by this playbook (ignored)
+warning: playbooks/cadu/mc.rs on host `arm`: var `timezone` is not declared by this playbook (ignored)
+playbooks/cadu/mc.rs: ok (2 hosts)
+playbooks/hello.rs: ok (1 host, no vars)
+[exit 0]
+
+$ rustible playbook list
+cadu/mc  playbooks/cadu/mc.rs
+hello    playbooks/hello.rs
+[exit 0]
+
+$ rustible playbook run playbooks/hello.rs
+[local]    hello from COGRAM-VM-2025
+[local]    Ubuntu 24.04 on X86_64, 16 cpus, 29394 MB, pm Apt
+host    ok  changed  would change  skipped  failed  warnings
+local    0        0             0        0       0         0
+[exit 0]
+
+$ rustible playbook run playbooks/cadu/mc.rs --check          # local + the ARM VM
+[local]  mc present ................................. ok
+[local]    already there: mc 3:4.8.30-1ubuntu0.1
+[arm  ]  mc present ................................. ok
+[arm  ]    already there: mc 3:4.8.30-1ubuntu0.1
+host    ok  changed  would change  skipped  failed  warnings
+local    1        0             0        0       0         0
+arm      1        0             0        0       0         0
+[exit 0]
+
+$ rustible playbook run playbooks/cadu/mc.rs -v
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=29394MB user=root
+[arm  ]    binary already cached (692248 bytes) in 33.34ms
+[arm  ]  facts: Ubuntu 24.04 Aarch64 Apt cpus=12 mem=28001MB user=root
+[arm  ]  mc present ................................. ok
+[arm  ]    already there: mc 3:4.8.30-1ubuntu0.1
+host    ok  changed  would change  skipped  failed  warnings
+local    1        0             0        0       0         0
+arm      1        0             0        0       0         0
+total 660.42ms
+[exit 0]
+(user=root on both hosts is the escalation from the attribute, through sudo.)
+
+$ rustible playbook run playbooks/cadu/mc.rs                   # second run, cached
+both hosts ok, nothing rebuilt or re-uploaded
+[exit 0]
+
+The two new flag behaviours, checked by hand:
+
+$ rustible --workspace <example workspace> playbook create playbooks/lead_check.rs
+    wrote <example workspace>/playbooks/lead_check.rs (playbook `lead_check`)   [exit 0, file removed after]
+
+$ rustible --workspace <dir> init <dir>/new
+error: --workspace does not apply to `init`; give the directory as its argument  [exit 3]
+
+$ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+392 tests passed, 0 failed; fmt and clippy clean.
+$ cargo build --manifest-path examples/workspace/Cargo.toml
+Finished (the CI job that guards this now exists on main).
+
