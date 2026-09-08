@@ -48,9 +48,3 @@ group "monitored" {
 /-host "web3" addr="10.0.1.13" {        // slash-dash: disabled, children included
     vars { nginx_workers 2 }
 }
-
-// The machines the unattended build runs against: this VM and the ARM VM.
-group "lab" {
-    host "local" connection="local"
-    host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
-}
