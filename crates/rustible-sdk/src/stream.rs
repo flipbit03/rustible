@@ -44,6 +44,13 @@ pub struct Chunks<R: Read> {
 /// confuse a shell, because it arrives over the wire. An id that survives
 /// nothing keeps a fixed name rather than a random one: two such runs then
 /// collide loudly at `create_dir` instead of quietly sharing a directory.
+///
+/// That filtering is not injective: `a/b` and `ab` both give
+/// `.rustible-ab`, and anything unsanitisable gives `.rustible-unnamed`.
+/// Two colliding runs fail at `create_dir`, which refuses an existing path,
+/// so a collision is loud rather than silent, and the orchestrator sends
+/// hex ids so it is not reachable today. Feed this a structured id and that
+/// stops being true.
 pub fn run_dir_name(run_id: &str) -> String {
     let safe: String = run_id
         .chars()

