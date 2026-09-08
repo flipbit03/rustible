@@ -29,7 +29,7 @@ use serde_json::Value;
 use crate::backend::serve_helper;
 use crate::channel::{Channel, Feeder};
 use crate::ctx::{Ctx, HostInfo};
-use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink};
+use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink, WarnCounter};
 use crate::protocol::{self, Down, FrameSink, Up};
 use crate::registry::{Named, describe_all};
 use crate::secret::Secret;
@@ -446,6 +446,10 @@ fn execute(
     escalate_password: Option<Secret>,
     run_id: String,
 ) -> ExitCode {
+    // Every warning is counted here, at the one point every event passes,
+    // rather than by each of the three places that write one.
+    let counter = Arc::new(WarnCounter::new(sink));
+    let sink: SharedSink = counter.clone();
     let sys = System::local(check_mode, sink.clone())
         .with_escalation(&host.escalate_method, escalate_password);
     sink.emit(Event::Facts(sys.facts().clone()));
@@ -465,7 +469,7 @@ fn execute(
     let failed = match outcome {
         Ok(Ok(())) => false,
         Ok(Err(e)) => {
-            sink.emit(Event::failed(None, &e));
+            sink.emit(Event::failed(e.step_failed().map(|s| s.step.clone()), &e));
             true
         }
         Err(payload) => {
@@ -484,6 +488,7 @@ fn execute(
     };
 
     let mut summary = ctx.summary();
+    summary.warnings = counter.count();
     if failed && summary.failed == 0 {
         summary.failed += 1;
     }
@@ -604,6 +609,145 @@ mod tests {
             "{}",
             c.problems[0].message
         );
+    }
+
+    /// Every producer of a `WARNING:` line reaches the summary's warning
+    /// column: `Ctx::warn`, `System::warn` from inside an op, and the
+    /// runtime's own undeclared-var notice. A column that disagrees with
+    /// what the operator just read on screen is worse than no column.
+    #[test]
+    fn every_warning_producer_reaches_the_summary() {
+        use crate::event::{Collect, Level};
+        use crate::op::{Op, Plan};
+        use crate::system::System;
+
+        struct WarnsFromCheck;
+        impl Op for WarnsFromCheck {
+            type Output = ();
+            fn check(&self, sys: &System) -> crate::Result<Plan<()>> {
+                sys.warn("the op has an opinion");
+                Ok(Plan::Satisfied(()))
+            }
+            fn apply(&self, _: &System, _: crate::Change<()>) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        static WARNS: Playbook = Playbook {
+            hosts: "local",
+            escalate: false,
+            schema: vars::schema_for::<Vars>,
+            entry: |ctx, _| {
+                ctx.warn("the playbook has an opinion");
+                ctx.step("op that warns", WarnsFromCheck)?;
+                Ok(())
+            },
+            check_vars: |_| Ok(()),
+        };
+        let named = Named {
+            name: "warns",
+            playbook: &WARNS,
+        };
+
+        let sink = Arc::new(Collect::default());
+        // `pakage` is undeclared, which is the runtime's own warning.
+        let host_vars = serde_json::json!({ "package": "mc", "ports": [22], "pakage": "mc" });
+        execute(
+            &named,
+            HostInfo::local(),
+            host_vars,
+            false,
+            sink.clone(),
+            Channel::detached(),
+            None,
+            "test".into(),
+        );
+
+        let events = sink.events();
+        let printed = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::Log {
+                        level: Level::Warn,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(printed, 3, "three WARNING: lines: {events:#?}");
+        let summary = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Finished(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the run finished");
+        assert_eq!(
+            summary.warnings, 3,
+            "the summary counts every warning the operator saw"
+        );
+    }
+
+    /// The `Failed` frame names the step itself. The renderer's fallback
+    /// recovers the name by parsing the `` step `...`: `` prefix off the
+    /// chain, which a name containing a backtick and a colon splits in the
+    /// wrong place, so the field has to be filled where the name is known.
+    #[test]
+    fn failed_frame_carries_the_step_name() {
+        use crate::event::Collect;
+        use crate::op::{Op, Plan};
+        use crate::system::System;
+
+        struct Boom;
+        impl Op for Boom {
+            type Output = ();
+            fn check(&self, _: &System) -> crate::Result<Plan<()>> {
+                Err(crate::Error::msg("deeper"))
+            }
+            fn apply(&self, _: &System, _: crate::Change<()>) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        static FAILS: Playbook = Playbook {
+            hosts: "local",
+            escalate: false,
+            schema: vars::no_schema,
+            entry: |ctx, _| {
+                ctx.step("odd `: name", Boom)?;
+                Ok(())
+            },
+            check_vars: |_| Ok(()),
+        };
+        let named = Named {
+            name: "fails",
+            playbook: &FAILS,
+        };
+
+        let sink = Arc::new(Collect::default());
+        execute(
+            &named,
+            HostInfo::local(),
+            Value::Null,
+            false,
+            sink.clone(),
+            Channel::detached(),
+            None,
+            "test".into(),
+        );
+
+        let (step, error) = sink
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Failed { step, error, .. } => Some((step, error)),
+                _ => None,
+            })
+            .expect("the run failed");
+        assert_eq!(step.as_deref(), Some("odd `: name"));
+        assert_eq!(error, "step `odd `: name`: deeper");
     }
 
     #[test]

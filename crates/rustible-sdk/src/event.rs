@@ -5,6 +5,7 @@
 //! running a playbook binary by hand.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,11 @@ use crate::facts::Facts;
 /// [`Op::apply`](crate::op::Op::apply) reported, puts it in
 /// [`Event::StepFinished`], and adds one to the matching counter in
 /// [`Summary`]. A reporter turns it into the word on the step line.
+///
+/// There is no `Skipped`: a skip never reaches a step, so
+/// [`Ctx::skip`](crate::ctx::Ctx::skip) reports it as its own
+/// [`Event::StepSkipped`], carrying the playbook's reason where a status
+/// would sit. Every variant here is emitted by `Ctx::step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     /// Nothing to do: `check` returned
@@ -33,10 +39,6 @@ pub enum Status {
     /// show diffs for this exactly as for `Changed`; the only difference is
     /// the word and the column.
     WouldChange,
-    /// Part of the vocabulary so the status words match the summary columns,
-    /// but no `StepFinished` carries it: `Ctx::skip` reports a skip as
-    /// [`Event::StepSkipped`] instead, which has no status field of its own.
-    Skipped,
     /// `check` or `apply` returned an error, or the run was cancelled between
     /// the two. The rendered context chain travels in the `note` field, and
     /// an [`Event::Failed`] normally follows once the error reaches the top
@@ -185,10 +187,12 @@ pub enum Event {
     /// chain in its `note`; `rustible` prefers this frame and prints the
     /// chain once.
     Failed {
-        /// The step the failure belongs to, when the emitter knows it. The
-        /// runtime always sends `None` today, and `rustible` recovers the
-        /// name from the `` step `...`: `` prefix `Ctx::step` puts on the
-        /// chain.
+        /// The step the failure belongs to. The runtime reads it off the
+        /// [`StepFailed`](crate::error::StepFailed) layer `Ctx::step`
+        /// attaches, so it is filled for anything that failed inside a step
+        /// and `None` for a panic or an error the playbook raised on its
+        /// own. `error` still opens with that layer's text; a reporter that
+        /// prints the name separately drops it.
         step: Option<String>,
         /// The rendered context chain, outermost first.
         error: String,
@@ -228,9 +232,10 @@ pub enum Level {
     /// asked for this line to be in the output.
     Info,
     /// `Ctx::warn`, `System::warn`, and the runtime's near-miss notice for
-    /// an undeclared var. Printed as `WARNING: `. Only `Ctx::warn` also adds
-    /// to [`Summary::warnings`], so the counter can read lower than the
-    /// number of warning lines on screen.
+    /// an undeclared var. Printed as `WARNING: `, and counted into
+    /// [`Summary::warnings`] as the frame passes the sink, so the counter
+    /// matches the number of warning lines on screen whichever of the three
+    /// wrote them.
     Warn,
 }
 
@@ -249,7 +254,8 @@ pub struct Summary {
     /// Steps a check-mode run would have changed. Always 0 outside check
     /// mode.
     pub would_change: u32,
-    /// Steps `Ctx::skip` recorded. These never ran a check.
+    /// Steps `Ctx::skip` recorded. These never ran a check, so they carry
+    /// no [`Status`]; they arrive as [`Event::StepSkipped`].
     pub skipped: u32,
     /// Steps whose check or apply failed. The runtime forces this to at
     /// least 1 when the playbook returned an error or panicked without any
@@ -257,9 +263,12 @@ pub struct Summary {
     /// verdict are both read off this field, so a zero here would report a
     /// crashed run as a success.
     pub failed: u32,
-    /// How many times the playbook called `Ctx::warn`. Warnings an op emits
-    /// through `System::warn`, and the runtime's undeclared-var notices, are
-    /// printed but not counted here.
+    /// How many `Log { level: Warn }` frames the run emitted, from any of
+    /// `Ctx::warn`, `System::warn` inside an op, and the runtime's
+    /// undeclared-var notice. Counted at the sink rather than by each
+    /// producer, so this is exactly the number of `WARNING:` lines the
+    /// operator saw. Unlike the five above it does not belong to a step and
+    /// is not part of their sum.
     pub warnings: u32,
 }
 
@@ -278,6 +287,51 @@ pub trait EventSink: Send + Sync {
 /// `System` carries it into ops, and `Ctx::as_user` clones pass the same
 /// sink along so a step's events stay in one stream regardless of identity.
 pub type SharedSink = Arc<dyn EventSink>;
+
+/// A sink that counts the warnings passing through it and forwards
+/// everything to the sink it wraps.
+///
+/// [`Summary::warnings`] is filled from this at the end of a run instead of
+/// being bumped by whoever wrote each warning. Three unrelated places emit
+/// `Log { level: Warn }` (`Ctx::warn`, `System::warn`, the runtime's
+/// undeclared-var notice) and only one of them used to count, so the summary
+/// could report `0` with warnings visibly on screen. Counting where the
+/// frames are seen means a fourth producer is counted the day it is written.
+pub(crate) struct WarnCounter {
+    inner: SharedSink,
+    warnings: AtomicU32,
+}
+
+impl WarnCounter {
+    /// Wrap `inner`. Every event still reaches it, in order and unchanged.
+    pub(crate) fn new(inner: SharedSink) -> Self {
+        WarnCounter {
+            inner,
+            warnings: AtomicU32::new(0),
+        }
+    }
+
+    /// Warnings seen so far. Read once, after the playbook body has
+    /// returned and before `Finished` is emitted.
+    pub(crate) fn count(&self) -> u32 {
+        self.warnings.load(Ordering::SeqCst)
+    }
+}
+
+impl EventSink for WarnCounter {
+    fn emit(&self, event: Event) {
+        if matches!(
+            event,
+            Event::Log {
+                level: Level::Warn,
+                ..
+            }
+        ) {
+            self.warnings.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.emit(event);
+    }
+}
 
 /// JSON lines to any writer. What the real channel will look like, minus framing.
 pub struct JsonLines<W: Write + Send>(pub Mutex<W>);
@@ -355,7 +409,6 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     Status::Ok => "ok",
                     Status::Changed => "changed",
                     Status::WouldChange => "would change",
-                    Status::Skipped => "skipped",
                     Status::Failed => "FAILED",
                 };
                 let mut tail = String::new();
@@ -418,5 +471,34 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 s.ok, s.changed, s.would_change, s.skipped, s.failed, s.warnings
             ),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every [`Status`] has something that emits it. The match is
+    /// exhaustive on purpose: a variant added here without a `Ctx` path that
+    /// produces it stops compiling, which is how `Skipped` should have been
+    /// caught. A skip is [`Event::StepSkipped`] and has no status at all.
+    #[test]
+    fn every_status_has_an_emitter() {
+        fn emitted_by(s: Status) -> &'static str {
+            match s {
+                Status::Ok => "Ctx::step: check satisfied, or apply reported no change",
+                Status::Changed => "Ctx::step: apply ran and changed something",
+                Status::WouldChange => "Ctx::step: check found a difference in check mode",
+                Status::Failed => "Ctx::step: check or apply errored, or the run was cancelled",
+            }
+        }
+        for s in [
+            Status::Ok,
+            Status::Changed,
+            Status::WouldChange,
+            Status::Failed,
+        ] {
+            assert!(!emitted_by(s).is_empty());
+        }
     }
 }

@@ -10,7 +10,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::channel::Channel;
-use crate::error::{Context as _, Error, Result};
+use crate::error::{Context as _, Error, Result, StepFailed};
 use crate::event::{Event, Level, Status, Summary};
 use crate::facts::Facts;
 use crate::op::{Applied, Op, Plan};
@@ -213,7 +213,7 @@ impl Ctx {
         self.shared
             .channel
             .check_cancelled()
-            .with_context(|| format!("step `{name}` not started"))?;
+            .with_context(|| StepFailed::cancelled(&name, "not started"))?;
         let id = self.next_id();
         let identity = self.sys.identity().label();
         let sink = self.sys.sink().clone();
@@ -246,7 +246,7 @@ impl Ctx {
             Err(e) => {
                 finish(Status::Failed, None, Some(e.chain()));
                 self.bump(|s| s.failed += 1);
-                return Err(e.context(format!("step `{name}`")));
+                return Err(e.context(StepFailed::at(&name)));
             }
             Ok(Plan::Satisfied(out)) => {
                 finish(Status::Ok, None, None);
@@ -276,7 +276,7 @@ impl Ctx {
                 if let Err(e) = self.shared.channel.check_cancelled() {
                     finish(Status::Failed, Some(diff), Some(e.chain()));
                     self.bump(|s| s.failed += 1);
-                    return Err(e.context(format!("step `{name}` not applied")));
+                    return Err(e.context(StepFailed::cancelled(&name, "not applied")));
                 }
                 self.sys.set_phase(Phase::Applying);
                 let applied = op.apply(&self.sys, change);
@@ -285,7 +285,7 @@ impl Ctx {
                     Err(e) => {
                         finish(Status::Failed, Some(diff), Some(e.chain()));
                         self.bump(|s| s.failed += 1);
-                        return Err(e.context(format!("step `{name}`")));
+                        return Err(e.context(StepFailed::at(&name)));
                     }
                     Ok(out) if !op.changed_by_apply(&out) => {
                         // The op ran and decided nothing changed (a command
@@ -347,8 +347,11 @@ impl Ctx {
     /// A `WARNING:` line, and one more on the run's warning count that the
     /// summary prints at the end. Nothing fails; this is how a playbook says
     /// something is off without giving up on the host.
+    ///
+    /// The counting happens at the sink, not here, so a warning an op writes
+    /// with [`System::warn`](crate::system::System::warn) reaches the same
+    /// column.
     pub fn warn(&self, msg: impl Into<String>) {
-        self.bump(|s| s.warnings += 1);
         self.sys.warn(msg);
     }
 
@@ -419,6 +422,12 @@ impl Ctx {
     // ---- tier 2 ----
 
     /// Record a step that was deliberately not run.
+    ///
+    /// Nothing is checked or applied, so there is no verdict to report and
+    /// no [`Status`] for it: this emits [`Event::StepSkipped`], which
+    /// carries `reason` where a status would sit, and moves the summary's
+    /// `skipped` counter. Takes the next step id, so skips and steps stay
+    /// one numbered sequence.
     pub fn skip(&mut self, name: impl Into<String>, reason: impl Into<String>) {
         let id = self.next_id();
         self.bump(|s| s.skipped += 1);

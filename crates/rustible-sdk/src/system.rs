@@ -575,6 +575,10 @@ impl System {
     /// verbosity, prefixed `WARNING:`, and does not affect the step's
     /// status: this is for something the operator should know that is not
     /// worth failing over.
+    ///
+    /// Counted in [`Summary::warnings`](crate::event::Summary::warnings)
+    /// exactly as [`Ctx::warn`](crate::ctx::Ctx::warn) is, because the count
+    /// is taken at the sink every event passes rather than by the caller.
     pub fn warn(&self, msg: impl Into<String>) {
         self.sink.emit(Event::Log {
             level: Level::Warn,

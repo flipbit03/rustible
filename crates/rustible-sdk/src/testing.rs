@@ -766,7 +766,6 @@ fn status_word(s: Status) -> &'static str {
         Status::Ok => "ok",
         Status::Changed => "changed",
         Status::WouldChange => "would change",
-        Status::Skipped => "skipped",
         Status::Failed => "failed",
     }
 }

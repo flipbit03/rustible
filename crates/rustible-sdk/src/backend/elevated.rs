@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{Backend, CmdSpec, Local, Output, Stat};
-use crate::protocol::{MAX_FRAME_PAYLOAD, read_frame, write_frame};
+use crate::protocol::{FrameTooLarge, MAX_FRAME_PAYLOAD, read_frame, write_frame};
 use crate::secret::Secret;
 
 /// One `Backend` primitive on the wire.
@@ -691,7 +691,13 @@ impl Elevated {
         let label = op.label();
         let req = HelperRequest { checking, op };
         let resp = conn.call(&req).map_err(|e| {
-            if e.to_string().contains("exceeds limit") {
+            // The typed signal, not the message: `protocol.rs` is free to
+            // reword the framing error without silently degrading this
+            // refusal back into it.
+            if e.get_ref()
+                .and_then(|inner| inner.downcast_ref::<FrameTooLarge>())
+                .is_some()
+            {
                 io::Error::other(format!(
                     "{label}: the helper's answer is larger than one frame can carry \
                      ({MAX_FRAME_PAYLOAD} bytes of payload); reading a file this large \
@@ -1033,6 +1039,31 @@ mod tests {
         // The helper is still usable: this is a refusal, not a failure.
         e.write(&f, b"small").unwrap();
         assert_eq!(e.read(&f).unwrap(), b"small");
+    }
+
+    /// A response too large for a frame gets the friendly refusal, which
+    /// names the file, the limit and the identity, rather than the framing
+    /// error. The detection is on the typed
+    /// [`FrameTooLarge`](crate::protocol::FrameTooLarge) signal, so the
+    /// wording of the framing error is free to change.
+    #[test]
+    fn an_oversized_response_gets_the_friendly_refusal() {
+        // A "helper" that answers every request with a length prefix one
+        // byte over the frame ceiling. Nothing else has to be there: the
+        // read fails on the prefix, before a body is allocated.
+        let prefix = u32::try_from(crate::protocol::MAX_FRAME + 1).unwrap();
+        let e = Elevated::connected(
+            "tester",
+            Box::new(io::sink()),
+            Box::new(io::Cursor::new(prefix.to_be_bytes().to_vec())),
+            Arc::new(AtomicU8::new(Phase::Applying as u8)),
+        );
+        let err = e.read(Path::new("/etc/shadow")).unwrap_err().to_string();
+        assert!(err.contains("/etc/shadow"), "{err}");
+        assert!(err.contains(&MAX_FRAME_PAYLOAD.to_string()), "{err}");
+        assert!(err.contains("tester"), "{err}");
+        assert!(err.contains("as_user"), "{err}");
+        assert!(!err.contains("exceeds limit"), "raw framing error: {err}");
     }
 
     #[test]

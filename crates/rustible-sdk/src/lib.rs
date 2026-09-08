@@ -31,6 +31,7 @@ pub use ctx::{Ctx, HostInfo};
 pub use diff::{AttrChange, Diff};
 pub use error::{
     CmdFailed, Context, Error, IoAt, MutationDuringCheck, OutputUnavailable, Result, SpawnFailed,
+    StepFailed,
 };
 pub use facts::{Arch, Distro, Facts, Init, Os, Pm};
 pub use op::{Applied, Change, Op, Plan};

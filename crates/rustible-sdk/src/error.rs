@@ -41,6 +41,20 @@ impl Error {
     pub fn cmd_failed(&self) -> Option<&CmdFailed> {
         self.downcast_ref::<CmdFailed>()
     }
+
+    /// The step the failure happened in, if it came from
+    /// [`Ctx::step`](crate::ctx::Ctx::step).
+    ///
+    /// `Ctx::step` adds a [`StepFailed`] layer to every error it returns, so
+    /// a reporter can name the step instead of parsing it back out of
+    /// [`Error::chain`]. Nested steps layer more than once and the outermost
+    /// wins, which is the one whose text opens the rendered chain.
+    ///
+    /// Unlike [`Error::downcast_ref`] this looks at context layers as well
+    /// as at the errors themselves, because a context layer is what this is.
+    pub fn step_failed(&self) -> Option<&StepFailed> {
+        self.0.downcast_ref::<StepFailed>()
+    }
 }
 
 impl fmt::Display for Error {
@@ -127,6 +141,46 @@ pub struct OutputUnavailable {
     /// The name passed to `ctx.step`, so the message names the playbook line
     /// whose output was read rather than the one that would have produced it.
     pub step: String,
+}
+
+/// The step a failure happened in, as [`Ctx::step`](crate::ctx::Ctx::step)
+/// attaches it.
+///
+/// It is a context layer, not a cause: it renders as the outermost part of
+/// [`Error::chain`] exactly as the plain string it replaced did, and its
+/// reason for being a type is [`Error::step_failed`], which lets the runtime
+/// fill [`Event::Failed::step`](crate::event::Event::Failed) without parsing
+/// the chain back apart.
+#[derive(Debug, thiserror::Error)]
+#[error("step `{step}`{suffix}")]
+pub struct StepFailed {
+    /// The name passed to `ctx.step`, verbatim: it is a label, so it may
+    /// hold a backtick, a colon, or both, which is exactly what parsing the
+    /// rendered chain gets wrong.
+    pub step: String,
+    /// What follows the name in the rendered chain. Empty when `check` or
+    /// `apply` failed; `" not started"` or `" not applied"` when the run was
+    /// cancelled on one side of `apply` and the step never ran.
+    pub suffix: String,
+}
+
+impl StepFailed {
+    /// The layer for a step whose `check` or `apply` returned an error.
+    pub fn at(step: impl Into<String>) -> Self {
+        StepFailed {
+            step: step.into(),
+            suffix: String::new(),
+        }
+    }
+
+    /// The layer for a step a `Cancel` frame stopped, with `suffix` naming
+    /// which side of `apply` the run was cancelled on.
+    pub fn cancelled(step: impl Into<String>, suffix: &str) -> Self {
+        StepFailed {
+            step: step.into(),
+            suffix: format!(" {suffix}"),
+        }
+    }
 }
 
 /// A command exited non-zero. The message names the command and status;

@@ -316,7 +316,6 @@ fn status_word(s: Status) -> &'static str {
         Status::Ok => "ok",
         Status::Changed => "changed",
         Status::WouldChange => "would change",
-        Status::Skipped => "skipped",
         Status::Failed => "FAILED",
     }
 }
@@ -332,9 +331,27 @@ fn step_line(depth: u8, name: &str, status: &str, tail: &str) -> String {
 
 /// `Ctx::step` wraps a failure as `` step `name`: cause ``; the frame's own
 /// `step` field wins when set.
+///
+/// The chain still carries that layer even when the field is filled, so it
+/// is dropped here rather than printed a second time after `FAILED at`. A
+/// cancelled step's layer reads `` step `name` not applied ``, and the words
+/// after the name are part of the cause and stay.
+///
+/// Parsing the chain is the fallback for an error that did not come from
+/// `ctx.step` at all, and it is only a guess: a step name holding a backtick
+/// followed by a colon splits in the wrong place. That is why the field
+/// exists.
 fn split_step<'a>(step: Option<&'a str>, error: &'a str) -> (Option<&'a str>, &'a str) {
     if let Some(s) = step {
-        return (Some(s), error);
+        let head = format!("step `{s}`");
+        let Some(rest) = error.strip_prefix(&head) else {
+            return (Some(s), error);
+        };
+        let cause = rest
+            .strip_prefix(": ")
+            .or_else(|| rest.strip_prefix(' '))
+            .unwrap_or(rest);
+        return (Some(s), cause);
     }
     if let Some(rest) = error.strip_prefix("step `")
         && let Some((name, cause)) = rest.split_once("`: ")
@@ -600,6 +617,46 @@ arm      0        1             0        0       0         0
             "{swallowed}"
         );
         assert!(swallowed.find("FAILED at").unwrap() < swallowed.find("y ....").unwrap());
+    }
+
+    /// A step name holding a backtick and a colon splits the chain in the
+    /// wrong place, which is why the frame carries the name itself. The
+    /// filled field wins, and the chain's own `step `...`: ` layer is not
+    /// printed twice.
+    #[test]
+    fn a_step_name_with_a_backtick_needs_the_frames_own_field() {
+        let name = "odd `: name";
+        let chain = format!("step `{name}`: deeper");
+        assert_eq!(
+            split_step(None, &chain),
+            (Some("odd "), "name`: deeper"),
+            "the fallback parser cannot do better than this"
+        );
+        assert_eq!(split_step(Some(name), &chain), (Some(name), "deeper"));
+
+        let out = render(0, |r| {
+            r.event("local", &step_started(1, name));
+            r.event("local", &step_finished(1, name, Status::Failed));
+            r.event(
+                "local",
+                &Event::Failed {
+                    step: Some(name.into()),
+                    error: chain.clone(),
+                    cmd: None,
+                },
+            );
+        });
+        assert!(out.contains("FAILED at `odd `: name`: deeper\n"), "{out}");
+    }
+
+    /// A cancellation wraps the step differently (`` step `x` not started ``);
+    /// the layer still goes, and what it said stays.
+    #[test]
+    fn a_cancelled_step_keeps_its_reason() {
+        assert_eq!(
+            split_step(Some("x"), "step `x` not started: cancelled"),
+            (Some("x"), "not started: cancelled")
+        );
     }
 
     #[test]
