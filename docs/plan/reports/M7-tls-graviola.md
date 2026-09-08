@@ -268,3 +268,38 @@ than Intel Broadwell or AMD Zen, or on aarch64 without the crypto extensions
 missing extension. Every op that does not use the network is unaffected, and
 plain-HTTP downloads still work there. This is the accepted price of one
 crypto path.
+
+### Self-review (lead, PR #20)
+
+Read before merging, against Cadu's decision (graviola, no fallback, no silent
+downgrade) and vision 5.3.
+
+- **The pre-flight is where it has to be.** Building the agent does no crypto,
+  so a check at construction would pass on a machine that then panics at the
+  handshake. `preflight_url` runs immediately before each request, and only for
+  a URL that will actually use TLS, so a plain `http://` download still works
+  on an old CPU instead of being refused with a message about HTTPS that does
+  not describe the request. That distinction was not in the brief and is right.
+- **The failure is a step failure, not a panic**, which is the whole point:
+  graviola asserts its instruction-set requirements, and an assert inside a
+  handshake would abort a running playbook rather than fail one step. The
+  message names the missing extension, the hardware it implies in terms a
+  reader recognises, why there is no fallback to select, and what to do
+  instead. It is tested without lying about the running CPU.
+- **No fallback exists to be reached.** `rustls-rustcrypto` is gone from the
+  tree, so there is one crypto path and nothing that could quietly downgrade.
+- **The rule still holds, demonstrated rather than asserted**: both musl
+  targets cross-built with stock rustup and no C toolchain, and a real
+  handshake ran, including on the ARM VM, which is the only end-to-end
+  exercise of the aarch64 detection path.
+
+Two costs I want on the record rather than buried, neither a reason to
+reverse:
+
+- **The minimum supported Rust version moves 1.88 to 1.89**, because graviola
+  declares it. The manifest and the CI job both moved, and the report shows
+  1.88 failing for that reason.
+- **Playbook binaries grow by about a third**, roughly half a megabyte, on
+  both targets. That is the opposite of what the dependency graph suggests,
+  and the report says so plainly rather than glossing it.
+
