@@ -8,6 +8,34 @@ use super::{Backend, CmdSpec, FileKind, Output, Stat};
 /// The production backend: real filesystem, real processes.
 pub struct Local;
 
+impl Local {
+    fn stat_with(m: io::Result<std::fs::Metadata>) -> io::Result<Option<Stat>> {
+        match m {
+            Ok(m) => {
+                let ft = m.file_type();
+                let kind = if ft.is_symlink() {
+                    FileKind::Symlink
+                } else if ft.is_dir() {
+                    FileKind::Dir
+                } else if ft.is_file() {
+                    FileKind::File
+                } else {
+                    FileKind::Other
+                };
+                Ok(Some(Stat {
+                    mode: m.permissions().mode() & 0o7777,
+                    uid: m.uid(),
+                    gid: m.gid(),
+                    size: m.len(),
+                    kind,
+                }))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Backend for Local {
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(p)
@@ -32,29 +60,11 @@ impl Backend for Local {
     }
 
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
-        match std::fs::symlink_metadata(p) {
-            Ok(m) => {
-                let ft = m.file_type();
-                let kind = if ft.is_symlink() {
-                    FileKind::Symlink
-                } else if ft.is_dir() {
-                    FileKind::Dir
-                } else if ft.is_file() {
-                    FileKind::File
-                } else {
-                    FileKind::Other
-                };
-                Ok(Some(Stat {
-                    mode: m.permissions().mode() & 0o7777,
-                    uid: m.uid(),
-                    gid: m.gid(),
-                    size: m.len(),
-                    kind,
-                }))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+        Self::stat_with(std::fs::symlink_metadata(p))
+    }
+
+    fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+        Self::stat_with(std::fs::metadata(p))
     }
 
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {

@@ -72,7 +72,10 @@ pub trait Backend: Send + Sync {
     fn read(&self, p: &Path) -> io::Result<Vec<u8>>;
     /// Must be atomic (temp file + rename) and preserve mode/owner of an existing file.
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()>;
+    /// `lstat`: a symlink reports `FileKind::Symlink`.
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>>;
+    /// `stat`: follows symlinks, so a link to a directory reports `Dir`.
+    fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>>;
     fn mkdir_all(&self, p: &Path) -> io::Result<()>;
     fn remove(&self, p: &Path) -> io::Result<()>;
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()>;
