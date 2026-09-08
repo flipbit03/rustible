@@ -3,5 +3,6 @@
 
 pub mod apt;
 pub mod file;
+pub mod hostname;
 pub mod shell;
 pub mod ssh;
