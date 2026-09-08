@@ -166,4 +166,47 @@ let hosts = ctx.step("lab hosts",
 ctx.log(format!("block at line {}", hosts.line_no));
 ```
 
-Self-review: run by the lead on the PR.
+Self-review: run by the lead on PR #7, see below.
+
+## Self-review (lead, PR #7)
+
+`code-review` at effort high: eight finder passes, consolidated by the lead
+(the orchestrator finished without an address). Applied on the branch:
+
+1. `Local::write` created new files at tempfile's default 0600, while the
+   fake said 0644, so a `Copy` without `.mode()` produced unreadable files on
+   real hosts and green unit tests. New files are now created 0666 minus the
+   umask, like any newly created file; existing files keep their attributes.
+2. `Backend::remove` was recursive, so `Absent`'s non-recursive guard lived
+   only in `check`. `remove` now removes one entry (an empty directory,
+   `ENOTEMPTY` otherwise) and `remove_all` is the only recursive delete;
+   `Absent::apply` picks by `.recursive`. Test: a directory populated between
+   check and apply is refused.
+3. Replacing a symlink was remove-then-create. Now the new link is created at
+   a temp name and `rename`d over the old one (new `Backend::rename`).
+4. The fake's `stat_follow` did not follow and `read` returned a link's target
+   path as content. The fake now resolves links (relative targets against the
+   link's parent, hop limit) for `read`, `stat_follow`, `read_dir`, and
+   `copy`; `write` at a link's path replaces the link with a regular file,
+   mirroring `Local`'s tempfile-plus-rename. `with_symlink` delegates to
+   `symlink`. Tests added.
+5. `Line` and `Block` read through a symlink and then rewrote over it,
+   destroying the link (`/etc/resolv.conf` is the classic case). Both now
+   refuse a symlinked path with a message; shared `read_text_or_empty` and
+   `write_with_backup` helpers replace three copies of the same I/O.
+6. A block body containing a line equal to a marker grew the file on every
+   run. Refused at `check`.
+7. CRLF files were rewritten as LF. `plan_line` and `plan_block` keep the
+   file's line terminator.
+8. `Copy::apply` decided whether to rewrite by pattern-matching the `Diff`
+   variant. `CopyReport` gained `content_changed` and `apply` branches on the
+   prediction, recomputing when absent. `Line`/`Block::apply` re-plan from the
+   current text instead of trusting the copy in the diff.
+9. `Directory` used `lstat`, so a symlink to a directory (`/var/lock`) failed
+   as "not a directory". It follows links now (Ansible's `follow=yes`).
+10. Dead `path_str` removed; `Owner::of(&Stat)` replaces two hand-rolled
+    renderings.
+
+Noted, not changed: `Attrs` deliberately refuses symlinks (DECISIONS); the
+`Elevated` backend on the M5 branch must implement `stat_follow`, `symlink`,
+`read_link`, `read_dir`, `remove_all`, and `rename` when it merges.

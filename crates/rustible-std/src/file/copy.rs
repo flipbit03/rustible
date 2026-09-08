@@ -56,6 +56,9 @@ pub struct CopyBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyReport {
+    /// Whether the bytes were (or would be) rewritten, as opposed to an
+    /// attributes-only change.
+    pub content_changed: bool,
     pub path: PathBuf,
     /// Set only when `.backup(true)` and a previous version was saved.
     pub backup_path: Option<PathBuf>,
@@ -165,6 +168,7 @@ impl Op for Copy {
         let content_changed = old.as_deref() != Some(new.as_slice());
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
         let report = CopyReport {
+            content_changed,
             path: self.dest.clone(),
             backup_path: None,
             bytes: new.len(),
@@ -184,25 +188,27 @@ impl Op for Copy {
     }
 
     fn apply(&self, sys: &System, change: Change<CopyReport>) -> Result<CopyReport> {
-        // An `Attrs` diff means the content already matched: chmod/chown only.
-        let rewrite = !matches!(change.diff, Diff::Attrs { .. });
-        let mut backup_path = None;
-        if rewrite {
-            if self.backup && sys.exists(&self.dest)? {
-                backup_path = Some(sys.backup(&self.dest)?);
-            }
-            let bytes = self.source_bytes(sys)?;
-            sys.write_atomic(&self.dest, &bytes)?;
-        }
-        apply_attrs(sys, &self.dest, self.mode, self.owner)?;
-        let bytes = match change.predicted {
-            Some(p) => p.bytes,
-            None => self.source_bytes(sys)?.len(),
+        // Branch on the plan, not on the diff's presentation: recompute the
+        // comparison when no prediction is at hand.
+        let bytes = self.source_bytes(sys)?;
+        let rewrite = match &change.predicted {
+            Some(p) => p.content_changed,
+            None => match sys.stat(&self.dest)? {
+                Some(s) if s.kind == FileKind::File => sys.read(&self.dest)? != bytes,
+                _ => true,
+            },
         };
+        let backup_path = if rewrite {
+            super::write_with_backup(sys, &self.dest, self.backup, &bytes)?
+        } else {
+            None
+        };
+        apply_attrs(sys, &self.dest, self.mode, self.owner)?;
         Ok(CopyReport {
+            content_changed: rewrite,
             path: self.dest.clone(),
             backup_path,
-            bytes,
+            bytes: bytes.len(),
         })
     }
 }
@@ -231,6 +237,7 @@ mod tests {
         assert_eq!(
             r,
             CopyReport {
+                content_changed: false,
                 path: "/etc/x.conf".into(),
                 backup_path: None,
                 bytes: 4

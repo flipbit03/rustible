@@ -50,7 +50,7 @@ impl Op for Directory {
 
     fn check(&self, sys: &System) -> Result<Plan<DirReport>> {
         let mut changes = vec![];
-        let stat = sys.stat(&self.path)?;
+        let stat = sys.stat_follow(&self.path)?;
         let created = match &stat {
             None => {
                 changes.push(AttrChange {
@@ -147,5 +147,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    #[test]
+    fn a_symlink_to_a_directory_counts_as_the_directory() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/run/lock")
+                .with_symlink("/var/lock", "/run/lock"),
+        );
+        let sys = fake_sys(&fake);
+        assert!(matches!(
+            Directory::at("/var/lock").check(&sys).unwrap(),
+            Plan::Satisfied(_)
+        ));
     }
 }

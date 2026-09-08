@@ -122,9 +122,15 @@ impl Op for Symlink {
 
     fn apply(&self, sys: &System, change: Change<SymlinkReport>) -> Result<SymlinkReport> {
         if sys.exists(&self.link)? {
-            sys.remove(&self.link)?;
+            // Replace atomically: a reader never sees the path missing.
+            let mut tmp = self.link.clone().into_os_string();
+            tmp.push(format!(".rustible-tmp-{}", std::process::id()));
+            let tmp = std::path::PathBuf::from(tmp);
+            sys.symlink(&self.target, &tmp)?;
+            sys.rename(&tmp, &self.link)?;
+        } else {
+            sys.symlink(&self.target, &self.link)?;
         }
-        sys.symlink(&self.target, &self.link)?;
         Ok(change.predicted.unwrap_or_else(|| self.report()))
     }
 }
@@ -208,5 +214,22 @@ mod tests {
         assert!(r.changed && r.predicted);
         assert_eq!(r.target, PathBuf::from("/t"));
         assert!(fake.file("/l").is_none());
+    }
+
+    #[test]
+    fn replacing_a_link_is_atomic_and_leaves_no_temp_link() {
+        let fake = Arc::new(Fake::new().with_symlink("/etc/l", "/old").with_dir("/new"));
+        let sys = fake_sys(&fake);
+        let op = Symlink::at("/etc/l").pointing_to("/new");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            sys.read_link("/etc/l").unwrap(),
+            std::path::PathBuf::from("/new")
+        );
+        assert!(
+            fake.file(format!("/etc/l.rustible-tmp-{}", std::process::id()))
+                .is_none()
+        );
     }
 }

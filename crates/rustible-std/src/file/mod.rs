@@ -84,6 +84,13 @@ impl Owner {
     fn label(&self) -> String {
         format!("{}:{}", self.uid, self.gid)
     }
+
+    fn of(s: &Stat) -> Owner {
+        Owner {
+            uid: s.uid,
+            gid: s.gid,
+        }
+    }
 }
 
 /// Pure planning of the attribute part shared by every op that takes
@@ -114,10 +121,10 @@ pub fn plan_attrs(
     }
     if let Some(want) = owner {
         match current {
-            Some(s) if s.uid == want.uid && s.gid == want.gid => {}
+            Some(s) if Owner::of(s) == want => {}
             Some(s) => changes.push(AttrChange {
                 name: "owner".into(),
-                from: format!("{}:{}", s.uid, s.gid),
+                from: Owner::of(s).label(),
                 to: want.label(),
             }),
             None => changes.push(AttrChange {
@@ -142,9 +149,47 @@ fn apply_attrs(sys: &System, path: &Path, mode: Option<u32>, owner: Option<Owner
     Ok(())
 }
 
-/// Helper for ops that take a path.
-pub fn path_str(p: &Path) -> String {
-    p.display().to_string()
+/// The line terminator a text uses, so a rewrite keeps CRLF files CRLF.
+pub(crate) fn eol_of(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// Read a text file for editing. Refuses a symlink: an atomic rewrite would
+/// replace the link with a regular file and leave its target stale, which is
+/// never what an edit meant. Missing is empty text when `create`, else an
+/// error naming the `.create(true)` option.
+pub(crate) fn read_text_or_empty(sys: &System, path: &Path, create: bool) -> Result<String> {
+    use rustible_sdk::backend::FileKind;
+    match sys.stat(path)? {
+        Some(s) if s.kind == FileKind::Symlink => bail!(
+            "{} is a symlink; edit its target instead (an atomic rewrite would replace the link)",
+            path.display()
+        ),
+        Some(s) if s.kind == FileKind::Dir => bail!("{} is a directory", path.display()),
+        Some(_) => sys.read_to_string(path),
+        None if create => Ok(String::new()),
+        None => bail!(
+            "{} does not exist (use .create(true) to create it)",
+            path.display()
+        ),
+    }
+}
+
+/// Back up (when asked, and the file exists) then write atomically. Returns
+/// the backup path.
+pub(crate) fn write_with_backup(
+    sys: &System,
+    path: &Path,
+    backup: bool,
+    bytes: &[u8],
+) -> Result<Option<std::path::PathBuf>> {
+    let backup_path = if backup && sys.exists(path)? {
+        Some(sys.backup(path)?)
+    } else {
+        None
+    };
+    sys.write_atomic(path, bytes)?;
+    Ok(backup_path)
 }
 
 #[cfg(test)]
@@ -157,6 +202,14 @@ pub(crate) mod testing {
 
     pub fn fake_sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// A `Ctx` in check mode over the fake, for "check writes nothing" tests.
+    pub fn check_mode_ctx(fake: &Arc<Fake>) -> Ctx {
+        Ctx::new(
+            fake_sys(fake).with_check_mode(true),
+            rustible_sdk::HostInfo::local(),
+        )
     }
 
     /// Run `check`, insist on a change, return it.

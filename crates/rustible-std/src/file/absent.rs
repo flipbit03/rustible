@@ -88,7 +88,13 @@ impl Op for Absent {
     }
 
     fn apply(&self, sys: &System, change: Change<AbsentReport>) -> Result<AbsentReport> {
-        sys.remove(&self.path)?;
+        // The kernel is the floor: without `.recursive(true)` a populated
+        // directory fails here too, not only at check.
+        if self.recursive {
+            sys.remove_all(&self.path)?;
+        } else {
+            sys.remove(&self.path)?;
+        }
         Ok(change.predicted.unwrap_or_else(|| self.report(true)))
     }
 }
@@ -97,7 +103,7 @@ impl Op for Absent {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, Fake};
     use rustible_sdk::event::Collect;
 
     use super::super::testing::{expect_change, fake_sys};
@@ -178,5 +184,22 @@ mod tests {
         let r = ctx.step("rm", Absent::at("/f")).unwrap();
         assert!(r.changed && r.predicted && r.removed);
         assert!(fake.file("/f").is_some());
+    }
+
+    #[test]
+    fn non_recursive_apply_refuses_a_directory_populated_after_check() {
+        let fake = Arc::new(Fake::new().with_dir("/d"));
+        let sys = fake_sys(&fake);
+        let op = Absent::at("/d");
+        let c = expect_change(&op, &sys);
+        // Something lands in the directory between check and apply.
+        Backend::write(&*fake, std::path::Path::new("/d/late"), b"x").unwrap();
+        assert!(op.apply(&sys, c).is_err(), "remove must not take the tree");
+        assert!(fake.file("/d/late").is_some());
+        // Recursive removal is explicit.
+        let op = Absent::at("/d").recursive(true);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert!(fake.file("/d").is_none() && fake.file("/d/late").is_none());
     }
 }

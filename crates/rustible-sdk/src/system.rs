@@ -218,10 +218,28 @@ impl System {
         self.backend.mkdir_all(p).map_err(Self::io(p))
     }
 
+    /// Remove one entry: a file, a symlink, or an empty directory. A
+    /// populated directory is an error; use `remove_all` for trees.
     pub fn remove(&self, p: impl AsRef<Path>) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;
         self.backend.remove(p).map_err(Self::io(p))
+    }
+
+    /// Remove a directory tree. The only recursive delete.
+    pub fn remove_all(&self, p: impl AsRef<Path>) -> Result<()> {
+        let p = p.as_ref();
+        self.guard_mutation(p)?;
+        self.backend.remove_all(p).map_err(Self::io(p))?;
+        self.debug(format!("removed tree {}", p.display()));
+        Ok(())
+    }
+
+    /// Atomically move `from` to `to`, replacing `to` if it exists.
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+        let (from, to) = (from.as_ref(), to.as_ref());
+        self.guard_mutation(to)?;
+        self.backend.rename(from, to).map_err(Self::io(to))
     }
 
     pub fn set_mode(&self, p: impl AsRef<Path>, mode: u32) -> Result<()> {

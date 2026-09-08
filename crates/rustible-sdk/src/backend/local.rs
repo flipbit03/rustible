@@ -44,8 +44,13 @@ impl Backend for Local {
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
         let dir = p.parent().unwrap_or(Path::new("."));
         let existing = std::fs::metadata(p).ok();
+        // A new file gets the mode any newly created file would (0666 minus
+        // the umask); tempfile's own default is 0600, which is not what an
+        // op that creates a config file expects. An existing file's mode and
+        // owner are copied below.
         let mut tmp = tempfile::Builder::new()
             .prefix(".rustible-")
+            .permissions(std::fs::Permissions::from_mode(0o666))
             .tempfile_in(dir)?;
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
@@ -73,11 +78,24 @@ impl Backend for Local {
 
     fn remove(&self, p: &Path) -> io::Result<()> {
         match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir(p),
+            Ok(_) => std::fs::remove_file(p),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn remove_all(&self, p: &Path) -> io::Result<()> {
+        match std::fs::symlink_metadata(p) {
             Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
             Ok(_) => std::fs::remove_file(p),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
     }
 
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
