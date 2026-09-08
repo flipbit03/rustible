@@ -26,22 +26,46 @@ pub fn from_value<T: DeserializeOwned + schemars::JsonSchema>(raw: Value) -> Res
         raw
     };
     let schema = schema_for::<T>();
+    let raw = coerce_scalars_to_lists(&schema, raw);
     validate(&schema, &raw)?;
     serde_json::from_value(raw).map_err(|e| Error::msg(format!("vars: {e}")))
+}
+
+/// An inventory `vars` block cannot spell a one-element list (a single
+/// positional value is a scalar), so where the schema wants a list and the
+/// bag holds a scalar, wrap it. Applied on both sides (orchestrator pre-check
+/// and `Start`) so they agree. Objects and existing arrays pass through.
+pub fn coerce_scalars_to_lists(schema: &Value, raw: Value) -> Value {
+    let Value::Object(mut obj) = raw else {
+        return raw;
+    };
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        for (name, p) in props {
+            let wants_list = resolve(schema, p).get("type").is_some_and(|t| {
+                t == "array" || t.as_array().is_some_and(|a| a.iter().any(|x| x == "array"))
+            });
+            if wants_list
+                && let Some(v) = obj.get_mut(name)
+                && !v.is_array()
+                && !v.is_null()
+            {
+                let scalar = v.take();
+                *v = Value::Array(vec![scalar]);
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 /// Check a vars object against a playbook's schema: every required key
 /// present, and the schema itself flat. All problems in one message.
 pub fn validate(schema: &Value, raw: &Value) -> Result<()> {
     let mut problems = flatness_violations(schema);
-    let obj = raw.as_object();
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for r in required.iter().filter_map(Value::as_str) {
-            if obj.is_none_or(|o| !o.contains_key(r)) {
-                problems.push(format!("missing required var `{r}`"));
-            }
-        }
-    }
+    problems.extend(
+        missing_required(schema, raw)
+            .iter()
+            .map(|r| format!("missing required var `{r}`")),
+    );
     if problems.is_empty() {
         Ok(())
     } else {
@@ -53,15 +77,21 @@ pub fn validate(schema: &Value, raw: &Value) -> Result<()> {
 /// object cannot be filled from an inventory `vars` block. Returns one
 /// message per offending field.
 pub fn flatness_violations(schema: &Value) -> Vec<String> {
+    non_flat_vars(schema)
+        .into_iter()
+        .map(|name| format!("var `{name}` is an object; vars are flat scalars, lists, or enums"))
+        .collect()
+}
+
+/// The names of the properties `flatness_violations` complains about.
+pub fn non_flat_vars(schema: &Value) -> Vec<String> {
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return vec![];
     };
     props
         .iter()
         .filter(|(_, p)| is_object_schema(schema, resolve(schema, p)))
-        .map(|(name, _)| {
-            format!("var `{name}` is an object; vars are flat scalars, lists, or enums")
-        })
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -100,6 +130,39 @@ fn is_object_schema(root: &Value, p: &Value) -> bool {
 /// shared across playbooks), but worth a warning, especially when one is
 /// within an edit or two of a declared name.
 pub fn unknown_key_warnings(schema: &Value, raw: &Value) -> Vec<String> {
+    unknown_keys(schema, raw)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// A key the playbook does not declare, with the nearest declared name if
+/// one is close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    pub key: String,
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.suggestion {
+            Some(near) => write!(
+                f,
+                "var `{}` is not declared by this playbook; did you mean `{near}`?",
+                self.key
+            ),
+            None => write!(
+                f,
+                "var `{}` is not declared by this playbook (ignored)",
+                self.key
+            ),
+        }
+    }
+}
+
+/// Keys in `raw` that the schema does not declare, structured.
+pub fn unknown_keys(schema: &Value, raw: &Value) -> Vec<UnknownKey> {
     let declared: Vec<&str> = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -110,15 +173,191 @@ pub fn unknown_key_warnings(schema: &Value, raw: &Value) -> Vec<String> {
     };
     obj.keys()
         .filter(|k| !declared.contains(&k.as_str()))
-        .map(
-            |k| match declared.iter().find(|d| edit_distance(k, d) <= 2) {
-                Some(near) => {
-                    format!("var `{k}` is not declared by this playbook; did you mean `{near}`?")
-                }
-                None => format!("var `{k}` is not declared by this playbook (ignored)"),
-            },
-        )
+        .map(|k| UnknownKey {
+            key: k.clone(),
+            suggestion: did_you_mean(k, declared.iter().copied()).map(str::to_string),
+        })
         .collect()
+}
+
+/// Names the schema marks `required` that `raw` does not carry. `raw` that
+/// is not an object counts as empty.
+pub fn missing_required(schema: &Value, raw: &Value) -> Vec<String> {
+    let obj = raw.as_object();
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|r| obj.is_none_or(|o| !o.contains_key(*r)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A var whose value does not fit the type its schema declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeMismatch {
+    pub var: String,
+    /// What the schema asks for, in words: `integer`, `list of string`,
+    /// `one of "sudo" | "doas"`, `string or null`.
+    pub expected: String,
+    /// What the inventory gave, rendered as JSON.
+    pub got: String,
+}
+
+impl std::fmt::Display for TypeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "var `{}` must be {}, got {}",
+            self.var, self.expected, self.got
+        )
+    }
+}
+
+/// Every declared var present in `raw` whose value does not match its
+/// property schema (schemars 1.x output: `type`, `enum`, `const`, `items`,
+/// `anyOf`/`oneOf`, `$ref` into `$defs`, integer `format` and bounds).
+/// Undeclared keys and missing keys are not reported here.
+pub fn type_mismatches(schema: &Value, raw: &Value) -> Vec<TypeMismatch> {
+    let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(Value::as_object),
+        raw.as_object(),
+    ) else {
+        return vec![];
+    };
+    props
+        .iter()
+        .filter_map(|(name, p)| {
+            let v = obj.get(name)?;
+            (!fits(schema, p, v)).then(|| TypeMismatch {
+                var: name.clone(),
+                expected: describe(schema, p),
+                got: v.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn fits(root: &Value, p: &Value, v: &Value) -> bool {
+    let p = resolve(root, p);
+    if let Some(alts) = p
+        .get("anyOf")
+        .or_else(|| p.get("oneOf"))
+        .and_then(Value::as_array)
+    {
+        return alts.iter().any(|a| fits(root, a, v));
+    }
+    if let Some(c) = p.get("const") {
+        return c == v;
+    }
+    if let Some(allowed) = p.get("enum").and_then(Value::as_array) {
+        return allowed.contains(v);
+    }
+    let types: Vec<&str> = match p.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => return true,
+    };
+    types.iter().any(|t| match (*t, v) {
+        ("null", Value::Null) => true,
+        ("boolean", Value::Bool(_)) => true,
+        ("string", Value::String(_)) => true,
+        ("number", Value::Number(_)) => true,
+        ("integer", Value::Number(n)) => match n.as_i64() {
+            Some(i) => {
+                let ok_min = p
+                    .get("minimum")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|m| i >= m);
+                let ok_max = p
+                    .get("maximum")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|m| i <= m);
+                ok_min && ok_max && int_format_fits(p, i)
+            }
+            // Beyond i64: only an unsigned 64-bit slot can hold it.
+            None => {
+                n.as_u64().is_some()
+                    && p.get("format")
+                        .and_then(Value::as_str)
+                        .is_none_or(|f| matches!(f, "uint" | "uint64"))
+            }
+        },
+        ("array", Value::Array(items)) => p
+            .get("items")
+            .is_none_or(|item| items.iter().all(|x| fits(root, item, x))),
+        ("object", Value::Object(_)) => true,
+        _ => false,
+    })
+}
+
+fn int_format_fits(p: &Value, i: i64) -> bool {
+    match p.get("format").and_then(Value::as_str) {
+        Some("uint8") => u8::try_from(i).is_ok(),
+        Some("uint16") => u16::try_from(i).is_ok(),
+        Some("uint32") => u32::try_from(i).is_ok(),
+        Some("uint" | "uint64") => i >= 0,
+        Some("int8") => i8::try_from(i).is_ok(),
+        Some("int16") => i16::try_from(i).is_ok(),
+        Some("int32") => i32::try_from(i).is_ok(),
+        _ => true,
+    }
+}
+
+fn describe(root: &Value, p: &Value) -> String {
+    let p = resolve(root, p);
+    if let Some(alts) = p
+        .get("anyOf")
+        .or_else(|| p.get("oneOf"))
+        .and_then(Value::as_array)
+    {
+        let parts: Vec<String> = alts.iter().map(|a| describe(root, a)).collect();
+        return parts.join(" or ");
+    }
+    if let Some(c) = p.get("const") {
+        return c.to_string();
+    }
+    if let Some(allowed) = p.get("enum").and_then(Value::as_array) {
+        let parts: Vec<String> = allowed.iter().map(Value::to_string).collect();
+        return format!("one of {}", parts.join(" | "));
+    }
+    let one = |t: &str| match t {
+        "array" => match p.get("items") {
+            Some(item) => format!("list of {}", describe(root, item)),
+            None => "list".to_string(),
+        },
+        "integer" => match p.get("format").and_then(Value::as_str) {
+            Some(f) => format!("integer ({f})"),
+            None => "integer".to_string(),
+        },
+        t => t.to_string(),
+    };
+    match p.get("type") {
+        Some(Value::String(t)) => one(t),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(one)
+            .collect::<Vec<_>>()
+            .join(" or "),
+        _ => "any".to_string(),
+    }
+}
+
+/// The candidate within two edits of `word`, if any. Shared by every
+/// "unknown name" message so suggestions behave the same everywhere.
+pub fn did_you_mean<'a>(
+    word: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    candidates
+        .into_iter()
+        .map(|c| (edit_distance(word, c), c))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -244,6 +483,76 @@ mod tests {
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w[0].contains("did you mean `user`"), "{w:?}");
         assert!(w[1].contains("ignored"), "{w:?}");
+    }
+
+    #[test]
+    fn missing_required_names_every_gap() {
+        let s = schema_for::<Two>();
+        assert_eq!(
+            missing_required(&s, &serde_json::json!({})),
+            ["user", "fruit"]
+        );
+        assert_eq!(
+            missing_required(&s, &serde_json::json!({"user": "x"})),
+            ["fruit"]
+        );
+        assert!(missing_required(&s, &serde_json::json!({"user": "x", "fruit": "y"})).is_empty());
+        assert_eq!(missing_required(&s, &Value::Null), ["user", "fruit"]);
+    }
+
+    #[test]
+    fn type_mismatches_follow_the_schema() {
+        let s = schema_for::<WithEnum>();
+        let bad = serde_json::json!({"env": "Prod", "ports": [22, "80"]});
+        let m = type_mismatches(&s, &bad);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(m[0].var, "env");
+        assert_eq!(m[0].expected, "one of \"Staging\" | \"Production\"");
+        assert_eq!(m[0].got, "\"Prod\"");
+        assert_eq!(
+            m[1].to_string(),
+            "var `ports` must be list of integer (uint16), got [22,\"80\"]"
+        );
+        let good = serde_json::json!({"env": "Staging", "ports": [22, 80]});
+        assert!(type_mismatches(&s, &good).is_empty());
+        // Option<u16>: null or an integer in range.
+        let s = schema_for::<V>();
+        assert!(type_mismatches(&s, &serde_json::json!({"user": "a", "port": null})).is_empty());
+        assert!(type_mismatches(&s, &serde_json::json!({"user": "a", "port": 22})).is_empty());
+        let m = type_mismatches(&s, &serde_json::json!({"user": 1, "port": 70000}));
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(m[0].expected, "integer (uint16) or null");
+        assert_eq!(m[1].expected, "string");
+    }
+
+    #[test]
+    fn did_you_mean_picks_the_closest_within_two_edits() {
+        assert_eq!(
+            did_you_mean("sshuser", ["addr", "ssh_user", "port"]),
+            Some("ssh_user")
+        );
+        assert_eq!(did_you_mean("prot", ["port", "post"]), Some("port"));
+        assert_eq!(did_you_mean("zzzzz", ["port"]), None);
+    }
+
+    #[derive(serde::Deserialize, schemars::JsonSchema, Debug, PartialEq)]
+    struct Lists {
+        packages: Vec<String>,
+        ports: Option<Vec<u16>>,
+    }
+
+    #[test]
+    fn scalar_for_a_list_field_becomes_a_one_element_list() {
+        let v: Lists = from_value(serde_json::json!({"packages": "nginx", "ports": 22})).unwrap();
+        assert_eq!(
+            v,
+            Lists {
+                packages: vec!["nginx".into()],
+                ports: Some(vec![22])
+            }
+        );
+        let v: Lists = from_value(serde_json::json!({"packages": []})).unwrap();
+        assert_eq!(v.packages, Vec::<String>::new());
     }
 
     #[test]

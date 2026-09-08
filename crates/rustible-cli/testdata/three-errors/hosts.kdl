@@ -1,0 +1,10 @@
+// Three planted errors for `rustible inventory check` (M2 done-when).
+
+defaults ssh_user="cadu" port=22
+
+group "web" addr="10.0.1.1" {           // error 1: addr on a group
+    host "web1" addr="10.0.1.11"
+    host "web2" addr="10.0.1.12" sshuser="deploy"   // error 2: unknown parameter
+}
+
+host "db1" addr="10.0.2.11" port="2222" // error 3: wrong type
