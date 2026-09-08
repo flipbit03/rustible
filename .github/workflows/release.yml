@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # One `version = "0.0.1"` under [workspace.package] and one per
+      # inter-crate entry under [workspace.dependencies]: all of them move
+      # together, and the grep below is the proof that none was missed.
+      - name: Patch the workspace version
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i "s/^version = \"0\.0\.1\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/version = \"0\.0\.1\" }/version = \"${VERSION}\" }/" Cargo.toml
+          if grep -n '0\.0\.1' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.1 after patching"
+            exit 1
+          fi
+          cargo update --workspace
+          grep -n "^version" Cargo.toml
+
+      # Dependency order: a crate may only be published after everything it
+      # depends on is live. crates.io needs a moment to index each one, so
+      # every publish retries while the registry still says the dependency is
+      # missing.
+      - name: Publish the seven crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          publish() {
+            local crate="$1"
+            for attempt in 1 2 3 4 5 6 7 8; do
+              echo "::group::publish $crate (attempt $attempt)"
+              if cargo publish -p "$crate" --allow-dirty --no-verify; then
+                echo "::endgroup::"
+                echo "$crate published"
+                return 0
+              fi
+              echo "::endgroup::"
+              if cargo search "$crate" --limit 1 | grep -q "^$crate = \"${{ steps.version.outputs.VERSION }}\""; then
+                echo "$crate is already at ${{ steps.version.outputs.VERSION }}; continuing"
+                return 0
+              fi
+              echo "publish of $crate failed; waiting for the index and retrying"
+              sleep 30
+            done
+            echo "::error::could not publish $crate"
+            return 1
+          }
+          for crate in rustible-sdk rustible-macros rustible-build rustible-std rustible-github rustible rustible-cli; do
+            publish "$crate" || exit 1
+          done
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: rustible_linux_x86_64
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: rustible_linux_aarch64
+          - name: macOS aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: rustible_macos_aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-cargo-
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch the workspace version
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i'' -e "s/^version = \"0\.0\.1\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i'' -e "s/version = \"0\.0\.1\" }/version = \"${VERSION}\" }/" Cargo.toml
+
+      # `rust-lld` plus the self-contained musl crt ships with rustup, so no
+      # musl-tools and no cross-compiler: the code is pure Rust all the way
+      # down (.cargo/config.toml carries the linker settings).
+      - name: Build the CLI
+        run: cargo build -p rustible-cli --profile dist --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      - name: Name the binary after its platform
+        run: cp target/${{ matrix.target }}/dist/rustible ${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: Upload release binaries
+    needs: [publish, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload binaries to release
+        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/rustible_*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

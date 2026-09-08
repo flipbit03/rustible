@@ -4,7 +4,7 @@
 //!
 //! | Ansible | Rustible |
 //! |---|---|
-//! | `copy` (with `src` or `content`) | [`Copy`] |
+//! | `copy` (with `src` or `content`) | [`struct@Copy`] |
 //! | `file: state=directory` | [`Directory`] |
 //! | `file: state=link` | [`Symlink`] |
 //! | `file: state=absent` | [`Absent`] |
