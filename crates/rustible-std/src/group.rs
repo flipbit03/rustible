@@ -290,6 +290,12 @@ impl Op for Present {
                 current.expect("no changes means it exists"),
             ));
         }
+        if current.is_none() {
+            // Check mode: let a later `user::Present`/`user::Membership` in
+            // this run accept the group this step would create (vision 6.7
+            // still holds: nothing is created here).
+            sys.note_would_create("group", &self.name, self.gid);
+        }
         let diff = Diff::Attrs {
             subject: format!("group {}", self.name),
             changes,
@@ -440,11 +446,6 @@ impl Op for Absent {
         })
     }
 }
-
-// TODO(M6 harness): once `rustible_sdk::testing::integration` and
-// `#[rustible::integration_test(images = [..])]` from branch m6-harness are
-// on main, add the container test: `Present::new("rustible-test")` twice on
-// debian:12 and ubuntu:24.04 (changed, then ok), then `Absent` twice.
 
 #[cfg(test)]
 mod tests {
@@ -754,6 +755,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("group::Absent needs root"), "{err}");
+    }
+
+    #[test]
+    fn a_planned_creation_is_noted_for_later_steps_in_check_mode_only() {
+        let fake = Arc::new(base());
+        let sys = fake_sys(&fake).with_check_mode(true);
+        assert!(!sys.would_create("group", "rustible"));
+        assert!(Present::new("rustible").check(&sys).unwrap().is_change());
+        assert!(sys.would_create("group", "rustible"));
+        assert!(sys.would_create_id("group", 5000).is_none());
+        assert!(
+            Present::new("fixed")
+                .gid(5000)
+                .check(&sys)
+                .unwrap()
+                .is_change()
+        );
+        assert_eq!(sys.would_create_id("group", 5000).unwrap().name, "fixed");
+        // An existing group is not "planned".
+        assert!(matches!(
+            Present::new("docker").check(&sys).unwrap(),
+            Plan::Satisfied(_)
+        ));
+        assert!(!sys.would_create("group", "docker"));
+        // Outside check mode the note is inert: a real run never accepts a
+        // group that is not on the machine.
+        let real = fake_sys(&fake);
+        assert!(Present::new("rustible").check(&real).unwrap().is_change());
+        assert!(!real.would_create("group", "rustible"));
     }
 
     #[test]

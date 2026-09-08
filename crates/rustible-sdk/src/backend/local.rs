@@ -144,12 +144,21 @@ impl Backend for Local {
         });
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
-        if let Some(input) = &spec.stdin {
+        // Feed stdin from a thread while the parent drains stdout/stderr: a
+        // child that writes more than a pipe buffer before reading its input
+        // would otherwise deadlock against our blocking write.
+        let feeder = spec.stdin.clone().map(|input| {
             let mut stdin = child.stdin.take().expect("piped stdin");
-            stdin.write_all(input)?;
-            drop(stdin);
-        }
+            std::thread::spawn(move || {
+                // EPIPE (the child exited without reading) is not an error
+                // of ours; the exit status tells the story.
+                let _ = stdin.write_all(&input);
+            })
+        });
         let out = child.wait_with_output()?;
+        if let Some(f) = feeder {
+            let _ = f.join();
+        }
         Ok(Output {
             status: out.status.code().unwrap_or(-1),
             stdout: out.stdout,
@@ -183,5 +192,42 @@ mod tests {
         Local.remove(&link).unwrap();
         assert!(Local.stat(&link).unwrap().is_none());
         assert!(Local.stat(&target).unwrap().is_some());
+    }
+
+    fn spec(program: &str, args: &[&str], stdin: Option<Vec<u8>>) -> CmdSpec {
+        CmdSpec {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: Default::default(),
+            cwd: None,
+            stdin,
+            prefix: vec![],
+        }
+    }
+
+    #[test]
+    fn stdin_reaches_the_child_and_a_large_input_does_not_deadlock() {
+        let out = Local
+            .spawn(&spec("cat", &[], Some(b"hello stdin".to_vec())))
+            .unwrap();
+        assert_eq!(out.status, 0);
+        assert_eq!(out.stdout, b"hello stdin");
+
+        // Larger than any pipe buffer (64 KiB on Linux), echoed back in
+        // full: the child writes while we are still feeding it.
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let out = Local.spawn(&spec("cat", &[], Some(big.clone()))).unwrap();
+        assert_eq!(out.stdout.len(), big.len());
+
+        // Without stdin the child sees EOF at once, not our terminal.
+        let out = Local.spawn(&spec("cat", &[], None)).unwrap();
+        assert_eq!(out.status, 0);
+        assert!(out.stdout.is_empty());
+
+        // A child that never reads its input still exits cleanly.
+        let out = Local
+            .spawn(&spec("true", &[], Some(vec![b'y'; 1024 * 1024])))
+            .unwrap();
+        assert_eq!(out.status, 0);
     }
 }
