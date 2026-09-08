@@ -35,6 +35,8 @@ similar = "2"
 regex = "1"
 tempfile = "3"
 rustix = { version = "1", features = ["process"] }
+zeroize = "1"
+base64 = "0.22"
 
 # Profile for binaries shipped to targets: small over fast-to-build.
 [profile.dist]
