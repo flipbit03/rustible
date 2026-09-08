@@ -572,7 +572,7 @@ arm      0        1             0        0       0         0
         assert_eq!(reported.matches("boom: deeper").count(), 1, "{reported}");
         assert!(
             reported.contains(
-                "[h]  x .......................................... FAILED
+                "[local]  x .......................................... FAILED
 "
             ),
             "{reported}"
