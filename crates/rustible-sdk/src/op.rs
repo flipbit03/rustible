@@ -24,6 +24,18 @@ pub trait Op {
     fn always_changes(&self) -> bool {
         false
     }
+
+    /// Asked after `apply` ran: does the step count as `changed`? The default
+    /// is yes, which is right for every desired-state op (`check` found a
+    /// difference, `apply` removed it). An action that can only tell after
+    /// running whether anything happened (Ansible's `changed_when` on
+    /// `command`) overrides this; `false` reports the step `ok`, with the
+    /// diff kept so `-v` still shows what ran. Never consulted in check mode,
+    /// where such a step honestly reports `would change`.
+    fn changed_by_apply(&self, output: &Self::Output) -> bool {
+        let _ = output;
+        true
+    }
 }
 
 #[derive(Debug)]

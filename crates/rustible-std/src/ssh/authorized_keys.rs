@@ -687,12 +687,6 @@ impl Op for Absent {
     }
 }
 
-// TODO(M6 harness): once `rustible_sdk::testing::integration` and
-// `#[rustible::integration_test(images = [..])]` from branch m6-harness are
-// on main, add the container test: `Present::for_user_name` twice on
-// debian:12 and ubuntu:24.04 (changed, then ok), asserting the file mode
-// 0600, `.ssh` mode 0700, and ownership on the real filesystem.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
