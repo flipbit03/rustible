@@ -169,7 +169,10 @@ pub fn select_one(dir: &Path, name: &str) -> Result<Discovered, DiscoverError> {
     }
 }
 
-fn name_of(dir: &Path, path: &Path) -> String {
+/// A playbook's registry name: its path under `dir` without the extension,
+/// `/`-separated. Shared with the CLI so `playbook create` names files the
+/// way the registry will.
+pub fn name_of(dir: &Path, path: &Path) -> String {
     path.strip_prefix(dir)
         .unwrap_or(path)
         .with_extension("")

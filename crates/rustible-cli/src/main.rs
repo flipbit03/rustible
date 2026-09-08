@@ -1,9 +1,13 @@
-//! Spike orchestrator: build a playbook per target triple, ship it, run it
-//! over the framed protocol, render the events. Local and SSH transports.
-//! Serves `FileRequest`s from the workspace, writes `FetchChunk`s under it,
-//! and turns ctrl-c into a `Cancel` frame with a ten second grace period.
+//! The `rustible` command. `run` is the spike orchestrator (build a playbook
+//! per target triple, ship it, run it over the framed protocol, render the
+//! events, serve `FileRequest`s from the workspace, write `FetchChunk`s under
+//! it, and turn ctrl-c into a `Cancel` frame with a ten second grace period);
+//! `init` and `playbook create` scaffold workspaces and playbooks.
 
+mod create;
+mod init;
 mod transport;
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::{Event, EventSink, Pretty};
 use rustible_sdk::protocol::{Down, Up};
@@ -26,8 +30,37 @@ use transport::{Proc, Transport};
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
-#[command(name = "rustible", about = "Rustible orchestrator (spike)")]
+#[command(
+    name = "rustible",
+    about = "Configuration management as real code",
+    version
+)]
 struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Build a playbook and run it on hosts (spike orchestrator).
+    Run(RunArgs),
+    /// Create a Rustible workspace in a directory.
+    Init(init::InitArgs),
+    /// Playbook commands.
+    Playbook {
+        #[command(subcommand)]
+        cmd: PlaybookCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PlaybookCmd {
+    /// Scaffold a playbook file.
+    Create(create::CreateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RunArgs {
     /// Rustible workspace directory (a Cargo package generated like
     /// `examples/workspace`).
     #[arg(long, default_value = "examples/workspace")]
@@ -62,7 +95,16 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    match Cli::parse().cmd {
+        Cmd::Run(args) => run(args).await,
+        Cmd::Init(args) => init::run(args),
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Create(args),
+        } => create::run(args),
+    }
+}
+
+async fn run(cli: RunArgs) -> Result<()> {
     let t_start = Instant::now();
     let mut vars_map = serde_json::Map::new();
     for kv in &cli.vars {
