@@ -29,11 +29,14 @@
 //!
 //! ## Using it from a collection
 //!
+//! Build the agent with [`provider`], and call [`preflight_url`] with the URL
+//! immediately before each request. Building an agent does no crypto, so the
+//! check belongs at the request, not at construction.
+//!
 //! ```no_run
 //! use rustible_std::tls;
 //!
 //! # fn main() -> rustible_sdk::error::Result<()> {
-//! tls::preflight("mycollection::Fetch")?;
 //! let agent = ureq::Agent::config_builder()
 //!     .tls_config(
 //!         ureq::tls::TlsConfig::builder()
@@ -41,7 +44,10 @@
 //!             .build(),
 //!     )
 //!     .build();
-//! # let _ = agent;
+//!
+//! let url = "https://example.com/thing";
+//! tls::preflight_url("mycollection::Fetch", url)?;
+//! # let _ = (agent, url);
 //! # Ok(())
 //! # }
 //! ```
@@ -75,6 +81,29 @@ pub fn preflight(op: &str) -> Result<()> {
     } else {
         Err(unsupported_cpu(op, &missing))
     }
+}
+
+/// [`preflight`], but only for a URL that will actually use TLS.
+///
+/// A plain `http://` request never reaches the crypto provider, so refusing it
+/// on an old CPU would refuse a machine that works and would do it with a
+/// message about HTTPS that does not describe the request. `http::Download`
+/// documents both schemes and its own container test downloads over plain
+/// HTTP, so this distinction is not hypothetical.
+///
+/// Anything that is not `https://` (case-insensitively, as
+/// [`crate::http::validate_url`] matches it) passes. Deciding whether the URL
+/// is valid at all is the caller's job.
+pub fn preflight_url(op: &str, url: &str) -> Result<()> {
+    if is_https(url) { preflight(op) } else { Ok(()) }
+}
+
+/// Byte-wise on purpose: slicing `&url[..8]` would panic on a URL whose eighth
+/// byte is inside a multi-byte character.
+fn is_https(url: &str) -> bool {
+    url.as_bytes()
+        .split_at_checked("https://".len())
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(b"https://"))
 }
 
 /// Every CPU feature the crypto provider requires, each with whether this
@@ -228,6 +257,38 @@ mod tests {
         assert!(e.contains("Broadwell"), "{e}");
         #[cfg(target_arch = "aarch64")]
         assert!(e.contains("Raspberry Pi 4"), "{e}");
+    }
+
+    /// Only `https://` reaches the provider, so only `https://` is gated. The
+    /// eighth-byte cases would panic under `&url[..8]`.
+    #[test]
+    fn only_https_urls_are_gated() {
+        for yes in [
+            "https://github.com/x",
+            "HTTPS://GITHUB.COM/x",
+            "HtTpS://x",
+            "https://",
+        ] {
+            assert!(is_https(yes), "{yes}");
+        }
+        for no in [
+            "http://github.com/x",
+            "HTTP://x",
+            "file:///tmp/x",
+            "https:/",
+            "",
+            "https:/é",
+            "😀😀",
+        ] {
+            assert!(!is_https(no), "{no}");
+        }
+    }
+
+    /// A plain-HTTP request passes the pre-flight whatever the CPU is,
+    /// because it never reaches the provider.
+    #[test]
+    fn plain_http_is_never_refused() {
+        preflight_url("http::Download", "http://mirror.internal/x.tar.gz").unwrap();
     }
 
     /// Several missing extensions are all named, not just the first.

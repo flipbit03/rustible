@@ -7,11 +7,12 @@
 //! `rust-lld`. Certificates are checked against Mozilla's bundled roots
 //! (`webpki-roots`); there is no `validate_certs: no`.
 //!
-//! Graviola asserts on the CPU extensions it needs, so `apply` runs
-//! [`tls::preflight`](crate::tls::preflight) first and fails the step with a
-//! readable error on a machine below the floor (pre-Broadwell x86_64,
-//! Raspberry Pi 4 and earlier). It never panics mid-run, and there is no
-//! fallback provider.
+//! Graviola asserts on the CPU extensions it needs, so an `https://` `apply`
+//! runs [`tls::preflight_url`](crate::tls::preflight_url) first and fails the
+//! step with a readable error on a machine below the floor (pre-Broadwell
+//! x86_64, Raspberry Pi 4 and earlier). It never panics mid-run, and there is
+//! no fallback provider. A plain `http://` download is not gated: it never
+//! reaches the provider, so it keeps working on those machines.
 //!
 //! `check` never touches the network. It decides from the file on disk
 //! whether a download is due, so a dry run is fast and honest (vision 12).
@@ -364,8 +365,9 @@ impl Download {
     fn fetch(&self) -> Result<Vec<u8>> {
         // Before anything reaches the handshake: graviola panics on a CPU
         // without the extensions it needs, and a panic here would take the
-        // whole playbook down instead of failing this step.
-        crate::tls::preflight("http::Download")?;
+        // whole playbook down instead of failing this step. Only `https://`
+        // is gated; a plain HTTP download never touches the provider.
+        crate::tls::preflight_url("http::Download", &self.url)?;
         let agent = agent(self.timeout);
         let mut req = agent.get(&self.url);
         for (k, v) in &self.headers {

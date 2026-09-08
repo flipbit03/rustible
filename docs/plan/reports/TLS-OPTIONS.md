@@ -1,5 +1,39 @@
 # TLS options for the target binary
 
+## Decision
+
+**Cadu, 2026-09-08: switch to `rustls-graviola`, with no fallback.**
+`rustls-rustcrypto` leaves the tree entirely.
+
+That is option (2) of section 7, not the hybrid this report leans towards. The
+reasoning for taking the stricter branch is that one crypto path is one thing
+to reason about, and an opt-in fallback would keep alpha code in the graph for
+a hardware population Rustible has no user on. The cost is accepted knowingly:
+`http::Download` and `github::UserKeys` cannot run at all on pre-Broadwell
+x86_64 or on Raspberry Pi 4 and earlier. Every non-network op still works
+there.
+
+The pre-flight this report calls not optional is built, as
+`rustible_std::tls::preflight`, and both ops call it before any handshake, so
+an unsupported CPU gets a named error instead of a panic mid-playbook.
+
+Two things this report did not predict:
+
+- **graviola 0.4.1 declares `rust-version = 1.89`**, so the workspace MSRV
+  moved from 1.88 to 1.89. Every graviola from 0.3.0 onwards is on 1.89, and
+  `rustls-graviola` 0.4 requires graviola 0.4, so pinning back is not
+  available.
+- **The static musl binary grows by about a third**, not shrinks, despite
+  graviola having a far smaller dependency graph and despite the duplicate
+  `rustls-webpki` copy going away.
+
+Implemented on branch `tls-graviola`. See
+`docs/plan/reports/M7-tls-graviola.md` and the `[M7-tls]` entries in
+`docs/plan/DECISIONS.md`. Everything below is the original research,
+unchanged.
+
+---
+
 Research report. No code changed. Everything marked **verified** was executed or
 read on this machine on 2026-09-08; everything marked **inferred** is reasoning
 from a source I could read but not run.
