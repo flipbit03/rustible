@@ -19,7 +19,7 @@ use rustible_cli::inventory::{
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::Event;
 use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
-use rustible_sdk::runtime::{self, HostVars};
+use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -262,28 +262,9 @@ pub fn cli_vars(flags: &[String]) -> Result<serde_json::Map<String, Value>> {
     Ok(map)
 }
 
-/// Validate every target's vars through the playbook binary. `Ok(None)` is
-/// clean; `Ok(Some(report))` is the vision 10.3 message. Warnings
-/// (undeclared vars) come back separately.
-pub async fn precheck(
-    ws: &Workspace,
-    cargo: &Cargo,
-    d: &Describe,
-    targets: &[Resolved],
-    cli: &serde_json::Map<String, Value>,
-) -> Result<(Option<String>, Vec<(String, String)>)> {
-    if d.vars_schema.is_null() {
-        return Ok((None, vec![]));
-    }
-    let bin = describe::check_binary(cargo, d).await?;
-    let input: Vec<HostVars> = targets
-        .iter()
-        .map(|r| HostVars {
-            host: r.host.clone(),
-            vars: merged_vars(r, cli),
-        })
-        .collect();
-    let checks = describe::check_vars(&bin, &d.name, &input).await?;
+/// `--check-vars` output split into what the vision 10.3 report takes and
+/// the warnings (undeclared vars) as `(host, message)`.
+pub fn split_checks(checks: Vec<HostCheck>) -> (HostResults, Vec<(String, String)>) {
     let mut results: HostResults = vec![];
     let mut warnings = vec![];
     for c in checks {
@@ -300,15 +281,40 @@ pub async fn precheck(
         }
         results.push((c.host, errs));
     }
-    let is_group = !targets.iter().all(|r| r.host == d.hosts);
-    let report = format_vars_report(
+    (results, warnings)
+}
+
+/// Validate every target's vars through the playbook binary before
+/// anything is built for a target (vision 5.2 step 3). `Ok(None)` is
+/// clean; `Ok(Some(report))` is the vision 10.3 message. Warnings are not
+/// printed here: the binary repeats them at `Start`, rendered with the run.
+pub async fn precheck(
+    ws: &Workspace,
+    inv: &Inventory,
+    cargo: &Cargo,
+    d: &Describe,
+    targets: &[Resolved],
+    cli: &serde_json::Map<String, Value>,
+) -> Result<Option<String>> {
+    if d.vars_schema.is_null() {
+        return Ok(None);
+    }
+    let bin = describe::check_binary(cargo, d).await?;
+    let input: Vec<HostVars> = targets
+        .iter()
+        .map(|r| HostVars {
+            host: r.host.clone(),
+            vars: merged_vars(r, cli),
+        })
+        .collect();
+    let (results, _warnings) = split_checks(describe::check_vars(&bin, &d.name, &input).await?);
+    Ok(format_vars_report(
         &d.hosts,
-        is_group,
+        inv.groups.contains_key(&d.hosts),
         &ws.playbook_file(&d.name),
         &ws.config.inventory.display().to_string(),
         &results,
-    );
-    Ok((report, warnings))
+    ))
 }
 
 pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
@@ -324,8 +330,7 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
 
     // 3. Hosts, then vars for every one of them, before anything else.
     let targets = select_targets(inv, &d.hosts, args.limit.as_deref())?;
-    let (report, _warnings) = precheck(ws, &cargo, &d, &targets, &cli).await?;
-    if let Some(report) = report {
+    if let Some(report) = precheck(ws, inv, &cargo, &d, &targets, &cli).await? {
         eprint!("{report}");
         return Ok(1);
     }
@@ -409,22 +414,20 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         }
 
         // 7, 8, 9. Per host: upload if missing, execute, stream frames.
+        let plan = Arc::new(Plan {
+            name: name.clone(),
+            escalate: d.escalate,
+            check: args.check,
+            verbosity: args.verbose,
+        });
         let mut runs = vec![];
         for (r, tr, probe) in hosts {
             let artifact = artifacts[&probe.triple].clone();
-            let out = out.clone();
-            let name = name.clone();
+            let (out, plan) = (out.clone(), plan.clone());
             let vars = merged_vars(&r, &cli);
-            let escalate = d.escalate;
-            let (check, verbosity) = (args.check, args.verbose);
             runs.push(tokio::spawn(async move {
-                let host = r.host.clone();
-                let result = drive(
-                    &r, &tr, &probe, &artifact, &name, vars, escalate, check, verbosity, &out,
-                )
-                .await;
-                if let Err(e) = result {
-                    out.lock().unwrap().failed(&host, &format!("{e:#}"));
+                if let Err(e) = drive(&plan, &r, &tr, &probe, &artifact, vars, &out).await {
+                    out.lock().unwrap().failed(&r.host, &format!("{e:#}"));
                 }
                 tr.close().await;
             }));
@@ -441,20 +444,27 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
     Ok(if failed { EXIT_FAILED } else { 0 })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What every host of one run shares.
+struct Plan {
+    name: String,
+    escalate: bool,
+    check: bool,
+    verbosity: u8,
+}
+
+/// Steps 7 to 9 for one host: upload if missing, execute, drive the
+/// protocol until EOF, hand every frame to the output.
 async fn drive(
+    plan: &Plan,
     r: &Resolved,
     tr: &Transport,
     probe: &Probe,
     artifact: &(Vec<u8>, String),
-    name: &str,
     vars: Value,
-    escalate: bool,
-    check: bool,
-    verbosity: u8,
     out: &Shared,
 ) -> Result<()> {
     let host = r.host.as_str();
+    let name = plan.name.as_str();
     let (bytes, hash) = artifact;
     let path = remote_path(&probe.home, name, hash);
 
@@ -473,13 +483,18 @@ async fn drive(
         ),
     );
 
-    if escalate && r.params.escalate == Escalate::None {
+    if plan.escalate && r.params.escalate == Escalate::None {
         out.lock().unwrap().note(
             host,
             "playbook says escalate, host has escalate=\"none\": running unescalated",
         );
     }
-    let argv = exec_argv(&path, escalate, r.params.escalate, &r.params.escalate_user);
+    let argv = exec_argv(
+        &path,
+        plan.escalate,
+        r.params.escalate,
+        &r.params.escalate_user,
+    );
     let mut proc = tr.spawn(&argv).await?;
 
     let start = Down::Start {
@@ -498,8 +513,8 @@ async fn drive(
             connection: r.params.connection.as_str().to_string(),
         },
         vars,
-        check_mode: check,
-        verbosity,
+        check_mode: plan.check,
+        verbosity: plan.verbosity,
     };
     write_frame(&mut proc.stdin, &start).await?;
 

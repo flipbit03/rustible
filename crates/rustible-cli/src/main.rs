@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rustible_cli::inventory::{Inventory, Severity, VarError, format_vars_report, render_show};
-use rustible_sdk::runtime::{self, HostVars};
+use rustible_cli::inventory::{Inventory, format_vars_report, render_show};
+use rustible_sdk::runtime::HostVars;
 
 use describe::Cargo;
 use workspace::Workspace;
@@ -257,23 +257,10 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result
                 vars: rustible_cli::inventory::bag_to_json(&r.vars),
             })
             .collect();
-        let checks = describe::check_vars(&bin, &d.name, &input).await?;
-        let mut results = vec![];
-        for c in checks {
-            let mut errs = vec![];
-            for p in c.problems {
-                match p.severity {
-                    runtime::Severity::Error => errs.push(VarError {
-                        var: p.var,
-                        severity: Severity::Error,
-                        message: p.message,
-                    }),
-                    runtime::Severity::Warning => {
-                        eprintln!("warning: {src} on host `{}`: {}", c.host, p.message);
-                    }
-                }
-            }
-            results.push((c.host, errs));
+        let (results, warnings) =
+            run::split_checks(describe::check_vars(&bin, &d.name, &input).await?);
+        for (host, message) in warnings {
+            eprintln!("warning: {src} on host `{host}`: {message}");
         }
         let is_group = inv.groups.contains_key(&d.hosts);
         match format_vars_report(&d.hosts, is_group, &src, &inventory_file, &results) {
