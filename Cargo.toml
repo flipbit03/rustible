@@ -32,6 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 similar = "2"
+# Network, pure Rust (vision 5.3). `ureq` without its default `rustls` feature
+# because that pulls `ring` (C); the provider is `rustls-rustcrypto`, wired by
+# hand in `rustible-github` (and in `rustible-std::http` once that lands).
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 regex = "1"
 tempfile = "3"
 rustix = { version = "1", features = ["process"] }
