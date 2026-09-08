@@ -14,7 +14,7 @@ Updated by whoever is working; read first on every resume.
 | M6 rustible-github | todo | |
 | M6 docker harness | merged | PR #5, 2026-09-08; review: 7 fixes, 3 dismissed with reasons; `rustible_sdk::testing` + `#[rustible::integration_test]` |
 | D dogfood | human-only | never unattended |
-| M7 release prep | partly done | CI and release workflows merged (PR #11), all four CI jobs green on GitHub, seven crates package cleanly, both musl dist builds verified; README rewrite and the rustdoc pass wait for M3; publishing is Cadu's |
+| M7 release prep | partly done | CI and release workflows merged (PR #11), all four CI jobs green on GitHub, seven crates package cleanly, both musl dist builds verified; README merged (PR #13), verified command by command; remaining: the rustdoc pass over every public item, and the release itself, which is Cadu's |
 
 ## Log
 (append one line per event: date, milestone, what happened)
@@ -41,3 +41,4 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 15:28 UTC  M3  merged as PR #10 after review (eight findings: six fixed on the branch, two recorded). Fixes: unique upload temp name (a fixed one could publish an interleaved binary as a permanent cache hit), a 64 MiB frame cap, the child's stderr kept on early failures, src/main.rs bin-target selection, the vars report naming the file actually read, and --workspace honoured by playbook create and refused by init. Re-verified on local and the ARM VM
 - 2026-09-08 15:32 UTC  M7  README rewritten and opened as PR #13, verified command by command from an empty directory against the merged CLI (init, playbook create, list, inventory check, run). The install section says plainly that the crates.io names are 0.0.1 placeholders and builds from a clone instead.
 - 2026-09-08 15:32 UTC  ALL  Four subagents hit the Fable model quota mid-task and were resumed on Opus against their existing worktrees: m5-rework (merge onto M3, re-verify through the real CLI), m6-net-archive-2, m6-shell-tests-2, m6-github-2. Each had already committed its implementation; what remained was verification, reports and PRs.
+- 2026-09-08 15:33 UTC  M7  README merged as PR #13 (CI green).
