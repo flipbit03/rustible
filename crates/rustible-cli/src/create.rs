@@ -1,7 +1,6 @@
 //! `rustible playbook create <path>`: write a playbook skeleton (vision doc
 //! sections 3 and 9) and print the rust-analyzer check-on-save hint.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -29,8 +28,15 @@ pub struct CreateArgs {
 /// Run `rustible playbook create`.
 pub fn run(args: CreateArgs) -> Result<()> {
     let mut path = args.path;
+    ensure!(
+        !path.as_os_str().is_empty(),
+        "give a path for the playbook file"
+    );
     if path.extension().is_none_or(|e| e != "rs") {
-        path.set_extension("rs");
+        // Append, never replace: `nginx.v2` becomes `nginx.v2.rs`.
+        let mut os = path.into_os_string();
+        os.push(".rs");
+        path = PathBuf::from(os);
     }
     ensure!(
         !path.exists(),
@@ -39,11 +45,11 @@ pub fn run(args: CreateArgs) -> Result<()> {
     );
 
     let (name, warning) = playbook_name(&path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(&path, skeleton(&name)).with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("    wrote {} (playbook `{name}`)", path.display());
+    crate::workspace::write_file(
+        &path,
+        &skeleton(&name),
+        &format!("{} (playbook `{name}`)", path.display()),
+    )?;
     if let Some(w) = warning {
         eprintln!("warning: {w}");
     }
@@ -61,11 +67,7 @@ pub fn skeleton(name: &str) -> String {
 /// the name falls back to the file stem and a warning explains why the build
 /// script will not find the file.
 fn playbook_name(path: &Path) -> Result<(String, Option<String>)> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+    let abs = crate::workspace::absolute(path)?;
     let stem = abs
         .file_stem()
         .and_then(|s| s.to_str())
@@ -73,7 +75,7 @@ fn playbook_name(path: &Path) -> Result<(String, Option<String>)> {
         .with_context(|| format!("{} has no file name", path.display()))?
         .to_string();
 
-    let Some(root) = find_workspace_root(abs.parent().unwrap_or(&abs)) else {
+    let Some(root) = crate::workspace::find_workspace_root(abs.parent().unwrap_or(&abs)) else {
         return Ok((
             stem,
             Some(format!(
@@ -84,41 +86,42 @@ fn playbook_name(path: &Path) -> Result<(String, Option<String>)> {
         ));
     };
     let playbooks = root.join("playbooks");
-    match abs.strip_prefix(&playbooks) {
-        Ok(rel) => {
-            let rel = rel.with_extension("");
-            let name = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            Ok((name, None))
-        }
-        Err(_) => Ok((
+    if abs.starts_with(&playbooks) {
+        // The same rule the build script applies, so `create` names the
+        // playbook exactly as the registry will.
+        let name = rustible_build::name_of(&playbooks, &abs);
+        validate_name(&name)?;
+        Ok((name, None))
+    } else {
+        validate_name(&stem)?;
+        Ok((
             stem,
             Some(format!(
                 "{} is outside {}; the build script only discovers playbooks there",
                 path.display(),
                 playbooks.display()
             )),
-        )),
+        ))
     }
 }
 
-/// Walk up from `start` looking for `rustible.toml` (vision doc section 10.4).
-fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        if d.join("rustible.toml").is_file() {
-            return Some(d.to_path_buf());
-        }
-        dir = d.parent();
-    }
-    None
+/// Names are spliced into the skeleton's doc comment and a string literal,
+/// and become module identifiers; keep them to a safe alphabet.
+fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')),
+        "playbook name `{name}` may only contain ASCII letters, digits, `_`, `-`, `.` and `/`"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]

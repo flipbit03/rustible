@@ -5,6 +5,7 @@
 mod create;
 mod init;
 mod transport;
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

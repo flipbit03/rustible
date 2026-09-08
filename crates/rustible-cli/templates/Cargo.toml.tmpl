@@ -38,3 +38,6 @@ strip = true
 lto = "fat"
 codegen-units = 1
 opt-level = "z"
+# The runtime turns a playbook panic into a reported failure with `catch_unwind`;
+# `abort` would kill the remote binary with no report.
+panic = "unwind"

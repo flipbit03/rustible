@@ -63,8 +63,9 @@ fn regenerates_the_example_workspace() {
             read(&dir, rel),
             read(&example, rel),
             "{rel} differs from examples/workspace; if the version was bumped, run \
-             `cargo run -p rustible-cli -- init --refresh examples/workspace` (shims) or \
-             `... init examples/workspace --force --path-deps ../..` and restore the example content"
+             `cargo run -p rustible-cli -- init --refresh examples/workspace` for the shims; \
+             for other files, delete the example's copy and rerun \
+             `... init examples/workspace --force --path-deps ../..`"
         );
     }
     assert_eq!(read(&dir, ".gitignore"), "/target\n/.rustible\n");

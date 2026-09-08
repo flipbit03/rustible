@@ -8,6 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::workspace::normalize;
+
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 
@@ -38,8 +40,8 @@ pub struct InitArgs {
     /// crate name.
     #[arg(long)]
     pub name: Option<String>,
-    /// Write into a non-empty directory, overwriting the generated files.
-    /// `.gitignore` and `playbooks/` are never overwritten, only added to.
+    /// Write into a non-empty directory. Files that already exist are kept
+    /// (only the two generated shims are rewritten); missing ones are added.
     #[arg(long, conflicts_with = "refresh")]
     pub force: bool,
     /// Rewrite only the two generated shims (`build.rs`, `src/main.rs`) of an
@@ -75,7 +77,14 @@ pub fn run(args: InitArgs) -> Result<()> {
         return refresh(&args.dir);
     }
 
-    let dir = &args.dir;
+    // An empty argument (`rustible init ""`) means the current directory,
+    // and must go through the same emptiness check as `.`.
+    let dir = if args.dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        args.dir.clone()
+    };
+    let dir = &dir;
     if dir.exists() {
         ensure!(
             dir.is_dir(),
@@ -84,7 +93,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         );
         if !args.force && !is_empty_dir(dir)? {
             bail!(
-                "{} is not empty; use --force to write into it anyway (generated files are overwritten)",
+                "{} is not empty; use --force to add the missing files (existing files are kept, only the two shims are rewritten)",
                 dir.display()
             );
         }
@@ -121,14 +130,25 @@ pub fn run(args: InitArgs) -> Result<()> {
     };
 
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let shim_paths: Vec<&str> = shims().iter().map(|g| g.path).collect();
     for file in generate(&name, &deps) {
+        let target = dir.join(file.path);
+        // With --force, user-owned files (Cargo.toml, src/lib.rs, hosts.kdl,
+        // rustible.toml, .cargo/config.toml) are never overwritten; the shims
+        // are ours and always rewritten.
+        if args.force && target.exists() && !shim_paths.contains(&file.path) {
+            eprintln!("    kept existing {}", file.path);
+            continue;
+        }
         write_file(dir, file.path, &file.contents)?;
     }
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
 
+    // `rustible playbook run` arrives with M3; until then the generated
+    // binary runs playbooks directly.
     eprintln!(
-        "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    rustible playbook run playbooks/hello.rs",
+        "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    cargo run -- hello        # or, once available: rustible playbook run playbooks/hello.rs",
         dir.display()
     );
     Ok(())
@@ -139,6 +159,7 @@ pub fn run(args: InitArgs) -> Result<()> {
 /// are added to, never overwritten.
 pub fn generate(name: &str, deps: &Deps) -> Vec<Generated> {
     let crate_ident = name.replace('-', "_");
+    let [build_rs, main_rs] = shims();
     vec![
         Generated {
             path: "Cargo.toml",
@@ -150,14 +171,8 @@ pub fn generate(name: &str, deps: &Deps) -> Vec<Generated> {
                     &render_deps(&BUILD_DEPENDENCIES, deps),
                 ),
         },
-        Generated {
-            path: "build.rs",
-            contents: shim(BUILD_RS),
-        },
-        Generated {
-            path: "src/main.rs",
-            contents: shim(MAIN_RS),
-        },
+        build_rs,
+        main_rs,
         Generated {
             path: "src/lib.rs",
             contents: LIB_RS.replace("{{crate_ident}}", &crate_ident),
@@ -222,13 +237,7 @@ fn refresh(dir: &Path) -> Result<()> {
 }
 
 fn write_file(dir: &Path, rel: &str, contents: &str) -> Result<()> {
-    let path = dir.join(rel);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("    wrote {rel}");
-    Ok(())
+    crate::workspace::write_file(&dir.join(rel), contents, rel)
 }
 
 /// Create `.gitignore` with the template, or append the lines it lacks.
@@ -246,7 +255,7 @@ fn ensure_gitignore(dir: &Path) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let mut out = existing.clone();
+    let mut out = existing;
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
@@ -260,33 +269,10 @@ fn ensure_gitignore(dir: &Path) -> Result<()> {
 }
 
 fn ensure_gitkeep(dir: &Path) -> Result<()> {
-    let playbooks = dir.join("playbooks");
-    fs::create_dir_all(&playbooks).with_context(|| format!("creating {}", playbooks.display()))?;
-    let keep = playbooks.join(".gitkeep");
-    if !keep.exists() {
-        write_file(dir, "playbooks/.gitkeep", "")?;
+    if dir.join("playbooks/.gitkeep").exists() {
+        return Ok(());
     }
-    Ok(())
-}
-
-/// Resolve `.` and `..` lexically, without touching the filesystem.
-fn normalize(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    write_file(dir, "playbooks/.gitkeep", "")
 }
 
 /// A directory counts as empty when it holds nothing but `.git`, so
@@ -302,13 +288,9 @@ fn is_empty_dir(dir: &Path) -> Result<bool> {
 }
 
 fn package_name_from_dir(dir: &Path) -> Result<String> {
-    // `.` and `..` have no file name; resolve them first.
-    let abs = if dir.exists() {
-        dir.canonicalize()
-            .with_context(|| format!("resolving {}", dir.display()))?
-    } else {
-        std::env::current_dir()?.join(dir)
-    };
+    // `.` and `..` have no file name; resolve them lexically (never
+    // `canonicalize`, which would name a symlinked directory after its target).
+    let abs = crate::workspace::absolute(dir)?;
     let raw = abs
         .file_name()
         .and_then(|n| n.to_str())
@@ -406,13 +388,22 @@ const RESERVED: &[&str] = &[
     "alloc",
     "proc_macro",
     "proc-macro",
-    "rustible",
-    "rustible-std",
-    "rustible-sdk",
-    "rustible-build",
-    "rustible-macros",
-    "rustible-cli",
+    // Cargo forbids these as binary target names (they collide with its
+    // build directory layout).
+    "build",
+    "deps",
+    "examples",
+    "incremental",
 ];
+
+/// The generated package's lib would shadow one of its own dependencies.
+fn shadows_dependency(name: &str) -> bool {
+    let ident = name.replace('-', "_");
+    DEPENDENCIES
+        .iter()
+        .chain(BUILD_DEPENDENCIES.iter())
+        .any(|d| d.replace('-', "_") == ident)
+}
 
 /// Reject names Cargo would refuse or that would shadow a dependency.
 pub fn validate_package_name(name: &str) -> Result<()> {
@@ -428,7 +419,11 @@ pub fn validate_package_name(name: &str) -> Result<()> {
     );
     ensure!(
         !RESERVED.contains(&name),
-        "`{name}` is a Rust keyword or a reserved crate name and cannot be a package name"
+        "`{name}` is a Rust keyword or a name Cargo reserves and cannot be a package name"
+    );
+    ensure!(
+        !shadows_dependency(name),
+        "`{name}` would shadow a dependency of the generated workspace; pick another name"
     );
     Ok(())
 }
@@ -447,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_lexically() {
+    fn normalizes_lexically_via_workspace() {
         assert_eq!(
             normalize(Path::new("/a/b/new/../../crates")),
             PathBuf::from("/a/crates")

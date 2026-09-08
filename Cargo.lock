@@ -458,6 +458,7 @@ dependencies = [
  "anyhow",
  "clap",
  "openssh",
+ "rustible-build",
  "rustible-sdk",
  "serde",
  "serde_json",
