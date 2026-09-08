@@ -170,6 +170,9 @@ ctx.step("Persist only (container)",
 - `apt::Latest` also has `.install_recommends(bool)` (mirrors `Present`).
 - No `update_cache_always()`; `update_cache(Duration::ZERO)` is the spelling.
 - No container tests (see Verified).
+- After merging main (9379095): the sysctl drop-in is read through the shared
+  `file::read_text_or_empty` (symlink and directory refusals for free); the
+  parent-directory check stays local.
 
 ## Decisions
 

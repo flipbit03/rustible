@@ -1,41 +1,43 @@
 $ cargo test -p rustible-std apt
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+   Compiling rustible-sdk v0.0.1 (/home/cadu/w/cadu/rustible-m6so/crates/rustible-sdk)
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-m6so/crates/rustible-std)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.60s
      Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
 
 running 31 tests
 test apt::tests::absent_apply_without_prediction_is_refused ... ok
 test apt::tests::absent_autoremove_without_purge ... ok
+test apt::tests::absent_check_mode_runs_only_dpkg_query_and_predicts ... ok
 test apt::tests::absent_change_and_apply_runs_apt_get_remove ... ok
 test apt::tests::absent_config_files_count_as_present_only_when_purging ... ok
-test apt::tests::absent_check_mode_runs_only_dpkg_query_and_predicts ... ok
 test apt::tests::absent_purge_uses_apt_get_purge_and_autoremove_purge ... ok
 test apt::tests::absent_refuses_half_configured_package ... ok
-test apt::tests::absent_refuses_wrong_pm_and_non_root ... ok
 test apt::tests::absent_satisfied_when_not_installed ... ok
-test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::absent_refuses_wrong_pm_and_non_root ... ok
 test apt::tests::deconfigured_package_counts_as_missing ... ok
-test apt::tests::latest_check_mode_runs_only_read_only_commands ... ok
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
 test apt::tests::latest_installs_missing_packages ... ok
-test apt::tests::latest_mixed_install_upgrade_current ... ok
-test apt::tests::latest_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::latest_check_mode_runs_only_read_only_commands ... ok
 test apt::tests::latest_refuses_unknown_package ... ok
+test apt::tests::latest_refuses_wrong_pm_and_non_root ... ok
 test apt::tests::latest_satisfied_when_at_candidate ... ok
-test apt::tests::parse_policy_installed_and_candidate ... ok
+test apt::tests::latest_update_cache_runs_before_install ... ok
 test apt::tests::latest_upgrades_with_only_upgrade ... ok
 test apt::tests::parse_dpkg_status_variants ... ok
 test apt::tests::parse_policy_none_means_not_installed ... ok
+test apt::tests::parse_policy_installed_and_candidate ... ok
 test apt::tests::parse_policy_unknown_package_has_no_candidate ... ok
 test apt::tests::parse_stat_mtime_reads_seconds ... ok
-test apt::tests::latest_update_cache_runs_before_install ... ok
 test apt::tests::present_refuses_without_root ... ok
-test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::latest_mixed_install_upgrade_current ... ok
 test apt::tests::satisfied_when_installed ... ok
-test apt::tests::update_cache_falls_back_to_pkgcache_then_updates_when_unknown ... ok
-test apt::tests::update_cache_runs_apt_get_update_when_lists_are_stale ... ok
-test apt::tests::update_cache_zero_always_updates_without_stat ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
 test apt::tests::update_cache_skips_update_when_lists_are_fresh ... ok
+test apt::tests::update_cache_falls_back_to_pkgcache_then_updates_when_unknown ... ok
+test apt::tests::update_cache_zero_always_updates_without_stat ... ok
+test apt::tests::update_cache_runs_apt_get_update_when_lists_are_stale ... ok
 
-test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.00s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 133 filtered out; finished in 0.00s
 
 
 $ cargo test -p rustible-std hostname
@@ -43,23 +45,23 @@ $ cargo test -p rustible-std hostname
      Running unittests src/lib.rs (target/debug/deps/rustible_std-1752bf55933614f4)
 
 running 15 tests
+test hostname::tests::apply_without_prediction_is_refused ... ok
 test hostname::tests::apply_creates_etc_hostname_when_missing ... ok
 test hostname::tests::apply_on_systemd_uses_hostnamectl ... ok
-test hostname::tests::apply_without_prediction_is_refused ... ok
-test hostname::tests::change_when_only_the_file_differs ... ok
 test hostname::tests::apply_without_systemd_writes_file_and_runs_hostname ... ok
 test hostname::tests::change_when_only_the_kernel_differs ... ok
-test hostname::tests::check_mode_predicts_and_runs_nothing ... ok
+test hostname::tests::change_when_only_the_file_differs ... ok
 test hostname::tests::invalid_hostnames ... ok
-test hostname::tests::missing_etc_hostname_reads_as_absent ... ok
+test hostname::tests::check_mode_predicts_and_runs_nothing ... ok
 test hostname::tests::kernel_falls_back_to_facts_when_proc_is_unreadable ... ok
+test hostname::tests::missing_etc_hostname_reads_as_absent ... ok
 test hostname::tests::refuses_invalid_name_before_touching_anything ... ok
 test hostname::tests::refuses_without_root ... ok
 test hostname::tests::satisfied_when_file_and_kernel_match ... ok
-test hostname::tests::valid_hostnames ... ok
 test hostname::tests::step_is_ok_on_second_run_after_apply ... ok
+test hostname::tests::valid_hostnames ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 98 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.00s
 
 
 $ cargo test -p rustible-std sysctl
@@ -68,19 +70,19 @@ $ cargo test -p rustible-std sysctl
 
 running 21 tests
 test sysctl::tests::apply_now_false_only_persists ... ok
-test sysctl::tests::apply_without_prediction_is_refused ... ok
 test sysctl::tests::change_when_only_live_differs_and_apply_runs_sysctl_w ... ok
-test sysctl::tests::change_when_both_differ ... ok
 test sysctl::tests::change_when_only_the_file_differs_and_apply_writes_without_sysctl ... ok
 test sysctl::tests::check_mode_predicts_writes_nothing_and_runs_nothing ... ok
+test sysctl::tests::apply_without_prediction_is_refused ... ok
 test sysctl::tests::custom_file_is_used ... ok
+test sysctl::tests::change_when_both_differ ... ok
 test sysctl::tests::key_validation ... ok
 test sysctl::tests::missing_directory_is_refused ... ok
 test sysctl::tests::missing_proc_key_is_refused_unless_persist_only ... ok
-test sysctl::tests::parse_line_handles_spacing_comments_and_ignore_marker ... ok
 test sysctl::tests::multi_value_keys_compare_token_wise ... ok
-test sysctl::tests::plan_collapses_duplicates_onto_the_first_line ... ok
+test sysctl::tests::parse_line_handles_spacing_comments_and_ignore_marker ... ok
 test sysctl::tests::plan_appends_to_empty_and_existing_text ... ok
+test sysctl::tests::plan_collapses_duplicates_onto_the_first_line ... ok
 test sysctl::tests::plan_does_not_match_a_key_prefix_or_comment ... ok
 test sysctl::tests::plan_is_satisfied_regardless_of_spacing ... ok
 test sysctl::tests::plan_replaces_in_place_and_keeps_the_rest ... ok
@@ -89,15 +91,14 @@ test sysctl::tests::refuses_bad_key_newline_value_and_non_root ... ok
 test sysctl::tests::satisfied_when_file_and_live_match ... ok
 test sysctl::tests::step_changed_then_ok_when_live_follows ... ok
 
-test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.00s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 143 filtered out; finished in 0.00s
 
 
 $ cargo fmt --all --check
 (clean)
 
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Checking rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-m6so/crates/rustible-macros)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.43s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
 
 $ cargo test --workspace
      Running unittests src/lib.rs (target/debug/deps/rustible-9b3428ddd10b8556)
@@ -115,11 +116,11 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running unittests src/lib.rs (target/debug/deps/rustible_macros-3c628cdf2feaa5e1)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
      Running tests/ui.rs (target/debug/deps/ui-03e2bf62c6153ec4)
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
      Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
      Running unittests src/lib.rs (target/debug/deps/rustible_std-9603fe1879444ace)
-test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
      Running unittests src/bin/mc.rs (target/debug/deps/mc-f66f4918ce89550d)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
      Running unittests src/main.rs (target/debug/deps/spike_playbook-0ea54633e4475fe6)
@@ -137,4 +138,4 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
    Doc-tests rustible_sdk
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
    Doc-tests rustible_std
-test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
