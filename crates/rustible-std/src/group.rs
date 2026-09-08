@@ -53,6 +53,19 @@ pub fn group_entry(text: &str, name: &str) -> Option<Group> {
     parse_group(text).into_iter().find(|g| g.name == name)
 }
 
+/// Pure: like [`group_entry`], but a line that names the group and does not
+/// parse is an error rather than "missing", so an op never tries to create
+/// a group whose line is merely broken.
+pub fn lookup_group(text: &str, name: &str) -> Result<Option<Group>> {
+    match group_entry(text, name) {
+        Some(g) => Ok(Some(g)),
+        None => match text.lines().find(|l| l.split(':').next() == Some(name)) {
+            Some(line) => bail!("/etc/group has a malformed line for `{name}`: {line}"),
+            None => Ok(None),
+        },
+    }
+}
+
 /// Pure: the group with this gid, if `/etc/group` text has it.
 pub fn group_by_gid(text: &str, gid: u32) -> Option<Group> {
     parse_group(text).into_iter().find(|g| g.gid == gid)
@@ -118,13 +131,28 @@ pub(crate) fn run_tool(cmd: rustible_sdk::Cmd, tools: Tools, program: &str) -> R
     Ok(())
 }
 
-/// Reject names that would break the passwd/group format or the tools.
+/// Reject names that would break the passwd/group format or the tools:
+/// empty, a leading `-` (read as a flag), or any of `:`, `,`, whitespace
+/// and control characters.
 pub(crate) fn validate_name(what: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("{what} name is empty");
     }
-    if name.contains([':', '\n', ',']) || name.starts_with('-') {
-        bail!("{what} name `{name}` is not valid");
+    if name.starts_with('-')
+        || name
+            .chars()
+            .any(|c| c == ':' || c == ',' || c.is_whitespace() || c.is_control())
+    {
+        bail!("{what} name `{}` is not valid", name.escape_default());
+    }
+    Ok(())
+}
+
+/// Reject a free-text field (home, shell, comment) that would corrupt a
+/// passwd line: `:` and control characters.
+pub(crate) fn validate_field(what: &str, value: &str) -> Result<()> {
+    if value.chars().any(|c| c == ':' || c.is_control()) {
+        bail!("{what} `{}` is not valid", value.escape_default());
     }
     Ok(())
 }
@@ -186,7 +214,7 @@ impl Present {
     fn inspect(&self, sys: &System) -> Result<Inspection> {
         validate_name("group", &self.name)?;
         let text = sys.read_to_string("/etc/group")?;
-        let current = group_entry(&text, &self.name);
+        let current = lookup_group(&text, &self.name)?;
         let mut changes = vec![];
         match &current {
             None => {
@@ -356,7 +384,7 @@ impl Op for Absent {
         require_root(sys, "group::Absent")?;
         validate_name("group", &self.name)?;
         let text = sys.read_to_string("/etc/group")?;
-        let Some(group) = group_entry(&text, &self.name) else {
+        let Some(group) = lookup_group(&text, &self.name)? else {
             return Ok(Plan::Satisfied(Removed {
                 name: self.name.clone(),
                 gid: None,
@@ -442,6 +470,15 @@ mod tests {
         assert_eq!(group_entry(GROUP, "ghost"), None);
         assert_eq!(group_by_gid(GROUP, 4).unwrap().name, "adm");
         assert_eq!(group_by_gid(GROUP, 5), None);
+    }
+
+    #[test]
+    fn malformed_line_for_the_name_is_an_error_not_missing() {
+        let text = format!("{GROUP}docker2:x:notanumber:\n");
+        assert_eq!(lookup_group(&text, "docker").unwrap().unwrap().gid, 998);
+        assert_eq!(lookup_group(&text, "ghost").unwrap(), None);
+        let err = lookup_group(&text, "docker2").unwrap_err().to_string();
+        assert!(err.contains("malformed line for `docker2`"), "{err}");
     }
 
     #[test]
@@ -634,8 +671,10 @@ mod tests {
         let sys = fake_sys(&fake);
         let err = Present::new("").check(&sys).unwrap_err().to_string();
         assert!(err.contains("name is empty"), "{err}");
-        let err = Present::new("a:b").check(&sys).unwrap_err().to_string();
-        assert!(err.contains("not valid"), "{err}");
+        for bad in ["a:b", "a b", "a,b", "-x", "a\nb"] {
+            let err = Present::new(bad).check(&sys).unwrap_err().to_string();
+            assert!(err.contains("not valid"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use rustible_sdk::prelude::*;
 
 use crate::group::{
-    Group, Tools, group_by_gid, group_entry, groups_of, require_root, run_tool, validate_name,
+    Group, Tools, group_by_gid, group_entry, groups_of, lookup_group, require_root, run_tool,
+    validate_field, validate_name,
 };
 
 /// A user account as it stands on the machine. Output of [`Present`] and
@@ -77,6 +78,19 @@ pub fn passwd_entry(text: &str, name: &str) -> Option<PasswdEntry> {
     parse_passwd(text).into_iter().find(|e| e.name == name)
 }
 
+/// Pure: like [`passwd_entry`], but a line that names the user and does not
+/// parse is an error rather than "missing", so an op never tries to create
+/// an account whose line is merely broken.
+pub fn lookup_user(text: &str, name: &str) -> Result<Option<PasswdEntry>> {
+    match passwd_entry(text, name) {
+        Some(e) => Ok(Some(e)),
+        None => match text.lines().find(|l| l.split(':').next() == Some(name)) {
+            Some(line) => bail!("/etc/passwd has a malformed line for `{name}`: {line}"),
+            None => Ok(None),
+        },
+    }
+}
+
 /// Pure: the account with this uid, if `/etc/passwd` text has it.
 pub fn passwd_by_uid(text: &str, uid: u32) -> Option<PasswdEntry> {
     parse_passwd(text).into_iter().find(|e| e.uid == uid)
@@ -97,7 +111,7 @@ pub fn account_of(entry: &PasswdEntry, group_text: &str) -> Account {
 /// Read both files and build the account, or `None` if the user is missing.
 fn read_account(sys: &System, name: &str) -> Result<Option<Account>> {
     let passwd = sys.read_to_string("/etc/passwd")?;
-    let Some(entry) = passwd_entry(&passwd, name) else {
+    let Some(entry) = lookup_user(&passwd, name)? else {
         return Ok(None);
     };
     let group = sys.read_to_string("/etc/group")?;
@@ -494,7 +508,7 @@ impl Present {
                      group::Present first"
                 ),
             },
-            Some(GroupId::Name(name)) => match group_entry(group_text, name) {
+            Some(GroupId::Name(name)) => match lookup_group(group_text, name)? {
                 Some(g) => Some((g.gid, g.name)),
                 None => bail!(
                     "group `{name}` does not exist; user::Present does not create groups, use \
@@ -506,11 +520,26 @@ impl Present {
 
     fn inspect(&self, sys: &System) -> Result<Inspection> {
         validate_name("user", &self.name)?;
+        if let Some(home) = &self.home {
+            validate_field("home", &home.display().to_string())?;
+        }
+        if let Some(shell) = &self.shell {
+            validate_field("shell", &shell.display().to_string())?;
+        }
+        if let Some(comment) = &self.comment {
+            validate_field("comment", comment)?;
+        }
+        for g in &self.groups {
+            validate_name("group", g)?;
+        }
+        if let Some(GroupId::Name(name)) = &self.gid {
+            validate_name("group", name)?;
+        }
         let passwd = sys.read_to_string("/etc/passwd")?;
         let group_text = sys.read_to_string("/etc/group")?;
 
         for g in &self.groups {
-            if group_entry(&group_text, g).is_none() {
+            if lookup_group(&group_text, g)?.is_none() {
                 bail!(
                     "group `{g}` does not exist; user::Present does not create groups, use \
                      group::Present first"
@@ -519,7 +548,7 @@ impl Present {
         }
         let primary = self.resolve_primary(&group_text)?;
 
-        let current = passwd_entry(&passwd, &self.name);
+        let current = lookup_user(&passwd, &self.name)?;
         if current.is_none()
             && let Some(uid) = self.uid
             && let Some(taken) = passwd_by_uid(&passwd, uid)
@@ -874,7 +903,7 @@ impl Op for Absent {
         require_root(sys, "user::Absent")?;
         validate_name("user", &self.name)?;
         let passwd = sys.read_to_string("/etc/passwd")?;
-        let Some(entry) = passwd_entry(&passwd, &self.name) else {
+        let Some(entry) = lookup_user(&passwd, &self.name)? else {
             return Ok(Plan::Satisfied(Removed {
                 name: self.name.clone(),
                 home: None,
@@ -1042,7 +1071,7 @@ impl Op for Membership {
         validate_name("user", &self.user)?;
         validate_name("group", &self.group)?;
         let passwd = sys.read_to_string("/etc/passwd")?;
-        let Some(entry) = passwd_entry(&passwd, &self.user) else {
+        let Some(entry) = lookup_user(&passwd, &self.user)? else {
             bail!(
                 "user `{}` does not exist; user::Membership does not create users, use \
                  user::Present first",
@@ -1050,7 +1079,7 @@ impl Op for Membership {
             );
         };
         let group_text = sys.read_to_string("/etc/group")?;
-        let Some(group) = group_entry(&group_text, &self.group) else {
+        let Some(group) = lookup_group(&group_text, &self.group)? else {
             bail!(
                 "group `{}` does not exist; user::Membership does not create groups, use \
                  group::Present first",
@@ -1150,6 +1179,15 @@ mod tests {
                 shell: "/bin/sh".into(),
             }
         );
+    }
+
+    #[test]
+    fn malformed_line_for_the_name_is_an_error_not_missing() {
+        let text = format!("{PASSWD}broken:x:abc:1:b:/home/broken:/bin/sh\n");
+        assert_eq!(lookup_user(&text, "cadu").unwrap().unwrap().uid, 1000);
+        assert_eq!(lookup_user(&text, "ghost").unwrap(), None);
+        let err = lookup_user(&text, "broken").unwrap_err().to_string();
+        assert!(err.contains("malformed line for `broken`"), "{err}");
     }
 
     #[test]
@@ -1737,11 +1775,44 @@ mod tests {
             .to_string();
         assert!(err.contains("user::Present needs root"), "{err}");
         assert!(err.contains("runs as `cadu`"), "{err}");
-        let err = Present::new("a:b")
-            .check(&fake_sys(&fake))
+        let sys = fake_sys(&fake);
+        for bad in ["a:b", "a b", "-x", "a\nb", ""] {
+            assert!(Present::new(bad).check(&sys).is_err(), "{bad:?}");
+        }
+        let err = Present::new("x")
+            .comment("a:b")
+            .check(&sys)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not valid"), "{err}");
+        assert!(err.contains("comment `a:b` is not valid"), "{err}");
+        let err = Present::new("x")
+            .shell("/bin/sh\n")
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shell `/bin/sh\\n` is not valid"), "{err}");
+        let err = Present::new("cadu")
+            .groups(["a b"])
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("group name `a b` is not valid"), "{err}");
+        assert!(fake.commands().is_empty());
+    }
+
+    #[test]
+    fn malformed_passwd_line_for_the_user_fails_instead_of_creating() {
+        let fake = Arc::new(base().with_file(
+            "/etc/passwd",
+            format!("{PASSWD}svc:x:abc:1:b:/home/svc:/bin/sh\n"),
+        ));
+        let sys = fake_sys(&fake);
+        let err = Present::new("svc").check(&sys).unwrap_err().to_string();
+        assert!(err.contains("malformed line for `svc`"), "{err}");
+        let err = Absent::new("svc").check(&sys).unwrap_err().to_string();
+        assert!(err.contains("malformed line for `svc`"), "{err}");
+        let err = Existing::named("svc").check(&sys).unwrap_err().to_string();
+        assert!(err.contains("malformed line for `svc`"), "{err}");
     }
 
     #[test]
