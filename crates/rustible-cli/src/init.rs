@@ -145,10 +145,8 @@ pub fn run(args: InitArgs) -> Result<()> {
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
 
-    // `rustible playbook run` arrives with M3; until then the generated
-    // binary runs playbooks directly.
     eprintln!(
-        "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    cargo run -- hello        # or, once available: rustible playbook run playbooks/hello.rs",
+        "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    rustible playbook run playbooks/hello.rs",
         dir.display()
     );
     Ok(())
