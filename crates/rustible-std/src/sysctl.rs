@@ -267,11 +267,6 @@ impl Op for Present {
     }
 }
 
-// TODO(M6 harness): once `#[rustible::integration_test]` (branch m6-harness)
-// is on main, add a container test on debian:12 and ubuntu:24.04 with
-// `.apply_now(false)` (containers cannot write /proc/sys): changed, then ok,
-// and `/etc/sysctl.d/99-rustible.conf` holds exactly `key = value`.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

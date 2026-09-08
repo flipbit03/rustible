@@ -527,11 +527,6 @@ impl Op for Latest {
     }
 }
 
-// TODO(M6 harness): once `#[rustible::integration_test]` (branch m6-harness)
-// is on main, add a container test on debian:12 and ubuntu:24.04: `Present`
-// installs `sl` (changed, then ok), `Absent::new(["sl"]).purge(true)` removes
-// it (changed, then ok), and `dpkg-query` no longer knows it.
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

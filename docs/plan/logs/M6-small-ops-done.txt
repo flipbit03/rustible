@@ -139,3 +139,139 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
    Doc-tests rustible_std
 test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+# Container tests (harness on main at f7471aa), 2026-09-08T11:03Z
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_absent -- --nocapture
+
+running 1 test
+integration: building test target `it_apt_absent` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_apt_absent-bda802958248f8c3 in 0.9s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (not installed) .................. ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get update (as self, exit 0, 1044ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 791ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get purge -y sl (as self, exit 0, 609ms)
+  [debian:12]    $ apt-get autoremove -y --purge (as self, exit 0, 619ms)
+  [debian:12]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  remove sl (again) .......................... ok           
+  [debian:12]    $ dpkg-query -W -f=${Status}
+[debian:12] ok in 3.4s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (not installed) .................. ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 3668ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 3727ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get purge -y sl (as self, exit 0, 958ms)
+  [ubuntu:24.04]    $ apt-get autoremove -y --purge (as self, exit 0, 931ms)
+  [ubuntu:24.04]  remove sl .................................. changed         sl=purged
+        | apt packages:
+        |   sl: installed -> purged
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  remove sl (again) .......................... ok           
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}
+[ubuntu:24.04] ok in 9.6s  remove sl (not installed): ok, install sl: changed, remove sl: changed, remove sl (again): ok
+test absent_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.00s
+
+wall 14.44s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present -- --nocapture
+
+running 1 test
+integration: building test target `it_sysctl_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_sysctl_present-8d91a699c9dce57a in 0.3s
+  [debian:12]  persist without the directory .............. FAILED          /etc/sysctl.d does not exist; sysctl::Present creates the file but not its directory (use file::Directory)
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [debian:12]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [debian:12]  persist ip_forward (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [debian:12]  persist swappiness (again) ................. ok           
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [debian:12]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [debian:12]  flip ip_forward (again) .................... ok           
+  [debian:12]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [debian:12]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [debian:12]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[debian:12] ok in 0.3s  persist without the directory: failed, persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (24 bytes)
+  [ubuntu:24.04]  persist ip_forward ......................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+  [ubuntu:24.04]  persist ip_forward (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  persist swappiness ......................... changed         /etc/sysctl.d/99-rustible.conf=10
+        | sysctl vm.swappiness:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 10
+  [ubuntu:24.04]  persist swappiness (again) ................. ok           
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (43 bytes)
+  [ubuntu:24.04]  flip ip_forward ............................ changed         /etc/sysctl.d/99-rustible.conf=0
+        | sysctl net.ipv4.ip_forward:
+        |   /etc/sysctl.d/99-rustible.conf: 1 -> 0
+  [ubuntu:24.04]  flip ip_forward (again) .................... ok           
+  [ubuntu:24.04]  live for a missing key ..................... FAILED          sysctl key `net.rustible.nope` does not exist on this kernel (/proc/sys/net/rustible/nope is missing); use .apply_now(false) to only persist it
+  [ubuntu:24.04]    debug: wrote /etc/sysctl.d/99-rustible.conf (65 bytes)
+  [ubuntu:24.04]  persist a missing key ...................... changed         /etc/sysctl.d/99-rustible.conf=1
+        | sysctl net.rustible.nope:
+        |   /etc/sysctl.d/99-rustible.conf: absent -> 1
+[ubuntu:24.04] ok in 0.3s  persist ip_forward: changed, persist ip_forward (again): ok, persist swappiness: changed, persist swappiness (again): ok, flip ip_forward: changed, flip ip_forward (again): ok, live for a missing key: failed, persist a missing key: changed
+test present_persist_only_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+wall 1.20s
+
+$ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_present -- --nocapture
+
+running 1 test
+integration: building test target `it_apt_present` for x86_64-unknown-linux-musl (release)
+integration: built /home/cadu/w/cadu/rustible-m6so/target/x86_64-unknown-linux-musl/release/deps/it_apt_present-a8e871b37f718423 in 0.3s
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]    $ apt-get update (as self, exit 0, 1020ms)
+  [debian:12]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 719ms)
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [debian:12]    $ dpkg-query -W -f=${Status}	${Version}
+  [debian:12]  install sl (again) ......................... ok           
+[debian:12] ok in 2.1s  install sl: changed, install sl (again): ok
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]    $ apt-get update (as self, exit 0, 5055ms)
+  [ubuntu:24.04]    $ apt-get install -y --no-install-recommends sl (as self, exit 0, 3596ms)
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl ................................. changed         sl=installed
+        | apt packages:
+        |   sl: absent -> installed
+  [ubuntu:24.04]    $ dpkg-query -W -f=${Status}	${Version}
+  [ubuntu:24.04]  install sl (again) ......................... ok           
+[ubuntu:24.04] ok in 9.0s  install sl: changed, install sl (again): ok
+test present_changed_then_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.46s
+
+wall 11.72s

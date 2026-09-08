@@ -149,12 +149,26 @@ ctx.step("Persist only (container)",
   newline value and non-root refusals; apply without prediction refused;
   check mode through `ctx.step` predicts, writes nothing, runs nothing;
   changed then ok across two steps.
-- Container tests: not added. Branch `m6-harness` (PR #5) has not merged
-  into `main` at the time of this PR, so there is no
-  `#[rustible::integration_test]` to use. `TODO(M6 harness)` comments in
-  `apt.rs` (install `sl`, `Absent` purge, changed then ok) and `sysctl.rs`
-  (`.apply_now(false)`, assert the drop-in) name the tests to add. Not
-  faked.
+- Container tests (harness merged into main at f7471aa while this PR was
+  open), run with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test
+  <file> -- --nocapture`, full output in the log:
+  - `tests/it_apt_absent.rs`: `Absent` on a missing package is `ok` with the
+    name in `not_present`; `Present` installs `sl` (`update_cache(ZERO)`);
+    `Absent::new(["sl"]).purge(true).autoremove(true)` changed then ok, the
+    removed entry carries the dpkg version, `/usr/games/sl` is gone and
+    `dpkg-query` no longer says installed. debian:12 3.4s, ubuntu:24.04 9.6s
+    (apt-get update dominates), wall 14.4s.
+  - `tests/it_sysctl_present.rs` (`.apply_now(false)`, containers cannot
+    write `/proc/sys`): on debian:12, which ships no `/etc/sysctl.d`, the
+    missing-directory refusal is asserted first and the directory created;
+    then `net.ipv4.ip_forward = 1` changed then ok with `previous_live` read
+    from `/proc/sys`; a second key appends; flipping the first rewrites its
+    line in place (file asserted byte for byte); a key the kernel lacks is
+    refused live and persisted with `previous_live == None`. 0.3s per image,
+    wall 1.2s.
+  - `tests/it_apt_present.rs` (pre-existing) adjusted to
+    `update_cache(Duration::ZERO)`; still passes: debian:12 2.1s,
+    ubuntu:24.04 9.0s, wall 11.7s.
 - Nothing was run against a real host: every apt, hostname and sysctl op
   needs root, and the protocol forbids sudo on this VM.
 
@@ -169,10 +183,10 @@ ctx.step("Persist only (container)",
   `key=value` and `key = value` must compare equal.
 - `apt::Latest` also has `.install_recommends(bool)` (mirrors `Present`).
 - No `update_cache_always()`; `update_cache(Duration::ZERO)` is the spelling.
-- No container tests (see Verified).
 - After merging main (9379095): the sysctl drop-in is read through the shared
   `file::read_text_or_empty` (symlink and directory refusals for free); the
-  parent-directory check stays local.
+  parent-directory check stays local. After merging main again (f7471aa):
+  container tests added, harness TODOs removed.
 
 ## Decisions
 
