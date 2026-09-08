@@ -240,8 +240,10 @@ Consequences accepted with remote-brain:
    This bootstrap probe is the only shell-dependent step; everything after it
    is the static binary.
 6. **Compile** once for all needed triples in **one cargo invocation**
-   (`RUSTIBLE_PLAYBOOK=<name> cargo build --profile dist --target A --target B`;
-   the build script includes only that playbook, section 9).
+   (`RUSTIBLE_PLAYBOOK=<name> cargo build --profile dist --features selected
+   --target A --target B`; the build script includes only that playbook, and
+   the `selected` feature keeps the build's output directory apart from the
+   editor's, section 9).
    Cargo accepts several `--target` flags and locks the target directory, so one
    invocation is both simplest and fastest. Per-triple target directories keep
    the caches independent. Use the `dist` profile (section 5.3).
@@ -921,8 +923,41 @@ Networking and anything async are also off `System` for now.
   the target-side cache. With the variable unset, as in the IDE, `cargo
   check`, and CI, every playbook is included, so every broken playbook is
   visible while editing and fails CI, which is the desired behaviour, not a
-  wart. Switching playbooks between runs re-runs the build script and
-  recompiles the bin crate, the same cost as editing a playbook.
+  wart.
+
+  **The `selected` feature, and why it must exist (DECIDED 2026-09-07).** The
+  selected build and the editor's own `cargo check` are the same package with
+  the same feature set and profile, so Cargo gives them the **same build-script
+  output directory**. The discovery spike showed what that does in practice:
+  with `playbooks/top.rs` open and healthy in the editor, a terminal
+  `RUSTIBLE_PLAYBOOK=cadu/a cargo build` rewrote the registry file
+  rust-analyzer was reading down to `['cadu/a']`, and `top.rs` immediately
+  showed as `unlinked-file` in the editor, with every other playbook likewise
+  gone, until the next plain check-on-save wrote the full registry back. Every
+  switch of the selected playbook also marked the whole package dirty on both
+  sides, so the IDE and the CLI kept re-running the build script and
+  recompiling each other's view. Running a playbook from a terminal must not
+  make the editor forget the rest of the tree.
+
+  The fix is a Cargo feature that carries no code: `rustible init` writes
+  `[features] selected = []` into the workspace manifest, and every CLI build
+  that sets `RUSTIBLE_PLAYBOOK` also passes `--features selected`. A different
+  feature set changes the package's metadata hash, so the build script run,
+  its `OUT_DIR`, and the bin artifact for the selected build live in their own
+  directories, while dependencies (the SDK, the stdlib, collections) keep the
+  same hash and stay shared and Fresh. Verified: after a selected build, the
+  IDE's `cargo check` reports Fresh with nothing to do; switching the selection
+  re-runs only the selected side; the editor's registry is never touched. The
+  cost is one extra bin compile the first time, and none after. Alternatives
+  that also isolate but cost more: a separate `--target-dir` for CLI builds
+  (duplicates every dependency's artifacts) or a dedicated Cargo profile (a
+  second artifact tree).
+
+  Two rules follow. The build script **refuses `RUSTIBLE_PLAYBOOK` unless
+  `CARGO_FEATURE_SELECTED` is set**, with a message saying so, so a variable
+  left exported in a shell can never silently narrow an IDE or CI build to one
+  playbook. And nothing in a playbook may depend on the `selected` feature; it
+  is a cache-key, not a configuration knob, and the SDK does not expose it.
 
   **Consequences for playbook files.** A playbook file is a module, not a
   crate root: `use rustible::prelude::*;` works, `#[rustible::vars] struct
@@ -1531,6 +1566,10 @@ Rendered example:
   `--remote`, `--describe`, `--helper` flags (section 5.5).
 - **Predicted**: an op's declared post-apply output, returned in check mode
   instead of applying.
+- **`selected` feature**: an empty Cargo feature in every workspace manifest,
+  enabled only by CLI builds that set `RUSTIBLE_PLAYBOOK`, so the selected
+  build gets its own build-script output directory and never clobbers the
+  editor's registry (section 9).
 
 ## 16. Open questions, with the milestone by which each is decided
 
