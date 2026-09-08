@@ -33,7 +33,7 @@ pub use error::{
 pub use facts::{Arch, Distro, Facts, Init, Os, Pm};
 pub use op::{Applied, Change, Op, Plan};
 pub use secret::Secret;
-pub use system::{Cmd, System};
+pub use system::{Cmd, Planned, System};
 
 pub mod prelude {
     pub use crate::ctx::Ctx;

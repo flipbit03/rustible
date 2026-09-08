@@ -10,5 +10,14 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
 
+# A collection depends on the SDK and, when it composes with standard ops, on
+# rustible-std. Never on rustible-cli (vision 9).
 [dependencies]
 rustible-sdk.workspace = true
+rustible-std.workspace = true
+# HTTPS for the `.keys` endpoint, pure Rust all the way down (vision 5.3).
+ureq.workspace = true
+# No direct `rustls` entry: nothing here names a `rustls::` path (the provider
+# comes from `rustls-rustcrypto`), and the features it would ask for are a
+# subset of what ureq already enables.
+rustls-rustcrypto.workspace = true

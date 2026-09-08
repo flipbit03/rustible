@@ -194,6 +194,18 @@ impl Ctx {
                         self.bump(|s| s.failed += 1);
                         return Err(e.context(format!("step `{name}`")));
                     }
+                    Ok(out) if !op.changed_by_apply(&out) => {
+                        // The op ran and decided nothing changed (a command
+                        // with `changed_when`). Reported `ok`; the diff stays
+                        // so verbose output shows what ran.
+                        finish(
+                            Status::Ok,
+                            Some(diff.clone()),
+                            Some("ran, unchanged".into()),
+                        );
+                        self.bump(|s| s.ok += 1);
+                        Applied::new(name, Some(out), false, false, Some(diff), t0.elapsed())
+                    }
                     Ok(out) => {
                         let note = if op.always_changes() {
                             Some("action".into())
