@@ -369,3 +369,36 @@ Eleven `[M6-sh]` entries in `docs/plan/DECISIONS.md`, each with a Reverse clause
 BusyBox shell prediction, the distinct test names, the same-named-group fix,
 `would_create_id_by_name`, the `wait_for_systemd` `offline` fix, and the
 separate Alpine binary.
+
+### Self-review (lead, PR #16)
+
+Reviewed with the `code-review` skill: four findings, all real, all fixed on
+the branch and each re-verified by the author against the pre-fix code. What I
+checked myself before merging:
+
+- **The planned-resource mechanism is honest.** Every reader (`would_create`,
+  `would_create_id`, `would_create_id_by_name`) gates on `check_mode` first, so
+  a real run can never accept a prerequisite that is not on the machine. Only a
+  `check` that has already committed to creating the resource writes the note.
+  A planned group whose gid is unknown yields no gid, so the user op still
+  refuses to predict one, which is the rule the merged `user`/`group` ops set.
+  It lives on `System`, not on a backend, so an escalated identity needs no
+  knowledge of it.
+- **The SDK diff is additive**: a defaulted `Op::changed_by_apply`, one match
+  arm in `Ctx::step`, four `System` methods and a re-exported struct, plus the
+  `wait_for_systemd` fix. The `Backend` trait, `CmdSpec` and `spawn` keep their
+  signatures, so the M5 branch's `Elevated` proxy has nothing to mirror. That
+  was confirmed explicitly and passed to the M5 agent.
+- **The container tests earn their place.** They caught a bug every `Fake` test
+  missed: the vision 6.1 shape, with one name for both the group and the user,
+  fails on every real image because `useradd` and BusyBox `adduser` each try to
+  create a private group of that name. A fake only ever returns the status a
+  test hands it. They also surfaced a flake in main's own harness, where
+  `offline` was treated as terminal although `systemctl is-system-running`
+  answers `offline` whenever it cannot reach the manager, including a
+  container's first moments. That fix is main's code, fixed here because this
+  branch found it.
+
+Verified before merge: all four CI jobs green, and eleven container binaries
+across debian:12, ubuntu:24.04, alpine:3.20 and the two systemd images.
+
