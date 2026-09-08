@@ -142,6 +142,11 @@ enum Entry {
     Key { raw: String, key: PublicKey },
 }
 
+/// The line terminator a file uses, so a rewrite keeps CRLF files CRLF.
+fn eol_of(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
 fn parse_text(text: &str) -> Vec<Entry> {
     text.lines()
         .map(|l| match parse_line(l) {
@@ -157,14 +162,14 @@ fn parse_text(text: &str) -> Vec<Entry> {
 /// Join entries back into file text. Always newline-terminated when there is
 /// at least one line, so a file that lacked a trailing newline gets one when
 /// it is rewritten (the same normalization `file::Line` does).
-fn render(entries: &[Entry]) -> String {
+fn render(entries: &[Entry], eol: &str) -> String {
     let mut out = String::new();
     for e in entries {
         match e {
             Entry::Other(l) => out.push_str(l),
             Entry::Key { raw, .. } => out.push_str(raw),
         }
-        out.push('\n');
+        out.push_str(eol);
     }
     out
 }
@@ -250,7 +255,7 @@ pub fn plan_present(text: &str, keys: &[PublicKey], exclusive: bool) -> Planned 
     }
 
     if !planned.added.is_empty() || !planned.removed.is_empty() {
-        planned.text = Some(render(&entries));
+        planned.text = Some(render(&entries, eol_of(text)));
     }
     planned
 }
@@ -276,7 +281,7 @@ pub fn plan_absent(text: &str, keys: &[PublicKey]) -> Planned {
     }
 
     if !planned.removed.is_empty() {
-        planned.text = Some(render(&entries));
+        planned.text = Some(render(&entries, eol_of(text)));
     }
     planned
 }
@@ -303,8 +308,11 @@ pub struct KeysReport {
 #[derive(Debug, Clone)]
 enum Target {
     /// `~user/.ssh/authorized_keys`, created 0600 and owned by the user; the
-    /// `.ssh` directory is created 0700 and owned by the user if missing.
+    /// `.ssh` directory must already exist (vision 6.7).
     User(String),
+    /// Same, but with home, uid, and gid already known (from `user::Present`
+    /// or `user::Existing`), so no lookup happens.
+    Account { home: PathBuf, uid: u32, gid: u32 },
     /// An explicit file. No ownership handling; the parent directory must
     /// exist.
     File(PathBuf),
@@ -320,15 +328,35 @@ struct Resolved {
     owner: Option<(u32, u32)>,
 }
 
-/// Pure: uid, gid, and home of `name` from `/etc/passwd` text.
-fn passwd_entry(passwd: &str, name: &str) -> Option<(u32, u32, PathBuf)> {
-    passwd.lines().find_map(|line| {
+/// Pure: uid, gid, and home of `name` from `/etc/passwd` text. `Ok(None)`
+/// when the user has no entry; an error when the entry exists but is
+/// malformed, so the caller never says "does not exist" about a user that does.
+fn passwd_entry(passwd: &str, name: &str) -> Result<Option<(u32, u32, PathBuf)>> {
+    for line in passwd.lines() {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 || f[0] != name {
-            return None;
+        if f.first() != Some(&name) {
+            continue;
         }
-        Some((f[2].parse().ok()?, f[3].parse().ok()?, PathBuf::from(f[5])))
-    })
+        if f.len() < 7 {
+            return Err(Error::msg(format!(
+                "malformed /etc/passwd entry for `{name}`: expected 7 fields"
+            )));
+        }
+        let uid = f[2].parse().map_err(|_| {
+            Error::msg(format!(
+                "malformed /etc/passwd entry for `{name}`: uid `{}`",
+                f[2]
+            ))
+        })?;
+        let gid = f[3].parse().map_err(|_| {
+            Error::msg(format!(
+                "malformed /etc/passwd entry for `{name}`: gid `{}`",
+                f[3]
+            ))
+        })?;
+        return Ok(Some((uid, gid, PathBuf::from(f[5]))));
+    }
+    Ok(None)
 }
 
 impl Target {
@@ -339,9 +367,20 @@ impl Target {
                 ssh_dir: None,
                 owner: None,
             }),
+            Target::Account { home, uid, gid } => {
+                let ssh_dir = home.join(".ssh");
+                Ok(Resolved {
+                    path: ssh_dir.join("authorized_keys"),
+                    ssh_dir: Some(ssh_dir),
+                    owner: Some((*uid, *gid)),
+                })
+            }
             Target::User(name) => {
+                // /etc/passwd only (vision 7.4 and 13 plan the user ops around
+                // it); NSS-only accounts (LDAP, SSSD, homed) are a known limit,
+                // recorded in DECISIONS.md.
                 let passwd = sys.read_to_string("/etc/passwd")?;
-                let Some((uid, gid, home)) = passwd_entry(&passwd, name) else {
+                let Some((uid, gid, home)) = passwd_entry(&passwd, name)? else {
                     bail!(
                         "user `{name}` does not exist in /etc/passwd; \
                          ssh::authorized_keys does not create users, use user::Present first"
@@ -363,6 +402,14 @@ fn parse_keys(lines: &[String]) -> Result<Vec<PublicKey>> {
     lines
         .iter()
         .map(|l| {
+            // One requested key is one file line: an embedded newline would
+            // smuggle a second, unrequested key into a 0600 file.
+            if l.chars().any(char::is_control) {
+                return Err(Error::msg(format!(
+                    "requested key contains a control character (newline?); one key per entry: {}",
+                    l.trim().replace(['\n', '\r'], "\\n")
+                )));
+            }
             parse_line(l).ok_or_else(|| Error::msg(format!("not a public key line: {}", l.trim())))
         })
         .collect()
@@ -371,18 +418,24 @@ fn parse_keys(lines: &[String]) -> Result<Vec<PublicKey>> {
 /// Read the file if it exists, else `None`. Refuses a target that is a
 /// directory.
 fn read_existing(sys: &System, path: &Path) -> Result<Option<String>> {
+    use rustible_sdk::backend::FileKind;
     match sys.stat(path)? {
         None => Ok(None),
-        Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => {
-            bail!("{} is a directory", path.display())
-        }
+        Some(s) if s.kind == FileKind::Dir => bail!("{} is a directory", path.display()),
+        // An atomic rewrite would replace the link itself with a regular file
+        // and leave the link's target stale; refuse rather than surprise.
+        Some(s) if s.kind == FileKind::Symlink => bail!(
+            "{} is a symlink; ssh::authorized_keys does not rewrite through symlinks, point the op at the real file with in_file()",
+            path.display()
+        ),
         Some(_) => Ok(Some(sys.read_to_string(path)?)),
     }
 }
 
-/// Vision 6.7: this op creates `~/.ssh` in the user form (as Ansible does),
-/// nothing else. The user's home must exist, and in the file form the parent
-/// directory must exist.
+/// Vision 6.7: this op owns the `authorized_keys` file and nothing else.
+/// The parent directory (`~/.ssh` in the user forms) must already exist;
+/// the vision's playbook ensures it with `file::Directory` in its own step.
+/// A symlinked parent is fine (`stat_follow`).
 fn check_parent(sys: &System, resolved: &Resolved) -> Result<()> {
     let parent = match &resolved.ssh_dir {
         Some(d) => d.clone(),
@@ -391,45 +444,20 @@ fn check_parent(sys: &System, resolved: &Resolved) -> Result<()> {
             _ => return Ok(()),
         },
     };
-    match sys.stat(&parent)? {
-        Some(s) if s.kind != rustible_sdk::backend::FileKind::Dir => {
-            bail!("{} exists and is not a directory", parent.display())
-        }
-        Some(_) => Ok(()),
-        None => match &resolved.ssh_dir {
-            // `.ssh` is created in apply, but only inside a home that exists.
-            Some(ssh_dir) => {
-                let home = ssh_dir.parent().unwrap_or(ssh_dir);
-                match sys.stat(home)? {
-                    Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => Ok(()),
-                    _ => bail!(
-                        "home directory {} does not exist; ssh::authorized_keys creates \
-                         ~/.ssh but not the home, use user::Present with create_home first",
-                        home.display()
-                    ),
-                }
-            }
-            None => bail!(
-                "{} does not exist; ssh::authorized_keys creates ~/.ssh only for \
-                 the user-name form, use file::Directory first",
-                parent.display()
-            ),
-        },
+    match sys.stat_follow(&parent)? {
+        Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => Ok(()),
+        Some(_) => bail!("{} exists and is not a directory", parent.display()),
+        None => bail!(
+            "{} does not exist; ssh::authorized_keys does not create it (vision 6.7), \
+             ensure it first with file::Directory::at(..).mode(0o700).owner(..)",
+            parent.display()
+        ),
     }
 }
 
-/// Write the planned text, creating `.ssh` and the file with the right mode
-/// and owner when they are new.
+/// Write the planned text, giving a new file mode 0600 and, in the user
+/// forms, the user's ownership. Existing files keep their attributes.
 fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
-    if let Some(dir) = &resolved.ssh_dir
-        && !sys.exists(dir)?
-    {
-        sys.mkdir_all(dir)?;
-        sys.set_mode(dir, 0o700)?;
-        if let Some((uid, gid)) = resolved.owner {
-            sys.set_owner(dir, uid, gid)?;
-        }
-    }
     let is_new = !sys.exists(&resolved.path)?;
     sys.write_atomic(&resolved.path, text.as_bytes())?;
     if is_new {
@@ -450,11 +478,13 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 ///     authorized_keys::Present::for_user_name("cadu").keys(keys).exclusive(true))?;
 /// ```
 ///
-/// The user-name form reads `/etc/passwd` for home, uid, and gid; it creates
-/// `~/.ssh` (0700) and `authorized_keys` (0600) owned by the user when they
-/// are missing, and does not touch the attributes of ones that exist. The
-/// `in_file` form writes an explicit path and handles no ownership. Both
-/// fail when the user does not exist.
+/// The user-name form reads `/etc/passwd` for home, uid, and gid; the
+/// `for_account` form takes them directly (from `user::Present` or
+/// `user::Existing`) with no lookup. Both create `authorized_keys` (0600,
+/// owned by the user) when missing and never touch the attributes of one
+/// that exists; `~/.ssh` must already exist (vision 6.7: ensure it with
+/// `file::Directory` first). The `in_file` form writes an explicit path and
+/// handles no ownership.
 #[derive(Debug, Clone)]
 pub struct Present {
     target: Target,
@@ -467,6 +497,20 @@ impl Present {
     pub fn for_user_name(name: impl Into<String>) -> PresentBuilder {
         PresentBuilder {
             target: Target::User(name.into()),
+            exclusive: false,
+        }
+    }
+
+    /// Keys for an account whose home, uid, and gid are already known (the
+    /// `user::Account` output of `user::Present`/`user::Existing`), in
+    /// `<home>/.ssh/authorized_keys`. No lookup.
+    pub fn for_account(home: impl Into<PathBuf>, uid: u32, gid: u32) -> PresentBuilder {
+        PresentBuilder {
+            target: Target::Account {
+                home: home.into(),
+                uid,
+                gid,
+            },
             exclusive: false,
         }
     }
@@ -571,6 +615,17 @@ impl Absent {
     pub fn for_user_name(name: impl Into<String>) -> AbsentBuilder {
         AbsentBuilder {
             target: Target::User(name.into()),
+        }
+    }
+
+    /// Keys for an account whose home, uid, and gid are already known. No lookup.
+    pub fn for_account(home: impl Into<PathBuf>, uid: u32, gid: u32) -> AbsentBuilder {
+        AbsentBuilder {
+            target: Target::Account {
+                home: home.into(),
+                uid,
+                gid,
+            },
         }
     }
 
@@ -861,10 +916,48 @@ mod tests {
         let passwd =
             "root:x:0:0:root:/root:/bin/bash\ncadu:x:1000:1001:Cadu:/home/cadu:/bin/zsh\nbroken\n";
         assert_eq!(
-            passwd_entry(passwd, "cadu"),
+            passwd_entry(passwd, "cadu").unwrap(),
             Some((1000, 1001, PathBuf::from("/home/cadu")))
         );
-        assert_eq!(passwd_entry(passwd, "nobody"), None);
+        assert_eq!(passwd_entry(passwd, "nobody").unwrap(), None);
+        // A present but malformed entry is an error, never "does not exist".
+        let e = passwd_entry("bad:x:abc:1000::/home/bad:/bin/sh\n", "bad")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("malformed") && e.contains("uid `abc`"), "{e}");
+    }
+
+    #[test]
+    fn requested_key_with_embedded_newline_is_refused() {
+        let fake = fake_with_user_and_ssh_dir();
+        let sys = fake_sys(&fake);
+        let smuggled = format!("{K1}\n{K2}");
+        let e = Present::for_user_name("cadu")
+            .keys([smuggled])
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("control character"), "{e}");
+    }
+
+    #[test]
+    fn crlf_files_keep_their_line_endings() {
+        let text = format!("# c\r\n{K1}\r\n");
+        let planned = plan_present(&text, &[key(K2)], false);
+        assert_eq!(planned.text.unwrap(), format!("# c\r\n{K1}\r\n{K2}\r\n"));
+    }
+
+    #[test]
+    fn for_account_form_does_no_lookup() {
+        let fake = Arc::new(Fake::new().with_dir("/srv/home/.ssh"));
+        let sys = fake_sys(&fake);
+        let op = Present::for_account("/srv/home", 42, 43).keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!()
+        };
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/srv/home/.ssh/authorized_keys").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o600, 42, 43));
     }
 
     // ---- Fake backend ----
@@ -884,9 +977,18 @@ mod tests {
         )
     }
 
+    fn fake_with_user_and_ssh_dir() -> Arc<Fake> {
+        Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", PASSWD)
+                .with_dir("/home/cadu")
+                .with_dir("/home/cadu/.ssh"),
+        )
+    }
+
     #[test]
-    fn user_form_creates_ssh_dir_and_file_with_mode_and_owner() {
-        let fake = fake_with_user();
+    fn user_form_creates_file_with_mode_and_owner_inside_existing_ssh_dir() {
+        let fake = fake_with_user_and_ssh_dir();
         let sys = fake_sys(&fake);
         let op = Present::for_user_name("cadu").keys([K1, K2]);
 
@@ -901,7 +1003,7 @@ mod tests {
         );
         assert_eq!(predicted.added, vec![key(K1), key(K2)]);
         assert!(
-            fake.file("/home/cadu/.ssh").is_none(),
+            fake.file("/home/cadu/.ssh/authorized_keys").is_none(),
             "check must not create"
         );
 
@@ -911,8 +1013,6 @@ mod tests {
             fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
             format!("{K1}\n{K2}\n")
         );
-        let dir = fake.file("/home/cadu/.ssh").unwrap();
-        assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 1000, 1001));
         let file = fake.file("/home/cadu/.ssh/authorized_keys").unwrap();
         assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
 
@@ -979,7 +1079,7 @@ mod tests {
 
     #[test]
     fn check_mode_predicts_and_writes_nothing() {
-        let fake = fake_with_user();
+        let fake = fake_with_user_and_ssh_dir();
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
@@ -988,7 +1088,6 @@ mod tests {
             .unwrap();
         assert!(r.changed && r.predicted && r.is_available());
         assert_eq!(r.added, vec![key(K1)]);
-        assert!(fake.file("/home/cadu/.ssh").is_none());
         assert!(fake.file("/home/cadu/.ssh/authorized_keys").is_none());
     }
 
@@ -1038,8 +1137,9 @@ mod tests {
     }
 
     #[test]
-    fn user_form_refuses_missing_home() {
-        let fake = Arc::new(Fake::new().with_file("/etc/passwd", PASSWD));
+    fn user_form_refuses_missing_ssh_dir_naming_file_directory() {
+        // Vision 6.7: the op owns the file, not the directory.
+        let fake = fake_with_user();
         let sys = fake_sys(&fake);
         let err = Present::for_user_name("cadu")
             .keys([K1])
@@ -1047,18 +1147,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("home directory /home/cadu does not exist"),
+            err.contains("/home/cadu/.ssh does not exist") && err.contains("file::Directory"),
             "{err}"
         );
+        assert!(fake.file("/home/cadu/.ssh").is_none());
     }
 
     #[test]
     fn create_path_through_ctx_passes_the_mutation_guard() {
         // The step driver runs `check` under the guard that refuses file
-        // mutations (vision 7.3). Creating `.ssh` and the file is the most
-        // write-prone path, so drive it end to end: a `check` that touched
-        // the filesystem would fail the step here.
-        let fake = fake_with_user();
+        // mutations (vision 7.3). Creating the file is the most write-prone
+        // path, so drive it end to end: a `check` that touched the
+        // filesystem would fail the step here.
+        let fake = fake_with_user_and_ssh_dir();
         let sys = fake_sys(&fake);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let r = ctx
@@ -1066,7 +1167,6 @@ mod tests {
             .unwrap();
         assert!(r.changed && !r.predicted);
         assert_eq!(r.added, vec![key(K1)]);
-        assert_eq!(fake.file("/home/cadu/.ssh").unwrap().mode, 0o700);
         assert_eq!(
             fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
             format!("{K1}\n")

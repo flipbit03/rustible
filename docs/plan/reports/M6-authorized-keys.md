@@ -128,3 +128,33 @@ ctx.log(format!("+{} -{} keys in {}", r.added.len(), r.removed.len(), r.path.dis
 ## Self-review
 
 Run by the lead on the PR.
+
+## Self-review (lead, PR #3)
+
+`code-review` at effort high: seven consolidated findings, two confirmed by
+test, the rest by code reading. Applied on the branch:
+
+1. A requested key with an embedded newline wrote two file lines and broke
+   changed-then-ok under `exclusive`. Requested lines containing any control
+   character are now refused at `check`. Test added.
+2. `check_parent` refused a symlinked `~/.ssh` because `System::stat` is
+   `lstat`. The SDK gained `Backend::stat_follow`/`System::stat_follow`
+   (`Local` uses `std::fs::metadata`, `Fake` aliases `stat`), and the parent
+   check follows links. A symlinked `authorized_keys` file is refused with a
+   message pointing at `in_file(real path)`, because an atomic rewrite would
+   replace the link with a regular file.
+3. The op created `~/.ssh` inside an op whose resource is the file, against
+   vision 6.7 (decided) and the 6.1 example, which ensures the directory in a
+   separate `file::Directory` step. Now a missing `~/.ssh` fails naming
+   `file::Directory`; the create branch is gone. Tests updated.
+4. The vision's `for_user(&Account)` shape was absent. Added
+   `for_account(home, uid, gid)` on both ops, a no-lookup form; when the
+   `user` ops merge, `for_user(&Account)` becomes a one-line wrapper (noted
+   for the m6-user-group merge).
+5. CRLF files lost their carriage returns on rewrite. The line terminator is
+   detected and preserved. Test added.
+6. A malformed `/etc/passwd` entry for the user was reported as "does not
+   exist". `passwd_entry` now distinguishes malformed from missing. Test added.
+7. `/etc/passwd` is read directly rather than through NSS, so LDAP/SSSD/homed
+   accounts are refused. Recorded as a known limitation (the vision plans the
+   user ops around `/etc/passwd`); `for_account` is the escape hatch.

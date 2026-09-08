@@ -149,6 +149,11 @@ impl Backend for Fake {
         }))
     }
 
+    fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+        // The fake has no symlinks, so following changes nothing.
+        self.stat(p)
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {
         let mut files = self.files.lock().unwrap();
         let mut cur = PathBuf::new();
