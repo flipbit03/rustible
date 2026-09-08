@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::backend::{Backend, CmdSpec, Fake, Local, Output, Stat};
@@ -37,6 +37,17 @@ impl Identity {
     }
 }
 
+/// A named resource an earlier step in this run would create (check mode
+/// only). See [`System::note_would_create`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The kind of resource, e.g. `"group"`. Ops agree on these strings.
+    pub kind: String,
+    pub name: String,
+    /// A numeric id the creating step knows for sure (a requested gid).
+    pub id: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct System {
     backend: Arc<dyn Backend>,
@@ -44,6 +55,8 @@ pub struct System {
     identity: Identity,
     check_mode: bool,
     phase: Arc<AtomicU8>,
+    /// Shared by every clone (sections, `as_user`), so one run has one list.
+    planned: Arc<Mutex<Vec<Planned>>>,
     sink: SharedSink,
 }
 
@@ -60,6 +73,7 @@ impl System {
             identity: Identity::Own,
             check_mode,
             phase: Arc::new(AtomicU8::new(Phase::Idle as u8)),
+            planned: Arc::new(Mutex::new(Vec::new())),
             sink,
         }
     }
@@ -127,6 +141,51 @@ impl System {
         let mut s = self.clone();
         s.identity = Identity::User(name.to_string());
         s
+    }
+
+    // ---- check-mode planning ----
+
+    /// Record that this step's `check` returned a change that creates the
+    /// named resource. An op calls this from `check` when it plans a
+    /// creation, so a later step in the same dry run can accept the
+    /// prerequisite (`group::Present` notes the group, `user::Present` with
+    /// `.groups([..])` accepts it through [`would_create`](Self::would_create)).
+    /// Nothing is created: vision 6.7 holds, and outside check mode the
+    /// record is inert because the real step creates the real thing before
+    /// the next step looks.
+    pub fn note_would_create(&self, kind: &str, name: impl Into<String>, id: Option<u32>) {
+        self.planned.lock().unwrap().push(Planned {
+            kind: kind.into(),
+            name: name.into(),
+            id,
+        });
+    }
+
+    /// In check mode: has an earlier step planned to create this resource?
+    /// Always `false` outside check mode, so a real run never accepts a
+    /// prerequisite that is not on the machine.
+    pub fn would_create(&self, kind: &str, name: &str) -> bool {
+        self.check_mode
+            && self
+                .planned
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.kind == kind && p.name == name)
+    }
+
+    /// In check mode: the planned resource of this kind with this id, if an
+    /// earlier step planned it with the id known. `None` outside check mode.
+    pub fn would_create_id(&self, kind: &str, id: u32) -> Option<Planned> {
+        if !self.check_mode {
+            return None;
+        }
+        self.planned
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.kind == kind && p.id == Some(id))
+            .cloned()
     }
 
     pub(crate) fn set_phase(&self, p: Phase) {
@@ -402,6 +461,24 @@ impl Cmd {
 mod tests {
     use super::*;
     use crate::event::Collect;
+
+    #[test]
+    fn planned_resources_are_shared_by_clones_and_visible_in_check_mode_only() {
+        let fake = Arc::new(Fake::new());
+        let sys = System::fake(fake, Arc::new(Collect::default())).with_check_mode(true);
+        assert!(!sys.would_create("group", "docker"));
+        sys.as_user("root")
+            .note_would_create("group", "docker", None);
+        assert!(sys.would_create("group", "docker"), "clones share the list");
+        assert!(!sys.would_create("user", "docker"), "kind matters");
+        assert!(sys.would_create_id("group", 998).is_none());
+        sys.note_would_create("group", "fixed", Some(998));
+        assert_eq!(sys.would_create_id("group", 998).unwrap().name, "fixed");
+
+        let real = sys.with_check_mode(false);
+        assert!(!real.would_create("group", "docker"));
+        assert!(real.would_create_id("group", 998).is_none());
+    }
 
     #[test]
     fn symlink_is_refused_during_check() {

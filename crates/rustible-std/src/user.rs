@@ -10,7 +10,11 @@
 //! except Alpine, whose BusyBox `adduser`/`deluser`/`addgroup`/`delgroup`
 //! take different flags and cannot modify an existing account's attributes.
 //! Nothing here creates a group (vision 6.7): a `.groups([..])` or `.gid(..)`
-//! naming a missing group fails at `check`; use `group::Present` first.
+//! naming a missing group fails at `check`; use `group::Present` first. In
+//! check mode a group that an earlier `group::Present` step in the same run
+//! would create is accepted (`System::would_create`), so a dry run of a
+//! playbook that creates the group and then the user gets as far as the
+//! real run would.
 
 use std::path::PathBuf;
 
@@ -149,6 +153,15 @@ impl From<&Group> for GroupId {
     fn from(group: &Group) -> Self {
         GroupId::Id(group.gid)
     }
+}
+
+/// The requested primary group as `check` resolved it: an existing group
+/// (gid known) or, in check mode, one an earlier step would create (gid
+/// known only if that step was given one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Primary {
+    name: String,
+    gid: Option<u32>,
 }
 
 /// What [`Present`] asks for on an existing account, with the primary group
@@ -356,7 +369,11 @@ pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desi
 /// What a new account gets when nothing is asked for: shadow-utils read
 /// `SHELL=` and `HOME=` (the base directory) from `/etc/default/useradd`
 /// (Debian and Ubuntu ship `/bin/sh` and `/home`, Fedora `/bin/bash`) and
-/// fall back to `/bin/sh` and `/home`; BusyBox uses those fixed values.
+/// fall back to `/bin/sh` and `/home`. BusyBox `adduser` uses `/home` but
+/// takes the shell from the invoking environment (`$SHELL`, else the
+/// invoking user's own shell in `/etc/passwd`, `/bin/ash` for root on
+/// Alpine), which this op cannot see through `sys`; the shell field here is
+/// not used for BusyBox.
 struct UseraddDefaults {
     shell: PathBuf,
     home_base: PathBuf,
@@ -393,8 +410,8 @@ struct Inspection {
     current: Option<PasswdEntry>,
     /// Its supplementary groups, sorted.
     current_groups: Vec<String>,
-    /// Primary group resolved to (gid, name), when asked for.
-    primary: Option<(u32, String)>,
+    /// Primary group, when asked for.
+    primary: Option<Primary>,
     /// Attribute changes on an existing account.
     delta: Delta,
     group_text: String,
@@ -424,11 +441,16 @@ struct Inspection {
 ///
 /// Prediction (vision 12): the output is predicted whenever it is honest.
 /// For an existing account everything is known. For a new account the uid
-/// must be given (the tool allocates it otherwise) and the primary gid must
-/// be given or follow from the tools' private-group rule (a group named
-/// after the user with gid equal to the uid, when that gid is free);
+/// must be given (the tool allocates it otherwise), the primary gid must be
+/// given (`gid`), and on BusyBox the shell must be given too (`adduser`
+/// takes it from the invoking environment, which this op cannot see);
 /// otherwise the step returns a change without a prediction and a
 /// check-mode run that chains from it stops there with a clear message.
+///
+/// Check mode and groups: a group named in `groups` or `gid` that an
+/// earlier `group::Present` step in the same run would create is accepted
+/// (`System::would_create`), so the dry run continues past the user step
+/// exactly where the real run would. Outside check mode the group must exist.
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,
@@ -524,19 +546,36 @@ impl Present {
         self
     }
 
-    /// The primary group as (gid, name), which must exist (vision 6.7).
-    fn resolve_primary(&self, group_text: &str) -> Result<Option<(u32, String)>> {
+    /// The primary group, which must exist (vision 6.7) or, in check mode,
+    /// be one an earlier step in this run would create.
+    fn resolve_primary(&self, sys: &System, group_text: &str) -> Result<Option<Primary>> {
         Ok(match &self.gid {
             None => None,
             Some(GroupId::Id(gid)) => match group_by_gid(group_text, *gid) {
-                Some(g) => Some((g.gid, g.name)),
-                None => bail!(
-                    "no group has gid {gid}; user::Present does not create groups, use \
-                     group::Present first"
-                ),
+                Some(g) => Some(Primary {
+                    name: g.name,
+                    gid: Some(g.gid),
+                }),
+                None => match sys.would_create_id("group", *gid) {
+                    Some(planned) => Some(Primary {
+                        name: planned.name,
+                        gid: Some(*gid),
+                    }),
+                    None => bail!(
+                        "no group has gid {gid}; user::Present does not create groups, use \
+                         group::Present first"
+                    ),
+                },
             },
             Some(GroupId::Name(name)) => match lookup_group(group_text, name)? {
-                Some(g) => Some((g.gid, g.name)),
+                Some(g) => Some(Primary {
+                    name: g.name,
+                    gid: Some(g.gid),
+                }),
+                None if sys.would_create("group", name) => Some(Primary {
+                    name: name.clone(),
+                    gid: None,
+                }),
                 None => bail!(
                     "group `{name}` does not exist; user::Present does not create groups, use \
                      group::Present first"
@@ -571,14 +610,14 @@ impl Present {
         let group_text = sys.read_to_string("/etc/group")?;
 
         for g in self.groups.iter().flatten() {
-            if lookup_group(&group_text, g)?.is_none() {
+            if lookup_group(&group_text, g)?.is_none() && !sys.would_create("group", g) {
                 bail!(
                     "group `{g}` does not exist; user::Present does not create groups, use \
                      group::Present first"
                 );
             }
         }
-        let primary = self.resolve_primary(&group_text)?;
+        let primary = self.resolve_primary(sys, &group_text)?;
 
         let current = lookup_user(&passwd, &self.name)?;
         if let Some(uid) = self.uid
@@ -598,7 +637,7 @@ impl Present {
                 &current_groups,
                 &Desired {
                     uid: self.uid,
-                    gid: primary.as_ref().map(|p| p.0),
+                    gid: primary.as_ref().and_then(|p| p.gid),
                     home: self.home.clone(),
                     shell: self.shell.clone(),
                     comment: self.comment.clone(),
@@ -633,12 +672,7 @@ impl Present {
 
     /// The plan for a missing account: the diff and, when honest, the
     /// predicted account.
-    fn plan_create(
-        &self,
-        sys: &System,
-        primary: Option<(u32, String)>,
-        group_text: &str,
-    ) -> Result<Plan<Account>> {
+    fn plan_create(&self, sys: &System, primary: Option<Primary>) -> Result<Plan<Account>> {
         let tools = Tools::of(sys);
         let mut changes = vec![AttrChange {
             name: "exists".into(),
@@ -658,8 +692,11 @@ impl Present {
         if let Some(uid) = self.uid {
             change("uid", uid.to_string());
         }
-        if let Some((gid, _)) = &primary {
-            change("gid", gid.to_string());
+        match &primary {
+            Some(Primary { gid: Some(gid), .. }) => change("gid", gid.to_string()),
+            // Planned by an earlier step in this dry run; the gid is not known.
+            Some(Primary { name, gid: None }) => change("group", name.clone()),
+            None => {}
         }
         let defaults = useradd_defaults(sys, tools)?;
         let home = self
@@ -670,11 +707,12 @@ impl Present {
         if !self.create_home {
             change("create_home", "no".into());
         }
-        // BusyBox gives system accounts other defaults; only an explicit
-        // shell is predicted there.
+        // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
+        // user's passwd entry, which this op cannot see through `sys`: only
+        // an explicit shell is predicted (and shown) there.
         let shell = match &self.shell {
             Some(s) => Some(s.clone()),
-            None if tools == Tools::BusyBox && self.system => None,
+            None if tools == Tools::BusyBox => None,
             None => Some(defaults.shell.clone()),
         };
         if let Some(s) = &shell {
@@ -698,9 +736,9 @@ impl Present {
         // The private group's gid is allocated by useradd from login.defs
         // ranges (GID_MIN/GID_MAX, SYS_GID_*, USERGROUPS_ENAB), which this op
         // does not model; guessing gid == uid would be a lie in a dry run
-        // (vision 12). Predict only an explicit primary group.
-        let _ = group_text;
-        let gid = primary.map(|(gid, _)| gid);
+        // (vision 12). Predict only an explicit primary group whose gid is
+        // known (a planned group without a gid is not).
+        let gid = primary.and_then(|p| p.gid);
         Ok(match (gid, shell) {
             (Some(gid), Some(shell)) => Plan::change_predicting(
                 diff,
@@ -717,7 +755,20 @@ impl Present {
         })
     }
 
-    fn create(&self, sys: &System, tools: Tools, primary: Option<(u32, String)>) -> Result<()> {
+    fn create(&self, sys: &System, tools: Tools, primary: Option<Primary>) -> Result<()> {
+        // `apply` resolved the primary group against the real `/etc/group`,
+        // so the gid is known; a planned-only group cannot reach here.
+        let primary = match primary {
+            Some(Primary {
+                name,
+                gid: Some(gid),
+            }) => Some((gid, name)),
+            Some(Primary { name, gid: None }) => bail!(
+                "group `{name}` does not exist; user::Present does not create groups, use \
+                 group::Present first"
+            ),
+            None => None,
+        };
         match tools {
             Tools::Shadow => {
                 let mut cmd = sys.cmd("useradd");
@@ -838,8 +889,23 @@ impl Op for Present {
             group_text,
         } = self.inspect(sys)?;
         let Some(entry) = current else {
-            return self.plan_create(sys, primary, &group_text);
+            return self.plan_create(sys, primary);
         };
+        // Check mode, existing account, primary group planned by an earlier
+        // step and its gid unknown: the group change is real but cannot be
+        // compared or predicted.
+        if let Some(Primary { name, gid: None }) = &primary {
+            let mut changes = delta.changes.clone();
+            changes.push(AttrChange {
+                name: "group".into(),
+                from: entry.gid.to_string(),
+                to: name.clone(),
+            });
+            return Ok(Plan::change(Diff::Attrs {
+                subject: format!("user {}", self.name),
+                changes,
+            }));
+        }
         if delta.is_empty() {
             return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
         }
@@ -870,7 +936,7 @@ impl Op for Present {
         };
         let tools = Tools::of(sys);
         if changes.iter().any(|c| c.name == "exists") {
-            let primary = self.resolve_primary(&sys.read_to_string("/etc/group")?)?;
+            let primary = self.resolve_primary(sys, &sys.read_to_string("/etc/group")?)?;
             self.create(sys, tools, primary)?;
         } else {
             self.modify(sys, tools, &Delta::from_changes(changes)?)?;
@@ -1047,7 +1113,9 @@ pub struct Member {
 ///
 /// Satisfied when the group's member field lists the user or the group is
 /// the user's primary group. Adds with `usermod -aG` (BusyBox: `addgroup
-/// user group`), which never removes other memberships.
+/// user group`), which never removes other memberships. In check mode a
+/// group an earlier `group::Present` step would create is accepted and the
+/// step reports `would change`.
 #[derive(Debug, Clone)]
 pub struct Membership {
     user: String,
@@ -1108,18 +1176,23 @@ impl Op for Membership {
             );
         };
         let group_text = sys.read_to_string("/etc/group")?;
-        let Some(group) = lookup_group(&group_text, &self.group)? else {
-            bail!(
+        let group = match lookup_group(&group_text, &self.group)? {
+            Some(g) => Some(g),
+            // Planned by an earlier step in this dry run: not a member yet.
+            None if sys.would_create("group", &self.group) => None,
+            None => bail!(
                 "group `{}` does not exist; user::Membership does not create groups, use \
                  group::Present first",
                 self.group
-            );
+            ),
         };
         let member = Member {
             user: self.user.clone(),
             group: self.group.clone(),
         };
-        if group.members.contains(&self.user) || group.gid == entry.gid {
+        if let Some(group) = &group
+            && (group.members.contains(&self.user) || group.gid == entry.gid)
+        {
             return Ok(Plan::Satisfied(member));
         }
         let before = groups_of(&group_text, &self.user);
@@ -1156,13 +1229,6 @@ impl Op for Membership {
         })
     }
 }
-
-// TODO(M6 harness): once `rustible_sdk::testing::integration` and
-// `#[rustible::integration_test(images = [..])]` from branch m6-harness are
-// on main, add the container tests on debian:12 and ubuntu:24.04:
-// `Present::new("rustible-test").shell("/bin/bash")` twice (changed, then
-// ok, home exists), `group::Present` plus `Membership` twice, and `Absent`
-// with `remove_home` (home gone).
 
 #[cfg(test)]
 mod tests {
@@ -1777,6 +1843,165 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(c.predicted.unwrap().shell, Path::new("/sbin/nologin"));
+    }
+
+    #[test]
+    fn present_on_busybox_does_not_predict_or_show_a_shell_it_did_not_ask_for() {
+        // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
+        // user's passwd entry (`/bin/ash` for root on Alpine), not `/bin/sh`.
+        let fake = Arc::new(base());
+        let sys = alpine(fake_sys(&fake));
+        let c = change(
+            Present::new("rustible")
+                .uid(1002)
+                .gid("docker")
+                .check(&sys)
+                .unwrap(),
+        );
+        assert!(c.predicted.is_none(), "uid and gid known, shell not");
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes uid=1002 gid=998 home=/home/rustible"
+        );
+        // With an explicit shell the prediction is honest again.
+        let c = change(
+            Present::new("rustible")
+                .uid(1002)
+                .gid("docker")
+                .shell("/bin/ash")
+                .check(&sys)
+                .unwrap(),
+        );
+        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/ash"));
+        // shadow-utils read the default from /etc/default/useradd.
+        let c = change(
+            Present::new("rustible")
+                .uid(1002)
+                .gid("docker")
+                .check(&fake_sys(&fake))
+                .unwrap(),
+        );
+        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/sh"));
+    }
+
+    #[test]
+    fn check_mode_accepts_a_group_an_earlier_step_would_create() {
+        // Vision 6.6: `group::Present` then `user::Present ... .groups([..])`
+        // in one dry run. Without the note the user step aborts the run
+        // while the real run succeeds.
+        let fake = Arc::new(base());
+        let sys = fake_sys(&fake).with_check_mode(true);
+        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+
+        let planned = ctx
+            .step("group", crate::group::Present::new("rustible"))
+            .unwrap();
+        assert!(planned.changed && !planned.is_available());
+
+        // New user, planned supplementary group: would change, no prediction
+        // (no uid), diff lists the group.
+        let u = ctx
+            .step("user", Present::new("svc").groups(["rustible", "adm"]))
+            .unwrap();
+        assert!(u.changed && !u.is_available());
+        let short = u.diff.as_ref().unwrap().short();
+        assert!(short.contains("groups=adm,rustible"), "{short}");
+
+        // New user, planned primary group by name: the gid is unknown, so the
+        // diff names the group and nothing is predicted even with a uid.
+        let u = ctx
+            .step(
+                "user primary",
+                Present::new("svc").uid(1002).gid("rustible"),
+            )
+            .unwrap();
+        assert!(u.changed && !u.is_available());
+        let short = u.diff.as_ref().unwrap().short();
+        assert!(short.contains("group=rustible"), "{short}");
+
+        // Existing user, planned primary group: a change, not predicted.
+        let u = ctx
+            .step("cadu primary", Present::new("cadu").gid("rustible"))
+            .unwrap();
+        assert!(u.changed && !u.is_available());
+        assert_eq!(u.diff.as_ref().unwrap().short(), "group=rustible");
+
+        // Existing user joining the planned group: predicted, group listed.
+        let u = ctx
+            .step("cadu joins", Present::new("cadu").groups(["rustible"]))
+            .unwrap();
+        assert!(u.changed && u.is_available());
+        assert_eq!(u.groups, vec!["adm", "rustible", "sudo"]);
+
+        // Membership in the planned group: would change.
+        let m = ctx
+            .step(
+                "member",
+                Membership::of_name("cadu").in_group_named("rustible"),
+            )
+            .unwrap();
+        assert!(m.changed && m.is_available());
+
+        // A planned group with a known gid predicts through `.gid(&grp)`.
+        let grp = ctx
+            .step(
+                "group with gid",
+                crate::group::Present::new("fixed").gid(5000),
+            )
+            .unwrap();
+        assert!(grp.predicted);
+        let u = ctx
+            .step(
+                "user in fixed",
+                Present::new("svc").uid(1002).gid(&*grp).shell("/bin/sh"),
+            )
+            .unwrap();
+        assert!(u.predicted);
+        assert_eq!(u.gid, 5000);
+        assert_eq!(
+            u.diff.as_ref().unwrap().short(),
+            "exists=yes uid=1002 gid=5000 home=/home/svc shell=/bin/sh"
+        );
+
+        // A group nobody planned is still refused in check mode.
+        let err = ctx
+            .step("user", Present::new("svc").groups(["nope"]))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `nope` does not exist"), "{err}");
+        let err = ctx
+            .step("user", Present::new("svc").gid(6000))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("no group has gid 6000"), "{err}");
+
+        assert!(fake.commands().is_empty(), "check mode runs nothing");
+    }
+
+    #[test]
+    fn outside_check_mode_a_planned_group_is_not_accepted() {
+        let fake = Arc::new(base());
+        let sys = fake_sys(&fake);
+        // Simulate the note an earlier `check` would have left.
+        sys.note_would_create("group", "rustible", Some(5000));
+        let err = Present::new("svc")
+            .groups(["rustible"])
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `rustible` does not exist"), "{err}");
+        let err = Present::new("svc")
+            .gid(5000)
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("no group has gid 5000"), "{err}");
+        let err = Membership::of_name("cadu")
+            .in_group_named("rustible")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `rustible` does not exist"), "{err}");
     }
 
     #[test]
