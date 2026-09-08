@@ -19,7 +19,7 @@ impl Error {
         Error(anyhow::Error::msg(m))
     }
 
-    /// Wrap with a context layer: "installing nginx: <inner>".
+    /// Wrap with a context layer: ``"installing nginx: <inner>"``.
     pub fn context(self, c: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
         Error(self.0.context(c))
     }

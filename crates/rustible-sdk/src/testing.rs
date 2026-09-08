@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ctx::{Ctx, HostInfo};
 use crate::error::Result;
-use crate::event::{Collect, Event, EventSink, Pretty, SharedSink, Status};
+use crate::event::{Collect, Compact, Event, EventSink, SharedSink, Status};
 use crate::op::{Applied, Op};
 use crate::system::System;
 
@@ -306,7 +306,7 @@ pub fn run_images(spec: &Spec, images: &[Image]) -> Vec<ImageResult> {
 
 // ---- the container side ----
 
-/// Fan out to several sinks: the pretty renderer for humans reading the
+/// Fan out to several sinks: the compact printer for humans reading the
 /// container log, and a collector for the structured report.
 struct Tee(Vec<SharedSink>);
 
@@ -322,7 +322,7 @@ fn inside(spec: &Spec, image: &str, body: Body) {
     let collect = Arc::new(Collect::default());
     let sink: SharedSink = Arc::new(Tee(vec![
         collect.clone(),
-        Arc::new(Pretty::new(std::io::stdout(), image, 2)),
+        Arc::new(Compact::new(std::io::stdout(), 2)),
     ]));
     let sys = System::local(false, sink);
     let facts = sys.facts().clone();
