@@ -201,10 +201,14 @@ impl Transport {
                 Ok(())
             }
             (Waiter::Ssh(_), Transport::Ssh(_)) => {
+                // Every process whose command line names the binary (the
+                // `sh -c` wrapper and the binary itself) and their children
+                // (a step's command, a helper).
                 let path = proc.argv0.replace("$HOME/", "");
-                let (_, _) = self
-                    .sh(&format!("pkill -KILL -f \"$HOME/{path}\" || true"))
-                    .await?;
+                let script = format!(
+                    "for p in $(pgrep -f \"$HOME/{path}\"); do pkill -KILL -P \"$p\"; kill -KILL \"$p\"; done 2>/dev/null; true"
+                );
+                self.sh(&script).await?;
                 Ok(())
             }
             _ => Ok(()),
