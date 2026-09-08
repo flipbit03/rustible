@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use rustible_sdk::prelude::*;
 
+#[allow(unused_imports)]
 use crate::group::{
     Group, Tools, group_by_gid, group_entry, groups_of, lookup_group, require_root, run_tool,
     validate_field, validate_name,
@@ -160,8 +161,10 @@ pub struct Desired {
     pub home: Option<PathBuf>,
     pub shell: Option<PathBuf>,
     pub comment: Option<String>,
-    /// Supplementary groups to have (`append`) or to have exactly.
-    pub groups: Vec<String>,
+    /// Supplementary groups to have (`append`) or to have exactly. `None`
+    /// leaves memberships alone whatever `append` says, like Ansible's
+    /// omitted `groups`.
+    pub groups: Option<Vec<String>>,
     pub append: bool,
 }
 
@@ -173,7 +176,7 @@ impl Default for Desired {
             home: None,
             shell: None,
             comment: None,
-            groups: vec![],
+            groups: None,
             append: true,
         }
     }
@@ -316,7 +319,12 @@ pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desi
         delta.comment = Some(comment.clone());
     }
 
-    let wanted = sorted(want.groups.clone());
+    // No `groups` asked for: memberships are not touched, whatever `append`
+    // says (an `append(false)` alone must never strip a user's groups).
+    let Some(wanted) = want.groups.clone().map(sorted) else {
+        delta.changes = changes;
+        return delta;
+    };
     let add: Vec<String> = wanted
         .iter()
         .filter(|g| !current_groups.contains(g))
@@ -345,22 +353,38 @@ pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desi
     delta
 }
 
-/// Login shell a new account gets when none is asked for: shadow-utils read
-/// `SHELL=` from `/etc/default/useradd` (Debian and Ubuntu ship `/bin/sh`,
-/// Fedora `/bin/bash`) and fall back to `/bin/sh`; BusyBox uses `/bin/sh`.
-fn default_shell(sys: &System, tools: Tools) -> Result<PathBuf> {
+/// What a new account gets when nothing is asked for: shadow-utils read
+/// `SHELL=` and `HOME=` (the base directory) from `/etc/default/useradd`
+/// (Debian and Ubuntu ship `/bin/sh` and `/home`, Fedora `/bin/bash`) and
+/// fall back to `/bin/sh` and `/home`; BusyBox uses those fixed values.
+struct UseraddDefaults {
+    shell: PathBuf,
+    home_base: PathBuf,
+}
+
+fn useradd_defaults(sys: &System, tools: Tools) -> Result<UseraddDefaults> {
+    let mut d = UseraddDefaults {
+        shell: PathBuf::from("/bin/sh"),
+        home_base: PathBuf::from("/home"),
+    };
     if tools == Tools::Shadow && sys.exists("/etc/default/useradd")? {
         let text = sys.read_to_string("/etc/default/useradd")?;
-        if let Some(shell) = text.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("SHELL=")
-                .map(|s| s.trim().trim_matches('"').to_string())
-        }) && !shell.is_empty()
-        {
-            return Ok(PathBuf::from(shell));
+        let value = |key: &str| {
+            text.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix(key)
+                    .map(|v| v.trim().trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+            })
+        };
+        if let Some(shell) = value("SHELL=") {
+            d.shell = PathBuf::from(shell);
+        }
+        if let Some(home) = value("HOME=") {
+            d.home_base = PathBuf::from(home);
         }
     }
-    Ok(PathBuf::from("/bin/sh"))
+    Ok(d)
 }
 
 /// What [`Present::check`] found and validated.
@@ -414,7 +438,7 @@ pub struct Present {
     shell: Option<PathBuf>,
     create_home: bool,
     system: bool,
-    groups: Vec<String>,
+    groups: Option<Vec<String>>,
     append: bool,
     comment: Option<String>,
 }
@@ -429,7 +453,7 @@ impl Present {
             shell: None,
             create_home: true,
             system: false,
-            groups: vec![],
+            groups: None,
             append: true,
             comment: None,
         }
@@ -459,7 +483,10 @@ impl Present {
         self
     }
 
-    /// Create the home directory when creating the account. Default true.
+    /// Create the home directory when creating the account (`useradd -m`).
+    /// Default true. Only matters on creation: an existing account whose
+    /// home is missing is not repaired here (unlike Ansible); use
+    /// `file::Directory` for that.
     pub fn create_home(mut self, on: bool) -> Self {
         self.create_home = on;
         self
@@ -478,14 +505,14 @@ impl Present {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.groups = groups.into_iter().map(Into::into).collect();
+        self.groups = Some(groups.into_iter().map(Into::into).collect());
         self
     }
 
     /// With `true` (the default) the account is added to `groups` and keeps
-    /// any others; with `false` it ends up in exactly `groups`. Ansible's
-    /// `append`, with the default flipped because keeping memberships is the
-    /// safe choice.
+    /// any others; with `false` it ends up in exactly `groups`. Has no effect
+    /// unless `groups(..)` was given. Ansible's `append`, with the default
+    /// flipped because keeping memberships is the safe choice.
     pub fn append(mut self, on: bool) -> Self {
         self.append = on;
         self
@@ -529,8 +556,13 @@ impl Present {
         if let Some(comment) = &self.comment {
             validate_field("comment", comment)?;
         }
-        for g in &self.groups {
+        for g in self.groups.iter().flatten() {
             validate_name("group", g)?;
+        }
+        if let Some(home) = &self.home
+            && !home.is_absolute()
+        {
+            bail!("home {} must be an absolute path", home.display());
         }
         if let Some(GroupId::Name(name)) = &self.gid {
             validate_name("group", name)?;
@@ -538,7 +570,7 @@ impl Present {
         let passwd = sys.read_to_string("/etc/passwd")?;
         let group_text = sys.read_to_string("/etc/group")?;
 
-        for g in &self.groups {
+        for g in self.groups.iter().flatten() {
             if lookup_group(&group_text, g)?.is_none() {
                 bail!(
                     "group `{g}` does not exist; user::Present does not create groups, use \
@@ -549,9 +581,9 @@ impl Present {
         let primary = self.resolve_primary(&group_text)?;
 
         let current = lookup_user(&passwd, &self.name)?;
-        if current.is_none()
-            && let Some(uid) = self.uid
+        if let Some(uid) = self.uid
             && let Some(taken) = passwd_by_uid(&passwd, uid)
+            && taken.name != self.name
         {
             bail!(
                 "uid {uid} is already used by user `{}`; user::Present does not renumber other \
@@ -578,8 +610,8 @@ impl Present {
         };
         if current.is_some() && delta.changes_attributes() && Tools::of(sys) == Tools::BusyBox {
             bail!(
-                "user `{}` exists and BusyBox has no `usermod` to change its {}; install the \
-                 `shadow` package or drop those builders",
+                "user `{}` exists and only BusyBox account tools were found (no `usermod`) to \
+                 change its {}; on Alpine `apk add shadow` provides usermod, or drop those builders",
                 self.name,
                 delta
                     .changes
@@ -629,10 +661,11 @@ impl Present {
         if let Some((gid, _)) = &primary {
             change("gid", gid.to_string());
         }
+        let defaults = useradd_defaults(sys, tools)?;
         let home = self
             .home
             .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("/home/{}", self.name)));
+            .unwrap_or_else(|| defaults.home_base.join(&self.name));
         change("home", home.display().to_string());
         if !self.create_home {
             change("create_home", "no".into());
@@ -642,7 +675,7 @@ impl Present {
         let shell = match &self.shell {
             Some(s) => Some(s.clone()),
             None if tools == Tools::BusyBox && self.system => None,
-            None => Some(default_shell(sys, tools)?),
+            None => Some(defaults.shell.clone()),
         };
         if let Some(s) = &shell {
             change("shell", s.display().to_string());
@@ -650,7 +683,7 @@ impl Present {
         if let Some(c) = &self.comment {
             change("comment", c.clone());
         }
-        let groups = sorted(self.groups.clone());
+        let groups = sorted(self.groups.clone().unwrap_or_default());
         if !groups.is_empty() {
             change("groups", groups.join(","));
         }
@@ -662,19 +695,12 @@ impl Present {
         let Some(uid) = self.uid else {
             return Ok(Plan::change(diff));
         };
-        let gid = match primary {
-            Some((gid, _)) => Some(gid),
-            // The private-group rule: both tool families name the new group
-            // after the user and prefer gid == uid; predict only when that
-            // gid is free and no group already carries the name.
-            None if tools == Tools::BusyBox && self.system => None,
-            None if group_by_gid(group_text, uid).is_none()
-                && group_entry(group_text, &self.name).is_none() =>
-            {
-                Some(uid)
-            }
-            None => None,
-        };
+        // The private group's gid is allocated by useradd from login.defs
+        // ranges (GID_MIN/GID_MAX, SYS_GID_*, USERGROUPS_ENAB), which this op
+        // does not model; guessing gid == uid would be a lie in a dry run
+        // (vision 12). Predict only an explicit primary group.
+        let _ = group_text;
+        let gid = primary.map(|(gid, _)| gid);
         Ok(match (gid, shell) {
             (Some(gid), Some(shell)) => Plan::change_predicting(
                 diff,
@@ -704,8 +730,8 @@ impl Present {
                 if let Some((gid, _)) = &primary {
                     cmd = cmd.args(["-g", &gid.to_string()]);
                 }
-                if !self.groups.is_empty() {
-                    cmd = cmd.args(["-G", &sorted(self.groups.clone()).join(",")]);
+                if let Some(groups) = self.groups.as_ref().filter(|g| !g.is_empty()) {
+                    cmd = cmd.args(["-G", &sorted(groups.clone()).join(",")]);
                 }
                 if let Some(home) = &self.home {
                     cmd = cmd.args(["-d", &home.display().to_string()]);
@@ -743,7 +769,7 @@ impl Present {
                     cmd = cmd.arg("-H");
                 }
                 run_tool(cmd.arg(&self.name), tools, "adduser")?;
-                for g in sorted(self.groups.clone()) {
+                for g in sorted(self.groups.clone().unwrap_or_default()) {
                     run_tool(
                         sys.cmd("addgroup").args([&self.name, &g]),
                         tools,
@@ -778,7 +804,10 @@ impl Present {
                     cmd = if self.append {
                         cmd.args(["-aG", &delta.add_groups.join(",")])
                     } else {
-                        cmd.args(["-G", &sorted(self.groups.clone()).join(",")])
+                        cmd.args([
+                            "-G",
+                            &sorted(self.groups.clone().unwrap_or_default()).join(","),
+                        ])
                     };
                 }
                 run_tool(cmd.arg(&self.name), tools, "usermod")
@@ -814,10 +843,10 @@ impl Op for Present {
         if delta.is_empty() {
             return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
         }
-        let groups = if self.append {
-            sorted([current_groups, delta.add_groups.clone()].concat())
-        } else {
-            sorted(self.groups.clone())
+        let groups = match &self.groups {
+            None => current_groups,
+            Some(_) if self.append => sorted([current_groups, delta.add_groups.clone()].concat()),
+            Some(g) => sorted(g.clone()),
         };
         Ok(Plan::change_predicting(
             Diff::Attrs {
@@ -1219,7 +1248,7 @@ mod tests {
             &groups_of(GROUP, "cadu"),
             &Desired {
                 shell: Some("/bin/zsh".into()),
-                groups: vec!["adm".into()],
+                groups: Some(vec!["adm".into()]),
                 append: true,
                 ..Desired::default()
             },
@@ -1234,7 +1263,7 @@ mod tests {
             &groups_of(GROUP, "cadu"),
             &Desired {
                 shell: Some("/bin/bash".into()),
-                groups: vec!["docker".into(), "adm".into()],
+                groups: Some(vec!["docker".into(), "adm".into()]),
                 append: true,
                 ..Desired::default()
             },
@@ -1262,7 +1291,7 @@ mod tests {
             &cadu(),
             &groups_of(GROUP, "cadu"),
             &Desired {
-                groups: vec!["docker".into(), "adm".into()],
+                groups: Some(vec!["docker".into(), "adm".into()]),
                 append: false,
                 ..Desired::default()
             },
@@ -1274,13 +1303,30 @@ mod tests {
             &cadu(),
             &groups_of(GROUP, "cadu"),
             &Desired {
-                groups: vec![],
+                groups: Some(vec![]),
                 append: false,
                 ..Desired::default()
             },
         );
         assert_eq!(d.remove_groups, vec!["adm", "sudo"]);
         assert_eq!(d.changes[0].to, "");
+    }
+
+    #[test]
+    fn modify_without_groups_leaves_memberships_alone() {
+        for append in [true, false] {
+            let d = plan_modify(
+                &cadu(),
+                &groups_of(GROUP, "cadu"),
+                &Desired {
+                    groups: None,
+                    append,
+                    ..Desired::default()
+                },
+            );
+            assert!(d.add_groups.is_empty() && d.remove_groups.is_empty());
+            assert!(d.changes.is_empty(), "append={append}: {:?}", d.changes);
+        }
     }
 
     #[test]
@@ -1311,7 +1357,7 @@ mod tests {
             home: Some("/srv/cadu".into()),
             shell: Some("/bin/bash".into()),
             comment: Some("Carlos E.".into()),
-            groups: vec!["docker".into()],
+            groups: Some(vec!["docker".into()]),
             append: false,
         };
         let d = plan_modify(&cadu(), &groups_of(GROUP, "cadu"), &want);
@@ -1389,13 +1435,14 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Present::new("rustible")
             .uid(1002)
+            .gid("adm")
             .shell("/bin/bash")
             .groups(["sudo", "docker"])
             .comment("Rustible");
         let c = change(op.check(&sys).unwrap());
         assert_eq!(
             c.diff.short(),
-            "exists=yes uid=1002 home=/home/rustible shell=/bin/bash comment=Rustible \
+            "exists=yes uid=1002 gid=4 home=/home/rustible shell=/bin/bash comment=Rustible \
              groups=docker,sudo"
         );
         let predicted = c.predicted.clone().unwrap();
@@ -1404,7 +1451,7 @@ mod tests {
             Account {
                 name: "rustible".into(),
                 uid: 1002,
-                gid: 1002,
+                gid: 4,
                 home: "/home/rustible".into(),
                 shell: "/bin/bash".into(),
                 groups: vec!["docker".into(), "sudo".into()],
@@ -1416,17 +1463,14 @@ mod tests {
         write(
             &fake,
             "/etc/passwd",
-            &format!("{PASSWD}rustible:x:1002:1002:Rustible:/home/rustible:/bin/bash\n"),
+            &format!("{PASSWD}rustible:x:1002:4:Rustible:/home/rustible:/bin/bash\n"),
         );
         write(
             &fake,
             "/etc/group",
-            &format!(
-                "{}rustible:x:1002:\n",
-                GROUP
-                    .replace("docker:x:998:", "docker:x:998:rustible")
-                    .replace("sudo:x:27:cadu", "sudo:x:27:cadu,rustible")
-            ),
+            &GROUP
+                .replace("docker:x:998:", "docker:x:998:rustible")
+                .replace("sudo:x:27:cadu", "sudo:x:27:cadu,rustible"),
         );
         let account = op.apply(&sys, c).unwrap();
         assert_eq!(account, predicted, "the prediction was honest");
@@ -1436,6 +1480,8 @@ mod tests {
                 "useradd",
                 "-u",
                 "1002",
+                "-g",
+                "4",
                 "-G",
                 "docker,sudo",
                 "-s",
@@ -1461,17 +1507,18 @@ mod tests {
     }
 
     #[test]
-    fn present_create_does_not_predict_when_private_gid_is_taken() {
+    fn present_create_predicts_only_with_an_explicit_primary_group() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake);
-        // gid 4 is adm's, so the private group cannot get it.
+        // The private group's gid comes from login.defs ranges the op does
+        // not model, so a uid alone is not enough for an honest prediction.
+        let c = change(Present::new("rustible").uid(1500).check(&sys).unwrap());
+        assert!(c.predicted.is_none());
         let c = change(Present::new("rustible").uid(4).check(&sys).unwrap());
         assert!(c.predicted.is_none());
-        // A group already named after the user: the tool will not create
-        // one and the outcome depends on login.defs.
         let c = change(Present::new("docker").uid(1500).check(&sys).unwrap());
         assert!(c.predicted.is_none());
-        // With an explicit primary group the gid is known again.
+        // With an explicit primary group the gid is known.
         let c = change(
             Present::new("rustible")
                 .uid(4)
@@ -1745,7 +1792,11 @@ mod tests {
             .check(&sys)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("BusyBox has no `usermod`"), "{err}");
+        assert!(
+            err.contains("only BusyBox account tools were found (no `usermod`)"),
+            "{err}"
+        );
+        assert!(err.contains("apk add shadow"), "{err}");
         assert!(err.contains("change its shell"), "{err}");
 
         let op = Present::new("cadu").groups(["docker"]).append(false);
@@ -1827,18 +1878,69 @@ mod tests {
     }
 
     #[test]
-    fn present_reads_default_shell_from_useradd_defaults() {
-        let fake =
-            Arc::new(base().with_file("/etc/default/useradd", "SHELL=/bin/bash\nHOME=/home\n"));
-        let c = change(Present::new("x").uid(1500).check(&fake_sys(&fake)).unwrap());
-        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/bash"));
+    fn present_reads_defaults_from_etc_default_useradd() {
+        let fake = Arc::new(base().with_file(
+            "/etc/default/useradd",
+            "SHELL=/bin/bash\nHOME=\"/srv/home\"\n",
+        ));
+        let c = change(Present::new("x").check(&fake_sys(&fake)).unwrap());
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes home=/srv/home/x shell=/bin/bash"
+        );
+        assert!(
+            c.predicted.is_none(),
+            "no primary group given, so no honest gid"
+        );
+
+        // With the primary group known the prediction carries the defaults.
+        let c = change(
+            Present::new("x")
+                .uid(1500)
+                .gid(4)
+                .check(&fake_sys(&fake))
+                .unwrap(),
+        );
+        let predicted = c.predicted.unwrap();
+        assert_eq!(predicted.shell, Path::new("/bin/bash"));
+        assert_eq!(predicted.home, Path::new("/srv/home/x"));
+
         let fake = Arc::new(
             Fake::new()
                 .with_file("/etc/passwd", PASSWD)
                 .with_file("/etc/group", GROUP),
         );
-        let c = change(Present::new("x").uid(1500).check(&fake_sys(&fake)).unwrap());
-        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/sh"));
+        let c = change(Present::new("x").check(&fake_sys(&fake)).unwrap());
+        assert_eq!(c.diff.short(), "exists=yes home=/home/x shell=/bin/sh");
+    }
+
+    #[test]
+    fn present_refuses_a_relative_home() {
+        let fake = Arc::new(base());
+        let err = Present::new("x")
+            .home("rustible")
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn present_refuses_a_uid_owned_by_another_account_even_when_modifying() {
+        let fake = Arc::new(base());
+        let err = Present::new("cadu")
+            .uid(65534)
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("65534"), "{err}");
+        assert!(err.contains("nobody"), "{err}");
+        // The account's own uid is not "taken".
+        let plan = Present::new("cadu")
+            .uid(1000)
+            .check(&fake_sys(&fake))
+            .unwrap();
+        assert!(matches!(plan, Plan::Satisfied(_)));
     }
 
     #[test]
@@ -1990,10 +2092,11 @@ mod tests {
         let account = ctx
             .step(
                 "user",
-                Present::new("rustible").uid(1002).shell("/bin/bash"),
+                Present::new("rustible").uid(1002).gid(4).shell("/bin/bash"),
             )
             .unwrap();
         assert!(account.changed && account.predicted && account.is_available());
+        assert_eq!(account.gid, 4);
         assert_eq!(account.home, Path::new("/home/rustible"));
 
         let unpredicted = ctx.step("user", Present::new("nouid")).unwrap();

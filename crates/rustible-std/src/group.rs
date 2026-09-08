@@ -98,7 +98,17 @@ pub(crate) enum Tools {
 }
 
 impl Tools {
+    /// Probe for the binaries first (so `apk add shadow` on Alpine, or a
+    /// BusyBox-only image of another distro, is honoured), then fall back to
+    /// the distro name.
     pub(crate) fn of(sys: &System) -> Tools {
+        let has = |p: &str| sys.exists(p).unwrap_or(false);
+        if has("/usr/sbin/usermod") || has("/usr/sbin/useradd") {
+            return Tools::Shadow;
+        }
+        if has("/bin/busybox") || has("/usr/sbin/adduser") {
+            return Tools::BusyBox;
+        }
         match sys.facts().distro {
             Distro::Alpine => Tools::BusyBox,
             _ => Tools::Shadow,
@@ -252,7 +262,7 @@ impl Present {
                     if Tools::of(sys) == Tools::BusyBox {
                         bail!(
                             "group `{}` has gid {} but {gid} was asked for, and BusyBox has no \
-                             `groupmod` to change it; install the `shadow` package or drop `.gid()`",
+                             `groupmod` to change it; on Alpine `apk add shadow` provides groupmod, or drop `.gid()`",
                             g.name,
                             g.gid
                         );
@@ -512,6 +522,20 @@ mod tests {
         Fake::new()
             .with_file("/etc/group", GROUP)
             .with_file("/etc/passwd", PASSWD)
+    }
+
+    #[test]
+    fn tools_probe_binaries_before_the_distro_name() {
+        // Nothing on disk: the distro decides.
+        let fake = Arc::new(base());
+        assert_eq!(Tools::of(&fake_sys(&fake)), Tools::Shadow);
+        assert_eq!(Tools::of(&alpine(fake_sys(&fake))), Tools::BusyBox);
+        // `apk add shadow` on Alpine: shadow tools win.
+        let fake = Arc::new(base().with_file("/usr/sbin/usermod", ""));
+        assert_eq!(Tools::of(&alpine(fake_sys(&fake))), Tools::Shadow);
+        // A BusyBox-only image of a non-Alpine distro.
+        let fake = Arc::new(base().with_file("/bin/busybox", ""));
+        assert_eq!(Tools::of(&fake_sys(&fake)), Tools::BusyBox);
     }
 
     #[test]

@@ -159,3 +159,37 @@ See the `[M6-ug]` entries in `docs/plan/DECISIONS.md`. In short:
 ## Self-review
 
 Run by the lead on the PR.
+
+### Self-review (lead, PR #6)
+
+Review pass with the `code-review` skill (finders consolidated by the lead) and
+fixes applied on the branch before merge:
+
+- **`groups` became `Option<Vec<String>>`** on `user::Present`. A `Present` that
+  names no groups now leaves memberships alone (before, `.append(false)` with no
+  groups silently removed the user from every supplementary group). An explicit
+  empty set (`.groups::<[&str; 0]>([])` with `.append(false)`) still means "no
+  supplementary groups". Tests: `modify_without_groups_leaves_memberships_alone`,
+  `modify_exact_groups_adds_and_removes`.
+- **uid-taken guard applies to existing accounts too.** `Present::new("cadu").uid(65534)`
+  is refused at `check` naming `nobody`, instead of `usermod -u` failing later.
+- **Private-group gid guess dropped.** A new account is predicted only with an
+  explicit primary group; the `gid == uid` guess depended on login.defs ranges
+  the op does not model. Check-mode chaining from a fresh `user::Present`
+  therefore needs `.gid(..)`, or stops with the vision's "output unavailable"
+  message.
+- **`/etc/default/useradd` `HOME=` honoured** next to `SHELL=`, so the predicted
+  and diffed home is right on systems that moved the base directory.
+- **Home must be absolute** (validated in `check`); `ssh::authorized_keys` also
+  refuses a relative or empty home from `/etc/passwd`.
+- **Tool detection probes binaries first** (`/usr/sbin/usermod|useradd` then
+  `/bin/busybox|/usr/sbin/adduser`) and falls back to the distro name, so
+  `apk add shadow` on Alpine is honoured; the BusyBox refusal message now says
+  that.
+- `ssh::authorized_keys` reuses `user::lookup_user` instead of a private passwd
+  parser.
+
+Verification after the fixes: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace` (std: 110
+unit tests). Container tests for user/group remain a TODO for the harness
+follow-up.
