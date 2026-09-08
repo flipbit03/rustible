@@ -1,6 +1,6 @@
 [package]
-name = "rustible-std"
-description = "Rustible standard operations"
+name = "rustible-github"
+description = "Rustible collection for GitHub: fetch a user's SSH keys and other GitHub-backed operations."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -12,5 +12,3 @@ readme = "../../README.md"
 
 [dependencies]
 rustible-sdk.workspace = true
-regex.workspace = true
-serde.workspace = true

@@ -1,6 +1,6 @@
 [package]
-name = "rustible-std"
-description = "Rustible standard operations"
+name = "rustible-build"
+description = "Build-script helper for Rustible workspaces: discovers playbook files marked #[rustible::playbook]. Called from the generated build.rs."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -9,8 +9,3 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
-
-[dependencies]
-rustible-sdk.workspace = true
-regex.workspace = true
-serde.workspace = true

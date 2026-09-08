@@ -1,16 +1,16 @@
 [package]
 name = "rustible"
-description = "Rustible orchestrator CLI (spike)"
+description = "Rustible: configuration management as real code. Typed Rust playbooks compiled to static binaries, no YAML, no remote interpreter."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 rustible-sdk.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-openssh = "0.11"
-sha2 = "0.10"
+rustible-macros.workspace = true
+rustible-std.workspace = true

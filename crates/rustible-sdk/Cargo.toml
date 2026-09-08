@@ -4,6 +4,11 @@ description = "SDK for writing Rustible operations and playbooks"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 serde.workspace = true

@@ -383,6 +383,19 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rustible"
 version = "0.0.1"
 dependencies = [
+ "rustible-macros",
+ "rustible-sdk",
+ "rustible-std",
+]
+
+[[package]]
+name = "rustible-build"
+version = "0.0.1"
+
+[[package]]
+name = "rustible-cli"
+version = "0.0.1"
+dependencies = [
  "anyhow",
  "clap",
  "openssh",
@@ -392,6 +405,17 @@ dependencies = [
  "sha2",
  "tokio",
 ]
+
+[[package]]
+name = "rustible-github"
+version = "0.0.1"
+dependencies = [
+ "rustible-sdk",
+]
+
+[[package]]
+name = "rustible-macros"
+version = "0.0.1"
 
 [[package]]
 name = "rustible-sdk"

@@ -1,6 +1,6 @@
 [package]
-name = "rustible-std"
-description = "Rustible standard operations"
+name = "rustible-macros"
+description = "Proc macros for Rustible playbooks (#[rustible::playbook], #[rustible::vars]). Use through the `rustible` crate."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -10,7 +10,5 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
 
-[dependencies]
-rustible-sdk.workspace = true
-regex.workspace = true
-serde.workspace = true
+[lib]
+proc-macro = true
