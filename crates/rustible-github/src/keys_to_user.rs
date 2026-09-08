@@ -146,9 +146,10 @@ impl KeysToUser {
             .iter()
             .map(|k| {
                 let mut k = k.clone();
-                if k.comment.is_none() {
-                    k.comment = self.comment.clone();
-                }
+                // Unconditional: `parse_keys_body` strips whatever comment a
+                // response carried, so this is the only label the line gets
+                // and `.comment(..)` is never silently ignored.
+                k.comment = self.comment.clone();
                 k.to_line()
             })
             .collect();

