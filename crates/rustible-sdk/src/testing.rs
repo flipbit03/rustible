@@ -153,6 +153,15 @@ pub fn run(spec: &Spec, body: Body) {
             })
             .unwrap_or_default();
         let verdict = if r.passed() { "ok" } else { "FAILED" };
+        // The container's step and command lines (the pretty renderer), so
+        // `--nocapture` reads like a playbook run.
+        for line in r
+            .output
+            .lines()
+            .filter(|l| l.starts_with('[') || l.trim_start().starts_with('|'))
+        {
+            println!("  {line}");
+        }
         println!(
             "[{}] {verdict} in {:.1}s  {steps}",
             r.image,
@@ -247,6 +256,8 @@ fn inside(spec: &Spec, image: &str, body: Body) {
             ..HostInfo::local()
         },
     );
+    // libtest prints `test <name> ... ` without a newline before the body runs.
+    println!();
     let t0 = Instant::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| body(&mut ctx)));
     let error = match outcome {
