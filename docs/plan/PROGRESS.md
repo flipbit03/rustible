@@ -10,7 +10,7 @@ Updated by whoever is working; read first on every resume.
 | M3 real run | in-progress (m3-run) | subagent, started after M2 merged |
 | M4 init | merged | PR #2, 2026-09-08; review: 10 findings, 9 fixed, 1 recorded as proposed amendment |
 | M5 elevated/cancel/streaming | in-progress (m5-elevated-streaming) | subagent, unattended run 1; ARM VM may be down |
-| M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` and `file` family in progress (subagents); others todo |
+| M6 stdlib wave one | in-progress | `ssh::authorized_keys` merged (PR #3); `user`+`group` pr-open (#6, review running); `file` family pr-open (#7, review queued); `systemd` and apt-Absent/Latest+hostname+sysctl in progress (subagents); http::Download, archive::Extracted, shell extras todo |
 | M6 rustible-github | todo | |
 | M6 docker harness | pr-open (#5) | review queued behind #3 and #4 |
 | D dogfood | human-only | never unattended |
@@ -28,3 +28,5 @@ Updated by whoever is working; read first on every resume.
 - 2026-09-08 10:50 UTC  M6  ssh::authorized_keys merged as PR #3 after review (7 findings, all addressed; ~/.ssh creation reversed per vision 6.7)
 - 2026-09-08 11:25 UTC  M2  merged as PR #4 after review (lead consolidated eight finder reports; 10 fixes)
 - 2026-09-08 11:30 UTC  M3  started on branch m3-run (subagent); active: M3, M5 (ARM pending), user/group, file ops; PR #5 harness under review
+- 2026-09-08 11:45 UTC  M6  user/group PR #6 opened (55 tests + for_user wrapper); systemd agent started; PR #5 harness review in finder phase
+- 2026-09-08 11:50 UTC  M6  file ops PR #7 opened (63 tests; SDK symlink/read_link/read_dir primitives); small-ops agent started (apt Absent/Latest, hostname, sysctl)
