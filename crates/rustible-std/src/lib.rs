@@ -11,4 +11,5 @@ pub mod shell;
 pub mod ssh;
 pub mod sysctl;
 pub mod systemd;
+pub mod tls;
 pub mod user;

@@ -1,0 +1,630 @@
+===============================================================================
+M7-tls (rustls-graviola) done-when commands
+Host: COGRAM-VM-2025  CPU: AMD Ryzen 9 9950X 16-Core Processor
+Date (UTC): 2026-09-08T18:12:19Z
+Tree: f951d1cf6ac6fcadf151d5652df4dd908bfe1d9a on tls-graviola
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+===============================================================================
+
+### cargo fmt --all --check
+OK (no output)
+
+### cargo clippy --workspace --all-targets -- -D warnings
+    Checking rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-std)
+    Checking rustible-cli v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-cli)
+    Checking rustible v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible)
+    Checking rustible-github v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-github)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.33s
+
+### cargo test --workspace
+     Running unittests src/lib.rs (target/debug/deps/rustible-76baa1c94b672227)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_build-044611665d7e579a)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_cli-5b30abff781e6214)
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/main.rs (target/debug/deps/rustible-30e0a31abb4a34f2)
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/init.rs (target/debug/deps/init-4cbed7fc65418fe7)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/rustible_github-1f21c4335081b1c4)
+test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/rustible_macros-1ea867f6fea3a93a)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/ui.rs (target/debug/deps/ui-315e09a950298d23)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.33s
+     Running unittests src/lib.rs (target/debug/deps/rustible_sdk-4043183cc145a911)
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-52098ed13b459a06)
+test result: ok. 331 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.38s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-e94d2a9ba2fb9f59)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_apt_latest.rs (target/debug/deps/it_apt_latest-f1a2ba2277d31fbb)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-239a9703015b5e97)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_archive_extracted.rs (target/debug/deps/it_archive_extracted-75b35f5469f5e70a)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-ca37638b490ceeef)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-9acdf806dcfd86ea)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-75fe765c007708cf)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_http_download.rs (target/debug/deps/it_http_download-64526f66add4df97)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-159adc9a4d6c287d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-6fc7484fc7f45d70)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-baa567c97de932d6)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-00aa88ed00ca4875)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_user_busybox.rs (target/debug/deps/it_user_busybox-95b1f6a42aec93c3)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-03fc3aa8b1ee3f97)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_build
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_cli
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_github
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_macros
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_sdk
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests rustible_std
+test result: ok. 10 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib
+ Documenting rustible v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible)
+ Documenting rustible-github v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-github)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
+   Generated /home/cadu/w/cadu/rustible-tls/target/doc/rustible/index.html and 6 other files
+
+### cargo build --manifest-path examples/workspace/Cargo.toml
+   Compiling rustible-std v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-std)
+   Compiling rustible v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible)
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-tls/examples/workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.96s
+
+### cargo +1.89 check --workspace --all-targets  (MSRV floor, raised from 1.88)
+    Checking rustible v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible)
+    Checking rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-macros)
+    Checking rustible-github v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-github)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.22s
+
+### cargo +1.88 check --workspace --all-targets  (the old floor: expected to fail)
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+  rustible-std@0.0.1 requires rustc 1.89
+
+
+### cargo test -p rustible-github -- --ignored   (live GitHub fetch over graviola TLS)
+test user_keys::tests::network_fetches_flipbit03_keys_over_https ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.52s
+test crates/rustible-github/src/lib.rs - (line 42) ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+### cargo test -p rustible-std --lib https_ -- --ignored   (live HTTPS download)
+test http::tests::https_download_from_github_with_graviola_tls ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 331 filtered out; finished in 0.02s
+
+### cargo test -p rustible-std --lib tls:: -- --nocapture   (the pre-flight)
+test tls::tests::required_features_are_the_asserted_set ... ok
+test tls::tests::the_error_lists_every_missing_feature ... ok
+test tls::tests::the_error_names_the_feature_the_op_and_the_rule ... ok
+test tls::tests::this_cpu_is_supported ... ok
+test tls::tests::detection_agrees_with_cpuinfo ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 327 filtered out; finished in 0.00s
+
+### RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_http_download   (Docker harness)
+test download_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+
+===============================================================================
+### Cross-build proof: stock rustup, rust-lld, no C toolchain
+===============================================================================
+which clang musl-gcc aarch64-linux-musl-gcc:
+clang not found
+musl-gcc not found
+aarch64-linux-musl-gcc not found
+  none of them installed
+
+Probe crate: a static musl binary linking rustible-std (http::Download) and
+rustible-github (Https), built with the repo's own .cargo/config.toml and the
+dist profile, then run against https://github.com/flipbit03.keys.
+
+--- cargo build --profile dist --target x86_64-unknown-linux-musl
+   Compiling tlsprobe v0.0.0 (/tmp/claude-1000/-home-cadu-w-cadu-rustible/5e9fe8ac-d62a-43bd-93c7-43bd950ce259/scratchpad/tlsprobe)
+    Finished `dist` profile [optimized] target(s) in 12.08s
+--- cargo build --profile dist --target aarch64-unknown-linux-musl
+   Compiling tlsprobe v0.0.0 (/tmp/claude-1000/-home-cadu-w-cadu-rustible/5e9fe8ac-d62a-43bd-93c7-43bd950ce259/scratchpad/tlsprobe)
+    Finished `dist` profile [optimized] target(s) in 8.71s
+
+--- file(1)
+/tmp/claude-1000/-home-cadu-w-cadu-rustible/5e9fe8ac-d62a-43bd-93c7-43bd950ce259/scratchpad/tlsprobe/target/aarch64-unknown-linux-musl/dist/tlsprobe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, stripped
+/tmp/claude-1000/-home-cadu-w-cadu-rustible/5e9fe8ac-d62a-43bd-93c7-43bd950ce259/scratchpad/tlsprobe/target/x86_64-unknown-linux-musl/dist/tlsprobe:  ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, stripped
+
+--- real handshake, x86_64 musl binary on this VM
+status 200 keys 4
+exit=0
+
+--- real handshake, aarch64 musl binary on cadu@cadu-cogram-vm-arm
+aarch64
+asimd aes pmull sha2 
+status 200 keys 4
+exit=0
+
+--- binary size, same probe, same profile, before and after the swap (bytes)
+target                             rustcrypto   graviola      delta
+x86_64-unknown-linux-musl             1702728    2290344    +587616
+aarch64-unknown-linux-musl            1406136    1939056    +532920
+
+===============================================================================
+### RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   (full Docker harness, CI form)
+===============================================================================
+     Running unittests src/lib.rs (target/debug/deps/rustible_std-b39aa5b28a0ec8a5)
+test apt::tests::absent_apply_without_prediction_is_refused ... ok
+test apt::tests::absent_autoremove_without_purge ... ok
+test apt::tests::absent_change_and_apply_runs_apt_get_remove ... ok
+test apt::tests::absent_check_mode_runs_only_dpkg_query_and_predicts ... ok
+test apt::tests::absent_config_files_count_as_present_only_when_purging ... ok
+test apt::tests::absent_purge_uses_apt_get_purge_and_autoremove_purge ... ok
+test apt::tests::absent_refuses_half_configured_package ... ok
+test apt::tests::absent_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::absent_satisfied_when_not_installed ... ok
+test apt::tests::change_when_missing_and_apply_runs_apt_get ... ok
+test apt::tests::deconfigured_package_counts_as_missing ... ok
+test apt::tests::latest_cache_refresh_outside_check_mode_does_not_warn ... ok
+test apt::tests::latest_check_mode_refreshes_the_cache_and_warns ... ok
+test apt::tests::latest_installs_missing_packages ... ok
+test apt::tests::latest_check_mode_runs_only_read_only_commands_without_update_cache ... ok
+test apt::tests::latest_mixed_install_upgrade_current ... ok
+test apt::tests::latest_refuses_unknown_package ... ok
+test apt::tests::latest_refuses_wrong_pm_and_non_root ... ok
+test apt::tests::latest_satisfied_when_at_candidate ... ok
+test apt::tests::latest_update_cache_runs_in_check_before_reading_candidates ... ok
+test apt::tests::latest_update_cache_skips_a_fresh_cache ... ok
+test apt::tests::parse_dpkg_status_variants ... ok
+test apt::tests::parse_policy_installed_and_candidate ... ok
+test apt::tests::latest_upgrades_with_only_upgrade ... ok
+test apt::tests::parse_stat_mtime_reads_seconds ... ok
+test apt::tests::parse_policy_unknown_package_has_no_candidate ... ok
+test apt::tests::present_apply_refuses_a_plan_with_no_packages ... ok
+test apt::tests::present_does_not_predict_when_the_lists_have_no_candidate ... ok
+test apt::tests::present_apply_installs_what_the_plan_named_and_rereads_versions ... ok
+test apt::tests::parse_policy_none_means_not_installed ... ok
+test apt::tests::refuses_on_non_apt_distro ... ok
+test apt::tests::satisfied_when_installed ... ok
+test apt::tests::present_predicts_the_candidate_version_when_the_lists_know_it ... ok
+test apt::tests::update_cache_runs_apt_get_update_when_lists_are_stale ... ok
+test apt::tests::update_cache_falls_back_to_pkgcache_then_updates_when_unknown ... ok
+test apt::tests::update_cache_skips_update_when_lists_are_fresh ... ok
+test archive::tests::an_absurd_header_size_is_refused_at_check_without_aborting ... ok
+test apt::tests::present_refuses_without_root ... ok
+test archive::tests::creates_marker_is_satisfied_without_opening_the_archive ... ok
+test archive::tests::entry_path_validation ... ok
+test archive::tests::an_absurd_header_size_does_not_abort_apply_either ... ok
+test archive::tests::format_detection_by_magic ... ok
+test archive::tests::check_mode_predicts_and_writes_nothing ... ok
+test archive::tests::escaping_symlinks_and_writes_through_symlinks_are_refused ... ok
+test archive::tests::hard_links_are_copies_of_the_earlier_file ... ok
+test archive::tests::destination_and_source_problems ... ok
+test archive::tests::intra_archive_path_collisions_are_refused_at_check ... ok
+test archive::tests::link_target_validation ... ok
+test apt::tests::update_cache_zero_always_updates_without_stat ... ok
+test archive::tests::on_disk_conflicts_are_refused_at_check ... ok
+test archive::tests::missing_creates_marker_after_apply_warns ... ok
+test archive::tests::re_extracting_over_an_existing_tree_replaces_files_and_links ... ok
+test archive::tests::tar_slip_paths_are_refused_naming_the_member ... ok
+test file::absent::tests::absent_in_check_mode_predicts_and_removes_nothing ... ok
+test archive::tests::strip_components_and_owner ... ok
+test archive::tests::strip_components_drops_leading_parts_and_skips_short_paths ... ok
+test file::absent::tests::absent_is_satisfied_when_missing ... ok
+test file::absent::tests::absent_refuses_non_empty_directory_unless_recursive ... ok
+test file::absent::tests::absent_removes_an_empty_directory_without_recursive ... ok
+test file::attrs::tests::attrs_changes_mode_and_owner_then_is_satisfied ... ok
+test file::absent::tests::absent_removes_a_file_and_a_symlink ... ok
+test file::attrs::tests::attrs_in_check_mode_predicts_and_changes_nothing ... ok
+test file::attrs::tests::attrs_fails_on_missing_path_and_on_symlink ... ok
+test file::attrs::tests::attrs_is_satisfied_when_matching_or_nothing_asked ... ok
+test file::attrs::tests::attrs_only_touches_what_was_asked ... ok
+test file::absent::tests::non_recursive_apply_refuses_a_directory_populated_after_check ... ok
+test file::block::tests::block_op_default_marker_and_create ... ok
+test file::block::tests::block_op_rejects_marker_without_mark ... ok
+test file::block::tests::block_op_check_apply_then_satisfied ... ok
+test file::block::tests::plan_block_identical_is_satisfied ... ok
+test file::block::tests::block_in_check_mode_predicts_and_writes_nothing ... ok
+test file::block::tests::plan_block_empty_removes_managed_block ... ok
+test file::block::tests::body_line_equal_to_a_marker_is_refused ... ok
+test file::block::tests::plan_block_appends_when_absent ... ok
+test file::block::tests::plan_block_orphan_begin_marker_counts_as_absent ... ok
+test file::block::tests::crlf_files_keep_their_line_endings ... ok
+test file::block::tests::plan_block_trailing_newline_edge_cases ... ok
+test file::block::tests::symlinked_file_is_refused_not_replaced ... ok
+test file::copy::tests::copy_attrs_only_change_does_not_rewrite ... ok
+test file::copy::tests::copy_backup_is_taken_before_rewrite ... ok
+test file::copy::tests::copy_creates_missing_file_with_mode ... ok
+test file::copy::tests::copy_from_local_path_reads_source_through_sys ... ok
+test file::copy::tests::copy_binary_content_produces_summary_diff ... ok
+test file::block::tests::plan_block_replaces_existing_in_place ... ok
+test file::copy::tests::copy_in_check_mode_predicts_and_writes_nothing ... ok
+test file::copy::tests::copy_is_satisfied_when_bytes_and_attrs_match ... ok
+test file::copy::tests::copy_large_text_falls_back_to_summary ... ok
+test file::block::tests::plan_block_inserts_after_and_before_regex ... ok
+test file::directory::tests::directory_fails_on_file_in_the_way ... ok
+test file::copy::tests::copy_rewrite_preserves_existing_mode_when_none_given ... ok
+test file::directory::tests::directory_is_created_with_mode_and_owner ... ok
+test file::directory::tests::directory_owner_change_on_existing_dir ... ok
+test file::copy::tests::copy_text_change_has_unified_diff_and_predicts ... ok
+test file::copy::tests::copy_fails_when_dest_is_a_directory_or_link ... ok
+test file::line::tests::check_mode_output_unavailable_unless_predicted ... ok
+test file::directory::tests::a_symlink_to_a_directory_counts_as_the_directory ... ok
+test file::line::tests::line_op_creates_when_asked ... ok
+test file::line::tests::line_op_check_then_apply_on_fake ... ok
+test file::line::tests::line_op_fails_on_missing_file_without_create ... ok
+test file::line::tests::mutation_during_check_is_refused ... ok
+test file::line::tests::plan_appends_when_absent ... ok
+test file::symlink::tests::replacing_a_link_is_atomic_and_leaves_no_temp_link ... ok
+test file::line::tests::plan_is_satisfied_when_line_present ... ok
+test file::symlink::tests::symlink_is_created_when_missing ... ok
+test file::line::tests::plan_replaces_commented_line ... ok
+test file::symlink::tests::symlink_never_replaces_a_directory ... ok
+test file::symlink::tests::symlink_over_file_needs_force ... ok
+test file::line::tests::plan_inserts_after_regex ... ok
+test file::symlink::tests::symlink_in_check_mode_predicts_and_creates_nothing ... ok
+test file::tests::plan_attrs_ignores_file_type_bits ... ok
+test file::line::tests::plan_handles_missing_trailing_newline ... ok
+test file::symlink::tests::symlink_with_wrong_target_is_replaced ... ok
+test file::tests::plan_attrs_reports_mode_and_owner_changes ... ok
+test group::tests::a_planned_creation_is_noted_for_later_steps_in_check_mode_only ... ok
+test group::tests::absent_is_satisfied_when_missing ... ok
+test group::tests::absent_needs_root ... ok
+test file::tests::plan_attrs_on_missing_path_renders_dash ... ok
+test file::tests::insert_positions ... ok
+test group::tests::absent_refuses_a_primary_group ... ok
+test file::tests::plan_attrs_nothing_wanted_or_all_equal_is_empty ... ok
+test group::tests::groups_of_user_are_sorted_supplementary_groups ... ok
+test group::tests::lookups_by_name_and_gid ... ok
+test group::tests::absent_removes_with_groupdel ... ok
+test group::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test group::tests::absent_on_alpine_uses_delgroup ... ok
+test group::tests::present_creates_with_groupadd_and_rereads ... ok
+test group::tests::present_changes_gid_with_groupmod ... ok
+test group::tests::check_mode_through_ctx_runs_nothing_and_predicts ... ok
+test group::tests::present_is_satisfied_when_group_exists ... ok
+test group::tests::present_missing_binary_names_the_tool_family ... ok
+test group::tests::present_needs_root ... ok
+test group::tests::present_rejects_bad_names ... ok
+test group::tests::tools_probe_binaries_before_the_distro_name ... ok
+test group::tests::present_on_alpine_uses_addgroup_flags ... ok
+test hostname::tests::apply_creates_etc_hostname_when_missing ... ok
+test group::tests::present_refuses_a_taken_gid ... ok
+test group::tests::parses_members_and_skips_malformed_lines ... ok
+test hostname::tests::apply_without_prediction_is_refused ... ok
+test group::tests::present_without_gid_does_not_predict ... ok
+test hostname::tests::apply_without_systemd_writes_file_and_runs_hostname ... ok
+test group::tests::present_on_alpine_cannot_change_gid ... ok
+test hostname::tests::change_when_only_the_file_differs ... ok
+test hostname::tests::change_when_only_the_kernel_differs ... ok
+test hostname::tests::check_mode_predicts_and_runs_nothing ... ok
+test hostname::tests::invalid_hostnames ... ok
+test hostname::tests::refuses_invalid_name_before_touching_anything ... ok
+test hostname::tests::step_is_ok_on_second_run_after_apply ... ok
+test hostname::tests::valid_hostnames ... ok
+test hostname::tests::missing_etc_hostname_reads_as_absent ... ok
+test hostname::tests::apply_on_systemd_uses_hostnamectl ... ok
+test hostname::tests::kernel_falls_back_to_facts_when_proc_is_unreadable ... ok
+test hostname::tests::refuses_without_root ... ok
+test hostname::tests::satisfied_when_file_and_kernel_match ... ok
+test http::tests::attrs_only_change_predicts_and_applies_without_downloading ... ok
+test http::tests::check_mode_reports_would_change_and_fetches_nothing ... ok
+test http::tests::a_body_over_max_bytes_is_refused_by_content_length ... ok
+test http::tests::checksum_parsing ... ok
+test http::tests::existing_file_without_checksum_is_satisfied_unless_forced ... ok
+test http::tests::a_body_over_max_bytes_is_refused_without_a_content_length ... ok
+test http::tests::a_body_exactly_at_max_bytes_is_accepted ... ok
+test http::tests::https_download_from_github_with_graviola_tls ... ignored, needs network
+test http::tests::connection_refused_names_the_url ... ok
+test http::tests::check_hashes_the_destination_only_when_a_checksum_asks_for_it ... ok
+test http::tests::checksum_mismatch_after_download_fails_and_leaves_the_old_file ... ok
+test http::tests::missing_file_and_checksum_mismatch_plan_a_download ... ok
+test http::tests::refusals_at_check ... ok
+test shell::tests::changed_when_false_reports_ok_after_running ... ok
+test shell::tests::check_mode_runs_nothing_and_reports_would_change_even_with_changed_when ... ok
+test http::tests::satisfied_when_checksum_matches_without_touching_the_network ... ok
+test http::tests::digests_match_the_fixture ... ok
+test http::tests::download_writes_atomically_then_is_satisfied ... ok
+test shell::tests::check_plans_the_command_line_and_apply_runs_it_with_env_cwd_and_stdin ... ok
+test shell::tests::creates_and_removes_make_check_satisfied_without_running ... ok
+test http::tests::force_redownloads_and_backs_up ... ok
+test http::tests::url_validation ... ok
+test shell::tests::non_zero_exit_fails_the_step_with_stderr ... ok
+test shell::tests::sh_runs_through_bin_sh_dash_c ... ok
+test shell::tests::stdin_is_absent_unless_given ... ok
+test shell::tests::debug_hides_stdin_and_env_values_and_names_the_closure ... ok
+test http::tests::http_errors_name_status_and_url_and_write_nothing ... ok
+test ssh::authorized_keys::tests::absent_of_missing_key_is_satisfied ... ok
+test ssh::authorized_keys::tests::absent_on_empty_text_is_satisfied ... ok
+test ssh::authorized_keys::tests::absent_removes_matching_lines_only ... ok
+test ssh::authorized_keys::tests::absent_removes_every_duplicate_line_of_a_key ... ok
+test ssh::authorized_keys::tests::create_path_through_ctx_passes_the_mutation_guard ... ok
+test ssh::authorized_keys::tests::crlf_files_keep_their_line_endings ... ok
+test ssh::authorized_keys::tests::exclusive_through_ctx_is_changed_then_ok ... ok
+test ssh::authorized_keys::tests::absent_removes_exactly_one_of_three ... ok
+test ssh::authorized_keys::tests::existing_file_and_dir_keep_their_attributes ... ok
+test ssh::authorized_keys::tests::for_account_form_does_no_lookup ... ok
+test ssh::authorized_keys::tests::check_mode_predicts_and_writes_nothing ... ok
+test ssh::authorized_keys::tests::for_user_chains_from_user_existing ... ok
+test ssh::authorized_keys::tests::in_file_form_refuses_missing_parent ... ok
+test ssh::authorized_keys::tests::comment_and_options_do_not_affect_identity ... ok
+test http::tests::download_follows_redirects_and_sends_headers ... ok
+test ssh::authorized_keys::tests::absent_on_missing_file_is_satisfied_and_creates_nothing ... ok
+test ssh::authorized_keys::tests::in_file_form_writes_the_given_path_without_owner ... ok
+test ssh::authorized_keys::tests::parses_key_without_comment_and_with_extra_spaces ... ok
+test ssh::authorized_keys::tests::parses_options_field_with_quoted_spaces ... ok
+test ssh::authorized_keys::tests::parses_plain_key_with_comment ... ok
+test ssh::authorized_keys::tests::invalid_key_line_is_an_error ... ok
+test ssh::authorized_keys::tests::present_adds_missing_trailing_newline_when_writing ... ok
+test ssh::authorized_keys::tests::present_dedupes_requested_keys ... ok
+test ssh::authorized_keys::tests::present_is_satisfied_when_all_there ... ok
+test ssh::authorized_keys::tests::non_keys_do_not_parse ... ok
+test ssh::authorized_keys::tests::present_lacking_trailing_newline_alone_is_satisfied ... ok
+test ssh::authorized_keys::tests::present_on_empty_file_appends ... ok
+test ssh::authorized_keys::tests::present_exclusive_is_satisfied_when_exact ... ok
+test ssh::authorized_keys::tests::parses_cert_and_sk_types ... ok
+test ssh::authorized_keys::tests::present_preserves_comments_blank_lines_and_options ... ok
+test ssh::authorized_keys::tests::present_exclusive_removes_strangers_and_keeps_comments ... ok
+test ssh::authorized_keys::tests::relative_or_empty_home_is_refused ... ok
+test ssh::authorized_keys::tests::present_non_exclusive_leaves_strangers ... ok
+test ssh::authorized_keys::tests::user_form_creates_file_with_mode_and_owner_inside_existing_ssh_dir ... ok
+test ssh::authorized_keys::tests::user_form_refuses_missing_ssh_dir_naming_file_directory ... ok
+test sysctl::tests::apply_now_false_only_persists ... ok
+test sysctl::tests::change_when_only_live_differs_and_apply_runs_sysctl_w ... ok
+test ssh::authorized_keys::tests::unknown_user_is_an_error ... ok
+test ssh::authorized_keys::tests::present_matches_ignoring_comment_and_keeps_existing_line ... ok
+test sysctl::tests::apply_without_prediction_is_refused ... ok
+test sysctl::tests::change_when_only_the_file_differs_and_apply_writes_without_sysctl ... ok
+test sysctl::tests::check_mode_predicts_writes_nothing_and_runs_nothing ... ok
+test sysctl::tests::custom_file_is_used ... ok
+test sysctl::tests::key_validation ... ok
+test ssh::authorized_keys::tests::requested_key_with_embedded_newline_is_refused ... ok
+test sysctl::tests::parse_line_handles_spacing_comments_and_ignore_marker ... ok
+test sysctl::tests::plan_appends_to_empty_and_existing_text ... ok
+test sysctl::tests::missing_directory_is_refused ... ok
+test sysctl::tests::plan_is_satisfied_regardless_of_spacing ... ok
+test sysctl::tests::missing_proc_key_is_refused_unless_persist_only ... ok
+test sysctl::tests::plan_replaces_in_place_and_keeps_the_rest ... ok
+test sysctl::tests::multi_value_keys_compare_token_wise ... ok
+test sysctl::tests::proc_path_maps_dots_to_slashes ... ok
+test sysctl::tests::change_when_both_differ ... ok
+test sysctl::tests::refuses_bad_key_newline_value_and_non_root ... ok
+test sysctl::tests::satisfied_when_file_and_live_match ... ok
+test sysctl::tests::plan_collapses_duplicates_onto_the_first_line ... ok
+test sysctl::tests::step_changed_then_ok_when_live_follows ... ok
+test systemd::tests::check_mode_through_ctx_runs_only_probes_and_predicts_state_ops ... ok
+test systemd::tests::daemon_reload_default_matches_new ... ok
+test systemd::tests::active_state_classification ... ok
+test sysctl::tests::plan_does_not_match_a_key_prefix_or_comment ... ok
+test systemd::tests::daemon_reload_through_ctx_in_check_mode_runs_nothing ... ok
+test systemd::tests::daemon_reload_always_changes_names_no_unit_and_runs_nothing_in_check ... ok
+test systemd::tests::daemon_reload_user_mode_needs_no_root_and_carries_the_flag ... ok
+test systemd::tests::disabled_now_stops_and_fails_with_journal_if_still_running ... ok
+test systemd::tests::enabled_fails_when_still_disabled_after_enable ... ok
+test systemd::tests::enabled_plans_change_with_diff_and_prediction ... ok
+test systemd::tests::disabled_refuses_static_generated_transient ... ok
+test systemd::tests::disabled_satisfied_on_disabled_masked_and_linked ... ok
+test systemd::tests::enabled_satisfied_and_only_probes_ran ... ok
+test systemd::tests::enabled_state_classification ... ok
+test systemd::tests::enabled_satisfied_on_static_alias_indirect_even_when_inactive ... ok
+test systemd::tests::enabled_apply_runs_enable_then_reads_both_probes ... ok
+test systemd::tests::enabled_surfaces_systemctl_failure ... ok
+test systemd::tests::every_op_refuses_a_non_systemd_init_without_running_anything ... ok
+test systemd::tests::daemon_reload_apply_runs_exactly_one_command ... ok
+test systemd::tests::enabled_now_adds_active_change_and_the_flag ... ok
+test systemd::tests::enabled_now_fails_with_journal_when_unit_does_not_come_up ... ok
+test systemd::tests::disabled_plans_and_applies_disable ... ok
+test systemd::tests::parse_is_enabled_every_documented_word ... ok
+test systemd::tests::every_op_refuses_without_root_and_names_the_user ... ok
+test systemd::tests::parse_is_enabled_nonzero_exit_with_meaningful_stdout ... ok
+test systemd::tests::enabled_refuses_masked_and_missing_units ... ok
+test systemd::tests::reload_surfaces_systemctl_failure_on_inactive_unit ... ok
+test systemd::tests::every_op_rejects_a_bad_unit_name ... ok
+test systemd::tests::reload_uses_reload_and_or_restart_switches_verb ... ok
+test systemd::tests::restart_always_changes_and_check_runs_nothing ... ok
+test systemd::tests::parse_is_active_every_documented_word ... ok
+test systemd::tests::restart_apply_daemon_reloads_restarts_and_verifies ... ok
+test systemd::tests::restart_fails_with_journal_when_unit_stays_down ... ok
+test systemd::tests::parse_is_active_exit_codes_and_unknowns ... ok
+test systemd::tests::restart_through_ctx_passes_the_mutation_guard_and_reports_changed ... ok
+test systemd::tests::running_failure_message_survives_a_missing_journal ... ok
+test systemd::tests::running_refuses_masked_and_missing_units ... ok
+test systemd::tests::running_fails_with_journal_when_failed_after_start ... ok
+test systemd::tests::running_plans_change_from_failed_with_prediction ... ok
+test systemd::tests::running_satisfied_on_active_and_transitional_states ... ok
+test systemd::tests::stopped_fails_when_still_running_after_stop ... ok
+test systemd::tests::stopped_plans_and_applies_stop ... ok
+test systemd::tests::running_apply_starts_then_verifies ... ok
+test systemd::tests::validate_unit_rejects_unusable_names ... ok
+test systemd::tests::stopped_satisfied_on_inactive_and_failed ... ok
+test tls::tests::the_error_lists_every_missing_feature ... ok
+test tls::tests::the_error_names_the_feature_the_op_and_the_rule ... ok
+test systemd::tests::user_mode_adds_the_flag_everywhere_and_needs_no_root ... ok
+test tls::tests::detection_agrees_with_cpuinfo ... ok
+test user::tests::absent_is_satisfied_when_missing ... ok
+test tls::tests::this_cpu_is_supported ... ok
+test tls::tests::required_features_are_the_asserted_set ... ok
+test user::tests::absent_removes_with_userdel_and_reports_home ... ok
+test user::tests::delta_round_trips_through_its_changes ... ok
+test user::tests::check_mode_through_ctx_runs_nothing_and_chains_from_predictions ... ok
+test user::tests::existing_looks_up_without_root_and_fails_when_missing ... ok
+test user::tests::lookups_and_account_assembly ... ok
+test user::tests::malformed_line_for_the_name_is_an_error_not_missing ... ok
+test user::tests::check_mode_accepts_a_group_an_earlier_step_would_create ... ok
+test user::tests::absent_needs_root ... ok
+test user::tests::a_group_named_after_a_new_user_becomes_its_primary_group ... ok
+test user::tests::membership_adds_with_usermod_ag ... ok
+test user::tests::membership_refuses_missing_user_group_and_non_root ... ok
+test user::tests::modify_exact_groups_adds_and_removes ... ok
+test user::tests::membership_through_ctx_is_changed_then_ok ... ok
+test user::tests::malformed_passwd_line_for_the_user_fails_instead_of_creating ... ok
+test user::tests::modify_ids_home_and_comment ... ok
+test user::tests::absent_on_alpine_uses_deluser ... ok
+test user::tests::membership_is_satisfied_for_members_and_primary_group ... ok
+test user::tests::modify_nothing_asked_is_empty ... ok
+test user::tests::modify_shell_and_append_groups ... ok
+test user::tests::modify_without_groups_leaves_memberships_alone ... ok
+test user::tests::outside_check_mode_a_planned_group_is_not_accepted ... ok
+test user::tests::present_create_predicts_only_with_an_explicit_primary_group ... ok
+test user::tests::parses_entries_and_skips_malformed_lines ... ok
+test user::tests::present_exact_groups_uses_usermod_capital_g ... ok
+test user::tests::membership_on_alpine_uses_addgroup ... ok
+test user::tests::present_is_satisfied_when_attributes_match ... ok
+test user::tests::present_missing_binary_names_the_tool_family ... ok
+test user::tests::present_create_without_uid_does_not_predict ... ok
+test user::tests::present_modifies_ids_home_and_comment_in_one_usermod ... ok
+test user::tests::present_create_takes_gid_by_name_id_or_group_and_system_flags ... ok
+test user::tests::present_modifies_with_usermod_append ... ok
+test user::tests::present_on_alpine_uses_adduser_and_addgroup ... ok
+test user::tests::present_on_busybox_does_not_predict_or_show_a_shell_it_did_not_ask_for ... ok
+test user::tests::present_reads_defaults_from_etc_default_useradd ... ok
+test user::tests::present_on_alpine_changes_groups_but_not_attributes ... ok
+test user::tests::present_refuses_a_relative_home ... ok
+test user::tests::present_on_alpine_system_user_without_shell_does_not_predict ... ok
+test user::tests::present_refuses_a_uid_owned_by_another_account_even_when_modifying ... ok
+test user::tests::present_creates_with_useradd_predicts_and_rereads ... ok
+test user::tests::present_refuses_missing_groups_and_taken_uid ... ok
+test user::tests::present_needs_root_and_a_valid_name ... ok
+test archive::tests::every_format_extracts_the_same_tree ... ok
+test result: ok. 331 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.39s
+     Running tests/it_apt_absent.rs (target/debug/deps/it_apt_absent-39bae1cc2b65adf5)
+test absent_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.34s
+     Running tests/it_apt_latest.rs (target/debug/deps/it_apt_latest-08ab3e41da7ee9e0)
+test latest_refreshes_the_cache_in_check ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.43s
+     Running tests/it_apt_present.rs (target/debug/deps/it_apt_present-4ef553179fb9e591)
+test present_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.52s
+     Running tests/it_archive_extracted.rs (target/debug/deps/it_archive_extracted-a76b347b02772b2a)
+test extracted_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+     Running tests/it_authorized_keys.rs (target/debug/deps/it_authorized_keys-46e60611acde5c05)
+test authorized_keys_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+     Running tests/it_file_line.rs (target/debug/deps/it_file_line-1bfa18ab35e98559)
+test line_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+     Running tests/it_file_ops.rs (target/debug/deps/it_file_ops-caa080fd6359192f)
+test file_family_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+     Running tests/it_http_download.rs (target/debug/deps/it_http_download-bd963a474443a7ca)
+test download_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+     Running tests/it_shell_command.rs (target/debug/deps/it_shell_command-73617dca5899a6c1)
+test command_options_against_a_real_shell ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+     Running tests/it_sysctl_present.rs (target/debug/deps/it_sysctl_present-a629c4cfdc281d24)
+test present_persist_only_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+     Running tests/it_systemd.rs (target/debug/deps/it_systemd-4add6725e518798b)
+test unit_lifecycle_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.31s
+     Running tests/it_systemd_image.rs (target/debug/deps/it_systemd_image-fb65a5286863d025)
+test systemd_is_pid1 ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+     Running tests/it_user_busybox.rs (target/debug/deps/it_user_busybox-2400d867d59a8a2e)
+test busybox_user_and_group ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+     Running tests/it_user_group.rs (target/debug/deps/it_user_group-ff58ebfebb8c0d24)
+test users_and_groups_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+
+===============================================================================
+### RE-RUN after the review fix (scheme-gated pre-flight, tls::preflight_url)
+Date (UTC): 2026-09-08T18:23:21Z
+===============================================================================
+
+### cargo fmt --all --check
+OK (no output)
+
+### cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+
+### cargo test --workspace
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 333 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.39s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.81s
+   Generated /home/cadu/w/cadu/rustible-tls/target/doc/rustible/index.html and 6 other files
+
+### cargo build --manifest-path examples/workspace/Cargo.toml
+   Compiling workspace v0.1.0 (/home/cadu/w/cadu/rustible-tls/examples/workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.06s
+
+### cargo +1.89 check --workspace --all-targets
+    Checking rustible-macros v0.0.1 (/home/cadu/w/cadu/rustible-tls/crates/rustible-macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.86s
+
+### cargo test -p rustible-github -- --ignored
+test user_keys::tests::network_fetches_flipbit03_keys_over_https ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.46s
+test crates/rustible-github/src/lib.rs - (line 42) ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+### cargo test -p rustible-std --lib https_ -- --ignored
+test http::tests::https_download_from_github_with_graviola_tls ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 333 filtered out; finished in 0.20s
+
+### cargo test -p rustible-std --lib tls::
+test tls::tests::only_https_urls_are_gated ... ok
+test tls::tests::plain_http_is_never_refused ... ok
+test tls::tests::required_features_are_the_asserted_set ... ok
+test tls::tests::detection_agrees_with_cpuinfo ... ok
+test tls::tests::the_error_lists_every_missing_feature ... ok
+test tls::tests::the_error_names_the_feature_the_op_and_the_rule ... ok
+test tls::tests::this_cpu_is_supported ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 327 filtered out; finished in 0.00s
+
+### RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_http_download
+test download_changed_then_ok ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s

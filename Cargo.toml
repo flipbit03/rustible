@@ -18,7 +18,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipbit03/rustible"
 homepage = "https://github.com/flipbit03/rustible"
 authors = ["Carlos Eduardo <cadu@cadu.dev>"]
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 rustible = { path = "crates/rustible", version = "0.0.1" }
@@ -32,11 +32,11 @@ serde_json = "1"
 thiserror = "2"
 similar = "2"
 # Network, pure Rust (vision 5.3). `ureq` without its default `rustls` feature
-# because that pulls `ring` (C); the provider is `rustls-rustcrypto`, wired by
-# hand in `rustible-std::http` and reused by `rustible-github`.
+# because that pulls `ring` (C); the provider is `rustls-graviola`, wired by
+# hand in `rustible-std::tls` and reused from there by `rustible-github`.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
+rustls-graviola = "0.4"
 regex = "1"
 tempfile = "3"
 rustix = { version = "1", features = ["process"] }
