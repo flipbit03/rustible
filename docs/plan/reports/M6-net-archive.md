@@ -115,26 +115,27 @@ gate was re-run after each merge:
    ops. Those tests exercise `file::apply_attrs`, which this branch
    reordered for the setuid fix, so they are a useful independent check;
    they pass. DECISIONS.md conflict, both sides kept.
+5. PR 17, the `rustible-github` collection's own review fixes. DECISIONS.md
+   conflict, both sides kept.
 
-The table is the last run, at merge commit `3e2278e`. Full output is in
-`docs/plan/logs/M6-net-archive-done.txt`, which has six UTC-stamped sections:
-the pre-merge run at `01623e5`, one after each of the four merges, and one
-after the review fixes.
+The table is the last run, at merge commit `1e3d624`. Full output is in
+`docs/plan/logs/M6-net-archive-done.txt`, which has seven UTC-stamped
+sections: the pre-merge run at `01623e5`, one after each of the five merges,
+and one after the review fixes.
 
 | command | result | wall |
 |---|---|---|
 | `cargo fmt --all --check` | pass | 0.18s |
-| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 2.66s |
-| `cargo test --workspace` | pass | 12.91s |
-| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 1.54s |
-| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 1.95s |
-| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 2.00s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all 13 harness files, as CI runs them) | pass | 46.16s |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 0.38s |
+| `cargo test --workspace` | pass | 4.75s |
+| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 0.73s |
+| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 0.10s |
+| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 0.29s |
+| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all 13 harness files, as CI runs them) | pass | 34.67s |
+| `cargo test -p rustible-github` (shares the merged `ureq` entry) | pass | 1.17s |
 
-Run after the previous merge and unchanged by this one: `cargo test -p
-rustible-github` (1.00s), which shares the merged `ureq` entry, and the
-`#[ignore]`d TLS test `https_download_from_github_with_rustcrypto_tls`
-(0.36s).
+Run earlier and unchanged since: the `#[ignore]`d TLS test
+`https_download_from_github_with_rustcrypto_tls` (0.36s).
 
 Times are with a warm `target/`, so they measure the gates and not the build;
 the first run of the same set on a cold tree took roughly four times as long.
@@ -143,13 +144,13 @@ The two new container tests were also run on their own after each merge,
 are in the log.
 
 CI on GitHub was green on all four jobs (format/clippy/test, MSRV 1.88,
-example workspace, Docker harness) at `33cf1ff` and again at `f65aa54`.
+example workspace, Docker harness) at `33cf1ff`, `f65aa54` and `b430343`.
 
 Counts: `rustible-std` has 318 unit tests passing and one ignored (the
 network TLS test, run separately). Of those, 20 are `http::` (19 running plus
 the ignored TLS one) and 18 are `archive::`; this branch added seven of them
 for the review fixes, and the jump from 305 to 318 is PR 16 arriving in the
-last merge. Both new ops have a compiled doctest. The harness now runs 13
+fourth merge. Both new ops have a compiled doctest. The harness now runs 13
 container test files and all pass.
 
 ### Converging the network dependencies
