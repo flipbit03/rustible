@@ -2,14 +2,14 @@
 # `playbooks/`, shared code in `src/lib.rs`. This manifest is yours to edit:
 # add collections with `cargo add`.
 [package]
-name = "workspace"
+name = "{{name}}"
 version = "0.1.0"
 edition = "2024"
 publish = false
 autobins = false
 
 [[bin]]
-name = "workspace"
+name = "{{name}}"
 path = "src/main.rs"
 
 [lib]
@@ -22,11 +22,10 @@ path = "src/lib.rs"
 selected = []
 
 [dependencies]
-rustible = { path = "../../crates/rustible" }
-rustible-std = { path = "../../crates/rustible-std" }
+{{dependencies}}
 
 [build-dependencies]
-rustible-build = { path = "../../crates/rustible-build" }
+{{build_dependencies}}
 
 # A Rustible workspace stands alone, even inside another Cargo workspace.
 [workspace]
