@@ -66,17 +66,25 @@ for h in "${HOSTS[@]}"; do
   sleep 2
   # The exact pids to look for afterwards: the playbook binary on the target
   # and its children (the step's `sleep 30`). Matching on the command line
-  # instead would also catch anything else on the box that says `sleep 30`.
-  PIDS=$(remote_sh "$h" 'b=$(pgrep -f "cache/rustible/bin/cadu_slow"); echo $b $(pgrep -P "$b" 2>/dev/null)')
+  # instead would also catch anything else on the box that says `sleep 30`,
+  # and, over ssh, the very shell that runs this check (its command line
+  # carries the pattern), so the candidates are filtered by /proc/<pid>/exe.
+  PIDS=$(remote_sh "$h" '
+    for p in $(pgrep -f cache/rustible/bin/cadu_slow); do
+      case "$(readlink /proc/$p/exe 2>/dev/null)" in
+        */cadu_slow-*) echo "$p"; pgrep -P "$p" ;;
+      esac
+    done' | tr '\n' ' ' | sed 's/ *$//')
+  PIDLIST=$(echo "$PIDS" | tr ' ' ',')
   echo "[$h] running before the interrupt:"
-  remote_sh "$h" "ps -o pid=,cmd= -p \$(echo $PIDS | tr ' ' ,)" | cut -c1-110 | sed 's/^/    /'
+  remote_sh "$h" "ps -o pid=,cmd= -p $PIDLIST" | cut -c1-110 | sed 's/^/    /'
   T0=$(date +%s)
   echo "[$h] SIGINT to the orchestrator (pid $CLI)"
   kill -INT "$CLI"; wait "$CLI"; CODE=$?
   echo "[$h] orchestrator exited $CODE after $(( $(date +%s) - T0 )) s"
   sed 's/^/    /' "$LOG"; rm -f "$LOG"
   sleep 1
-  echo "[$h] leftover of those pids ($PIDS): $(remote_sh "$h" "ps -o pid=,cmd= -p \$(echo $PIDS | tr ' ' ,) || echo none")"
+  echo "[$h] leftover of those pids ($PIDS): $(remote_sh "$h" "ps -o pid=,cmd= -p $PIDLIST || echo none")"
   echo "[$h] marker: $(remote_sh "$h" 'ls /tmp/rustible-m5-next-step-ran 2>&1 || true')"
 done
 

@@ -342,14 +342,15 @@ impl Transport {
                 Ok(())
             }
             (Waiter::Ssh(_), Transport::Ssh { .. }) => {
-                // Every process whose command line names the binary (the
-                // `sh -c` wrapper and the binary itself) and their children
-                // (a step's command, a helper).
-                let path = shell_quote(&proc.argv0);
-                let script = format!(
-                    "for p in $(pgrep -f {path}); do pkill -KILL -P \"$p\"; kill -KILL \"$p\"; done 2>/dev/null; true"
-                );
-                self.sh(&script).await?;
+                // The mux channel cannot signal the remote process, so the
+                // binary and its children (a step's command, a helper) are
+                // killed by pid. `pgrep -f` is only the candidate list: the
+                // pattern is the binary's path, and this script's own shell
+                // has that path on its command line too, so a bare `pgrep
+                // -f` loop kills the killer and whichever of the real
+                // targets it had not reached yet. `/proc/<pid>/exe` is the
+                // filter that tells the two apart.
+                self.sh(&kill_script(&proc.argv0)).await?;
                 Ok(())
             }
             _ => Ok(()),
@@ -357,9 +358,43 @@ impl Transport {
     }
 }
 
+/// The remote snippet that kills `bin` and its children. Only processes
+/// actually running `bin` are signalled: `/proc/<pid>/exe` is the kernel's
+/// answer to "what is this process running", where a command line is just
+/// text that anything, this script included, can carry.
+fn kill_script(bin: &str) -> String {
+    let q = shell_quote(bin);
+    format!(
+        "for p in $(pgrep -f {q}); do \
+           [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = {q} ] || continue; \
+           pkill -KILL -P \"$p\"; kill -KILL \"$p\"; \
+         done 2>/dev/null; true"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_script_only_signals_processes_running_the_binary() {
+        let script = kill_script("/home/cadu/.cache/rustible/bin/cadu_slow-ab12");
+        // The path is quoted once for `pgrep` and once for the comparison,
+        // and nothing is killed before `/proc/<pid>/exe` has been checked.
+        assert_eq!(
+            script
+                .matches("'/home/cadu/.cache/rustible/bin/cadu_slow-ab12'")
+                .count(),
+            2
+        );
+        let guard = script.find("readlink /proc/$p/exe").expect("checks exe");
+        assert!(guard < script.find("kill -KILL").expect("kills"));
+        // A path with a quote in it cannot close the quoting and run
+        // something: the quote comes back escaped, never bare.
+        let nasty = kill_script("/tmp/x'; rm -rf /; '");
+        assert!(!nasty.contains("x'; rm"), "{nasty}");
+        assert!(nasty.contains("x'\\''; rm"), "{nasty}");
+    }
 
     #[test]
     fn master_argv_passes_only_what_the_inventory_set() {
