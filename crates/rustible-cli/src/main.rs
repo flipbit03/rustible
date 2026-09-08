@@ -1,5 +1,7 @@
-//! Spike orchestrator: build a playbook per target triple, ship it, run it
-//! over the framed protocol, render the events. Local and SSH transports.
+//! The `rustible` command. `run` is the spike orchestrator: build a playbook
+//! per target triple, ship it, run it over the framed protocol, render the
+//! events (local and SSH transports). `inventory show` and `inventory check`
+//! are the M2 subcommands over `rustible_cli::inventory`.
 
 mod transport;
 
@@ -9,7 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
+use rustible_cli::inventory::{Inventory, render_show};
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::{Event, EventSink, Pretty};
 use rustible_sdk::protocol::{Down, Up};
@@ -19,8 +22,47 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use transport::Transport;
 
 #[derive(Parser, Debug)]
-#[command(name = "rustible", about = "Rustible orchestrator (spike)")]
+#[command(
+    name = "rustible",
+    about = "Rustible: configuration management as real code"
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Build, ship, and run a playbook on hosts named on the command line
+    /// (spike orchestrator; `playbook run` replaces it in M3).
+    Run(RunArgs),
+    /// Inspect and validate `hosts.kdl`.
+    Inventory {
+        #[command(subcommand)]
+        command: InventoryCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InventoryCommand {
+    /// Resolved parameters and vars of one host, with the source of each.
+    Show {
+        /// Host name as written in the inventory.
+        host: String,
+        /// Inventory file.
+        #[arg(long, default_value = "hosts.kdl")]
+        file: PathBuf,
+    },
+    /// Load the inventory and report every error (exit 1 on any).
+    Check {
+        /// Inventory file.
+        #[arg(long, default_value = "hosts.kdl")]
+        file: PathBuf,
+    },
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
     /// Rustible workspace directory (a Cargo package generated like
     /// `examples/workspace`).
     #[arg(long, default_value = "examples/workspace")]
@@ -50,7 +92,58 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    match Cli::parse().command {
+        Command::Run(args) => run(args).await,
+        Command::Inventory { command } => inventory(command),
+    }
+}
+
+/// `inventory show` and `inventory check`. Load errors go to stderr one per
+/// line as `file:line:col: error: message`; any error exits 1.
+fn inventory(cmd: InventoryCommand) -> Result<()> {
+    match cmd {
+        InventoryCommand::Show { host, file } => {
+            let inv = load_or_exit(&file);
+            match inv.resolve(&host) {
+                Ok(resolved) => print!("{}", render_show(&resolved)),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        InventoryCommand::Check { file } => {
+            let inv = load_or_exit(&file);
+            println!(
+                "{}: ok ({} hosts, {} groups)",
+                file.display(),
+                inv.hosts.len(),
+                inv.groups.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_or_exit(file: &std::path::Path) -> Inventory {
+    match Inventory::load(file) {
+        Ok(inv) => inv,
+        Err(errs) => {
+            for e in errs.iter() {
+                eprintln!("{e}");
+            }
+            let n = errs.len();
+            eprintln!(
+                "{}: {n} error{}",
+                file.display(),
+                if n == 1 { "" } else { "s" }
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run(cli: RunArgs) -> Result<()> {
     let t_start = Instant::now();
     let mut vars_map = serde_json::Map::new();
     for kv in &cli.vars {
