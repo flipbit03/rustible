@@ -149,3 +149,38 @@ Recorded in `docs/plan/DECISIONS.md` under `[M6-sd]`:
   hosts, `my_infra` untouched, root only inside throwaway containers.
 
 ## Self-review: run by the lead on the PR
+
+### Self-review (lead, PR #8)
+
+Reviewed by the lead against vision 6.3, 6.4, 6.7 and 12. No code changes were
+needed; the branch is merged as it stands. What was checked:
+
+- **Actions run nothing in `check`** and predict nothing, which is vision 6.4
+  exactly; `Restart` and `Reload` flag `always_changes`. The state ops run only
+  `is-enabled` and `is-active` in `check`, both read-only.
+- **Predictions are honest.** Each state op predicts the state it will have
+  produced, and `apply` re-reads and then asserts it (`ensure!(state.enabled)`,
+  `verify_running`, `verify_stopped`), so a prediction that turns out wrong
+  fails the step instead of being reported as truth.
+- **The refusals match vision 6.7**: masked units are refused rather than
+  unmasked, `static`, `generated` and `transient` units are refused by
+  `Disabled` with the reason, and a unit `is-enabled` cannot find is refused by
+  every state op rather than silently counting as stopped.
+- **The parsers cover every documented `systemctl` word** including the
+  nonzero-exit cases, with an `Other(String)` escape for future systemd
+  versions, and the container test pins the two real refusals against systemd
+  252 and 255.
+- **`--user` support** carries through the probes, the commands, the journal
+  tail and the messages, and is what lifts the root requirement.
+
+One gap noted, not changed: there is no way to run `systemctl daemon-reload`
+on its own, because `daemon_reload` is a flag on the two actions (the shape
+vision 6.4 and the M6 brief name). The container test has to reload journald
+to get systemd to notice a new unit file, which is a workaround, not a use.
+Recorded as a proposed amendment for Cadu below.
+
+Verification after merging main: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo test --workspace` (366 tests
+across the workspace), and the container test re-run green on
+jrei/systemd-debian:12 and jrei/systemd-ubuntu:24.04 in 3.8 s.
+
