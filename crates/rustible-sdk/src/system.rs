@@ -2,14 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::backend::{Backend, CmdSpec, Fake, Local, Output, Stat};
+use crate::backend::{Backend, CmdSpec, Elevated, Fake, Local, Output, Spawner, Stat};
 use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
+use crate::secret::Secret;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -23,8 +24,9 @@ pub enum Phase {
 pub enum Identity {
     /// Whatever the process runs as.
     Own,
-    /// Run commands via sudo as this user. File ops still happen as the
-    /// process user in this spike; the `Elevated` helper backend is future work.
+    /// Another user. On a real system every primitive goes through an
+    /// `Elevated` helper running as that user (vision doc 11.3); on a `Fake`
+    /// system commands get a `sudo -n -u <user>` prefix so tests can assert it.
     User(String),
 }
 
@@ -37,6 +39,30 @@ impl Identity {
     }
 }
 
+/// How this run reaches other identities: the process's own user, the
+/// host's escalation method, and one `Elevated` backend per user, spawned on
+/// first use and kept for the run (vision doc 11.3). Only a real system has
+/// one; `Fake` systems have none.
+pub struct Escalation {
+    own_user: String,
+    local: Arc<dyn Backend>,
+    spawner: Spawner,
+    helpers: Mutex<BTreeMap<String, Arc<Elevated>>>,
+}
+
+impl Escalation {
+    fn backend_for(&self, user: &str, phase: &Arc<AtomicU8>) -> Arc<dyn Backend> {
+        if user == self.own_user {
+            return self.local.clone();
+        }
+        let mut helpers = self.helpers.lock().unwrap();
+        helpers
+            .entry(user.to_string())
+            .or_insert_with(|| Arc::new(Elevated::new(user, self.spawner.clone(), phase.clone())))
+            .clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct System {
     backend: Arc<dyn Backend>,
@@ -45,6 +71,7 @@ pub struct System {
     check_mode: bool,
     phase: Arc<AtomicU8>,
     sink: SharedSink,
+    escalation: Option<Arc<Escalation>>,
 }
 
 impl System {
@@ -61,14 +88,46 @@ impl System {
             check_mode,
             phase: Arc::new(AtomicU8::new(Phase::Idle as u8)),
             sink,
+            escalation: None,
         }
     }
 
-    /// Real machine, real facts.
+    /// Real machine, real facts; other identities through `sudo` without a
+    /// password. See `with_escalation` for the inventory's method.
     pub fn local(check_mode: bool, sink: SharedSink) -> Self {
-        let backend = Arc::new(Local);
+        let backend: Arc<dyn Backend> = Arc::new(Local);
         let facts = Facts::gather(&*backend);
-        Self::new(backend, facts, check_mode, sink)
+        let mut sys = Self::new(backend.clone(), facts, check_mode, sink);
+        sys.escalation = Some(Arc::new(Escalation {
+            own_user: sys.facts.user.clone(),
+            local: backend,
+            spawner: Spawner {
+                method: "sudo".into(),
+                exe: std::env::current_exe().unwrap_or_default(),
+                password: None,
+            },
+            helpers: Mutex::new(BTreeMap::new()),
+        }));
+        sys
+    }
+
+    /// Set the host's escalation method (`sudo`, `doas`, `none`) and the
+    /// password `sudo -S` gets when `sudo -n` is refused. No effect on a
+    /// `Fake` system.
+    pub fn with_escalation(mut self, method: &str, password: Option<Secret>) -> Self {
+        if let Some(esc) = &self.escalation {
+            self.escalation = Some(Arc::new(Escalation {
+                own_user: esc.own_user.clone(),
+                local: esc.local.clone(),
+                spawner: Spawner {
+                    method: method.to_string(),
+                    exe: esc.spawner.exe.clone(),
+                    password,
+                },
+                helpers: Mutex::new(BTreeMap::new()),
+            }));
+        }
+        self
     }
 
     /// Fake backend for tests. Facts default to a plausible Debian box; use
@@ -122,10 +181,23 @@ impl System {
         }
     }
 
-    /// A clone whose commands run as another user. Not a mutation.
+    /// A clone that runs as another user. Not a mutation. On a real system
+    /// the clone's backend is the `Elevated` helper for that user (shared by
+    /// every clone asking for the same user); asking for the process's own
+    /// user gives back the plain local system.
     pub fn as_user(&self, name: &str) -> System {
         let mut s = self.clone();
-        s.identity = Identity::User(name.to_string());
+        match &self.escalation {
+            Some(esc) if name == esc.own_user => {
+                s.identity = Identity::Own;
+                s.backend = esc.local.clone();
+            }
+            Some(esc) => {
+                s.identity = Identity::User(name.to_string());
+                s.backend = esc.backend_for(name, &self.phase);
+            }
+            None => s.identity = Identity::User(name.to_string()),
+        }
         s
     }
 
@@ -243,9 +315,13 @@ impl System {
                 env: BTreeMap::new(),
                 cwd: None,
                 stdin: None,
-                prefix: match &self.identity {
-                    Identity::Own => vec![],
-                    Identity::User(u) => vec!["sudo".into(), "-n".into(), "-u".into(), u.clone()],
+                // With a helper the process already is the user; without one
+                // (a `Fake`), the prefix stands in for it.
+                prefix: match (&self.identity, &self.escalation) {
+                    (Identity::User(u), None) => {
+                        vec!["sudo".into(), "-n".into(), "-u".into(), u.clone()]
+                    }
+                    _ => vec![],
                 },
             },
             allow_failure: false,
