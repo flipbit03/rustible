@@ -17,8 +17,8 @@ settled.
 question has a decision below together with the alternatives it beat. Three
 spikes validated the design in running code across two machines and two CPU
 architectures (section 17). The next phase is **building the real thing**
-against a milestone plan, `docs/05_BUILD_PLAN.md`, which is written only after
-this document has been vetted.
+against a milestone plan, `docs/06_BUILD_PLAN.md` (written 2026-09-08 after
+vetting), with one brief per milestone under `docs/plan/`.
 
 **The two modes, and their rules.**
 
