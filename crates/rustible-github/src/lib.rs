@@ -73,7 +73,11 @@
 //! refused rather than emptying `authorized_keys`.
 //!
 //! Pure Rust all the way down (vision 5.3): `ureq` over `rustls` with the
-//! `rustls-rustcrypto` provider; no `ring`, no OpenSSL, no C.
+//! `rustls-graviola` provider, taken from `rustible_std::tls` so this crate
+//! and `rustible_std::http` share one crypto path; no `ring`, no OpenSSL, no
+//! C. That provider requires a CPU from roughly 2015 onwards, and
+//! [`Https`] checks for it before every request rather than letting the
+//! handshake panic; see `rustible_std::tls` for what is excluded.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
