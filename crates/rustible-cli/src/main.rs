@@ -1,22 +1,29 @@
 //! Spike orchestrator: build a playbook per target triple, ship it, run it
 //! over the framed protocol, render the events. Local and SSH transports.
+//! Serves `FileRequest`s from the workspace, writes `FetchChunk`s under it,
+//! and turns ctrl-c into a `Cancel` frame with a ten second grace period.
 
 mod transport;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::{Event, EventSink, Pretty};
 use rustible_sdk::protocol::{Down, Up};
+use rustible_sdk::secret::Secret;
+use rustible_sdk::stream::{WorkspaceFiles, chunks};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use transport::Transport;
+use transport::{Proc, Transport};
+
+/// How long a cancelled binary gets to stop between steps before it is killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Parser, Debug)]
 #[command(name = "rustible", about = "Rustible orchestrator (spike)")]
@@ -39,6 +46,11 @@ struct Cli {
     /// `r#become` everywhere is ugly.
     #[arg(long)]
     escalate: bool,
+    /// Name of an environment variable holding the sudo password for
+    /// per-step escalation (`ctx.as_root()`) on hosts where `sudo -n` is
+    /// refused. Sent in the `Start` frame, never on a command line.
+    #[arg(long, value_name = "VAR")]
+    escalate_password_env: Option<String>,
     #[arg(long)]
     check: bool,
     #[arg(short, action = clap::ArgAction::Count)]
@@ -62,6 +74,27 @@ async fn main() -> Result<()> {
         vars_map.insert(k.to_string(), value);
     }
     let vars_json = serde_json::Value::Object(vars_map);
+    let escalate_password = match &cli.escalate_password_env {
+        Some(var) => Some(Secret::from(
+            std::env::var(var).with_context(|| format!("reading ${var}"))?,
+        )),
+        None => None,
+    };
+    let files = Arc::new(
+        WorkspaceFiles::new(&cli.workspace)
+            .with_context(|| format!("workspace {}", cli.workspace.display()))?,
+    );
+
+    // Ctrl-c: every host run watches this and sends `Cancel`.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!(
+                "\nctrl-c: cancelling; each host gets {CANCEL_GRACE:?} to stop between steps"
+            );
+            let _ = cancel_tx.send(true);
+        }
+    });
 
     // 1. Connect to every host in parallel and probe its triple.
     let mut connects = vec![];
@@ -133,13 +166,19 @@ async fn main() -> Result<()> {
     let mut runs = vec![];
     for (name, tr, triple) in hosts {
         let artifacts = artifacts.clone();
+        let files = files.clone();
         let bin = cli.bin.clone();
         let playbook = cli.playbook.clone();
         let vars_json = vars_json.clone();
+        let escalate_password = escalate_password.clone();
         let (escalate, check, verbosity) = (cli.escalate, cli.check, cli.verbose);
+        let cancel_rx = cancel_rx.clone();
         runs.push(tokio::spawn(async move {
             let (bytes, hash) = &artifacts[&triple];
-            let remote_path = format!(".cache/rustible/bin/{bin}-{}-{hash}", playbook.replace('/', "_"));
+            let remote_path = format!(
+                ".cache/rustible/bin/{bin}-{}-{hash}",
+                playbook.replace('/', "_")
+            );
 
             let t0 = Instant::now();
             let cached = tr.exists(&remote_path).await?;
@@ -167,44 +206,32 @@ async fn main() -> Result<()> {
                 playbook: playbook.clone(),
                 host: HostInfo {
                     name: name.clone(),
-                    connection: if name == "local" { "local".into() } else { "ssh".into() },
+                    connection: if name == "local" {
+                        "local".into()
+                    } else {
+                        "ssh".into()
+                    },
                     ..HostInfo::local()
                 },
                 vars: vars_json,
                 check_mode: check,
                 verbosity,
+                escalate_password,
             };
             write_frame(&mut proc.stdin, &start).await?;
 
-            let sink: Arc<dyn EventSink> = Arc::new(Pretty::new(std::io::stdout(), name.clone(), verbosity));
-            let mut t_hello = None;
-            let mut summary = None;
-            loop {
-                let Some(up) = read_frame::<_, Up>(&mut proc.stdout).await? else {
-                    break;
-                };
-                match up {
-                    Up::Hello { protocol, playbook: announced } => {
-                        t_hello = Some(t_exec.elapsed());
-                        if protocol != rustible_sdk::protocol::PROTOCOL_VERSION {
-                            bail!(
-                                "protocol mismatch: orchestrator speaks {}, binary speaks {protocol}; rebuild the workspace against this rustible",
-                                rustible_sdk::protocol::PROTOCOL_VERSION
-                            );
-                        }
-                        if announced != playbook {
-                            bail!("asked for playbook `{playbook}`, binary answered with `{announced}`");
-                        }
-                        eprintln!("[{name}]  hello: protocol {protocol}, playbook {announced}, {:.2?} after exec", t_exec.elapsed());
-                    }
-                    Up::Event(ev) => {
-                        if let Event::Finished(s) = &ev {
-                            summary = Some(s.clone());
-                        }
-                        sink.emit(ev);
-                    }
-                }
-            }
+            let sink: Arc<dyn EventSink> =
+                Arc::new(Pretty::new(std::io::stdout(), name.clone(), verbosity));
+            let mut driver = Driver {
+                name: name.clone(),
+                playbook: playbook.clone(),
+                files,
+                sink,
+                t_exec,
+                t_hello: None,
+                summary: None,
+            };
+            let outcome = driver.drive(&tr, &mut proc, cancel_rx).await;
             let exit = proc.wait().await?;
             let stderr = proc.stderr_text().await;
             if !stderr.trim().is_empty() {
@@ -213,11 +240,15 @@ async fn main() -> Result<()> {
                 }
             }
             eprintln!(
-                "[{name}]  exit {exit}, hello after {:?}, total run {:.2?}",
-                t_hello.map(|d| format!("{d:.2?}")).unwrap_or_else(|| "never".into()),
+                "[{name}]  exit {exit}, hello after {}, total run {:.2?}",
+                driver
+                    .t_hello
+                    .map(|d| format!("{d:.2?}"))
+                    .unwrap_or_else(|| "never".into()),
                 t_exec.elapsed()
             );
-            anyhow::Ok((name, exit, summary))
+            outcome?;
+            anyhow::Ok((name, exit, driver.summary))
         }));
     }
 
@@ -240,6 +271,160 @@ async fn main() -> Result<()> {
     if failed {
         std::process::exit(2)
     } else {
+        Ok(())
+    }
+}
+
+/// One host's protocol loop: renders events, answers file requests, writes
+/// fetched chunks, and handles cancellation.
+struct Driver {
+    name: String,
+    playbook: String,
+    files: Arc<WorkspaceFiles>,
+    sink: Arc<dyn EventSink>,
+    t_exec: Instant,
+    t_hello: Option<Duration>,
+    summary: Option<rustible_sdk::event::Summary>,
+}
+
+impl Driver {
+    async fn drive(
+        &mut self,
+        tr: &Transport,
+        proc: &mut Proc,
+        mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        // Frames are read by their own task: `read_exact` is not cancel-safe,
+        // so it cannot sit directly in the `select!`.
+        let mut stdout = std::mem::replace(&mut proc.stdout, Box::pin(tokio::io::empty()));
+        let (tx, mut frames) = tokio::sync::mpsc::channel::<Result<Up>>(64);
+        tokio::spawn(async move {
+            loop {
+                match read_frame::<_, Up>(&mut stdout).await {
+                    Ok(Some(up)) => {
+                        if tx.send(Ok(up)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { break };
+                    self.handle(proc, frame?).await?;
+                }
+                changed = cancel_rx.changed(), if deadline.is_none() => {
+                    if changed.is_err() || !*cancel_rx.borrow() {
+                        continue;
+                    }
+                    eprintln!("[{}]  sending Cancel", self.name);
+                    // A binary that already exited has closed its stdin; that
+                    // is fine, the read side reports the exit.
+                    let _ = write_frame(&mut proc.stdin, &Down::Cancel).await;
+                    deadline = Some(tokio::time::Instant::now() + CANCEL_GRACE);
+                }
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                    eprintln!("[{}]  cancelled: the running step did not finish within {CANCEL_GRACE:?}, killing the binary", self.name);
+                    tr.kill(proc).await?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle(&mut self, proc: &mut Proc, up: Up) -> Result<()> {
+        match up {
+            Up::Hello {
+                protocol,
+                playbook: announced,
+            } => {
+                self.t_hello = Some(self.t_exec.elapsed());
+                if protocol != rustible_sdk::protocol::PROTOCOL_VERSION {
+                    bail!(
+                        "protocol mismatch: orchestrator speaks {}, binary speaks {protocol}; rebuild the workspace against this rustible",
+                        rustible_sdk::protocol::PROTOCOL_VERSION
+                    );
+                }
+                if announced != self.playbook {
+                    bail!(
+                        "asked for playbook `{}`, binary answered with `{announced}`",
+                        self.playbook
+                    );
+                }
+                eprintln!(
+                    "[{}]  hello: protocol {protocol}, playbook {announced}, {:.2?} after exec",
+                    self.name,
+                    self.t_exec.elapsed()
+                );
+            }
+            Up::Event(ev) => {
+                if let Event::Finished(s) = &ev {
+                    self.summary = Some(s.clone());
+                }
+                self.sink.emit(ev);
+            }
+            Up::FileRequest { req, path } => {
+                let t0 = Instant::now();
+                match self.files.open(&path) {
+                    Err(reason) => {
+                        eprintln!("[{}]  denied file request `{path}`: {reason}", self.name);
+                        write_frame(&mut proc.stdin, &Down::FileDenied { req, reason }).await?;
+                    }
+                    Ok(file) => {
+                        let mut total = 0u64;
+                        for chunk in chunks(file) {
+                            let chunk = chunk.with_context(|| format!("reading `{path}`"))?;
+                            total += chunk.bytes.len() as u64;
+                            let last = chunk.last;
+                            write_frame(
+                                &mut proc.stdin,
+                                &Down::FileChunk {
+                                    req,
+                                    offset: chunk.offset,
+                                    bytes: chunk.bytes,
+                                    last,
+                                },
+                            )
+                            .await?;
+                        }
+                        eprintln!(
+                            "[{}]  sent `{path}` ({total} bytes) in {:.2?}",
+                            self.name,
+                            t0.elapsed()
+                        );
+                    }
+                }
+            }
+            Up::FetchChunk {
+                dest,
+                offset,
+                bytes,
+                last,
+                ..
+            } => {
+                let written = self
+                    .files
+                    .write_chunk(&dest, offset, &bytes)
+                    .map_err(|reason| anyhow::anyhow!("fetch to `{dest}` refused: {reason}"))?;
+                if last {
+                    eprintln!(
+                        "[{}]  fetched `{dest}` ({} bytes) to {}",
+                        self.name,
+                        offset + bytes.len() as u64,
+                        written.display()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

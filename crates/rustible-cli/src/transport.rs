@@ -1,5 +1,11 @@
 //! How the orchestrator reaches a host: run a process locally, or over an SSH
 //! ControlMaster session. The playbook binary never knows which.
+//!
+//! Ctrl-c on the orchestrator must not kill what it spawned: the binary is
+//! told to stop with a `Cancel` frame and gets ten seconds (vision doc 5.5).
+//! Local children therefore start in their own process group, and SSH uses
+//! the native mux client so no per-command `ssh` process sits in the
+//! terminal's foreground group; the master itself is daemonized by ssh.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +25,8 @@ pub struct Proc {
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
     stderr: Pin<Box<dyn AsyncRead + Send>>,
     waiter: Waiter,
+    /// What `kill` matches on a remote host.
+    argv0: String,
 }
 
 enum Waiter {
@@ -53,7 +61,7 @@ impl Transport {
         if spec == "local" {
             return Ok(Transport::Local);
         }
-        let session = Session::connect(spec, KnownHosts::Accept)
+        let session = Session::connect_mux(spec, KnownHosts::Accept)
             .await
             .with_context(|| format!("ssh to {spec}"))?;
         Ok(Transport::Ssh(Arc::new(session)))
@@ -67,6 +75,7 @@ impl Transport {
                 let out = tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(script)
+                    .process_group(0)
                     .output()
                     .await?;
                 Ok((
@@ -127,6 +136,11 @@ impl Transport {
     /// remote shell expands; that is why it goes through `sh -c`.
     pub async fn spawn(&self, argv: &[String]) -> Result<Proc> {
         let script = argv.join(" ");
+        let argv0 = argv
+            .iter()
+            .find(|a| !matches!(a.as_str(), "sudo" | "-n"))
+            .cloned()
+            .unwrap_or_default();
         match self {
             Transport::Local => {
                 let mut child = tokio::process::Command::new("sh")
@@ -135,6 +149,7 @@ impl Transport {
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
+                    .process_group(0)
                     .spawn()
                     .with_context(|| format!("spawning {script}"))?;
                 Ok(Proc {
@@ -142,6 +157,7 @@ impl Transport {
                     stdout: Box::pin(child.stdout.take().unwrap()),
                     stderr: Box::pin(child.stderr.take().unwrap()),
                     waiter: Waiter::Local(child),
+                    argv0,
                 })
             }
             Transport::Ssh(s) => {
@@ -161,8 +177,37 @@ impl Transport {
                     stdout: Box::pin(child.stdout().take().unwrap()),
                     stderr: Box::pin(child.stderr().take().unwrap()),
                     waiter: Waiter::Ssh(Some(child)),
+                    argv0,
                 })
             }
+        }
+    }
+
+    /// Stop a process that ignored `Cancel` for too long. Locally the whole
+    /// process group goes (the binary and any helper it spawned); over SSH
+    /// every process running the binary's path is killed, since the mux
+    /// channel cannot signal the remote process.
+    pub async fn kill(&self, proc: &mut Proc) -> Result<()> {
+        match (&mut proc.waiter, self) {
+            (Waiter::Local(child), _) => {
+                if let Some(pid) = child.id() {
+                    // Negative pid: the process group we created at spawn.
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{pid}")])
+                        .status()
+                        .await;
+                }
+                child.start_kill().ok();
+                Ok(())
+            }
+            (Waiter::Ssh(_), Transport::Ssh(_)) => {
+                let path = proc.argv0.replace("$HOME/", "");
+                let (_, _) = self
+                    .sh(&format!("pkill -KILL -f \"$HOME/{path}\" || true"))
+                    .await?;
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 }
