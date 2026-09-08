@@ -14,6 +14,12 @@
 //!
 //! All I/O goes through [`System`] (vision 7). Every op predicts its output
 //! so chained steps keep working in check mode (vision 12).
+//!
+//! TODO(m6-harness): once the Docker harness (PR #5) is on main, add
+//! `tests/it_file_copy.rs` and `tests/it_file_block.rs` doing changed-then-ok
+//! on `debian:12` and `ubuntu:24.04`, in the shape of `tests/it_file_line.rs`
+//! from that branch. Not written here so the branch does not carry a test
+//! that cannot run.
 
 use std::path::Path;
 
