@@ -113,10 +113,16 @@ impl Workspace {
         }
         let abs = absolute(Path::new(arg))?;
         if !abs.is_file() {
+            if arg.ends_with(".rs") {
+                bail!(
+                    "no playbook `{arg}`: {} does not exist (see `rustible playbook list`)",
+                    abs.display()
+                );
+            }
             bail!(
                 "no playbook `{arg}`: neither {} nor {} exists (see `rustible playbook list`)",
-                abs.display(),
-                by_name.display()
+                by_name.display(),
+                abs.display()
             );
         }
         if abs.strip_prefix(&dir).is_err() {

@@ -24,6 +24,10 @@ struct HostState {
     /// Something outside the playbook went wrong: connect, upload, protocol.
     error: Option<String>,
     exit: Option<i32>,
+    /// A step reported `Failed` with its chain in `note`; the binary's
+    /// `Failed` frame normally follows and prints it once. If it does not
+    /// (the playbook swallowed the error), the chain prints from here.
+    pending_fail: Option<(String, String)>,
 }
 
 pub struct Renderer<W: Write> {
@@ -75,6 +79,9 @@ impl<W: Write> Renderer<W> {
             for l in buf {
                 self.line(host, &l);
             }
+        }
+        if let Some((step, chain)) = self.state(host).pending_fail.take() {
+            self.line(host, &format!("FAILED at `{step}`: {chain}"));
         }
     }
 
@@ -145,8 +152,15 @@ impl<W: Write> Renderer<W> {
                 if let Some(d) = diff {
                     let _ = write!(tail, "   {}", d.short());
                 }
-                if let Some(n) = note {
-                    let _ = write!(tail, "   {n}");
+                let mut pending = None;
+                match note {
+                    Some(chain) if *status == Status::Failed => {
+                        pending = Some((name.clone(), chain.clone()));
+                    }
+                    Some(n) => {
+                        let _ = write!(tail, "   {n}");
+                    }
+                    None => {}
                 }
                 if identity != "self" {
                     let _ = write!(tail, "   as {identity}");
@@ -165,6 +179,7 @@ impl<W: Write> Renderer<W> {
                 for l in buffered {
                     self.line(host, &l);
                 }
+                self.state(host).pending_fail = pending;
             }
             Event::StepSkipped {
                 depth,
@@ -191,14 +206,20 @@ impl<W: Write> Renderer<W> {
                 if self.verbosity >= 2 {
                     let text = format!(
                         "  $ {} (as {identity}, exit {status}, {elapsed_ms}ms)",
-                        argv.join(" ")
+                        argv_text(argv)
                     );
                     self.nested(host, text);
                 }
             }
             Event::Failed { step, error, cmd } => {
-                self.flush(host);
                 let (step, error) = split_step(step.as_deref(), error);
+                // The frame carries the chain; the step line's copy is not needed.
+                if let Some(p) = &self.state(host).pending_fail
+                    && step == Some(p.0.as_str())
+                {
+                    self.state(host).pending_fail = None;
+                }
+                self.flush(host);
                 let text = match step {
                     Some(s) => format!("FAILED at `{s}`: {error}"),
                     None => format!("FAILED: {error}"),
@@ -209,7 +230,7 @@ impl<W: Write> Renderer<W> {
                 {
                     self.line(
                         host,
-                        &format!("  $ {} (exit {})", c.argv.join(" "), c.status),
+                        &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
                     );
                     for l in c.stderr.lines() {
                         self.line(host, &format!("    {l}"));
@@ -273,6 +294,21 @@ impl<W: Write> Renderer<W> {
         let _ = self.w.flush();
         any_failed
     }
+}
+
+/// A command line on one line: arguments with whitespace or control
+/// characters are shown quoted and escaped.
+fn argv_text(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                format!("{a:?}")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn status_word(s: Status) -> &'static str {
@@ -506,6 +542,78 @@ arm      0        1             0        0       0         0
             out.contains("local  no summary (binary exited 101 before finishing)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn failed_step_chain_prints_once_and_still_prints_when_swallowed() {
+        let mut finished = step_finished(1, "x", Status::Failed);
+        if let Event::StepFinished { note, .. } = &mut finished {
+            *note = Some("boom: deeper".into());
+        }
+        let reported = render(0, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &finished);
+            r.event(
+                "h",
+                &Event::Failed {
+                    step: None,
+                    error: "step `x`: boom: deeper".into(),
+                    cmd: None,
+                },
+            );
+            r.event(
+                "h",
+                &Event::Finished(Summary {
+                    failed: 1,
+                    ..Default::default()
+                }),
+            );
+        });
+        assert_eq!(reported.matches("boom: deeper").count(), 1, "{reported}");
+        assert!(
+            reported.contains(
+                "[h]  x .......................................... FAILED
+"
+            ),
+            "{reported}"
+        );
+
+        let swallowed = render(0, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &finished);
+            r.event("local", &step_started(2, "y"));
+            r.event("local", &step_finished(2, "y", Status::Ok));
+            r.event(
+                "h",
+                &Event::Finished(Summary {
+                    failed: 1,
+                    ok: 1,
+                    ..Default::default()
+                }),
+            );
+        });
+        assert!(
+            swallowed.contains(
+                "[local]  FAILED at `x`: boom: deeper
+"
+            ),
+            "{swallowed}"
+        );
+        assert!(swallowed.find("FAILED at").unwrap() < swallowed.find("y ....").unwrap());
+    }
+
+    #[test]
+    fn argv_with_control_characters_stays_on_one_line() {
+        let argv = vec![
+            "dpkg-query".to_string(),
+            "-f=${Status}\t${Version}\n".to_string(),
+            "mc".to_string(),
+        ];
+        assert_eq!(
+            argv_text(&argv),
+            "dpkg-query \"-f=${Status}\\t${Version}\\n\" mc"
+        );
+        assert_eq!(argv_text(&["a b".to_string()]), "\"a b\"");
     }
 
     #[test]

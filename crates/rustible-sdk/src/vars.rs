@@ -161,8 +161,13 @@ impl std::fmt::Display for UnknownKey {
     }
 }
 
-/// Keys in `raw` that the schema does not declare, structured.
+/// Keys in `raw` that the schema does not declare, structured. A playbook
+/// without vars (`null` schema) declares nothing and ignores everything, so
+/// nothing is reported for it.
 pub fn unknown_keys(schema: &Value, raw: &Value) -> Vec<UnknownKey> {
+    if schema.is_null() {
+        return vec![];
+    }
     let declared: Vec<&str> = schema
         .get("properties")
         .and_then(Value::as_object)

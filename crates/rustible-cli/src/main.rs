@@ -197,14 +197,19 @@ async fn inventory(ws: Option<&Path>, cmd: InventoryCmd) -> Result<u8> {
         }
         InventoryCmd::Check { .. } => {
             let inv = load_or_exit(&file);
+            let shown = match &ws {
+                Some(ws) if file == ws.inventory_path() => {
+                    ws.config.inventory.display().to_string()
+                }
+                _ => file.display().to_string(),
+            };
             println!(
-                "{}: ok ({} hosts, {} groups)",
-                file.display(),
+                "{shown}: ok ({} hosts, {} groups)",
                 inv.hosts.len(),
                 inv.groups.len()
             );
             match ws {
-                Some(ws) => check_playbooks(&ws, &inv, &file).await,
+                Some(ws) => check_playbooks(&ws, &inv, &shown).await,
                 None => {
                     eprintln!("not inside a rustible workspace: playbooks not checked");
                     Ok(0)
@@ -217,7 +222,7 @@ async fn inventory(ws: Option<&Path>, cmd: InventoryCmd) -> Result<u8> {
 /// Vars of every playbook against every host it targets (vision 3, 10.3),
 /// through one host-native build of the whole workspace and its
 /// `--check-vars` mode.
-async fn check_playbooks(ws: &Workspace, inv: &Inventory, file: &Path) -> Result<u8> {
+async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result<u8> {
     let cargo = Cargo::load(&ws.manifest()).await?;
     cargo
         .build(None, &[])
@@ -242,7 +247,7 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, file: &Path) -> Result
             resolved.push(inv.resolve(&h.name).map_err(|e| anyhow::anyhow!("{e}"))?);
         }
         if d.vars_schema.is_null() {
-            println!("{src}: ok ({} hosts, no vars)", hosts.len());
+            println!("{src}: ok ({}, no vars)", count(hosts.len(), "host"));
             continue;
         }
         let input: Vec<HostVars> = resolved
@@ -276,18 +281,18 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, file: &Path) -> Result
                 eprint!("{report}");
                 errors += 1;
             }
-            None => println!("{src}: ok ({} hosts)", hosts.len()),
+            None => println!("{src}: ok ({})", count(hosts.len(), "host")),
         }
     }
     if errors > 0 {
-        eprintln!(
-            "{}: {errors} playbook{} with vars errors",
-            file.display(),
-            if errors == 1 { "" } else { "s" }
-        );
+        eprintln!("{shown}: {} with vars errors", count(errors, "playbook"));
         return Ok(EXIT_ERROR);
     }
     Ok(0)
+}
+
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
 fn load_or_exit(file: &Path) -> Inventory {

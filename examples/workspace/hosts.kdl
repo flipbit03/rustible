@@ -50,7 +50,9 @@ group "monitored" {
 }
 
 // The machines the unattended build runs against: this VM and the ARM VM.
+// `playbooks/cadu/mc.rs` targets this group and needs `package`.
 group "lab" {
+    vars { package "mc" }
     host "local" connection="local"
     host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
 }
