@@ -305,3 +305,119 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
         _ => Ok(()),
     }
 }
+
+/// Marks a Docker integration test (vision doc section 8, tier 3).
+///
+/// ```ignore
+/// #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+/// fn line_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
+///     changed_then_ok(ctx, "add line", || Line::in_path("/etc/x").create(true).set("hi"))?;
+///     Ok(())
+/// }
+/// ```
+///
+/// Expands to a `#[test]` that calls `rustible::sdk::testing::run`: skipped
+/// unless `RUSTIBLE_INTEGRATION=1` and docker work; otherwise the test binary
+/// is built for musl and the body runs inside each image as root over the
+/// real `Local` backend. `images` are stock images run as-is;
+/// `systemd_images` (the `SystemdImage` variant, for the systemd ops) are
+/// booted with systemd as PID 1 first, see `testing::Image::Systemd` for the
+/// images that work. At least one of the two lists is required. The function
+/// takes exactly `ctx: &mut Ctx` and returns `Result<()>`.
+#[proc_macro_attribute]
+pub fn integration_test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match integration_test_impl(attr.into(), item.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn integration_test_impl(
+    attr: proc_macro2::TokenStream,
+    item: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    // (image literal, is systemd) in attribute order.
+    let mut images: Vec<(LitStr, bool)> = Vec::new();
+    let parser = syn::meta::parser(|meta| {
+        let systemd = if meta.path.is_ident("images") {
+            false
+        } else if meta.path.is_ident("systemd_images") {
+            true
+        } else {
+            return Err(meta.error(
+                "unknown option; expected `images = [\"debian:12\", ...]` \
+                 or `systemd_images = [\"jrei/systemd-debian:12\", ...]`",
+            ));
+        };
+        let arr: syn::ExprArray = meta.value()?.parse()?;
+        for elem in arr.elems {
+            match elem {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => images.push((s, systemd)),
+                other => {
+                    return Err(Error::new_spanned(
+                        other,
+                        "image lists take string literals like \"debian:12\"",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    });
+    parser.parse2(attr)?;
+    if images.is_empty() {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[rustible::integration_test]` needs `images = [\"debian:12\", ...]` \
+             and/or `systemd_images = [\"jrei/systemd-debian:12\", ...]`",
+        ));
+    }
+    let images = images.iter().map(|(lit, systemd)| {
+        if *systemd {
+            quote!(::rustible::sdk::testing::Image::Systemd(#lit))
+        } else {
+            quote!(::rustible::sdk::testing::Image::Plain(#lit))
+        }
+    });
+
+    let mut f: ItemFn = syn::parse2(item)?;
+    let bad_signature = f.sig.inputs.len() != 1
+        || matches!(f.sig.inputs.first(), Some(FnArg::Receiver(_)))
+        || f.sig.output == syn::ReturnType::Default;
+    if bad_signature {
+        return Err(Error::new_spanned(
+            &f.sig,
+            "expected `fn name(ctx: &mut Ctx) -> Result<()>`",
+        ));
+    }
+
+    let name = f.sig.ident.clone();
+    let inner = format_ident!("__rustible_integration_{}", name);
+    f.sig.ident = inner.clone();
+    // The author's attributes (`#[ignore]`, `#[should_panic]`, `#[cfg(..)]`,
+    // doc comments) belong on the test libtest runs, not on the inner body.
+    let outer_attrs: Vec<syn::Attribute> = std::mem::take(&mut f.attrs);
+    f.attrs
+        .push(syn::parse_quote!(#[allow(clippy::needless_pass_by_ref_mut)]));
+
+    Ok(quote! {
+        #f
+
+        #(#outer_attrs)*
+        #[::core::prelude::v1::test]
+        fn #name() {
+            ::rustible::sdk::testing::run(
+                &::rustible::sdk::testing::Spec {
+                    name: stringify!(#name),
+                    module_path: module_path!(),
+                    crate_name: env!("CARGO_CRATE_NAME"),
+                    manifest_dir: env!("CARGO_MANIFEST_DIR"),
+                    images: &[#(#images),*],
+                },
+                #inner,
+            )
+        }
+    })
+}
