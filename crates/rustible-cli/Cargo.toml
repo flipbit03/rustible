@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 rustible-sdk.workspace = true
+rustible-build.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow = "1"
@@ -24,3 +25,6 @@ tokio = { version = "1", features = ["full"] }
 openssh = "0.11"
 sha2 = "0.10"
 kdl = "6.5.0"
+
+[dev-dependencies]
+tempfile.workspace = true

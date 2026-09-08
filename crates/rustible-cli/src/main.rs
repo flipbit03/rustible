@@ -1,9 +1,13 @@
-//! The `rustible` command. `run` is the spike orchestrator: build a playbook
+//! The `rustible` command. `run` is the spike orchestrator (build a playbook
 //! per target triple, ship it, run it over the framed protocol, render the
-//! events (local and SSH transports). `inventory show` and `inventory check`
-//! are the M2 subcommands over `rustible_cli::inventory`.
+//! events); `init` and `playbook create` scaffold workspaces and playbooks;
+//! `inventory show` and `inventory check` are the M2 subcommands over
+//! `rustible_cli::inventory`.
 
+mod create;
+mod init;
 mod transport;
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use rustible_cli::inventory::{Inventory, render_show};
 use rustible_sdk::HostInfo;
 use rustible_sdk::event::{Event, EventSink, Pretty};
@@ -24,27 +28,41 @@ use transport::Transport;
 #[derive(Parser, Debug)]
 #[command(
     name = "rustible",
-    about = "Rustible: configuration management as real code"
+    about = "Configuration management as real code",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
-    /// Build, ship, and run a playbook on hosts named on the command line
-    /// (spike orchestrator; `playbook run` replaces it in M3).
+enum Cmd {
+    /// Build a playbook and run it on hosts (spike orchestrator; `playbook
+    /// run` replaces it in M3).
     Run(RunArgs),
+    /// Create a Rustible workspace in a directory.
+    Init(init::InitArgs),
+    /// Playbook commands.
+    Playbook {
+        #[command(subcommand)]
+        cmd: PlaybookCmd,
+    },
     /// Inspect and validate `hosts.kdl`.
     Inventory {
         #[command(subcommand)]
-        command: InventoryCommand,
+        cmd: InventoryCmd,
     },
 }
 
 #[derive(Subcommand, Debug)]
-enum InventoryCommand {
+enum PlaybookCmd {
+    /// Scaffold a playbook file.
+    Create(create::CreateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum InventoryCmd {
     /// Resolved parameters and vars of one host, with the source of each.
     Show {
         /// Host name as written in the inventory.
@@ -61,7 +79,7 @@ enum InventoryCommand {
     },
 }
 
-#[derive(Args, Debug)]
+#[derive(clap::Args, Debug)]
 struct RunArgs {
     /// Rustible workspace directory (a Cargo package generated like
     /// `examples/workspace`).
@@ -92,17 +110,21 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Run(args) => run(args).await,
-        Command::Inventory { command } => inventory(command),
+    match Cli::parse().cmd {
+        Cmd::Run(args) => run(args).await,
+        Cmd::Init(args) => init::run(args),
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Create(args),
+        } => create::run(args),
+        Cmd::Inventory { cmd } => inventory(cmd),
     }
 }
 
 /// `inventory show` and `inventory check`. Load errors go to stderr one per
 /// line as `file:line:col: error: message`; any error exits 1.
-fn inventory(cmd: InventoryCommand) -> Result<()> {
+fn inventory(cmd: InventoryCmd) -> Result<()> {
     match cmd {
-        InventoryCommand::Show { host, file } => {
+        InventoryCmd::Show { host, file } => {
             let inv = load_or_exit(&file);
             match inv.resolve(&host) {
                 Ok(resolved) => print!("{}", render_show(&resolved)),
@@ -112,7 +134,7 @@ fn inventory(cmd: InventoryCommand) -> Result<()> {
                 }
             }
         }
-        InventoryCommand::Check { file } => {
+        InventoryCmd::Check { file } => {
             let inv = load_or_exit(&file);
             println!(
                 "{}: ok ({} hosts, {} groups)",

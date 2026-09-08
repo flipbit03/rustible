@@ -1,0 +1,20 @@
+//! {{name}}: say what this playbook ensures.
+
+use rustible::prelude::*;
+
+// Typed vars, filled from the inventory. Uncomment the struct, then add
+// `vars = Vars` to the attribute and `vars: Vars` to `main`.
+//
+// #[rustible::vars]
+// struct Vars {
+//     /// The doc comment becomes the schema description.
+//     package: String,
+//     #[default = false]
+//     update_cache: bool,
+// }
+
+#[rustible::playbook(hosts = "local")]
+fn main(ctx: &mut Ctx) -> Result<()> {
+    ctx.log("hello from {{name}}");
+    Ok(())
+}
