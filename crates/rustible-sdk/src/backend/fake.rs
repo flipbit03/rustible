@@ -76,6 +76,21 @@ impl Fake {
         self
     }
 
+    /// Plant a symbolic link at `p` pointing at `target`.
+    pub fn with_symlink(self, p: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
+        self.files.lock().unwrap().insert(
+            p.into(),
+            FakeFile {
+                bytes: target.into().as_os_str().as_encoded_bytes().to_vec(),
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                kind: FileKind::Symlink,
+            },
+        );
+        self
+    }
+
     /// Can a command: any invocation of `program` (optionally with exactly
     /// these args) returns this output.
     pub fn with_cmd(self, program: &str, args: Option<&[&str]>, status: i32, stdout: &str) -> Self {
@@ -195,6 +210,57 @@ impl Backend for Fake {
         self.write(to, &bytes)
     }
 
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        let mut files = self.files.lock().unwrap();
+        if files.contains_key(link) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{}: already exists (fake)", link.display()),
+            ));
+        }
+        files.insert(
+            link.to_path_buf(),
+            FakeFile {
+                bytes: target.as_os_str().as_encoded_bytes().to_vec(),
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                kind: FileKind::Symlink,
+            },
+        );
+        Ok(())
+    }
+
+    fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+        let files = self.files.lock().unwrap();
+        match files.get(p) {
+            Some(f) if f.kind == FileKind::Symlink => Ok(PathBuf::from(
+                String::from_utf8_lossy(&f.bytes).into_owned(),
+            )),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: not a symlink (fake)", p.display()),
+            )),
+            None => Err(not_found(p)),
+        }
+    }
+
+    fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        let files = self.files.lock().unwrap();
+        match files.get(p) {
+            Some(f) if f.kind == FileKind::Dir => Ok(files
+                .keys()
+                .filter(|k| k.parent() == Some(p))
+                .cloned()
+                .collect()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{}: not a directory (fake)", p.display()),
+            )),
+            None => Err(not_found(p)),
+        }
+    }
+
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
         self.ran.lock().unwrap().push(spec.clone());
         let canned = self.canned.lock().unwrap();
@@ -212,5 +278,55 @@ impl Backend for Fake {
                 format!("no canned response for `{}` (fake)", spec.argv().join(" ")),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_read_link_and_stat_kind() {
+        let fake = Fake::new().with_dir("/etc");
+        fake.symlink(Path::new("/etc/real"), Path::new("/etc/link"))
+            .unwrap();
+        assert_eq!(
+            fake.read_link(Path::new("/etc/link")).unwrap(),
+            PathBuf::from("/etc/real")
+        );
+        assert_eq!(
+            fake.stat(Path::new("/etc/link")).unwrap().unwrap().kind,
+            FileKind::Symlink
+        );
+        // Creating over an existing path fails, like symlink(2).
+        let err = fake
+            .symlink(Path::new("/other"), Path::new("/etc/link"))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn read_link_on_non_symlink_fails() {
+        let fake = Fake::new().with_file("/f", "x");
+        assert!(fake.read_link(Path::new("/f")).is_err());
+        assert_eq!(
+            fake.read_link(Path::new("/missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn read_dir_lists_direct_children_only() {
+        let fake = Fake::new()
+            .with_dir("/d")
+            .with_file("/d/a", "")
+            .with_dir("/d/sub")
+            .with_file("/d/sub/deep", "")
+            .with_file("/other", "");
+        let kids = fake.read_dir(Path::new("/d")).unwrap();
+        assert_eq!(kids, vec![PathBuf::from("/d/a"), PathBuf::from("/d/sub")]);
+        assert!(fake.read_dir(Path::new("/d/sub")).unwrap().len() == 1);
+        assert!(fake.read_dir(Path::new("/d/a")).is_err());
+        assert!(fake.read_dir(Path::new("/nope")).is_err());
     }
 }

@@ -78,5 +78,11 @@ pub trait Backend: Send + Sync {
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()>;
     fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()>;
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Create the symbolic link `link` pointing at `target`. Fails if `link` exists.
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
+    /// Where the symbolic link at `p` points. Fails if `p` is not a symlink.
+    fn read_link(&self, p: &Path) -> io::Result<PathBuf>;
+    /// Full paths of the direct children of the directory `p`.
+    fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>>;
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output>;
 }

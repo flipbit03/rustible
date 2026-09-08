@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::{Backend, CmdSpec, FileKind, Output, Stat};
@@ -80,6 +80,22 @@ impl Backend for Local {
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::copy(from, to).map(|_| ())
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+        std::fs::read_link(p)
+    }
+
+    fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(p)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<io::Result<_>>()?;
+        out.sort();
+        Ok(out)
     }
 
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
