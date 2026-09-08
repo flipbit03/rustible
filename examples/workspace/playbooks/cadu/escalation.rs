@@ -28,7 +28,13 @@ fn main(ctx: &mut Ctx) -> Result<()> {
         me.stdout_str().trim(),
         who.stdout_str().trim()
     ));
-    let content = root.sys().read_to_string("/etc/rustible-m5-test")?;
-    ctx.log(format!("/etc/rustible-m5-test: {}", content.trim()));
+    // In `--check` the step above changed nothing, so there is nothing to
+    // read back; the point of that run is that the helper refused the write.
+    if ctx.check_mode() {
+        ctx.log("check mode: the marker was not written, nothing to read back");
+    } else {
+        let content = root.sys().read_to_string("/etc/rustible-m5-test")?;
+        ctx.log(format!("/etc/rustible-m5-test: {}", content.trim()));
+    }
     Ok(())
 }

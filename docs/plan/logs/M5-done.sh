@@ -1,39 +1,54 @@
 #!/bin/bash
-# The M5 brief's "Done when" block, run with the spike orchestrator
-# (`cargo run -p rustible-cli -- run --playbook <name> --host <h>` stands in for
-# `rustible playbook run playbooks/<name>.rs` until M3 lands). Usage:
+# The M5 brief's "Done when" block, run through the real CLI that M3 shipped
+# (`rustible playbook run <path> [--check] [-v] [--limit <hosts>]`). Usage:
 #   docs/plan/logs/M5-done.sh [host ...]      default: local
-# Output goes to stdout; the milestone saves it as docs/plan/logs/M5-done.txt.
+# The hosts must be members of the `lab` group the three playbooks target.
+# Output goes to stdout; the milestone appends it to docs/plan/logs/M5-done.txt.
 set -u
-cd "$(dirname "$0")/../../.."
+ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 HOSTS=("${@:-local}")
-HOST_ARGS=()
-for h in "${HOSTS[@]}"; do HOST_ARGS+=(--host "$h"); done
-WS=examples/workspace
+LIMIT=$(IFS=,; echo "${HOSTS[*]}")
+BIN=/tmp/rustible-m5-bin
+export PATH="$BIN/bin:$PATH"
+
 run() { echo; echo "\$ $*"; "$@" 2>&1; echo "[exit $?]"; }
+# The inventory's ssh parameters for a host, so a check runs where the
+# playbook ran. `local` is this VM; `arm` is the ARM VM over Tailscale.
 remote_sh() { # remote_sh <host> <script>
-  if [ "$1" = local ]; then sh -c "$2"; else ssh -o BatchMode=yes "$1" "$2"; fi
+  case "$1" in
+    local) sh -c "$2" ;;
+    arm)   ssh -o BatchMode=yes cadu@cadu-cogram-vm-arm "$2" ;;
+    *)     echo "remote_sh: unknown host $1" >&2; return 1 ;;
+  esac
 }
 
-echo "# M5 done-when, $(date -u +%FT%TZ), hosts: ${HOSTS[*]}"
-echo "# rustible $(git rev-parse --short HEAD)"
+echo "# M5 done-when, $(date -u +%FT%TZ), hosts: ${HOSTS[*]} (--limit $LIMIT)"
+echo "# rustible $(cd "$ROOT" && git rev-parse --short HEAD), through the M3 CLI"
+cargo install -q --path "$ROOT/crates/rustible-cli" --root "$BIN" --force 2>&1 | tail -2
+echo "# CLI: $(command -v rustible), $(rustible --version)"
+cd "$ROOT/examples/workspace" || exit 1
 
-echo; echo "## 1. cadu/escalation without escalate=true (twice: changed, then ok)"
+echo; echo "## 1. cadu/escalation without escalate=true"
+echo "## (--check changes nothing, then twice for real: changed, then ok)"
 for h in "${HOSTS[@]}"; do remote_sh "$h" 'sudo -n rm -f /etc/rustible-m5-test'; done
-run cargo run -q -p rustible-cli -- run --playbook cadu/escalation "${HOST_ARGS[@]}" -v
-run cargo run -q -p rustible-cli -- run --playbook cadu/escalation "${HOST_ARGS[@]}" -v
+run rustible playbook run playbooks/cadu/escalation.rs --check -v --limit "$LIMIT"
+for h in "${HOSTS[@]}"; do
+  echo "[$h] after --check, /etc/rustible-m5-test: $(remote_sh "$h" 'sudo -n stat -c "%U %a" /etc/rustible-m5-test 2>&1 || true')"
+done
+run rustible playbook run playbooks/cadu/escalation.rs -v --limit "$LIMIT"
+run rustible playbook run playbooks/cadu/escalation.rs -v --limit "$LIMIT"
 for h in "${HOSTS[@]}"; do
   echo "[$h] /etc/rustible-m5-test: $(remote_sh "$h" 'sudo -n cat /etc/rustible-m5-test; sudo -n stat -c "%U %a" /etc/rustible-m5-test')"
 done
 
 echo; echo "## 2. cadu/streaming: 50 MB local_file, local_secret in memory, fetch /etc/hostname to out/"
-head -c 52428800 /dev/urandom > $WS/files/big.bin
-printf 'tok3n-%s\n' "$(head -c 12 /dev/urandom | base64)" > $WS/files/secret.txt
-rm -rf $WS/out
-echo "local sha256: $(sha256sum $WS/files/big.bin | cut -c1-64) files/big.bin"
-echo "local sha256: $(sha256sum $WS/files/secret.txt | cut -c1-64) files/secret.txt"
-run cargo run -q -p rustible-cli -- run --playbook cadu/streaming "${HOST_ARGS[@]}" -v
-echo "fetched:"; find $WS/out -type f -exec sh -c 'printf "  %s: %s\n" "$1" "$(cat "$1")"' _ {} \;
+head -c 52428800 /dev/urandom > files/big.bin
+printf 'tok3n-%s\n' "$(head -c 12 /dev/urandom | base64)" > files/secret.txt
+rm -rf out
+echo "local sha256: $(sha256sum files/big.bin | cut -c1-64) files/big.bin"
+echo "local sha256: $(sha256sum files/secret.txt | cut -c1-64) files/secret.txt"
+run rustible playbook run playbooks/cadu/streaming.rs -v --limit "$LIMIT"
+echo "fetched:"; find out -type f -exec sh -c 'printf "  %s: %s\n" "$1" "$(cat "$1")"' _ {} \;
 for h in "${HOSTS[@]}"; do
   echo "[$h] leftover run temp dirs: $(remote_sh "$h" 'ls -d /tmp/.rustible-* 2>/dev/null || echo none')"
 done
@@ -41,11 +56,13 @@ done
 echo; echo "## 3. ctrl-c during cadu/slow (30 s sleep step): cancelled within 10 s, no zombie, next step never ran"
 for h in "${HOSTS[@]}"; do
   remote_sh "$h" 'rm -f /tmp/rustible-m5-next-step-ran'
-  cargo build -q -p rustible-cli
   LOG=$(mktemp)
-  ./target/debug/rustible run --playbook cadu/slow --host "$h" -v >"$LOG" 2>&1 &
+  rustible playbook run playbooks/cadu/slow.rs -v --limit "$h" >"$LOG" 2>&1 &
   CLI=$!
-  for i in $(seq 1 240); do grep -q 'hello: protocol' "$LOG" && break; sleep 0.5; done
+  # `facts:` is printed once the binary is running and has sent its first
+  # event, so the 30 s step is in flight two seconds later. The step's own
+  # line only prints when it finishes, which is exactly what must not happen.
+  for _ in $(seq 1 480); do grep -q 'facts:' "$LOG" && break; sleep 0.5; done
   sleep 2
   T0=$(date +%s)
   echo "[$h] SIGINT to the orchestrator (pid $CLI)"
@@ -53,14 +70,15 @@ for h in "${HOSTS[@]}"; do
   echo "[$h] orchestrator exited $CODE after $(( $(date +%s) - T0 )) s"
   sed 's/^/    /' "$LOG"; rm -f "$LOG"
   sleep 1
-  echo "[$h] leftover processes: $(remote_sh "$h" 'pgrep -af "cache/rustible/bin/workspace-cadu_slow|sleep 30\$" | grep -v pgrep || echo none')"
+  echo "[$h] leftover processes: $(remote_sh "$h" 'pgrep -af "cache/rustible/bin/cadu_slow|sleep 30$" | grep -v pgrep || echo none')"
   echo "[$h] marker: $(remote_sh "$h" 'ls /tmp/rustible-m5-next-step-ran 2>&1 || true')"
 done
 
 echo; echo "## 4. cargo test --workspace"
-run cargo test --workspace
+(cd "$ROOT" && run cargo test --workspace)
 
 echo; echo "## cleanup"
+rm -f files/big.bin files/secret.txt
 for h in "${HOSTS[@]}"; do
   remote_sh "$h" 'sudo -n rm -f /etc/rustible-m5-test; rm -f /tmp/rustible-m5-next-step-ran'
   echo "[$h] removed /etc/rustible-m5-test and /tmp/rustible-m5-next-step-ran"
