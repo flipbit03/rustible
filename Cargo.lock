@@ -1142,7 +1142,6 @@ version = "0.0.1"
 dependencies = [
  "rustible-sdk",
  "rustible-std",
- "rustls",
  "rustls-rustcrypto",
  "ureq",
 ]

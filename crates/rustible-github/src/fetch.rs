@@ -72,32 +72,36 @@ impl<F: Fetch + ?Sized> Fetch for Arc<F> {
 /// user agent (GitHub rejects requests without one).
 #[derive(Debug, Clone)]
 pub struct Https {
-    timeout: Duration,
+    /// Built once: every `Agent` carries its own connection pool and its own
+    /// lazily built rustls `ClientConfig`, so building one per request would
+    /// re-parse the whole bundled root store and throw away keep-alive. A
+    /// playbook installing keys for twenty accounts would pay for twenty.
+    agent: ureq::Agent,
 }
 
 impl Https {
     /// A client with the default 20-second connect and read timeout.
     pub fn new() -> Self {
-        Https {
-            timeout: DEFAULT_TIMEOUT,
-        }
+        Self::with_timeout(DEFAULT_TIMEOUT)
     }
 
     /// A client with this connect and read timeout.
     pub fn with_timeout(timeout: Duration) -> Self {
-        Https { timeout }
+        Https {
+            agent: Self::build_agent(timeout),
+        }
     }
 
-    fn agent(&self) -> ureq::Agent {
+    fn build_agent(timeout: Duration) -> ureq::Agent {
         let tls = ureq::tls::TlsConfig::builder()
             .unversioned_rustls_crypto_provider(Arc::new(rustls_rustcrypto::provider()))
             .build();
         ureq::Agent::config_builder()
             .tls_config(tls)
             .http_status_as_error(false)
-            .timeout_connect(Some(self.timeout))
-            .timeout_recv_response(Some(self.timeout))
-            .timeout_recv_body(Some(self.timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .timeout_recv_body(Some(timeout))
             .user_agent(concat!("rustible-github/", env!("CARGO_PKG_VERSION")))
             .build()
             .into()
@@ -113,7 +117,7 @@ impl Default for Https {
 impl Fetch for Https {
     fn get(&self, url: &str) -> Result<Response> {
         let mut resp = self
-            .agent()
+            .agent
             .get(url)
             .call()
             .map_err(|e| Error::msg(format!("GET {url}: {e}")))?;
