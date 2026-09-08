@@ -75,6 +75,38 @@ pub enum HelperOp {
 }
 
 impl HelperOp {
+    /// The variant and the paths it touches, for messages. Never the bytes:
+    /// a `Write` carries file contents, which may be a secret
+    /// (`ctx.local_secret`) or 50 MB of them.
+    pub fn label(&self) -> String {
+        let one = |verb: &str, p: &Path| format!("{verb} {}", p.display());
+        let two =
+            |verb: &str, a: &Path, b: &Path| format!("{verb} {} -> {}", a.display(), b.display());
+        match self {
+            HelperOp::Read { path } => one("read", path),
+            HelperOp::Write { path, bytes } => {
+                format!("write {} ({} bytes)", path.display(), bytes.len())
+            }
+            HelperOp::Stat { path } => one("stat", path),
+            HelperOp::StatFollow { path } => one("stat_follow", path),
+            HelperOp::MkdirAll { path } => one("mkdir_all", path),
+            HelperOp::Remove { path } => one("remove", path),
+            HelperOp::RemoveAll { path } => one("remove_all", path),
+            HelperOp::Rename { from, to } => two("rename", from, to),
+            HelperOp::SetMode { path, mode } => {
+                format!("set_mode {} {mode:o}", path.display())
+            }
+            HelperOp::SetOwner { path, uid, gid } => {
+                format!("set_owner {} {uid}:{gid}", path.display())
+            }
+            HelperOp::Copy { from, to } => two("copy", from, to),
+            HelperOp::Symlink { target, link } => two("symlink", link, target),
+            HelperOp::ReadLink { path } => one("read_link", path),
+            HelperOp::ReadDir { path } => one("read_dir", path),
+            HelperOp::Spawn(spec) => format!("spawn {}", spec.argv().join(" ")),
+        }
+    }
+
     /// Mutations are refused by the helper while the main process is in a
     /// step's `check` phase: the guard holds on both sides (vision doc 11.3).
     pub fn mutates(&self) -> bool {
@@ -141,7 +173,10 @@ pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()>
         let resp = if req.checking && req.op.mutates() {
             HelperResponse::Err {
                 code: None,
-                message: format!("mutation during check refused by helper: {:?}", req.op),
+                message: format!(
+                    "mutation during check refused by helper: {}",
+                    req.op.label()
+                ),
             }
         } else {
             match req.op {
@@ -631,8 +666,16 @@ mod tests {
         let e = in_process(phase.clone());
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x");
-        let err = e.write(&f, b"x").unwrap_err();
+        let err = e.write(&f, b"hunter2-the-secret").unwrap_err();
         assert!(err.to_string().contains("mutation during check"), "{err}");
+        // The message names the write and its size, never the bytes: a write
+        // can carry a secret, and this message is rendered and logged.
+        assert!(err.to_string().contains("18 bytes"), "{err}");
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        assert!(
+            !err.to_string().contains("104"),
+            "byte values leaked: {err}"
+        );
         assert!(!f.exists());
         // Reads and spawns are fine while checking.
         assert_eq!(e.stat(&f).unwrap(), None);
