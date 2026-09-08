@@ -1,0 +1,126 @@
+# M1 done-when, run 2026-09-08 01:09 UTC on branch m1-foundation @ 8f0db84
+
+$ cargo test --workspace
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.68s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+exit=0
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+exit=0
+
+$ cargo fmt --all --check
+exit=0
+
+$ cargo run -q -- --describe
+{
+  "playbooks": [
+    {
+      "escalate": true,
+      "hosts": "lab",
+      "name": "cadu/mc",
+      "vars_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "package": {
+            "description": "The apt package to ensure.",
+            "type": "string"
+          },
+          "update_cache": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "package"
+        ],
+        "title": "Vars",
+        "type": "object"
+      }
+    },
+    {
+      "escalate": false,
+      "hosts": "local",
+      "name": "hello",
+      "vars_schema": null
+    }
+  ],
+  "protocol": 1
+}
+exit=0
+
+$ cargo run -q -- hello
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=28326MB user=cadu
+[local]    hello from COGRAM-VM-2025
+[local]    Ubuntu 24.04 on X86_64, 16 cpus, 28326 MB, pm Apt
+
+local    ok=0 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+exit=0
+
+$ cargo run -q -- cadu/mc --check
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=28326MB user=cadu
+[local]  FAILED: vars: missing required var `package`
+
+local    ok=0 changed=0 would_change=0 skipped=0 failed=1 warnings=0
+exit=2
+
+$ cargo run -q -- cadu/mc --check --var package=mc
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=28326MB user=cadu
+[local]  FAILED: this playbook needs root (escalate)
+
+local    ok=0 changed=0 would_change=0 skipped=0 failed=1 warnings=0
+exit=2
+
+$ sudo -n ./target/debug/workspace cadu/mc --check --var package=mc
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=28326MB user=root
+[local]  mc present ................................. ok           
+[local]    already there: mc 3:4.8.30-1ubuntu0.1
+
+local    ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+exit=0
+
+$ RUSTIBLE_PLAYBOOK=cadu/mc cargo build --features selected
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
+exit=0
+$ ./target/debug/workspace --describe | names
+['cadu/mc']
+
+$ cargo build -v   (after the selected build; dependencies must all be Fresh)
+     41 Fresh
+exit=0
+
+$ RUSTIBLE_PLAYBOOK=cadu/mc cargo build   (without the feature: refused)
+  error: RUSTIBLE_PLAYBOOK=`cadu/mc` is set but the `selected` Cargo feature is not enabled. The rustible CLI passes `--features selected` with it; an IDE or CI
+exit=101 (non-zero expected)
+
+$ cargo run -q -p rustible-cli -- --playbook cadu/mc --host local --escalate --check --var package=mc
+[local]  connected in 1.49µs, probed x86_64-unknown-linux-musl in 1.43ms
+built x86_64-unknown-linux-musl in 35.22ms
+x86_64-unknown-linux-musl: 727392 bytes, sha256 869d9c30489f32c0
+[local]  binary already cached in 1.08ms
+[local]  hello: protocol 1, playbook cadu/mc, 5.55ms after exec
+[local]  facts: Ubuntu 24.04 X86_64 Apt cpus=16 mem=28326MB user=root
+[local]  mc present ................................. ok           
+[local]    already there: mc 3:4.8.30-1ubuntu0.1
+
+local    ok=1 changed=0 would_change=0 skipped=0 failed=0 warnings=0
+[local]  exit 0, hello after "5.55ms", total run 14.63ms
+
+total 62.69ms
+exit=0
+
+ARM VM leg: see docs/plan/logs/M1-arm.txt (connection timed out at first attempt; retried per protocol section 5).
