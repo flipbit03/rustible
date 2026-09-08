@@ -100,26 +100,34 @@ Pure functions with their own tests: `detect_format`, `validate_entry_path`,
 
 ## Verification
 
-All commands below were re-run on the final tree after `git merge main` (which
-brought in M7's CI workflows and the M3 CLI work), at merge commit `85d6a62`,
-2026-09-08T15:28Z. Full output is in
-`docs/plan/logs/M6-net-archive-done.txt` under the "Re-run on the final tree"
-heading; the earlier section of that file is the pre-merge run at `01623e5`.
+`main` was merged twice while this branch was being finished: first for M7's
+CI workflows, then again for M3 (the real playbook run) and the README, which
+also removed `crates/spike-playbook`. The Cargo.lock and DECISIONS.md
+conflicts of the second merge were resolved keeping both sides; `cargo
+metadata --locked` then accepted the lock unchanged.
+
+The table below is the run on the final tree at merge commit `c37d128`. Full
+output is in `docs/plan/logs/M6-net-archive-done.txt`, which has three
+UTC-stamped sections: the pre-merge run at `01623e5`, the first re-run at
+`85d6a62`, and this one.
 
 | command | result | wall |
 |---|---|---|
-| `cargo fmt --all --check` | pass | 0.17s |
-| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 2.34s |
-| `cargo test --workspace` | pass | 11.63s |
-| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 1.84s |
-| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 14.71s |
-| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 8.46s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_http_download` | pass | 5.84s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_archive_extracted` | pass | 2.97s |
-| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 37.46s |
-| `cargo test -p rustible-std --lib -- --ignored https_download_from_github_with_rustcrypto_tls` | pass | 0.46s |
+| `cargo fmt --all --check` | pass | 0.18s |
+| `cargo clippy --workspace --all-targets -- -D warnings` | pass | 3.06s |
+| `cargo test --workspace` | pass | 13.94s |
+| `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --lib` | pass | 1.79s |
+| `cargo build --manifest-path examples/workspace/Cargo.toml` | pass | 2.79s |
+| `cargo +1.88 check --workspace --all-targets` (MSRV) | pass | 2.17s |
+| `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests` (all harness tests, as CI runs them) | pass | 41.77s |
 
-Counts on the final tree: `rustible-std` has 298 unit tests passing, one
+Times are with a warm `target/`. At `85d6a62`, before the second merge, the
+two new container tests were also run on their own: `it_http_download` in
+5.84s and `it_archive_extracted` in 2.97s, and the `#[ignore]`d TLS test
+`https_download_from_github_with_rustcrypto_tls` passed in 0.46s. All are in
+the log.
+
+Counts: `rustible-std` has 298 unit tests passing, one
 ignored (the network TLS test, run separately above); 16 of them are
 `http::`, 15 are `archive::`. Both new ops have a compiled doctest.
 
