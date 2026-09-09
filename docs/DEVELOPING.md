@@ -127,11 +127,17 @@ difference between them is a difference in architecture and nothing else.
 make vm-up          # the one matching this host: the fast one
 make vm-up-x86
 make vm-up-arm
-make vm-status
+make vm-status      # what is up, and the inventory that names it
+make vm-ssh         # a shell inside it (make vm-ssh M=arm to pick one)
 make vm-test        # run the playbook against whatever is up, twice
 make vm-halt        # stop, keep the disks
 make vm-destroy     # delete them
+make vm-orphans     # domains left behind by a deleted checkout
 ```
+
+Once one is up, a shell in it is `make vm-ssh`, and you have passwordless
+`sudo` there. It is an ordinary Debian box: install things, break things,
+`make vm-destroy` and start again.
 
 `vagrant up` writes `dev/vagrant/hosts.vagrant.kdl`, a complete inventory of
 the machines that are running, and rewrites it on every `up`, `halt` and
@@ -143,6 +149,16 @@ To limit a run to one machine:
 
 ```sh
 make vm-test HOSTS=vagrant-arm
+```
+
+To drive the machines with `rustible` directly — a dry run, more verbosity, a
+playbook of your own — point it at that inventory rather than editing a
+tracked file:
+
+```sh
+rustible --workspace examples/workspace \
+         --inventory dev/vagrant/hosts.vagrant.kdl \
+         playbook run vagrant --check -v
 ```
 
 `make vm-test` runs the playbook twice and fails unless the second run reports
@@ -184,6 +200,13 @@ did *not* bring up last, see the paragraph above.
 50023) so the inventory can name them. A Vagrant machine left over in another
 checkout holds them: `vagrant global-status --prune` finds it, and
 `vagrant destroy <id>` releases it.
+
+**A machine is running but Vagrant says `not created`.** The state tying a
+libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`, so deleting a
+checkout — or removing a git worktree — before destroying its machines leaves
+a domain running that nothing tracks. It keeps its disk and `vagrant destroy`
+can no longer see it. `make vm-orphans` lists any and prints the `virsh`
+commands to remove them. **Destroy the machines before deleting a checkout.**
 
 **Locale complaints on `vagrant ssh`.** Fixed: the Vagrantfile pins `LC_ALL`
 and `LANG` for the connection, because OpenSSH forwards them by default and

@@ -133,28 +133,55 @@ reference for voice and structure.
 
 ## Testing tiers
 
-Three, and they catch different things:
+Four, and they catch different things:
 
 1. **Pure functions** for parsers and planners.
 2. **`Fake` backend** for operation behaviour: satisfied, change, apply,
    failure, refusals.
 3. **Containers** (`#[rustible::integration_test]`, fourteen files in
    `crates/rustible-std/tests/`) against real distributions. These are the
-   source of truth and they have earned it: they caught that `useradd` refuses
-   to create a private group when one already carries the name, and that
-   `chown` clears setuid, neither of which a fake can model.
-
-They only run with `RUSTIBLE_INTEGRATION=1`; without it they skip themselves,
-so a plain `cargo test` stays offline and Docker-free.
-
+   source of truth for how a tool behaves and they have earned it: they caught
+   that `useradd` refuses to create a private group when one already carries
+   the name, and that `chown` clears setuid, neither of which a fake can
+   model. They only run with `RUSTIBLE_INTEGRATION=1`; without it they skip
+   themselves, so a plain `cargo test` stays offline and Docker-free.
 4. **Machines** (`make vm-test`), the Vagrant guests in `dev/vagrant/`: a real
    SSH transport, a real `sudo`, a live `/proc/sys` and a real init system,
    none of which a container has. Not in CI, optional day to day, and
    **expected of a new operation before it merges** — say in the pull request
-   which architecture you ran it on. `docs/DEVELOPING.md` is the setup.
+   which architecture you ran it on.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
+
+### Driving the machines
+
+`docs/DEVELOPING.md` is the setup and the full story; this is the loop.
+
+```sh
+make vm-up          # the guest matching this host's architecture
+make vm-ssh         # a shell in it
+make vm-test        # the playbook, twice, asserting the second changes nothing
+make vm-destroy     # give the disk back
+```
+
+`make vm-up-arm` and `make vm-up-x86` name a specific architecture. **Under
+libvirt only one of the two may exist at a time** (they share one box volume
+in the storage pool); `vagrant up` refuses with the command to run rather than
+corrupting the other machine. macOS has no such restriction.
+
+`vagrant up` writes `dev/vagrant/hosts.vagrant.kdl`, a complete inventory of
+whatever is running. It is not committed — it names one machine's key paths —
+so point runs at it with `--inventory` rather than editing a tracked file:
+
+```sh
+rustible --workspace examples/workspace          --inventory dev/vagrant/hosts.vagrant.kdl          playbook run vagrant --check -v
+```
+
+**Destroy the machines before deleting a checkout or a git worktree.** The
+state that ties a libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`,
+so removing the directory first leaves a domain running that nothing tracks
+and `vagrant destroy` can no longer see. `make vm-orphans` lists any.
 
 ## TLS, and why clang
 
