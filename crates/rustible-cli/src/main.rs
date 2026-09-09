@@ -12,6 +12,7 @@ mod init;
 mod render;
 mod run;
 mod toolchain;
+mod toolchain_cmd;
 mod transport;
 mod workspace;
 
@@ -74,6 +75,18 @@ enum Cmd {
         #[command(subcommand)]
         cmd: InventoryCmd,
     },
+    /// What this machine can build playbook binaries for.
+    Toolchain {
+        #[command(subcommand)]
+        cmd: ToolchainCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolchainCmd {
+    /// Check that this machine can build for the given targets, and show the
+    /// compiler environment a build would use.
+    Check(toolchain_cmd::CheckArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -163,6 +176,9 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             }
         },
         Cmd::Inventory { cmd } => inventory(ws, cmd).await,
+        Cmd::Toolchain { cmd } => match cmd {
+            ToolchainCmd::Check(args) => toolchain_cmd::run(ws, args),
+        },
     }
 }
 

@@ -107,15 +107,22 @@ jobs:
       - run: cargo test --workspace
 
       # The property that matters: a mac produces a Linux playbook binary,
-      # with Apple clang and the musl headers the CLI carries.
+      # with Apple clang and the musl headers the CLI carries. The compiler
+      # environment comes from `rustible toolchain check --print-env`, which
+      # is the same code `playbook run` uses; calling cargo directly here
+      # would set nothing and fail on `x86_64-linux-musl-gcc`, which is the
+      # error that whole module exists to prevent.
       - name: Cross-build a playbook for both Linux targets
         run: |
           set -euo pipefail
           cargo build --release -p rustible-cli
+          RUSTIBLE=$PWD/target/release/rustible
+          "$RUSTIBLE" toolchain check
           cd examples/workspace
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            RUSTIBLE_PLAYBOOK=hello cargo build --features selected \
-              --profile dist --target "$t"
+            env $("$RUSTIBLE" toolchain check --target "$t" --print-env | xargs) \
+              RUSTIBLE_PLAYBOOK=hello \
+              cargo build --features selected --profile dist --target "$t"
             file "target/$t/dist/workspace"
           done
 

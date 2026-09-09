@@ -65,6 +65,12 @@ rather than failing later.
 sudo apt install clang          # Debian/Ubuntu; dnf, pacman and apk all have it too
 ```
 
+To check a machine before you rely on it:
+
+```sh
+rustible toolchain check        # what this machine can build for, and how
+```
+
 macOS already has it: the command line tools ship clang, so `xcode-select
 --install` is the whole story there.
 
