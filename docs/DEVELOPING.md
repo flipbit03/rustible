@@ -124,7 +124,7 @@ Defined in `dev/vagrant/Vagrantfile`: `x86` and `arm`, both Debian 12 from
 difference between them is a difference in architecture and nothing else.
 
 ```sh
-make vm-up          # the one matching this host: the fast one
+make vm-up          # the one matching this host's architecture
 make vm-up-x86
 make vm-up-arm
 make vm-status      # what is up, and the inventory that names it
@@ -134,6 +134,16 @@ make vm-halt        # stop, keep the disks
 make vm-destroy     # delete them
 make vm-orphans     # domains left behind by a deleted checkout
 ```
+
+`make vm-up` with no suffix brings up **the guest whose architecture matches
+this host** — `x86` on an x86_64 machine, `arm` on Apple silicon — and only
+that one. It is the fastest guest available to you, though not necessarily an
+accelerated one: a host without hardware virtualisation interprets its own
+architecture too (63 s in the table above). It is also the machine `vagrant
+ssh` and `make vm-ssh` reach without being told which.
+
+The other architecture is always emulated, so it never starts by accident:
+ask for it by name with `make vm-up-arm` or `make vm-up-x86`.
 
 Once one is up, a shell in it is `make vm-ssh`, and you have passwordless
 `sudo` there. It is an ordinary Debian box: install things, break things,

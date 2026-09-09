@@ -46,10 +46,20 @@ integration:
 # a real init system, none of which a container models. Optional day to day,
 # and expected of a new operation before it merges.
 
-# The machine matching this host's architecture, which is the accelerated one.
+# `vagrant up` with no argument brings up only the machine whose architecture
+# matches this host -- x86 on an x86_64 host, arm on Apple silicon -- because
+# that is the one the Vagrantfile marks `autostart`. It is the fastest one
+# available here, though not necessarily an accelerated one: a host with no
+# /dev/kvm interprets its own architecture too. The other machine is always
+# emulated, so it is opt-in by name below.
+#
+# It is also the `primary` machine, which is what lets `make vm-ssh` and
+# `vagrant ssh` work without naming a machine.
 vm-up:
 	cd $(VAGRANT_DIR) && $(VAGRANT) up
 
+# By name, whichever host you are on. On a host of the other architecture this
+# is the emulated one: minutes of your life, and the point of having it.
 vm-up-x86:
 	cd $(VAGRANT_DIR) && $(VAGRANT) up x86
 
