@@ -1,5 +1,12 @@
 # M7 amendments: three decisions applied
 
+> **Superseded, 2026-09-08.** The handover patch this report describes was
+> applied to `docs/01_VISION.md` in `e42900e` (PR #24) and then deleted, at
+> Cadu's request. The apply command below no longer works and no longer needs
+> to: the vision document already says what this branch implemented. The rest
+> of this report stands as the record of the work.
+
+
 Branch `amendments`, worktree `/home/cadu/w/cadu/rustible-amend`.
 
 Three of the four amendments proposed by earlier milestone agents in
