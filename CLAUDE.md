@@ -14,39 +14,53 @@ and why.
 
 **`docs/01_VISION.md` is the source of truth.** It is long and it is vetted.
 When code and vision disagree, the vision wins and the code is wrong, unless
-Cadu says otherwise in the session you are in.
+the author decides otherwise in the session you are in.
 
-**Never edit it unattended.** The rule exists so a machine cannot rewrite the
-contract at 3am. If your work requires an amendment, write the exact
-replacement prose in your report and hand it over. If Cadu is present and
-decides the amendment, applying it is fine and normal.
+**Do not edit it on your own initiative.** The rule exists so the contract is
+not rewritten by whoever happens to be passing. If your work requires an
+amendment, write the exact replacement prose in your report and hand it over.
+When the author decides the amendment in the session, applying it is normal.
 
 `docs/plan/DECISIONS.md` is the running log of every decision made while
 building, each with a `Reverse:` clause saying how to undo it. Add to it, do
-not rewrite it. Entries tagged `PROPOSED AMENDMENT` are questions for Cadu;
-`KNOWN GAP` and `RECOMMENDED` are things deliberately left.
+not rewrite it. Entries tagged `PROPOSED AMENDMENT` are open questions;
+`KNOWN GAP` and `RECOMMENDED` are things deliberately left undone.
 
-`docs/plan/PROGRESS.md` is the resume point. It is read first on every resume,
-so keep it true: a stale line there sends the next session hunting for work
-that is done, or repeating it.
+`docs/plan/PROGRESS.md` is the resume point. Keep it true: a stale line there
+sends the next session hunting for work that is already done, or repeating it.
 
-## Rules that are not negotiable
+## The dependency rule
+
+**`rustup target add <triple>` plus `clang` is the entire set of dependencies
+for running Rustible, and that must never grow.** Not a preference, not a
+default to be revisited: it is the property the project exists to have. Target
+hosts need nothing at all, ever.
+
+This is what Ansible lost. Its modules need a Python interpreter on every
+target, and anything interesting needs more Python on top, so managing Docker
+or a cloud API turns into a dependency negotiation with every machine you own.
+Rustible ships one static binary and asks the target for nothing. Every
+addition to what a user must install moves us back toward that, and hurts
+adoption more than any feature repays.
+
+So: a crate that bundles a C *library* (`openssl-sys`, `libgit2-sys`) is
+unsupported, and the fix is the pure-Rust alternative. No cross-gcc, no zig,
+no docker for builds. `ring` is the single C dependency, for TLS, and even
+there Rustible carries musl's headers itself so nothing else is installed by
+hand. If a change appears to require another tool, that is a design problem to
+solve, not a requirement to document.
+
+## Other rules
 
 - **`escalate`, never `become`.** `become` is a reserved Rust keyword and the
   name is gone everywhere: the attribute, the inventory, the CLI, the code.
-- **No toolchain stock rustup cannot drive**: no cross-gcc, no zig, no docker
-  for builds. `rustup target add <triple>` plus **clang** is the whole setup,
-  and clang is needed only on the machine running `rustible`. Target hosts
-  need nothing, ever. A crate that bundles a C *library* (`openssl-sys`,
-  `libgit2-sys`) is unsupported; the fix is the pure-Rust alternative.
-  `ring` is the one C dependency, for TLS, and Rustible carries musl's headers
-  itself.
-- **Never publish.** Releases are Cadu's, cut by tagging `vX.Y.Z` and
-  publishing a GitHub release, which fires `.github/workflows/release.yml`.
+- **Never publish to crates.io.** Releases are cut by tagging and publishing a
+  GitHub release, which fires `.github/workflows/release.yml`.
+- **Release names are exactly `vX.Y.Z`.** No description, no suffix, no
+  "v0.1.0 — the streaming release". The tag and the release title are the
+  version and nothing else.
 - **Never force-push.**
-- `docs/07_UNATTENDED.md` holds the full hard limits for unattended runs
-  (which hosts may be touched, sudo scope, and so on). Read it before any long
-  autonomous session.
+- **SSH for git.** The remote is `git@github.com:flipbit03/rustible.git`.
 
 ## Layout
 
@@ -60,9 +74,14 @@ that is done, or repeating it.
 | `rustible-build` | playbook discovery for the generated `build.rs` |
 | `rustible-github` | the first collection, and the worked example of one |
 
-`examples/workspace` is a user's workspace, **excluded from the cargo
-workspace on purpose**. Nothing else compiles it, which is why CI builds it as
-its own job. It has rotted twice from an API change nobody noticed.
+`examples/workspace` is a workspace of the shape `rustible init` generates,
+kept in the repository so the generated layout is exercised by something. It
+is **excluded from the cargo workspace on purpose**: it depends on the crates
+by path and builds its playbooks through the build script, exactly as a user's
+workspace does, and folding it in would change that. The consequence is that
+`cargo test --workspace` never compiles it, so a change to an op's builder can
+break it silently. CI builds it as its own job for that reason. If you change
+a public API, check that workspace too.
 
 ## How to work
 
@@ -85,10 +104,6 @@ RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
 `#![deny(missing_docs)]` is on in every library crate, so a new public item
 without documentation does not compile.
 
-**Pushing anything under `.github/` fails over the https remote**, because the
-`gh` OAuth token has no `workflow` scope. Push over
-`git@github.com:flipbit03/rustible.git` instead.
-
 ## Writing an operation
 
 The shape matters more than the code. Read `crates/rustible-std/src/systemd.rs`
@@ -110,8 +125,7 @@ reference for voice and structure.
   the group it references, and `authorized_keys` does not create `~/.ssh`'s
   parent. Fail naming the operation the author wanted.
 - **Every message is read by someone at 2am.** Name the thing, say why, say
-  what to do. `rustible_std::tls`'s refusal and `toolchain.rs`'s clang message
-  are the standard.
+  what to do about it.
 - Everything the operation does to the machine goes through `sys`, including
   reads, so the `Fake` is meaningful.
 
@@ -134,26 +148,36 @@ so a plain `cargo test` stays offline and Docker-free.
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
 
-## Things that have cost time before
+## TLS, and why clang
 
-- **macOS is a supported controller, never a target.** It cross-builds for
-  both Linux targets; the local probe refuses `Darwin arm64` by name. Apple
-  patches clang's own `stddef.h` to delegate to the system header when the
-  target is musl, and ring's `-nostdlibinc` removes it, so cross-builds need
-  musl's headers offered with `-idirafter`. That is handled in
-  `rustible-cli/src/toolchain.rs`; do not "simplify" it away.
-- **`rustible toolchain check`** answers what a machine can build for, and
-  `--print-env` prints the compiler environment a build is given. Use it
-  rather than setting `CC_*` by hand.
-- The CPU floor is gone with ring, and it was never about old hardware: the
-  machine that exposed it is a modern Xeon whose hypervisor masks one flag.
-- **Ops run on the target, including lookups** (vision 5.1). So
-  `github::UserKeys` needs egress from the target, not from the controller.
+Rustible speaks TLS in two places: `http::Download` and the `rustible-github`
+collection. The provider is `ring`, reached through rustls, and it is the
+reason `clang` is in the dependency rule above.
 
-## Talking to Cadu
+Ring compiles a small amount of C, and cargo's C helper will not use the
+host's compiler for a musl target unless it is named, so `rustible-cli` names
+it and supplies the compiler flags itself (`crates/rustible-cli/src/toolchain.rs`).
+For `x86_64` musl it also supplies musl's libc headers, which it carries
+vendored and unpacks into the workspace cache. For other musl targets ring
+needs no libc headers, except that Apple's clang patches its own `stddef.h` to
+delegate to the system header when the target is musl, so those get musl's
+headers offered as a last-resort include. None of this is visible to a user,
+and none of it may grow into a second thing to install.
 
-He is a backend engineer and does not need Rust explained. Say what changed,
-what it cost, and what is unverified. If something was not tested, say so in
-the same breath as the result; a green suite is not a verified one. When a
-decision is his (a trade-off, an amendment, anything irreversible), put the
-options and a recommendation in front of him rather than choosing quietly.
+`rustible toolchain check` reports what a machine can build for, and
+`--print-env` prints the compiler environment a build is given. Use it rather
+than setting `CC_*` by hand.
+
+## Platforms
+
+Rustible **runs from** Linux (x86_64, aarch64) and macOS on Apple silicon. It
+**manages** Linux hosts, x86_64 and aarch64, any libc.
+
+macOS is a controller and never a target: the local probe refuses `Darwin
+arm64` by name, because the operations speak apt, systemd and `/etc/passwd`.
+A Linux controller cannot build macOS binaries at all, since linking Mach-O
+needs an Apple SDK that rustup does not ship.
+
+Operations run on the target, including lookups (vision 5.1), so
+`github::UserKeys` needs network egress from the target rather than from the
+controller.
