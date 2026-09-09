@@ -264,14 +264,14 @@ differs.
 
 | `-cpu` | graviola | ring |
 |---|---|---|
-| `qemu64` (baseline x86-64, no AES-NI) | not run | **OK 200, 4 keys** |
-| `Opteron_G1` | not run | **OK 200, 4 keys** |
-| `Nehalem`, `SandyBridge` | not run | **OK 200, 4 keys** |
+| `qemu64` (baseline x86-64, no AES-NI) | refused: lacks `aes, pclmulqdq, bmi1, adx, avx, avx2` | **OK 200, 4 keys** |
+| `Opteron_G1`, `core2duo`, `Nehalem` | refused: lacks all six | **OK 200, 4 keys** |
+| `SandyBridge`, `IvyBridge` | refused: lacks `bmi1, adx, avx2` | **OK 200, 4 keys** |
 | **`Haswell`** (the outpost's shape) | **refused: lacks `adx`** | **OK 200, 4 keys** |
-| `Broadwell`, `max` | ok | **OK 200, 4 keys** |
+| `Broadwell`, `max` | OK 200, 4 keys | **OK 200, 4 keys** |
 
 On aarch64 under `qemu-aarch64-static`, ring returned `OK 200 keys 4` on
-`cortex-a53`, `cortex-a72` and `max`.
+`cortex-a53`, `cortex-a57`, `cortex-a72` and `max`.
 
 The graviola line at `Haswell` is the pre-flight it shipped with, which turns
 the abort into a step failure. Without that pre-flight the same CPU gets
@@ -373,8 +373,10 @@ ignored network tests are renamed from `..._with_graviola_tls`.
 with `/usr/bin/clang` set through `update-alternatives`, so any job that needed
 it would find it. None does: the only musl build in CI is the harness job, which
 builds `x86_64-unknown-linux-musl` on an x86_64 runner and therefore takes the
-host-`cc` path. The MSRV job moves 1.89 to 1.88. No workflow file needed a push
-over SSH in the end, since the only edit is that version.
+host-`cc` path. The one workflow edit is the MSRV job, 1.89 to 1.88; because
+that touches `.github/`, the branch was pushed over
+`git@github.com:flipbit03/rustible.git` rather than through the `gh` OAuth
+token, which has no `workflow` scope.
 
 ---
 
