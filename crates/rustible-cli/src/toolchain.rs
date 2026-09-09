@@ -23,9 +23,11 @@
 //!   ring's build script passes `-nostdlibinc` when the compiler is clang-like
 //!   and supplies its own fallbacks, so no libc headers are needed at all.
 //! - **The host's own `cc` serves the musl target of the host's own
-//!   architecture**, and only that one, because the libc headers it falls back
-//!   to are then at least the right architecture. This is why an ordinary
-//!   x86_64 Linux box with nothing but gcc can still build for itself.
+//!   architecture**, and only that one, and only on Linux, because the libc
+//!   headers it falls back to are then both the right architecture and the
+//!   right operating system. This is why an ordinary x86_64 Linux box with
+//!   nothing but gcc can still build for itself, and why it is not offered on
+//!   a mac, whose SDK headers are Darwin's.
 //! - **`x86_64-unknown-linux-musl` under clang needs real libc headers**:
 //!   ring's `check.h` includes `<assert.h>` unguarded and clang's `immintrin.h`
 //!   pulls `<stdlib.h>`. Rustible carries musl's own headers ([`MUSL_VERSION`],
