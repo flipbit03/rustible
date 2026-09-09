@@ -553,8 +553,13 @@ fn host_c_compiler() -> std::result::Result<PathBuf, String> {
                 .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
         })
         .ok_or_else(|| {
-            "no C compiler on PATH (`cc`, `gcc` or `clang`). The integration harness              cross-compiles this test binary for musl, and Rustible's TLS provider (ring)              compiles C, so one is needed here; install clang (`sudo apt install clang`) or              set CC."
-                .to_string()
+            concat!(
+                "no C compiler on PATH (`cc`, `gcc` or `clang`). The integration harness ",
+                "cross-compiles this test binary for musl, and Rustible's TLS provider ",
+                "(ring) compiles C, so one is needed here; install clang ",
+                "(`sudo apt install clang`) or set CC."
+            )
+            .to_string()
         })
 }
 
