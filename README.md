@@ -48,6 +48,33 @@ readable runs, and throws out both of those problems.
 | Python on every target | one static binary, nothing preinstalled |
 | `--check` support per module | `check` is half of every op's definition |
 
+## Install
+
+**Two things: rustup and clang.** Nothing else, and nothing at all on the
+machines you manage.
+
+```sh
+sudo apt install clang          # Debian/Ubuntu; dnf, pacman and apk all have it too
+```
+
+macOS already has it: the command line tools ship clang, so `xcode-select
+--install` is the whole story there.
+
+Clang is there because Rustible's TLS provider (`ring`) compiles a small amount
+of C, and one clang cross-compiles for every architecture you might target.
+Rustible carries musl's own libc headers and sets the compiler flags itself, so
+there is no cross-gcc, no zig, no docker and no sysroot to install. If clang is
+missing, `rustible init` says so and `rustible playbook run` refuses with the
+package name rather than failing somewhere inside a build script. A build only
+needs clang to reach an architecture other than your own: an ordinary x86_64
+Linux box with `gcc` can build for itself.
+
+Targets are added with rustup as you need them:
+
+```sh
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+```
+
 ## Status
 
 Under active construction and **not released yet**. The crates on crates.io
