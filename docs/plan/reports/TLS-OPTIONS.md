@@ -2,7 +2,7 @@
 
 ## Decision
 
-**Cadu, 2026-09-08: switch to `rustls-graviola`, with no fallback.**
+**Cadu, 2026-09-08: switch to `rustls-graviola`, with no fallback.** **Reversed the same day**, after `docs/plan/reports/C-TOOLCHAIN-SPIKE.md`: the provider is now `ring` and the toolkit is rustup plus clang. See `docs/plan/reports/M7-tls-ring.md`. What follows described the graviola decision and is kept as written.
 `rustls-rustcrypto` leaves the tree entirely.
 
 That is option (2) of section 7, not the hybrid this report leans towards. The

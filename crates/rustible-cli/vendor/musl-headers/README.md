@@ -2,7 +2,7 @@
 
 **musl 1.2.5**, from <https://musl.libc.org/releases/musl-1.2.5.tar.gz>.
 **MIT licensed**, attribution only; the upstream licence text is `COPYRIGHT`
-in this directory, unchanged.
+in this directory, unchanged. 218 files, 470,198 bytes of text.
 
 ## Why these are here
 

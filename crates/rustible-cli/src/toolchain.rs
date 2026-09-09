@@ -94,7 +94,7 @@ impl Compilers {
         }
         let head = "warning: no `clang` on PATH. Rustible's TLS provider (ring) compiles C, \
              so building a playbook binary needs a C compiler.";
-        Some(match &self.host_cc {
+        Some(match usable_host_cc(self) {
             Some(cc) => format!(
                 "{head}\n         {} can serve {}, this machine's own architecture, so a \
                  playbook for hosts like this one will build. Any other architecture needs \
@@ -103,8 +103,8 @@ impl Compilers {
                 host_musl_triple(),
             ),
             None => format!(
-                "{head}\n         This machine has no C compiler at all, so no playbook will \
-                 build until one is installed:\n             {INSTALL_CLANG}"
+                "{head}\n         No playbook will build until one is \
+                 installed:\n             {INSTALL_CLANG}"
             ),
         })
     }
@@ -194,11 +194,31 @@ fn choose<'a>(compilers: &'a Compilers, triple: &str) -> Option<Chosen<'a>> {
     if let Some(clang) = &compilers.clang {
         return Some(Chosen::Clang(clang));
     }
-    // Without clang, only the host's own architecture can be served.
     match &compilers.host_cc {
-        Some(cc) if triple == host_musl_triple() => Some(Chosen::HostCc(cc)),
+        Some(cc) if host_cc_serves(triple) => Some(Chosen::HostCc(cc)),
         _ => None,
     }
+}
+
+/// Whether the host's own compiler can build for `triple` with no sysroot.
+///
+/// Only the host's own architecture, and only on Linux: the fallback works
+/// because the compiler's default headers are then both the right architecture
+/// and the right operating system. A mac's SDK headers are Darwin's and would
+/// not serve a musl Linux target, so this is not merely an architecture
+/// comparison. Nothing is lost there, since macOS always has clang.
+fn host_cc_serves(triple: &str) -> bool {
+    cfg!(target_os = "linux") && triple == host_musl_triple()
+}
+
+/// The host compiler, but only where it can actually serve the host's own
+/// musl target. Both messages below have to agree with [`choose`], or they
+/// would offer a compiler the build then refuses.
+fn usable_host_cc(compilers: &Compilers) -> Option<&PathBuf> {
+    compilers
+        .host_cc
+        .as_ref()
+        .filter(|_| host_cc_serves(&host_musl_triple()))
 }
 
 /// `<arch>-unknown-linux-musl` for the architecture this `rustible` is running
@@ -210,9 +230,9 @@ pub fn host_musl_triple() -> String {
 /// The message when a build needs clang and there is none.
 fn needs_clang(triples: &[&str], compilers: &Compilers) -> String {
     let list = triples.join(", ");
-    let have = match &compilers.host_cc {
-        Some(cc) => format!("{} serves {} alone", cc.display(), host_musl_triple(),),
-        None => "this machine has no C compiler at all".to_string(),
+    let have = match usable_host_cc(compilers) {
+        Some(cc) => format!("{} serves {} alone", cc.display(), host_musl_triple()),
+        None => "this machine has no other usable compiler".to_string(),
     };
     format!(
         "no `clang` on PATH, and this playbook has to be built for {list}. \
@@ -401,8 +421,10 @@ mod tests {
     }
 
     /// Without clang the host's own compiler still serves the host's own
-    /// architecture, with no sysroot: its headers are already the right one.
-    /// Refusing this machine would refuse one that works.
+    /// architecture, with no sysroot: its headers are already the right ones.
+    /// Refusing this machine would refuse one that works. Linux only, because
+    /// that is the only place the fallback is offered.
+    #[cfg(target_os = "linux")]
     #[test]
     fn host_cc_serves_the_host_architecture_alone() {
         let t = tempfile::tempdir().unwrap();
@@ -445,7 +467,7 @@ mod tests {
         let e = env_for_build(&c, &[host_musl_triple()], t.path())
             .unwrap_err()
             .to_string();
-        assert!(e.contains("no C compiler at all"), "{e}");
+        assert!(e.contains("no other usable compiler"), "{e}");
     }
 
     /// A host-native build needs no cross configuration, only a compiler.
@@ -481,7 +503,7 @@ mod tests {
         assert!(w.contains(&host_musl_triple()), "{w}");
         assert!(w.contains("will build"), "{w}");
         let w = compilers(None, None).init_warning().unwrap();
-        assert!(w.contains("no C compiler at all"), "{w}");
+        assert!(w.contains("No playbook will build"), "{w}");
     }
 
     /// The hint is attached to a build failure only where clang would be the
