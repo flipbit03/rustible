@@ -1,8 +1,20 @@
 # Vendored musl libc headers
 
-**musl 1.2.5**, from <https://musl.libc.org/releases/musl-1.2.5.tar.gz>.
+**musl 1.2.5**, from <https://musl.libc.org/releases/musl-1.2.5.tar.gz>,
+`sha256 a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`
+(the hash Debian, Arch and Fossies all publish for that tarball).
 **MIT licensed**, attribution only; the upstream licence text is `COPYRIGHT`
 in this directory, unchanged. 218 files, 470,198 bytes of text.
+
+**These are headers, not code.** Nothing from musl is linked into anything:
+ring's C is compiled against these declarations and then linked against the
+musl `libc.a` that *rustup* ships, so a musl CVE cannot reach Rustible through
+this directory, and a release of skew between these headers and rustup's
+`libc.a` does not matter for the four things ring uses (`memcpy`, `memset`,
+`assert`, and the types in `stdlib.h`). musl 1.2.6 exists (March 2026) and
+publishes only a GPG signature, no checksum; 1.2.5 is kept because its hash is
+independently corroborated across distributions and the difference is
+invisible here.
 
 ## Why these are here
 

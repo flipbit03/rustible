@@ -170,8 +170,19 @@ pulls `<stdlib.h>`.
 the two commands that regenerate it. The tree is upstream's `make
 install-headers` output exactly as produced; nothing is edited and nothing is
 hand-trimmed. Trimming to the handful of headers ring reaches today would save
-about a megabyte and produce a libc header set that is silently incomplete the
+most of that and produce a libc header set that is silently incomplete the
 moment ring adds an include.
+
+The tarball's `sha256` is
+`a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`, which is
+the hash Debian, Arch and Fossies all publish, and it is recorded in the
+vendored `README.md`. **These are headers, not code**: ring's C is compiled
+against these declarations and linked against the musl `libc.a` *rustup* ships,
+so nothing from this directory ends up in a binary and a musl CVE cannot reach
+Rustible through it. musl 1.2.6 exists (March 2026) but publishes a GPG
+signature and no checksum, so 1.2.5 is kept: its hash is independently
+corroborated across distributions, and the difference is invisible for the four
+things ring uses.
 
 **aarch64 is deliberately not vendored.** It takes ring's `-nostdlibinc` path
 and needs no headers at all, which this branch verified rather than assumed: the
