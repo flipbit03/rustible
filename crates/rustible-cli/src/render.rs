@@ -263,7 +263,11 @@ impl<W: Write> Renderer<W> {
             any_failed |= failed;
             match (&st.summary, &st.error) {
                 (_, Some(e)) => {
-                    let _ = writeln!(out, "{host:<w$}  failed: {e}");
+                    // One line, whatever the reason is. The full text was
+                    // printed as the FAILED line above; a multi-line reason
+                    // here (a clang pre-flight refusal, a long connect error)
+                    // would break the table it sits in.
+                    let _ = writeln!(out, "{host:<w$}  failed: {}", one_line(e, 96));
                 }
                 (Some(s), None) => {
                     let _ = writeln!(
@@ -359,6 +363,52 @@ fn split_step<'a>(step: Option<&'a str>, error: &'a str) -> (Option<&'a str>, &'
         return (Some(name), cause);
     }
     (None, error)
+}
+
+/// A reason reduced to one line of at most `max` characters, for the summary
+/// table. The whole text is already on screen above, so this only has to say
+/// which host failed and roughly why.
+fn one_line(text: &str, max: usize) -> String {
+    let first = text.lines().next().unwrap_or("").trim_end();
+    let multi = text.lines().nth(1).is_some();
+    if first.chars().count() <= max && !multi {
+        return first.to_string();
+    }
+    let cut: String = first.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+#[cfg(test)]
+mod one_line_tests {
+    use super::one_line;
+
+    /// The summary table is a table. A reason with newlines in it, which is
+    /// what a clang pre-flight refusal or a long connect error looks like,
+    /// must not turn one row into five.
+    #[test]
+    fn a_multi_line_reason_becomes_one_line() {
+        let reason = "no `clang` on PATH, and this playbook has to be built for \
+                      aarch64-unknown-linux-musl.\nInstall it and run this again:  \
+                      sudo apt install clang";
+        let got = one_line(reason, 96);
+        assert!(!got.contains('\n'), "{got}");
+        assert!(
+            got.chars().count() <= 96,
+            "{} chars: {got}",
+            got.chars().count()
+        );
+        assert!(got.starts_with("no `clang` on PATH"), "{got}");
+        assert!(
+            got.ends_with('…'),
+            "elided, so the reader knows there is more: {got}"
+        );
+    }
+
+    /// A short single-line reason is left exactly as it is.
+    #[test]
+    fn a_short_reason_is_untouched() {
+        assert_eq!(one_line("connection refused", 96), "connection refused");
+    }
 }
 
 #[cfg(test)]

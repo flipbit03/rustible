@@ -493,3 +493,37 @@ version follows it and adds the history of what the old rule was protecting.
 > abort below it, in exchange for one package the target audience mostly has
 > already. Target hosts remain untouched by this: they need nothing, as before.
 
+### Review round (lead)
+
+A `code-review` pass ran against this branch and its findings did not reach the
+agent, which reported three unanswered pings; the agent's own review stood in
+for it. The pass had found seven things. Two I took myself: the spike report
+was untracked, so eight tracked files cited a document nobody could open, and
+`docs/01_VISION.md` still forbade the C this branch introduces, including a
+line claiming every crate in the tree is pure Rust transitively. Both are
+committed here.
+
+Four more were still open when I checked the code rather than asking again,
+and are fixed in this round:
+
+- **A pre-existing `CFLAGS_<triple>` silently dropped the vendored sysroot.**
+  cc-rs treats those flags as additive, so an operator exporting `-O2` for that
+  target lost the headers and landed in the cc-rs failure this module exists to
+  prevent, with `build_failure_hint` staying quiet because clang was installed.
+  Appended now, unless the value already names a sysroot, which is a deliberate
+  override and wins. Two tests.
+- **The header unpack could be read while it was being written.** Now unpacked
+  to a per-process scratch and renamed into place, with a stale stamp-less
+  directory cleared first so a half-finished attempt is redone rather than
+  used.
+- **The summary table was destroyed by its own failure reason.** A clang
+  refusal is two paragraphs, and the table printed all of it in the `ok`
+  column. One elided line now; the full text is still above it.
+- **The harness accepted a non-executable file as a compiler**, where its
+  sibling in the CLI checks the bit and has a test for it.
+
+One the reviewer raised that I checked and did not change: the harness sets
+`CC_<triple>` with no sysroot. That is correct as written, because the harness
+only ever builds for the host's own architecture, where the host compiler's
+headers are the right ones; the comment there says so.
+

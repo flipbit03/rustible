@@ -165,9 +165,27 @@ fn env_for_build_with(
                 // takes ring's `-nostdlibinc` path under clang.
                 if triple.starts_with("x86_64-") {
                     let flags_var = format!("CFLAGS_{}", triple.replace('-', "_"));
-                    if existing(&flags_var).is_none() {
+                    // cc-rs treats these as additive, so append rather than
+                    // stand aside: an operator exporting `CFLAGS_..._musl=-O2`
+                    // would otherwise silently lose the headers and land in the
+                    // cc-rs failure this module exists to prevent, with no hint
+                    // printed because clang *is* installed. A value that names
+                    // a sysroot of its own is a deliberate override and wins.
+                    let prior = existing(&flags_var);
+                    let names_sysroot = prior.as_ref().is_some_and(|v| {
+                        let s = v.to_string_lossy();
+                        s.contains("--sysroot")
+                            || s.contains("-isysroot")
+                            || s.contains("-nostdlibinc")
+                    });
+                    if !names_sysroot {
                         let sysroot = unpack_x86_64_musl_headers(cache_dir)?;
-                        let mut flag = OsString::from("--sysroot=");
+                        let mut flag = OsString::new();
+                        if let Some(prior) = prior {
+                            flag.push(prior);
+                            flag.push(" ");
+                        }
+                        flag.push("--sysroot=");
                         flag.push(sysroot);
                         env.insert(flags_var, flag);
                     }
@@ -287,7 +305,14 @@ pub fn unpack_x86_64_musl_headers(cache_dir: &Path) -> Result<PathBuf> {
     if stamp.is_file() {
         return Ok(root);
     }
-    let include = root.join("include");
+    // Unpack beside the target and rename into place, so a second run in the
+    // same workspace cannot read a header while this one is still writing it.
+    // The rename is atomic; the loser of the race finds the directory already
+    // there and uses it. Its scratch is named after this process so two
+    // unpackers never share one.
+    let scratch = root.with_extension(format!("tmp.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let include = scratch.join("include");
     for (rel, bytes) in X86_64_MUSL_HEADERS {
         let path = include.join(rel);
         if let Some(parent) = path.parent() {
@@ -296,8 +321,31 @@ pub fn unpack_x86_64_musl_headers(cache_dir: &Path) -> Result<PathBuf> {
         }
         std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
     }
-    std::fs::write(&stamp, format!("musl {MUSL_VERSION}\n"))
-        .with_context(|| format!("writing {}", stamp.display()))?;
+    std::fs::write(scratch.join(".complete"), format!("musl {MUSL_VERSION}\n"))
+        .with_context(|| format!("writing the stamp in {}", scratch.display()))?;
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // An unpack that died half way leaves a directory with no stamp, and
+    // `rename` will not replace a directory. Clear that wreckage first; a
+    // complete one is left alone, so a concurrent run's finished work is
+    // never destroyed.
+    if root.exists() && !stamp.is_file() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    match std::fs::rename(&scratch, &root) {
+        Ok(()) => {}
+        // Another run got there first, or the directory exists from a partial
+        // attempt. Either way, if the stamp is there the content is complete.
+        Err(_) if stamp.is_file() => {
+            let _ = std::fs::remove_dir_all(&scratch);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(e).with_context(|| format!("moving the headers into {}", root.display()));
+        }
+    }
     Ok(root)
 }
 
@@ -387,6 +435,44 @@ mod tests {
                 .unwrap()
                 .contains("malloc")
         );
+    }
+
+    /// A `CFLAGS_<triple>` the operator already set is added to, not obeyed
+    /// instead of the sysroot: cc-rs treats those flags as additive, so
+    /// standing aside would silently drop the headers and produce the exact
+    /// cc-rs failure this module exists to prevent.
+    #[test]
+    fn existing_cflags_keep_the_sysroot() {
+        let t = tempfile::tempdir().unwrap();
+        let c = compilers(Some("/usr/bin/clang"), None);
+        let env = env_for_build_with(&c, &["x86_64-unknown-linux-musl".into()], t.path(), &|k| {
+            (k == "CFLAGS_x86_64_unknown_linux_musl").then(|| OsString::from("-O2"))
+        })
+        .unwrap();
+        let flags = env["CFLAGS_x86_64_unknown_linux_musl"]
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            flags.starts_with("-O2 "),
+            "the operator's flags survive: {flags}"
+        );
+        assert!(
+            flags.contains("--sysroot="),
+            "and so do the headers: {flags}"
+        );
+    }
+
+    /// A value that already names a sysroot is a deliberate override, and
+    /// nothing is appended to it.
+    #[test]
+    fn an_explicit_sysroot_is_left_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let c = compilers(Some("/usr/bin/clang"), None);
+        let env = env_for_build_with(&c, &["x86_64-unknown-linux-musl".into()], t.path(), &|k| {
+            (k == "CFLAGS_x86_64_unknown_linux_musl").then(|| OsString::from("--sysroot=/opt/musl"))
+        })
+        .unwrap();
+        assert!(!env.contains_key("CFLAGS_x86_64_unknown_linux_musl"));
     }
 
     /// With clang, every target is served, and only x86_64 gets a sysroot.

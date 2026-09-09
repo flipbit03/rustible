@@ -495,8 +495,7 @@ pub(crate) mod tests {
         assert!(e.contains("never changes"), "{e}");
     }
 
-    /// Real HTTPS through `ring` against GitHub, which also
-    /// exercises the CPU pre-flight on the way in. Not part of
+    /// Real HTTPS through `ring` against GitHub. Not part of
     /// `cargo test` (the suite stays offline): run it with
     /// `cargo test -p rustible-github network_ -- --ignored`.
     #[test]

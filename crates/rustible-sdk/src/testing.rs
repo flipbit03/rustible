@@ -537,6 +537,21 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
 }
 
 /// This machine's C compiler: `CC`, else `cc`, else `gcc`, else `clang`.
+/// A file that exists and can actually be run. The CLI's `toolchain` module
+/// makes the same check; a name on PATH that is not executable is not a
+/// compiler, and finding one would fail later with a worse message.
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// A file that exists, where the platform has no executable bit to check.
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
+}
+
 /// Named for the musl build of the test binary, which needs one because the
 /// TLS provider compiles C.
 fn host_c_compiler() -> std::result::Result<PathBuf, String> {
@@ -550,7 +565,7 @@ fn host_c_compiler() -> std::result::Result<PathBuf, String> {
         .find_map(|name| {
             dirs.iter()
                 .map(|d| d.join(name))
-                .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+                .find(|p| is_executable_file(p))
         })
         .ok_or_else(|| {
             concat!(
