@@ -103,9 +103,12 @@ $ rustible init
 Creates a Cargo package in the current directory or a chosen folder. It refuses
 only when a file it would itself write is already there, and names the ones that
 clash; a directory holding anything else (a `README.md`, a `LICENSE`, a
-`.gitignore` from a fresh clone) is written into and those files are left alone.
-`--force` adds the missing files anyway and keeps the existing ones, rewriting
-only the two generated shims. This is `cargo init`'s rule.
+`.gitignore` from a fresh clone) is written into. Those files are left alone and
+never read, with one exception: an existing `.gitignore` gains the lines it
+lacks, because a workspace that does not ignore `target/` is a workspace that
+commits build output. Refusing on conflict rather than on non-emptiness is
+`cargo init`'s rule. `--force` adds the missing files anyway and keeps the
+existing ones, rewriting only the two generated shims.
 Adds `rustible` (runtime) and `rustible-std` (the base operations, mirroring
 Ansible's builtin modules: files, users, groups, packages, services, ssh keys, and
 so on) as dependencies. Creates an opinionated layout: `.gitignore`, an inventory
@@ -723,10 +726,12 @@ let pkgs = ctx.step("Install nginx and curl",
 ctx.step("Remove apache2", apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
 ctx.step("Keep openssl current", apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
 ```
+All three refuse early on a non-Debian box using `facts.package_manager`, and
+all three need root.
+
 `Present` `check`: `dpkg-query -W` per name, build the missing set, `Satisfied`
 if empty. `apply`: `apt-get update` if the cache is older than the max age, then
-`apt-get install -y` the missing set. Refuses early on a non-Debian box using
-`facts.package_manager`.
+`apt-get install -y` the missing set.
 
 `Latest` compares each installed version against the *candidate* apt would
 install, and candidates come from the package lists, so it refreshes in `check`
