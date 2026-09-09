@@ -17,9 +17,9 @@ rustible-sdk.workspace = true
 rustible-std.workspace = true
 # HTTPS for the `.keys` endpoint, pure Rust all the way down (vision 5.3).
 ureq.workspace = true
-# No crypto entry of its own: the provider and its CPU pre-flight come from
-# `rustible_std::tls`, which this crate already depends on, so the two agree by
-# construction. Nothing here names a `rustls::` path either.
+# No crypto entry of its own: the provider comes from `rustible_std::tls`,
+# which this crate already depends on, so the two agree by construction.
+# Nothing here names a `rustls::` path either.
 
 [dev-dependencies]
 # Only so the module-header doctest can show a real `#[rustible::playbook]`.

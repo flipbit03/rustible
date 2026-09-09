@@ -65,19 +65,17 @@ impl<F: Fetch + ?Sized> Fetch for Arc<F> {
     }
 }
 
-/// The default [`Fetch`]: `ureq` over `rustls` with the pure-Rust
-/// `rustls-graviola` crypto provider from [`rustible_std::tls`] and the
-/// bundled `webpki-roots` trust store (vision 5.3: no C, no system certificate
-/// lookup). Follows redirects, caps the body at [`MAX_BODY_BYTES`], and sends a
-/// `rustible-github/<version>` user agent (GitHub rejects requests without
-/// one).
+/// The default [`Fetch`]: `ureq` over `rustls` with the `ring` crypto provider
+/// from [`rustible_std::tls`], so this crate and `rustible_std::http` share one
+/// crypto path, and the bundled `webpki-roots` trust store (no system
+/// certificate lookup). Follows redirects, caps the body at [`MAX_BODY_BYTES`],
+/// and sends a `rustible-github/<version>` user agent (GitHub rejects requests
+/// without one).
 ///
-/// Graviola asserts on the CPU extensions it needs, so [`Https::get`] runs
-/// [`rustible_std::tls::preflight_url`] before the handshake and returns a
-/// readable error on a machine below the floor (pre-Broadwell x86_64,
-/// Raspberry Pi 4 and earlier) rather than panicking mid-playbook. There is no
-/// fallback provider. A plain-HTTP base URL is not gated, since it never
-/// reaches the provider.
+/// `ring` dispatches on the CPU at runtime, so there is no instruction-set
+/// floor to check for and no pre-flight: a request works on any x86-64 or
+/// aarch64 machine. See [`rustible_std::tls`] for what the provider costs at
+/// build time.
 #[derive(Debug, Clone)]
 pub struct Https {
     /// Built once: every `Agent` carries its own connection pool and its own
@@ -124,11 +122,6 @@ impl Default for Https {
 
 impl Fetch for Https {
     fn get(&self, url: &str) -> Result<Response> {
-        // Before the handshake: graviola panics on a CPU without the
-        // extensions it needs, and a panic here would take the whole playbook
-        // down instead of failing this step. Only `https://` is gated, since
-        // `.base_url(..)` accepts a plain-HTTP mirror.
-        rustible_std::tls::preflight_url("github::UserKeys", url)?;
         let mut resp = self
             .agent
             .get(url)

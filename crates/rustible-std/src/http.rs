@@ -1,18 +1,16 @@
 //! Downloads over HTTP(S). Ansible's `ansible.builtin.get_url`.
 //!
 //! [`Download`] fetches a URL into a file on the target with `ureq` over
-//! `rustls`, pure Rust all the way down (vision 5.3): the TLS crypto provider
-//! is `rustls-graviola`, from [`crate::tls`], because rustls's default
-//! providers (`ring`, `aws-lc-rs`) bundle C and do not cross-link with
-//! `rust-lld`. Certificates are checked against Mozilla's bundled roots
-//! (`webpki-roots`); there is no `validate_certs: no`.
+//! `rustls`, with `ring` as the crypto provider, taken from [`crate::tls`] so
+//! this op and `rustible-github` share one crypto path. Certificates are
+//! checked against Mozilla's bundled roots (`webpki-roots`); there is no
+//! `validate_certs: no`.
 //!
-//! Graviola asserts on the CPU extensions it needs, so an `https://` `apply`
-//! runs [`tls::preflight_url`](crate::tls::preflight_url) first and fails the
-//! step with a readable error on a machine below the floor (pre-Broadwell
-//! x86_64, Raspberry Pi 4 and earlier). It never panics mid-run, and there is
-//! no fallback provider. A plain `http://` download is not gated: it never
-//! reaches the provider, so it keeps working on those machines.
+//! `ring` detects CPU features at runtime and falls back to baseline code, so
+//! there is no instruction-set floor and no pre-flight: the binary this op
+//! ships in runs on any x86-64 or aarch64 target. It does compile a little C,
+//! which the operator's machine needs a `clang` for (vision 5.3); the target
+//! host still needs nothing at all.
 //!
 //! `check` never touches the network. It decides from the file on disk
 //! whether a download is due, so a dry run is fast and honest (vision 12).
@@ -383,11 +381,6 @@ impl Download {
     }
 
     fn fetch(&self) -> Result<Vec<u8>> {
-        // Before anything reaches the handshake: graviola panics on a CPU
-        // without the extensions it needs, and a panic here would take the
-        // whole playbook down instead of failing this step. Only `https://`
-        // is gated; a plain HTTP download never touches the provider.
-        crate::tls::preflight_url("http::Download", &self.url)?;
         let agent = agent(self.timeout);
         let mut req = agent.get(&self.url);
         for (k, v) in &self.headers {
@@ -1098,12 +1091,11 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
-    /// Real TLS through rustls-graviola against a public host, which also
-    /// exercises the CPU pre-flight on the way in. Not part of `cargo test`:
-    /// run with `cargo test -p rustible-std https_ -- --ignored`.
+    /// Real TLS through `ring` against a public host. Not part of
+    /// `cargo test`: run with `cargo test -p rustible-std https_ -- --ignored`.
     #[test]
     #[ignore = "needs network"]
-    fn https_download_from_github_with_graviola_tls() {
+    fn https_download_from_github_with_ring_tls() {
         let fake = Arc::new(Fake::new().with_dir("/opt"));
         let sys = fake_sys(&fake);
         let op =
