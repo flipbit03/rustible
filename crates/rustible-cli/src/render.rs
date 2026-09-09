@@ -587,6 +587,41 @@ arm      0        1             0        0       0         0
         );
     }
 
+    /// The table stays a table. A clang pre-flight refusal is two paragraphs
+    /// and a connect error can carry a chain; both arrive here through the
+    /// same orchestrator-level path, and both used to print in full inside one
+    /// column. This pins the table, where `one_line_tests` pins the helper.
+    /// The full text is still above, as the `FAILED:` line.
+    #[test]
+    fn a_multi_line_reason_does_not_break_the_summary_table() {
+        let reason = "no `clang` on PATH, and this playbook has to be built for \
+                      aarch64-unknown-linux-musl. Rustible's TLS provider (ring) compiles a \
+                      little C, and building for any architecture but this machine's own needs \
+                      clang.\nInstall it and run this again:  sudo apt install clang";
+        let out = render(0, |r| {
+            r.failed("arm", reason);
+            r.event("local", &Event::Finished(Summary::default()));
+            r.exited("local", 0);
+            assert!(r.finish());
+        });
+        // The whole reason is above the table, newlines and all.
+        assert!(out.contains("Install it and run this again"), "{out}");
+        // The table itself is the header plus exactly one row per host.
+        let table: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("host "))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(table.len(), 3, "header plus two hosts, got {table:#?}");
+        let arm = table.iter().find(|l| l.starts_with("arm")).unwrap();
+        assert!(
+            arm.starts_with("arm    failed: no `clang` on PATH"),
+            "{arm}"
+        );
+        assert!(arm.ends_with('…'), "elided: {arm}");
+        assert!(!arm.contains("apt install"), "{arm}");
+    }
+
     #[test]
     fn orchestrator_failures_and_missing_summaries_fail_the_run() {
         let out = render(0, |r| {
