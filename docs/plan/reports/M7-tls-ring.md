@@ -368,6 +368,57 @@ route; and section 7's "the fix is a preflight" is now written.
 
 ---
 
+## Review
+
+A delegated review pass was started at effort `high` and had not returned by the
+time this was written; three pings went unanswered. What follows is my own pass
+over the whole diff. Three real problems were found and fixed, and one suspected
+breakage turned out not to exist.
+
+**Fixed — the host-compiler fallback was wrong off Linux.** The rule was
+originally "the host's `cc` serves the host's own architecture", justified by the
+headers being the right architecture. They also have to be the right operating
+system: on a mac, `cc` is Apple clang and its default headers are the macOS
+SDK's, which would not serve a musl Linux target. The predicate is now
+`cfg!(target_os = "linux") && triple == host_musl_triple()`, and both messages
+that offer the host compiler go through the same function as the choice itself,
+so neither can suggest a compiler the build would then refuse. Nothing is lost
+on macOS, which always has clang. The one test that depends on the fallback is
+`cfg(target_os = "linux")`.
+
+**Fixed — the harness's no-compiler message ran its words together.** The
+string lost its line continuations somewhere between being written and being
+committed, so it would have printed `harness              cross-compiles`. Now a
+`concat!` of explicit fragments, which cannot lose them again.
+
+**Fixed — the toolchain module header disagreed with the code** after the first
+fix, still describing the fallback as architecture-only.
+
+**Checked and clean — `release.yml` looked like it would break.** It cross-builds
+the CLI for both musl targets with no `CC_*` set, which is exactly the shape that
+fails under ring. It does not, because `rustible-cli` depends on `rustible-sdk`
+and `rustible-build`, not `rustible-std`, so `ring` is not in its graph at all.
+Verified by building it for both targets in a scrubbed environment (`env -i`,
+`PATH` without the clang prefix, no `CC_*`); both succeed and compile no C. This
+was worth chasing: it would have failed at the first real release rather than in
+CI.
+
+**Considered and kept as it is.** Two shapes a reviewer could reasonably object
+to, with the reason each stands:
+
+- **`env_for_build` unpacks the headers as a side effect of computing an
+  environment.** Splitting it would mean the caller deciding when the sysroot is
+  needed, which is precisely the per-target knowledge this module exists to hold.
+  The doc comment says the unpack happens.
+- **`Compilers::probe` looks for `clang` and no versioned name.** A user who
+  installed only `clang-18` has no `clang` on `PATH`. Every distro's plain
+  `clang` package provides the unversioned name, and guessing which of several
+  versions to prefer is a choice with no right answer; the documented
+  `CC_<triple>` escape hatch covers the case. Worth revisiting if it ever comes
+  up in practice.
+
+---
+
 ## Documentation and CI
 
 **README** gains an `## Install` section before `## Status`: rustup and clang,
@@ -420,10 +471,13 @@ every item.
 
 ---
 
-## The vision 5.3 amendment, for the lead to apply
+## The vision 5.3 amendment
 
-`docs/01_VISION.md` is untouched (docs/07_UNATTENDED.md rule 1). This is the
-replacement prose for the clause that currently forbids C outright:
+I did not touch `docs/01_VISION.md` (docs/07_UNATTENDED.md rule 1). **The lead
+applied the amendment on this branch** as commit `a21da4c`, alongside the spike
+report itself, which until then existed only as an untracked file. Below is the
+replacement prose I wrote and handed over, for the record; the committed
+version follows it and adds the history of what the old rule was protecting.
 
 > Cross-compiling needs **no toolchain stock rustup cannot drive: no cross-gcc,
 > no zig, no docker; clang on the operator's machine is required and is the only
