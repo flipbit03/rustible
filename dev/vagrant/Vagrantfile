@@ -20,19 +20,15 @@
 #
 # What costs what
 # ---------------
-# A guest whose architecture matches the host, on a host with hardware
-# virtualisation, is accelerated and boots in seconds. Everything else is
-# qemu's TCG interpreter. Measured (see docs/plan/reports/VAGRANT-SPIKE.md):
-#
-#   x86_64 guest, x86_64 host, KVM or HVF ............ seconds
-#   aarch64 guest, Apple silicon host, HVF ........... 17 s
-#   x86_64 guest, Apple silicon host, TCG ............ 37 s
-#   x86_64 guest, x86_64 host, no /dev/kvm (TCG) ..... 63 s
-#   aarch64 guest, x86_64 host, no /dev/kvm (TCG) .... 103 s, box upload included
+# All of it spawns fast: every combination is a boot, not a build, and none of
+# them is worth making a coffee over. A guest whose architecture matches the
+# host, on a host with hardware virtualisation, is accelerated and is the
+# quickest; everything else runs on qemu's TCG interpreter and is slower to
+# boot and noticeably slower to work in.
 #
 # This file refuses nothing, but it says which of those you are about to get
-# before it starts, so a slow boot is a number you were told rather than a
-# mysterious hang.
+# before it starts, so a slow boot is something you were told about rather
+# than a mysterious hang.
 
 require "rbconfig"
 
@@ -160,13 +156,13 @@ end
 def speed_note(machine)
   guest = MACHINES[machine][:arch]
   if accelerated?(machine)
-    "accelerated (#{HOST_OS == :macos ? 'Hypervisor.framework' : 'KVM'}); expect a boot in seconds"
+    "accelerated (#{HOST_OS == :macos ? 'Hypervisor.framework' : 'KVM'})"
   elsif guest == HOST_ARCH
     "EMULATED: this host has no hardware virtualisation (#{HOST_OS == :linux ? 'no /dev/kvm' : 'kern.hv_support is 0'}), " \
-    "so qemu interprets every instruction. Boot takes about 70 s and the machine is then usable but slow"
+    "so qemu interprets every instruction. It still boots quickly; it is slow to work in"
   else
-    "EMULATED ACROSS ARCHITECTURES: a #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
-    "supports. Boot takes 40 s to 2 min; work inside it is slower than that suggests"
+    "EMULATED ACROSS ARCHITECTURES: an #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
+    "supports. It still boots quickly; it is slow to work in"
   end
 end
 
