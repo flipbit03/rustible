@@ -101,6 +101,8 @@ cargo build --manifest-path examples/workspace/Cargo.toml
 RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
 ```
 
+or `make` for the first five and `make integration` for the last.
+
 `#![deny(missing_docs)]` is on in every library crate, so a new public item
 without documentation does not compile.
 
@@ -144,6 +146,12 @@ Three, and they catch different things:
 
 They only run with `RUSTIBLE_INTEGRATION=1`; without it they skip themselves,
 so a plain `cargo test` stays offline and Docker-free.
+
+4. **Machines** (`make vm-test`), the Vagrant guests in `dev/vagrant/`: a real
+   SSH transport, a real `sudo`, a live `/proc/sys` and a real init system,
+   none of which a container has. Not in CI, optional day to day, and
+   **expected of a new operation before it merges** — say in the pull request
+   which architecture you ran it on. `docs/DEVELOPING.md` is the setup.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.

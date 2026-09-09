@@ -57,14 +57,11 @@ group "lab" {
     host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
 }
 
-// The machines `dev/vagrant/Vagrantfile` brings up, for
-// `playbooks/vagrant.rs`. `vagrant up` writes the real block, with this
-// checkout's key path and the address the provider handed out, to
-// `dev/vagrant/hosts.vagrant.kdl`; paste it in here, replacing this comment.
-// It is not committed because both of those name one developer's disk.
+// `playbooks/vagrant.rs` targets a group named "vagrant", which is not here:
+// `dev/vagrant/Vagrantfile` writes it to `dev/vagrant/hosts.vagrant.kdl` on
+// `vagrant up`, naming the key path and address of that developer's machines.
+// That file is a complete inventory and is used instead of this one:
 //
-// group "vagrant" escalate="sudo" {
-//     host "vagrant-x86" addr="192.168.121.116" ssh_user="vagrant" port=22 {
-//         ssh_args "-i" "/path/to/rustible/dev/vagrant/.vagrant/machines/x86/libvirt/private_key" "-o" "IdentitiesOnly=yes" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null"
-//     }
-// }
+//     make vm-test
+//
+// which is `rustible --inventory dev/vagrant/hosts.vagrant.kdl ...`.

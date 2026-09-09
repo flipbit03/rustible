@@ -10,10 +10,13 @@
 #   vagrant up                 # the machine matching this host's architecture
 #   vagrant up arm             # the aarch64 machine (see "What costs what")
 #
-# `vagrant up` writes dev/vagrant/hosts.vagrant.kdl, a ready inventory whose
-# `group "vagrant"` block is what examples/workspace/playbooks/vagrant.rs
-# targets. Copy that block into the hosts.kdl of the workspace you are
-# working in.
+# `vagrant up` writes dev/vagrant/hosts.vagrant.kdl, a complete inventory of
+# whichever machines are up. Nothing has to be pasted anywhere: point a run at
+# it with --inventory, which is what `make vm-test` does.
+#
+#   rustible --workspace examples/workspace \
+#            --inventory dev/vagrant/hosts.vagrant.kdl \
+#            playbook run vagrant
 #
 # What costs what
 # ---------------
@@ -22,9 +25,10 @@
 # qemu's TCG interpreter. Measured (see docs/plan/reports/VAGRANT-SPIKE.md):
 #
 #   x86_64 guest, x86_64 host, KVM or HVF ............ seconds
-#   x86_64 guest, x86_64 host, no /dev/kvm (TCG) ..... ~70 s to boot, usable
-#   aarch64 guest, Apple silicon host, HVF ........... ~20 s to boot, usable
-#   cross-architecture, any host (TCG) ............... minutes, see the report
+#   aarch64 guest, Apple silicon host, HVF ........... 17 s
+#   x86_64 guest, Apple silicon host, TCG ............ 37 s
+#   x86_64 guest, x86_64 host, no /dev/kvm (TCG) ..... 63 s
+#   aarch64 guest, x86_64 host, no /dev/kvm (TCG) .... 103 s, box upload included
 #
 # This file refuses nothing, but it says which of those you are about to get
 # before it starts, so a slow boot is a number you were told rather than a
@@ -36,6 +40,21 @@ BOX          = "cloud-image/debian-12"
 VAGRANT_ROOT = File.expand_path(__dir__)
 FRAGMENT_DIR = File.join(VAGRANT_ROOT, ".vagrant", "rustible")
 INVENTORY    = File.join(VAGRANT_ROOT, "hosts.vagrant.kdl")
+
+# Debian and Fedora put the aarch64 UEFI image in different places; the first
+# that exists wins, and a missing one is reported at `up` rather than as a
+# libvirt error naming a path nobody set.
+AAVMF_CANDIDATES = [
+  "/usr/share/AAVMF/AAVMF_CODE.fd",
+  "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+  "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+].freeze
+AAVMF_CODE = AAVMF_CANDIDATES.find { |p| File.exist?(p) }
+
+# libvirt creates the per-machine variable store from the firmware's template
+# on first boot, but only somewhere its own qemu user can write, which a
+# directory under the developer's home is not.
+NVRAM_DIR = "/var/lib/libvirt/qemu/nvram"
 
 # ---------------------------------------------------------------- host facts
 
@@ -71,9 +90,14 @@ PROVIDER = HOST_OS == :macos ? :qemu : :libvirt
 # the architecture varies.
 BOX_PROVIDER = "libvirt"
 
+# `ssh_port` is the qemu provider's business only. vagrant-qemu reaches a
+# guest through user-mode networking on 127.0.0.1 and defaults every machine
+# to host port 50022, so two of them, or one of them and any other
+# vagrant-qemu project, collide and the second refuses to start. libvirt
+# needs none of this: it puts each guest on its own address.
 MACHINES = {
-  "x86" => { arch: "amd64", qemu_arch: "x86_64",  libvirt_arch: "x86_64"  },
-  "arm" => { arch: "arm64", qemu_arch: "aarch64", libvirt_arch: "aarch64" },
+  "x86" => { arch: "amd64", qemu_arch: "x86_64",  libvirt_arch: "x86_64",  ssh_port: 50022 },
+  "arm" => { arch: "arm64", qemu_arch: "aarch64", libvirt_arch: "aarch64", ssh_port: 50023 },
 }.freeze
 
 # The machine whose architecture matches this host is the one `vagrant up`
@@ -95,7 +119,7 @@ def speed_note(machine)
     "so qemu interprets every instruction. Boot takes about 70 s and the machine is then usable but slow"
   else
     "EMULATED ACROSS ARCHITECTURES: a #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
-    "supports. Boot takes many minutes. Use it to check that something works on #{guest}, not to work on it"
+    "supports. Boot takes 40 s to 2 min; work inside it is slower than that suggests"
   end
 end
 
@@ -126,6 +150,75 @@ def write_fragment(name, ssh)
   File.write(File.join(FRAGMENT_DIR, "#{name}.kdl"), lines.join("\n") + "\n")
 end
 
+# vagrant-libvirt 0.12.2 names the box volume it uploads into libvirt's
+# storage pool from the box name and version alone, with no architecture
+# (`get_volume_name` in action/handle_box_image.rb). `cloud-image/debian-12`
+# publishes amd64 and arm64 under that one name and version, so on a host that
+# uses both, the two architectures collide on a single pool volume: the first
+# `up` uploads its disk, and every later `up` of the other architecture
+# silently boots *that* disk. The failure has no error in it. An aarch64 guest
+# handed an amd64 disk finds no BOOTAA64.EFI, sits in UEFI forever, and
+# vagrant waits for an IP address that is never coming.
+#
+# So record which architecture the pool volume holds, and replace it when the
+# machine coming up needs the other one. The next `up` re-uploads from the box
+# already unpacked under ~/.vagrant.d, which is a local copy.
+#
+# Replacing it is only safe when no other machine is still standing on it.
+# Each machine's own disk is a copy-on-write overlay whose backing file *is*
+# that pool volume, so swapping the volume under a machine that already exists
+# leaves its overlay reading the other architecture's blocks. A running domain
+# survives on the open inode and looks fine, which makes this worse than the
+# hang it fixes, not better. So the two architectures cannot both exist under
+# libvirt at once, and this refuses rather than corrupting: destroy the other
+# machine first. (The qemu provider on macOS has no shared pool and no such
+# restriction; both machines coexist there.)
+BOX_ARCH_STAMP = File.join(FRAGMENT_DIR, "box-arch")
+
+def created_machines(exclude)
+  MACHINES.keys.reject { |n| n == exclude }.select do |n|
+    File.exist?(File.join(VAGRANT_ROOT, ".vagrant", "machines", n, PROVIDER.to_s, "id"))
+  end
+end
+
+def evict_foreign_box_volume(name, arch)
+  require "fileutils"
+  FileUtils.mkdir_p(FRAGMENT_DIR)
+  held = File.exist?(BOX_ARCH_STAMP) ? File.read(BOX_ARCH_STAMP).strip : nil
+  return if held == arch
+
+  # A volume with no stamp beside it was uploaded before this check existed,
+  # or by something else: its architecture is unknown, which is the same as
+  # wrong. Re-uploading a disk we might not have needed to is the cheap error.
+  prefix = "#{BOX.gsub('/', '-VAGRANTSLASH-')}_vagrant_box_image_"
+  volumes = `virsh -c qemu:///system vol-list default 2>/dev/null`
+            .lines.map { |l| l.split.first }
+            .compact.select { |v| v.start_with?(prefix) }
+
+  others = created_machines(name)
+  if !volumes.empty? && !others.empty?
+    raise "cannot bring up '#{name}' (#{arch}) while #{others.map { |o| "'#{o}'" }.join(', ')} " \
+          "exists.\n" \
+          "vagrant-libvirt keeps one box volume per box name and version, with no\n" \
+          "architecture in it, so both machines share it and their disks are\n" \
+          "copy-on-write overlays on top of it. Giving '#{name}' the #{arch} image\n" \
+          "would leave #{others.map { |o| "'#{o}'" }.join(', ')} reading the wrong architecture.\n" \
+          "\n" \
+          "    cd dev/vagrant && vagrant destroy -f #{others.join(' ')}\n" \
+          "\n" \
+          "Under libvirt it is one architecture at a time. See docs/DEVELOPING.md."
+  end
+
+  volumes.each do |vol|
+    puts "==> box volume #{vol} holds #{held || 'an unrecorded architecture'}; " \
+         "removing it so the #{arch} disk is uploaded"
+    system("virsh", "-c", "qemu:///system", "vol-delete", vol, "--pool", "default",
+           out: File::NULL, err: File::NULL)
+  end
+
+  File.write(BOX_ARCH_STAMP, arch)
+end
+
 def regenerate_inventory
   fragments = Dir.glob(File.join(FRAGMENT_DIR, "*.kdl")).sort
   if fragments.empty?
@@ -136,11 +229,15 @@ def regenerate_inventory
   File.write(INVENTORY, <<~KDL)
     // Generated by dev/vagrant/Vagrantfile on `vagrant up`. Do not edit: it is
     // rewritten on every up, halt and destroy, and it is not tracked in git.
+    // It names one developer's disk, which is why it is not tracked.
     //
-    // Copy the `group "vagrant"` block below into the hosts.kdl of the
-    // workspace you are working in, then:
+    // A complete inventory, not a fragment: run against it directly.
     //
-    //     rustible --workspace examples/workspace playbook run playbooks/vagrant.rs
+    //     rustible --workspace examples/workspace \\
+    //              --inventory dev/vagrant/hosts.vagrant.kdl \\
+    //              playbook run vagrant
+    //
+    // `make vm-test` from the repository root does exactly that.
 
     group "vagrant" escalate="sudo" {
     #{body.chomp}
@@ -161,6 +258,14 @@ Vagrant.configure("2") do |config|
   # so the machines behave identically.
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
+  # Do not carry the developer's locale into the guest. OpenSSH forwards
+  # `LC_*` and `LANG` by default and the box generates only C.UTF-8, so a
+  # developer with `en_US.UTF-8` set gets a seven-line locale complaint from
+  # bash and perl on every `vagrant ssh`. Pinning the environment for the
+  # connection is the fix; generating locales in the guest would be a
+  # provisioning step that exists only to satisfy the host's settings.
+  config.ssh.extra_args = ["-o", "SetEnv=LC_ALL=C LANG=C"]
+
   MACHINES.each do |name, spec|
     config.vm.define(name, autostart: name == NATIVE, primary: name == NATIVE) do |node|
       node.vm.box_architecture = spec[:arch]
@@ -169,6 +274,23 @@ Vagrant.configure("2") do |config|
       node.trigger.before :up do |t|
         t.info = "machine '#{name}': #{spec[:arch]} guest on an #{HOST_ARCH} #{HOST_OS} host, #{PROVIDER} provider\n" \
                  "  #{speed_note(name)}"
+        if PROVIDER == :libvirt
+          t.ruby do |_env, _machine|
+            # An aarch64 guest has no BIOS, so with no UEFI image on the host
+            # libvirt fails with a path nobody set. Say which package supplies
+            # it instead.
+            if spec[:libvirt_arch] != "x86_64" && AAVMF_CODE.nil?
+              raise "no aarch64 UEFI firmware on this host: looked for\n" \
+                    "  #{AAVMF_CANDIDATES.join("\n  ")}\n" \
+                    "Install it: `apt-get install qemu-efi-aarch64` on Debian " \
+                    "or Ubuntu, `dnf install edk2-aarch64` on Fedora. " \
+                    "See docs/DEVELOPING.md."
+            end
+            # Only libvirt has the shared pool this guards; the qemu provider
+            # keeps each machine's disk in its own .vagrant directory.
+            evict_foreign_box_volume(name, spec[:arch])
+          end
+        end
       end
 
       node.trigger.after :up do |t|
@@ -206,7 +328,20 @@ Vagrant.configure("2") do |config|
           lv.machine_type = "virt"
           lv.cpu_mode = "custom"
           lv.cpu_model = "cortex-a57"
-          lv.loader = "/usr/share/AAVMF/AAVMF_CODE.fd"
+          # libvirt refuses ACPI on aarch64 unless the loader is declared as
+          # UEFI pflash, which vagrant-libvirt only emits once `nvram` is set
+          # as well; the three PC-shaped defaults below have no counterpart on
+          # the "virt" board and are dropped rather than translated.
+          lv.loader = AAVMF_CODE
+          lv.nvram = File.join(NVRAM_DIR, "rustible-#{name}-VARS.fd")
+          # Cirrus video, a PS/2 mouse and a VNC head are PC hardware with no
+          # counterpart on the "virt" board. ACPI stays: dropping it was the
+          # first attempt at the "ACPI requires UEFI" error, and the real
+          # cause was the loader not being declared as pflash, which `nvram`
+          # above is what makes vagrant-libvirt emit.
+          lv.graphics_type = "none"
+          lv.video_type = "none"
+          lv.inputs = []
         end
       end
 
@@ -225,6 +360,7 @@ Vagrant.configure("2") do |config|
           q.cpu = "qemu64"
         end
         q.net_device = "virtio-net-pci"
+        q.ssh_port = spec[:ssh_port].to_s
       end
     end
   end

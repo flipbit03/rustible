@@ -57,6 +57,11 @@ struct Cli {
     /// up from the current directory.
     #[arg(long, global = true, value_name = "DIR")]
     workspace: Option<PathBuf>,
+    /// Inventory file, overriding the workspace's `inventory` setting. For
+    /// running against machines that are not in the committed inventory, such
+    /// as the Vagrant guests `dev/vagrant` brings up.
+    #[arg(long, global = true, value_name = "FILE")]
+    inventory: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -145,6 +150,7 @@ async fn main() {
 
 async fn dispatch(cli: Cli) -> Result<u8> {
     let ws = cli.workspace.as_deref();
+    let inventory_override = cli.inventory.clone();
     match cli.cmd {
         Cmd::Init(args) => {
             if ws.is_some() {
@@ -152,12 +158,16 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                     "--workspace does not apply to `init`; give the directory as its argument",
                 ));
             }
+            if inventory_override.is_some() {
+                return Err(usage("--inventory does not apply to `init`"));
+            }
             init::run(args).map(|()| 0)
         }
         Cmd::Playbook { cmd } => match cmd {
             PlaybookCmd::Run(args) => {
                 let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
-                let inv = load_or_exit(&ws.inventory_path());
+                let file = inventory_override.unwrap_or_else(|| ws.inventory_path());
+                let inv = load_or_exit(&file);
                 run::run(&ws, &inv, args).await
             }
             PlaybookCmd::List => {
@@ -175,7 +185,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 create::run(args).map(|()| 0)
             }
         },
-        Cmd::Inventory { cmd } => inventory(ws, cmd).await,
+        Cmd::Inventory { cmd } => inventory(ws, inventory_override, cmd).await,
         Cmd::Toolchain { cmd } => match cmd {
             ToolchainCmd::Check(args) => toolchain_cmd::run(ws, args),
         },
@@ -206,11 +216,19 @@ fn list(ws: &Workspace) -> Result<u8> {
 
 /// `inventory show` and `inventory check`. Load errors go to stderr one
 /// per line as `file:line:col: error: message`; any error exits 1.
-async fn inventory(ws: Option<&Path>, cmd: InventoryCmd) -> Result<u8> {
+async fn inventory(
+    ws: Option<&Path>,
+    inventory_override: Option<PathBuf>,
+    cmd: InventoryCmd,
+) -> Result<u8> {
     let (file, ws) = match &cmd {
         InventoryCmd::Show { file, .. } | InventoryCmd::Check { file } => {
-            match (file, Workspace::discover(ws)) {
-                (Some(f), ws) => (f.clone(), ws.ok()),
+            // `--file` is this subcommand's own spelling of the global
+            // `--inventory`; either names the file, and the workspace's
+            // setting answers when neither does.
+            let named = file.clone().or(inventory_override);
+            match (named, Workspace::discover(ws)) {
+                (Some(f), ws) => (f, ws.ok()),
                 (None, Ok(ws)) => (ws.inventory_path(), Some(ws)),
                 (None, Err(e)) => return Err(usage(format!("{e:#} (or pass --file)"))),
             }
