@@ -86,14 +86,27 @@ a public API, check that workspace too.
 ## How to work
 
 Every change goes through a branch and a pull request, even a one-line doc
-fix. CI runs five jobs on each: the fmt/clippy/test/rustdoc gate, an MSRV
-check on **1.88**, the example-workspace build, a macOS controller job, and
-the Docker harness. All five must be green.
+fix. CI runs five jobs on each, and all five must be green:
+
+| job | what it protects |
+|---|---|
+| Format, clippy, test | the gate: `fmt`, `clippy -D warnings`, the suite, rustdoc |
+| Minimum supported Rust version | the floor stays **1.88** |
+| Example workspace builds | `examples/workspace`, which the cargo workspace never compiles |
+| macOS controller | the suite on macOS, and a cross-build for both Linux targets |
+| Container ops (Docker harness) | tier 3, the 27 container runs |
 
 Before pushing, run what CI runs:
 
 ```sh
-cargo fmt --all
+make                # fmt, clippy, test, rustdoc, example workspace
+make integration    # the container tier; needs docker
+```
+
+which is these, in the order that fails soonest:
+
+```sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
@@ -101,7 +114,8 @@ cargo build --manifest-path examples/workspace/Cargo.toml
 RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
 ```
 
-or `make` for the first five and `make integration` for the last.
+`make vm-test` is the one tier CI does not run. It is not part of this list
+and it is not optional when an op needs it; see "The machine tier".
 
 `#![deny(missing_docs)]` is on in every library crate, so a new public item
 without documentation does not compile.
@@ -133,55 +147,103 @@ reference for voice and structure.
 
 ## Testing tiers
 
-Four, and they catch different things:
+Four. They are not redundant: each one can see something the tier below it
+cannot, and each costs more to run than the tier below it.
 
-1. **Pure functions** for parsers and planners.
-2. **`Fake` backend** for operation behaviour: satisfied, change, apply,
-   failure, refusals.
-3. **Containers** (`#[rustible::integration_test]`, fourteen files in
-   `crates/rustible-std/tests/`) against real distributions. These are the
-   source of truth for how a tool behaves and they have earned it: they caught
-   that `useradd` refuses to create a private group when one already carries
-   the name, and that `chown` clears setuid, neither of which a fake can
-   model. They only run with `RUSTIBLE_INTEGRATION=1`; without it they skip
-   themselves, so a plain `cargo test` stays offline and Docker-free.
-4. **Machines** (`make vm-test`), the Vagrant guests in `dev/vagrant/`: a real
-   SSH transport, a real `sudo`, a live `/proc/sys` and a real init system,
-   none of which a container has. Not in CI, optional day to day, and
-   **expected of a new operation before it merges** — say in the pull request
-   which architecture you ran it on.
+| tier | what it is | where it runs | cost |
+|---|---|---|---|
+| 1. pure | functions with no I/O | `cargo test` | free |
+| 2. fake | ops against the `Fake` backend | `cargo test` | free |
+| 3. container | ops against real distributions | `make integration`, **and CI** | seconds, needs docker |
+| 4. machine | a playbook against a real VM over SSH | `make vm-test`, **not CI** | a minute, needs vagrant |
+
+Today that is 579 tests in tiers 1 and 2, **27 container runs** across
+`debian:12`, `ubuntu:24.04`, `alpine:3.20` and two `jrei/systemd-*` images,
+and one playbook on each of two architectures.
+
+**Tiers 1–3 run in CI. Tier 4 does not** — see "The machine tier" below for
+why, and for what it is nonetheless expected to catch before you merge.
+
+### Choosing a tier
+
+Put a test in the *lowest* tier that can actually fail for the right reason.
+A test in too high a tier is slow and flaky; a test in too low a tier passes
+while the thing is broken.
+
+- **Parsing, planning, diffing, any decision made from data** → tier 1.
+- **An op's behaviour**: satisfied, change, apply, failure, refusal → tier 2.
+  The `Fake` lets you plant a tool's output and assert on the op's reaction,
+  which is why `check` must do all the thinking and `apply` must execute the
+  plan rather than re-inspecting.
+- **Anything where the answer comes from a real tool** → tier 3. This is the
+  source of truth for how `useradd`, `apt-get`, `systemctl` and friends
+  behave, and it has earned it: it caught that `useradd` refuses to create a
+  private group when one already carries the name, and that `chown` clears
+  setuid. A fake models what you *believe*; a container shows what is.
+- **Anything a container structurally cannot do** → tier 4. That list is
+  short and specific: writes to `/proc/sys` (a container shares the host
+  kernel, so the write is refused or hits the *host*), a real init system, a
+  real `sudo`, and the SSH transport itself. `it_sysctl_present.rs` says so in
+  its own header — it runs with `.apply_now(false)` and asserts only on the
+  drop-in file, because the live write is not available to it.
+
+If a new op needs nothing from tier 4, it does not need a tier-4 test. Say so
+in the pull request rather than adding a step to the playbook for symmetry.
+
+### The machine tier
+
+`dev/vagrant/` holds two Debian 12 guests, `x86` and `arm`, from one
+multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS.
+`docs/DEVELOPING.md` is the per-platform setup. The loop:
+
+```sh
+make vm-up          # the guest whose architecture matches this host
+make vm-ssh         # a shell in it, passwordless sudo
+make vm-test        # the playbook, twice
+make vm-status      # what is up, and the inventory naming it
+make vm-destroy     # give the disk back
+make vm-orphans     # domains left behind by a deleted checkout
+```
+
+`make vm-up` brings up **only** the guest matching this host's architecture,
+because that is the one marked `autostart` — and the one `vm-ssh` reaches
+without being told which. The other architecture is always emulated, so it is
+opt-in by name: `make vm-up-arm`, `make vm-up-x86`. Both spawn fast; the
+emulated one is slow to *work in*, not slow to start.
+
+`make vm-test` runs `examples/workspace/playbooks/vagrant.rs` **twice** and
+fails unless the second run reports nothing changed and nothing failed. The
+second run is the test. A first run reporting `changed` proves only that the
+op did something; an op that rewrites a correct file every pass reports
+`changed` too. Limit it with `make vm-test HOSTS=vagrant-arm`.
+
+To drive the machines yourself — a dry run, more verbosity, a playbook of your
+own — use the inventory `vagrant up` generates. Do not paste it into a tracked
+file; that is what `--inventory` is for:
+
+```sh
+rustible --workspace examples/workspace \
+         --inventory dev/vagrant/hosts.vagrant.kdl \
+         playbook run vagrant --check -v
+```
+
+Three things that will bite you:
+
+- **Under libvirt, only one of the two machines may exist at a time.** They
+  share one box volume in libvirt's storage pool, and each machine's disk is a
+  copy-on-write overlay on it, so giving one machine the other architecture's
+  image corrupts the one you left behind. `vagrant up` refuses and names the
+  `vagrant destroy` to run. macOS has no shared pool and no restriction.
+- **Destroy the machines before deleting a checkout or a git worktree.** The
+  state tying a libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`;
+  remove that first and the domain keeps running with nothing able to stop it.
+  `make vm-orphans` finds them and prints the `virsh` commands.
+- **It is not in CI, and it is still expected of a new operation that needs
+  it.** Nothing enforces this. Say in the pull request which architecture you
+  ran it on, or say why the op needs nothing tier 4 provides.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
-
-### Driving the machines
-
-`docs/DEVELOPING.md` is the setup and the full story; this is the loop.
-
-```sh
-make vm-up          # the guest matching this host's architecture
-make vm-ssh         # a shell in it
-make vm-test        # the playbook, twice, asserting the second changes nothing
-make vm-destroy     # give the disk back
-```
-
-`make vm-up-arm` and `make vm-up-x86` name a specific architecture. **Under
-libvirt only one of the two may exist at a time** (they share one box volume
-in the storage pool); `vagrant up` refuses with the command to run rather than
-corrupting the other machine. macOS has no such restriction.
-
-`vagrant up` writes `dev/vagrant/hosts.vagrant.kdl`, a complete inventory of
-whatever is running. It is not committed — it names one machine's key paths —
-so point runs at it with `--inventory` rather than editing a tracked file:
-
-```sh
-rustible --workspace examples/workspace          --inventory dev/vagrant/hosts.vagrant.kdl          playbook run vagrant --check -v
-```
-
-**Destroy the machines before deleting a checkout or a git worktree.** The
-state that ties a libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`,
-so removing the directory first leaves a domain running that nothing tracks
-and `vagrant destroy` can no longer see. `make vm-orphans` lists any.
 
 ## TLS, and why clang
 
