@@ -287,19 +287,35 @@ took 4.5 s).
 
 - **Linux only, `*-unknown-linux-musl` targets only**, for the MVP. Static musl
   binaries run on any Linux regardless of libc version.
-- **Rustible is pure Rust, all the way down the dependency tree (DECIDED
-  2026-09-07).** Playbooks, the SDK, the stdlib, and every collection are Rust
-  crates whose transitive dependencies contain no C code. Pure-Rust crates
-  targeting musl link with the bundled `rust-lld` after `rustup target add`,
-  with `linker = "rust-lld"` and `-C link-self-contained=yes` set per target in
-  `.cargo/config.toml` (validated in spike 1, `docs/03_SPIKE_CROSS_COMPILE.md`:
-  3.5 s link, no zig, no distro toolchain). A crate that bundles C under the
-  hood (`openssl-sys`, `libgit2-sys`, `libsqlite3-sys`) is **unsupported**: the
-  link fails, and the fix is the pure-Rust alternative (`rustls`, `gix`,
-  `rustix`). There is no escape hatch and no C cross-toolchain story, on
-  purpose: Ansible never had C modules either, and one rule is simpler than a
-  toolchain matrix. (`cargo-zigbuild` was considered as an escape hatch and
-  dropped.)
+- **Rustible needs no toolchain stock rustup cannot drive: no cross-gcc, no
+  zig, no docker. Clang on the operator's machine is required and is the only
+  addition (DECIDED 2026-09-07, AMENDED 2026-09-08).** `rustup target add
+  <triple>` plus a clang is the whole setup. Crates targeting musl link with
+  the bundled `rust-lld`, with `linker = "rust-lld"` and `-C
+  link-self-contained=yes` set per target in `.cargo/config.toml` (validated in
+  spike 1, `docs/03_SPIKE_CROSS_COMPILE.md`: 3.5 s link, no zig, no distro
+  toolchain), against the musl crt rustup ships, and playbook binaries are
+  fully static.
+
+  The one C dependency is `ring`, the TLS crypto provider. Rustible carries
+  musl's libc headers for the targets that need them and sets the compiler
+  flags itself, so nothing beyond clang is ever installed by hand, and **target
+  hosts still need nothing**, as before. A crate that bundles a C *library*
+  (`openssl-sys`, `libgit2-sys`, `libsqlite3-sys`) remains **unsupported**: the
+  fix is the pure-Rust alternative (`rustls`, `gix`, `rustix`).
+
+  **What this replaced, and why.** The original rule forbade C outright, and
+  `cargo-zigbuild` was considered as an escape hatch and dropped. What that
+  rule was protecting was the toolchain, not the language, and the difference
+  showed up on real hardware: the only non-alpha pure-Rust TLS provider
+  (`rustls-graviola`) asserts instruction set extensions and aborts
+  mid-playbook below Intel Broadwell (2014), which broke a live host in the
+  dogfood fleet. `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` measured the
+  alternative: `ring` runs down to baseline x86-64, cross-compiles for
+  aarch64-musl with clang and no headers at all, produces *smaller* binaries,
+  and needs one package the target audience mostly has already. Ansible's
+  equivalent is the system OpenSSL on every target; ours is a compiler on one
+  machine.
 - **Shipped binaries use the `dist` profile** (strip, fat LTO, `opt-level = "z"`):
   1.4 MB for the spike playbook on aarch64 versus 3.1 MB for plain release.
 - macOS and Windows targets are deferred. They have their own toolchain and SDK
@@ -1155,7 +1171,9 @@ Networking and anything async are also off `System` for now.
     `crates/rustible-cli` at M1, freeing the name for the facade.
 - **A playbook binary has four modes** (section 5.5): plain local run,
   `--remote`, `--describe`, `--helper`. The macro generates all of them.
-- Every crate in the tree is pure Rust, transitively (section 5.3).
+- Every crate in the tree is pure Rust except `ring`, the TLS crypto provider,
+  which compiles a little C on the operator's machine and nothing on the target
+  (section 5.3).
 
 ## 10. Inventory, typed vars, and the workspace (DECIDED 2026-09-05/06)
 

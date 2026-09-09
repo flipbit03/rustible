@@ -12,6 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::toolchain::{self, Compilers};
 use crate::workspace::Workspace;
 
 /// One playbook's `--describe` entry: what the attribute said and the
@@ -37,6 +38,11 @@ pub struct Cargo {
     pub manifest: PathBuf,
     pub target_dir: PathBuf,
     pub bin: String,
+    /// The workspace cache, where the vendored musl headers are unpacked.
+    pub cache_dir: PathBuf,
+    /// What this machine can compile C with. Probed once: `PATH` does not
+    /// change under a running command, and every build consults it.
+    pub compilers: Compilers,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +96,8 @@ fn pick_bin<'a>(targets: impl Iterator<Item = &'a Target>, manifest: &Path) -> R
 }
 
 impl Cargo {
-    pub async fn load(manifest: &Path) -> Result<Cargo> {
+    pub async fn load(ws: &Workspace) -> Result<Cargo> {
+        let manifest = &ws.manifest();
         let out = tokio::process::Command::new("cargo")
             .args([
                 "metadata",
@@ -116,6 +123,8 @@ impl Cargo {
             manifest: manifest.to_path_buf(),
             target_dir: md.target_directory,
             bin,
+            cache_dir: ws.cache_dir(),
+            compilers: Compilers::probe(),
         })
     }
 
@@ -133,9 +142,17 @@ impl Cargo {
     /// `--features selected` (vision 9); `None` builds every playbook, as
     /// the editor does. `triples` empty means the host target, dev profile;
     /// otherwise `--profile dist` with one `--target` per triple.
+    ///
+    /// Every build in Rustible funnels through here, which is why the C
+    /// toolchain pre-flight lives here too: the TLS provider compiles C, and
+    /// a machine that cannot do it should be told which package to install
+    /// rather than shown `cc-rs`'s message about a musl gcc (see
+    /// [`crate::toolchain`]).
     pub async fn build(&self, selected: Option<&str>, triples: &[String]) -> Result<()> {
+        let env = toolchain::env_for_build(&self.compilers, triples, &self.cache_dir)?;
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.arg("build").arg("--manifest-path").arg(&self.manifest);
+        cmd.envs(&env);
         if let Some(name) = selected {
             cmd.args(["--features", "selected"])
                 .env("RUSTIBLE_PLAYBOOK", name);
@@ -150,7 +167,19 @@ impl Cargo {
         }
         let status = cmd.status().await.context("running cargo build")?;
         if !status.success() {
-            bail!("cargo build failed (exit {})", status.code().unwrap_or(-1));
+            // The pre-flight above refuses what it knows cannot work, so a
+            // failure here is usually an ordinary compile error. On a machine
+            // with no clang it may still be the C toolchain, and cc-rs's own
+            // wording names a program nobody should install, so the hint goes
+            // on the end where the user is already looking.
+            let hint = match toolchain::build_failure_hint(&self.compilers) {
+                Some(h) => format!("\n\n{h}"),
+                None => String::new(),
+            };
+            bail!(
+                "cargo build failed (exit {}){hint}",
+                status.code().unwrap_or(-1)
+            );
         }
         Ok(())
     }

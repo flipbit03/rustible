@@ -1,5 +1,12 @@
 # M7-tls: the TLS crypto provider moves to `rustls-graviola`
 
+> **Superseded.** Cadu reversed this decision on 2026-09-08 after
+> `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` measured what the pure-Rust rule was
+> buying: graviola's CPU floor broke `github::UserKeys` on a real host. The
+> provider is now `ring` and the pre-flight described below is deleted. See
+> `docs/plan/reports/M7-tls-ring.md`. Everything here is accurate about
+> graviola and is kept for the history.
+
 Branch `tls-graviola`. Implements Cadu's decision on
 `docs/plan/reports/TLS-OPTIONS.md`: **switch to `rustls-graviola`, with no
 fallback.** `rustls-rustcrypto` is gone from the tree.

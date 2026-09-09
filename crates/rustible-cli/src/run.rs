@@ -383,7 +383,7 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         .playbook_name(&args.playbook)
         .map_err(|e| usage(format!("{e:#}")))?;
     let cli = cli_vars(&args.vars)?;
-    let cargo = Cargo::load(&ws.manifest()).await?;
+    let cargo = Cargo::load(ws).await?;
 
     // 2. Metadata from the compiled playbook.
     let d = describe::describe_playbook(ws, &cargo, &name).await?;

@@ -5,7 +5,7 @@
 //! itself from a loopback listener started inside the container. That
 //! covers the op end to end (request, status handling, redirect, checksum,
 //! atomic write, attributes) over plain HTTP; TLS is exercised by the
-//! ignored unit test `http::tests::https_download_from_github_with_graviola_tls`.
+//! ignored unit test `http::tests::https_download_from_github_with_ring_tls`.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

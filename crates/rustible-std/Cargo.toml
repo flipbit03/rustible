@@ -15,10 +15,11 @@ rustible-sdk.workspace = true
 regex.workspace = true
 serde.workspace = true
 # http::Download, and the `tls` module both it and `rustible-github` use.
-# The direct `rustls` entry stays: `tls` names `rustls::crypto::CryptoProvider`.
+# The direct `rustls` entry stays: `tls` names `rustls::crypto::CryptoProvider`
+# and reaches the `ring` provider through rustls's own `ring` feature, so there
+# is no separate `ring` entry to keep in step with rustls's.
 ureq.workspace = true
 rustls.workspace = true
-rustls-graviola.workspace = true
 sha2.workspace = true
 # archive::Extracted
 tar.workspace = true

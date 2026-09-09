@@ -76,12 +76,11 @@
 //! [`KeysToUser`] adds one guard on top: in exclusive mode an empty list is
 //! refused rather than emptying `authorized_keys`.
 //!
-//! Pure Rust all the way down (vision 5.3): `ureq` over `rustls` with the
-//! `rustls-graviola` provider, taken from `rustible_std::tls` so this crate
-//! and `rustible_std::http` share one crypto path; no `ring`, no OpenSSL, no
-//! C. That provider requires a CPU from roughly 2015 onwards, and
-//! [`Https`] checks for it before every request rather than letting the
-//! handshake panic; see `rustible_std::tls` for what is excluded.
+//! `ureq` over `rustls` with the `ring` provider, taken from
+//! `rustible_std::tls` so this crate and `rustible_std::http` share one crypto
+//! path; no OpenSSL and no system certificate store. `ring` detects CPU
+//! features at runtime, so there is no hardware floor for a fetch; see
+//! `rustible_std::tls` for the build-time cost.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
