@@ -56,3 +56,12 @@ group "lab" {
     host "local" connection="local"
     host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
 }
+
+// `playbooks/vagrant.rs` targets a group named "vagrant", which is not here:
+// `dev/vagrant/Vagrantfile` writes it to `dev/vagrant/hosts.vagrant.kdl` on
+// `vagrant up`, naming the key path and address of that developer's machines.
+// That file is a complete inventory and is used instead of this one:
+//
+//     make vm-test
+//
+// which is `rustible --inventory dev/vagrant/hosts.vagrant.kdl ...`.
