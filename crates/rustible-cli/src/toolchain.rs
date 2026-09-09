@@ -161,8 +161,48 @@ fn env_for_build_with(
         match choose(compilers, triple) {
             Some(Chosen::Clang(path)) => {
                 env.insert(cc_var, path.clone().into_os_string());
-                // Only x86_64 needs libc headers; every other musl target
-                // takes ring's `-nostdlibinc` path under clang.
+                // x86_64 musl needs a real sysroot, because ring includes libc
+                // headers normally there. Every other musl target takes ring's
+                // `-nostdlibinc` path, which needs nothing on Linux, where
+                // clang's own `stddef.h` defines the types it declares.
+                //
+                // On macOS it needs one flag anyway. Apple patches that header
+                // with a branch upstream does not have:
+                //
+                //     #elif defined(__musl__)
+                //     // On musl systems, use the system header
+                //     #include_next <stddef.h>
+                //
+                // So Apple's clang delegates to the system header when the
+                // target is musl, and `-nostdlibinc` is exactly what removes
+                // the directories holding it: the delegation finds nothing and
+                // the build dies on `'stddef.h' file not found`, from inside
+                // the compiler's own header. musl ships a `stddef.h`, so
+                // pointing `-idirafter` at the vendored headers satisfies the
+                // `#include_next` and costs nothing where it is not needed,
+                // being searched last. Given on every platform so the Linux
+                // and macOS paths cannot drift apart.
+                let flags_var = format!("CFLAGS_{}", triple.replace('-', "_"));
+                if !triple.starts_with("x86_64-") {
+                    let prior = existing(&flags_var);
+                    let names_includes = prior.as_ref().is_some_and(|v| {
+                        let s = v.to_string_lossy();
+                        s.contains("-idirafter")
+                            || s.contains("--sysroot")
+                            || s.contains("-isysroot")
+                    });
+                    if !names_includes {
+                        let sysroot = unpack_x86_64_musl_headers(cache_dir)?;
+                        let mut flag = OsString::new();
+                        if let Some(prior) = prior {
+                            flag.push(prior);
+                            flag.push(" ");
+                        }
+                        flag.push("-idirafter ");
+                        flag.push(sysroot.join("include"));
+                        env.insert(flags_var, flag);
+                    }
+                }
                 if triple.starts_with("x86_64-") {
                     let flags_var = format!("CFLAGS_{}", triple.replace('-', "_"));
                     // cc-rs treats these as additive, so append rather than
@@ -475,9 +515,11 @@ mod tests {
         assert!(!env.contains_key("CFLAGS_x86_64_unknown_linux_musl"));
     }
 
-    /// With clang, every target is served, and only x86_64 gets a sysroot.
+    /// With clang, every target is served. Only x86_64 gets a sysroot;
+    /// the others get musl's headers as a last-resort include, for Apple's
+    /// clang (see `env_for_build`).
     #[test]
-    fn clang_serves_every_target_and_only_x86_64_gets_headers() {
+    fn clang_serves_every_target_and_only_x86_64_gets_a_sysroot() {
         let t = tempfile::tempdir().unwrap();
         let c = compilers(Some("/usr/bin/clang"), None);
         let env = env_for_build(
@@ -505,7 +547,19 @@ mod tests {
             flags.ends_with(&format!("{MUSL_VERSION}-x86_64")),
             "{flags}"
         );
-        assert!(!env.contains_key("CFLAGS_aarch64_unknown_linux_musl"));
+        // aarch64 takes ring's `-nostdlibinc` path, which needs no sysroot,
+        // but Apple's clang delegates `stddef.h` to the system header when the
+        // target is musl and that flag removes it, so musl's own headers are
+        // offered as a last-resort include on every platform.
+        let arm = env["CFLAGS_aarch64_unknown_linux_musl"]
+            .to_string_lossy()
+            .into_owned();
+        assert!(arm.starts_with("-idirafter "), "{arm}");
+        assert!(arm.ends_with("/include"), "{arm}");
+        assert!(
+            !arm.contains("--sysroot"),
+            "not a sysroot, only a fallback: {arm}"
+        );
     }
 
     /// Without clang the host's own compiler still serves the host's own
@@ -539,8 +593,21 @@ mod tests {
             e.contains("install clang") || e.contains("xcode-select"),
             "{e}"
         );
-        assert!(e.contains("/usr/bin/gcc"), "{e}");
+        // Never the thing cc-rs would have named, which is the point.
         assert!(!e.contains("linux-musl-gcc"), "{e}");
+        // What the message can offer instead depends on the platform, and the
+        // two halves must not drift apart: on Linux the host's own compiler
+        // serves the host's own musl triple, so the message names it; on macOS
+        // it cannot (`host_cc_serves`), so the message must not pretend it can.
+        if cfg!(target_os = "linux") {
+            assert!(e.contains("/usr/bin/gcc"), "{e}");
+        } else {
+            assert!(e.contains("no other usable compiler"), "{e}");
+            assert!(
+                !e.contains("/usr/bin/gcc"),
+                "offered a compiler that cannot serve: {e}"
+            );
+        }
     }
 
     /// A machine with nothing fails even a host-native build, and says so
@@ -588,8 +655,14 @@ mod tests {
             .init_warning()
             .unwrap();
         assert!(w.contains("clang"), "{w}");
-        assert!(w.contains(&host_musl_triple()), "{w}");
-        assert!(w.contains("will build"), "{w}");
+        // Same platform split as the build error: a gcc that can serve the
+        // host's own musl triple is worth naming, and one that cannot is not.
+        if cfg!(target_os = "linux") {
+            assert!(w.contains(&host_musl_triple()), "{w}");
+            assert!(w.contains("will build"), "{w}");
+        } else {
+            assert!(w.contains("No playbook will build"), "{w}");
+        }
         let w = compilers(None, None).init_warning().unwrap();
         assert!(w.contains("No playbook will build"), "{w}");
     }

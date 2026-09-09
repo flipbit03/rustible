@@ -627,13 +627,27 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
+    /// Probing the machine the tests run on. Split by platform because the
+    /// probe answers what the machine *is*: a Linux host is a target Rustible
+    /// builds for, and a mac is a controller that Rustible refuses to target
+    /// (vision 5.3: Linux musl only). Both halves are the product behaving
+    /// correctly, so both are asserted rather than one being skipped.
     #[tokio::test]
     async fn local_probe_and_exists() {
         let t = Transport::Local;
-        let p = t.probe().await.unwrap();
-        assert!(p.home.starts_with('/'));
-        assert!(p.triple.ends_with("-unknown-linux-musl"));
         assert!(t.exists("/bin/sh").await.unwrap());
         assert!(!t.exists("/definitely/not/here").await.unwrap());
+
+        let probed = t.probe().await;
+        if cfg!(target_os = "linux") {
+            let p = probed.unwrap();
+            assert!(p.home.starts_with('/'));
+            assert!(p.triple.ends_with("-unknown-linux-musl"));
+        } else {
+            // A mac can drive Rustible; it cannot be driven by it.
+            let e = probed.unwrap_err().to_string();
+            assert!(e.contains("unsupported target"), "{e}");
+            assert!(e.contains("Linux"), "{e}");
+        }
     }
 }

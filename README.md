@@ -53,9 +53,27 @@ readable runs, and throws out both of those problems.
 **Two things: rustup and clang.** Nothing else, and nothing at all on the
 machines you manage.
 
+Rustible runs from **Linux (x86_64, aarch64) and macOS (Apple silicon)**, and
+manages **Linux hosts** on either architecture, any libc. A Mac is a
+first-class controller: it cross-builds playbook binaries for both Linux
+targets using the clang that Xcode's command line tools already provide, so
+there is nothing to install there. A Mac cannot be a *target*, because the
+operations speak apt, systemd and `/etc/passwd`; Rustible refuses it by name
+rather than failing later.
+
 ```sh
 sudo apt install clang          # Debian/Ubuntu; dnf, pacman and apk all have it too
 ```
+
+To check a machine before you rely on it:
+
+```sh
+rustible toolchain check        # what this machine can build for, and how
+```
+
+Its `--print-env` prints the compiler settings a build is given, ready for
+`eval`, which is useful when a cross-build fails and you want to see what
+Rustible actually handed to cargo.
 
 macOS already has it: the command line tools ship clang, so `xcode-select
 --install` is the whole story there.
