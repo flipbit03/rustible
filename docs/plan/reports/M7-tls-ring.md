@@ -140,6 +140,60 @@ Install it and run this again:  sudo apt install clang   (or: dnf install clang,
 
 With `clang` on `PATH` the same command cross-builds and runs on the ARM VM.
 
+### The summary table, the exit code, and how early it fails
+
+Three things the lead asked about after running the branch.
+
+**The refusal no longer floods the summary table.** The whole two-paragraph
+message was going into one column of a table that is one line per host, which
+destroyed it. That path is the orchestrator-level host failure in the renderer,
+the same one a connect error takes, so a long connect chain flooded it too. The
+table now shows the first line of the reason, truncated to 96 characters with an
+ellipsis; the full text is unchanged above, as the `FAILED:` line, which is where
+it belongs:
+
+```
+[arm]  FAILED: no `clang` on PATH, and this playbook has to be built for aarch64-unknown-linux-musl. ...
+Install it and run this again:  sudo apt install clang   (or: dnf install clang, pacman -S clang, apk add clang)
+
+host   ok  changed  would change  skipped  failed  warnings
+arm   failed: no `clang` on PATH, and this playbook has to be built for aarch64-unknown-linux-musl. Rustible'...
+```
+
+Two tests pin it: `one_line_tests` on the helper, and
+`a_multi_line_reason_does_not_break_the_summary_table` end to end, which feeds
+the renderer a deliberately multi-line reason and asserts the table is the
+header plus exactly one row per host, that the row is elided, and that the
+second paragraph is not in it.
+
+**A pre-flight refusal exits 2**, the same as any other host failure, because it
+is reported through the same path. Measured, not read off the source:
+
+```sh
+$ rustible playbook run playbooks/cadu/mc.rs --limit arm --check   # PATH without clang
+$ echo $?
+2
+```
+
+**Nothing is uploaded and no playbook runs, but the hosts are connected first.**
+The honest answer to "does it refuse before connecting" is no, and it cannot:
+the target triple comes from probing the host over its transport, so the set of
+triples to build for does not exist until every host has been reached. What the
+ordering does guarantee is the part that matters for a fleet: connect and probe
+run in parallel, then **one** build is attempted for the whole set of triples, so
+thirty hosts produce one refusal rather than thirty, and the run ends before the
+upload phase. A verbose run shows exactly that, `connected` and then the
+refusal, with no upload line between them:
+
+```
+[arm]    connected: aarch64-unknown-linux-musl home /home/cadu in 1.42s
+[arm]  FAILED: no `clang` on PATH, and this playbook has to be built for ...
+```
+
+Refusing before the connect phase would need the triples declared in the
+inventory rather than discovered, which is a different design and not this
+branch's to make.
+
 ### When cc-rs still escapes
 
 The hint is appended to a failed `cargo build` **only when this machine has no
@@ -370,10 +424,73 @@ route; and section 7's "the fix is a preflight" is now written.
 
 ## Review
 
-A delegated review pass was started at effort `high` and had not returned by the
-time this was written; three pings went unanswered. What follows is my own pass
-over the whole diff. Three real problems were found and fixed, and one suspected
-breakage turned out not to exist.
+Two passes. My own ran first, because the delegated one had been pointed at the
+wrong worktree and its first sends did not reach me; it landed afterwards with
+seven findings. Both are recorded here.
+
+### The delegated pass: seven findings
+
+Five were fixed, one had already been closed, and one does not reproduce.
+
+**Closed before it arrived — the spike report was not in the branch.** Nine
+citations across eight tracked files, four of them in shipped rustdoc, pointed
+at `docs/plan/reports/C-TOOLCHAIN-SPIKE.md`, which existed only as an untracked
+file in the other worktree. The lead committed it as `a21da4c`. A genuine
+blocker: it is the whole evidentiary basis for reversing the no-C rule.
+
+**Fixed — a pre-existing `CFLAGS_<triple>` silently dropped the vendored
+sysroot.** cc-rs treats those flags as additive, so standing aside when the
+variable was already set meant an operator exporting `-O2` lost the headers and
+landed in exactly the cc-rs failure the module exists to prevent, with no hint
+printed because clang *was* installed. The sysroot is appended to whatever is
+there, unless the existing value already names `--sysroot`, `-isysroot` or
+`-nostdlibinc`, which is a deliberate override and still wins.
+
+**Fixed — the header unpack was not atomic.** Two runs in one workspace could
+have one `fs::write` truncate a header while the other's `cargo build` read it.
+The tree is now built in a scratch directory named after the process and
+`rename`d into place; the loser of a race finds the directory already there and
+uses it.
+
+**Fixed — the summary table was flooded**, covered above, since the lead
+reported it independently.
+
+**Fixed — the harness accepted a file it could not execute**, where its sibling
+`toolchain::is_executable` checks the executable bit and has a test for it.
+
+**Fixed — a stale comment** in `user_keys.rs` still described the deleted CPU
+pre-flight; the twin in `http.rs` had been updated and this one missed.
+
+**Does not reproduce — the harness on a clang-only x86_64 box.** The finding was
+that `host_c_compiler` can pick clang while `build_test_binary` sets no sysroot,
+which the toolchain module documents as the broken combination on x86_64, so
+every integration test would fail on a missing `<assert.h>`. Tried rather than
+reasoned about:
+
+```sh
+CC=clang RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_http_download
+# test result: ok. 1 passed
+```
+
+and a bare cross-build with clang as the only compiler named, in a scrubbed
+environment, also succeeds. The premise conflates two things: ring drops libc
+includes *only* for non-x86_64 musl, so on x86_64 clang uses whatever libc
+headers the machine has, and every real clang install brings some (Debian's
+`clang` depends on `libc6-dev`, Fedora's on `glibc-headers`; on Alpine the host
+headers are musl's own and exactly right). "x86_64 under clang needs real libc
+headers" is correct, and is why the CLI vendors them; it does not mean there are
+none to be had.
+
+What the finding does point at correctly is that the harness compiles
+musl-targeted code against glibc declarations. That is the compromise the spike
+measured in section 1.4 and called low-risk, ring reaching only `memcpy`,
+`memset`, `assert` and the types in `stdlib.h`. The comment in `testing.rs`
+called those headers "the right ones", which glossed over it; it now says what
+is true, why it is acceptable, and that the clang case was tested.
+
+### My own pass
+
+Three real problems, and one suspected breakage that turned out not to exist.
 
 **Fixed — the host-compiler fallback was wrong off Linux.** The rule was
 originally "the host's `cc` serves the host's own architecture", justified by the

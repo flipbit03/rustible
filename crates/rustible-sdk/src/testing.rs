@@ -487,10 +487,22 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
     // The TLS provider (`ring`) compiles C, and cc-rs will not use the host's
     // own compiler for a musl target unless it is named: without this it looks
     // for `<arch>-linux-musl-gcc` and stops, even on a box with a perfectly
-    // good gcc. The target is always this machine's own architecture, so the
-    // host compiler's headers are the right ones and no sysroot is needed;
-    // cross-architecture builds are the `rustible` CLI's job, and it carries
-    // musl headers for them. Anything already in the environment wins.
+    // good gcc.
+    //
+    // No sysroot is set, and none is needed. The target is always this
+    // machine's own architecture, so whatever libc headers the compiler
+    // defaults to are at least the right one, and ring reaches only `memcpy`,
+    // `memset`, `assert` and the types in `stdlib.h`. It is glibc declarations
+    // for musl-targeted code on a glibc box, which is the compromise
+    // `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` section 1.4 measured and called
+    // low-risk; the principled path, with vendored musl headers, is the
+    // `rustible` CLI's, because that is what ships a binary to a real host.
+    // Checked with clang as well as gcc: `CC=clang RUSTIBLE_INTEGRATION=1 cargo
+    // test -p rustible-std --test it_http_download` passes, because ring drops
+    // libc includes only for non-x86_64 musl and every real clang install
+    // brings libc headers with it.
+    //
+    // Anything already in the environment wins.
     let cc_var = format!("CC_{}", triple.replace('-', "_"));
     if std::env::var_os(&cc_var).is_none_or(|v| v.is_empty()) {
         cmd.env(&cc_var, host_c_compiler()?);
