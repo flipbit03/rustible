@@ -76,6 +76,49 @@ jobs:
       # generated build script and the playbook registry.
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
+  macos:
+    name: macOS controller
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A mac is a supported *controller*: it builds the CLI natively and
+      # cross-builds playbook binaries for the Linux musl targets. It is never
+      # a target (vision 5.3, Linux musl only), which is why the local probe
+      # refuses it. Xcode's command line tools ship the clang that ring needs,
+      # so nothing is installed here.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-cargo-
+
+      - run: clang --version
+
+      - run: cargo test --workspace
+
+      # The property that matters: a mac produces a Linux playbook binary,
+      # with Apple clang and the musl headers the CLI carries.
+      - name: Cross-build a playbook for both Linux targets
+        run: |
+          set -euo pipefail
+          cargo build --release -p rustible-cli
+          cd examples/workspace
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            RUSTIBLE_PLAYBOOK=hello cargo build --features selected \
+              --profile dist --target "$t"
+            file "target/$t/dist/workspace"
+          done
+
   harness:
     name: Container ops (Docker harness)
     runs-on: ubuntu-latest

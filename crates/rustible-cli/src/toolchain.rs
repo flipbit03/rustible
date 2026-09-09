@@ -539,8 +539,21 @@ mod tests {
             e.contains("install clang") || e.contains("xcode-select"),
             "{e}"
         );
-        assert!(e.contains("/usr/bin/gcc"), "{e}");
+        // Never the thing cc-rs would have named, which is the point.
         assert!(!e.contains("linux-musl-gcc"), "{e}");
+        // What the message can offer instead depends on the platform, and the
+        // two halves must not drift apart: on Linux the host's own compiler
+        // serves the host's own musl triple, so the message names it; on macOS
+        // it cannot (`host_cc_serves`), so the message must not pretend it can.
+        if cfg!(target_os = "linux") {
+            assert!(e.contains("/usr/bin/gcc"), "{e}");
+        } else {
+            assert!(e.contains("no other usable compiler"), "{e}");
+            assert!(
+                !e.contains("/usr/bin/gcc"),
+                "offered a compiler that cannot serve: {e}"
+            );
+        }
     }
 
     /// A machine with nothing fails even a host-native build, and says so
@@ -588,8 +601,14 @@ mod tests {
             .init_warning()
             .unwrap();
         assert!(w.contains("clang"), "{w}");
-        assert!(w.contains(&host_musl_triple()), "{w}");
-        assert!(w.contains("will build"), "{w}");
+        // Same platform split as the build error: a gcc that can serve the
+        // host's own musl triple is worth naming, and one that cannot is not.
+        if cfg!(target_os = "linux") {
+            assert!(w.contains(&host_musl_triple()), "{w}");
+            assert!(w.contains("will build"), "{w}");
+        } else {
+            assert!(w.contains("No playbook will build"), "{w}");
+        }
         let w = compilers(None, None).init_warning().unwrap();
         assert!(w.contains("No playbook will build"), "{w}");
     }
