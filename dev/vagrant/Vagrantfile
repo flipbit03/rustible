@@ -36,6 +36,53 @@
 
 require "rbconfig"
 
+# ---------------------------------------------------------------- fog's noise
+#
+# vagrant-libvirt 0.12.2 opens every connection with `libvirt_ip_command`
+# (driver.rb), and fog-libvirt 0.15.0 recognizes only `libvirt_username` and
+# `libvirt_password`, so fog-core warns `Unrecognized arguments:
+# libvirt_ip_command` on *every* vagrant command. It is a version skew between
+# two third-party gems, nothing here can stop it being passed, and it says
+# nothing a developer can act on -- vagrant-libvirt finds guest addresses
+# through libvirt's own DHCP leases regardless.
+#
+# So drop that one line and let every other fog warning through, rather than
+# silencing the channel: a fog warning we have not seen before is worth
+# reading.
+# fog-core is not loaded yet when this file is parsed -- vagrant-libvirt pulls
+# it in when it first connects -- so ask for it by name. It is on the plugin
+# gem path either way, and if that ever stops being true the warning comes
+# back rather than anything breaking.
+begin
+  require "fog/core"
+rescue LoadError
+  # No fog, no fog warnings to filter.
+end
+
+if defined?(Fog::Logger)
+  class FogChannelFilter
+    def initialize(io, silence)
+      @io = io
+      @silence = silence
+    end
+
+    # Fog::Logger.write asks the channel this to decide on colour codes.
+    def tty?
+      @io.tty?
+    end
+
+    def write(message)
+      return message.bytesize if @silence.match?(message)
+      @io.write(message)
+    end
+  end
+
+  Fog::Logger[:warning] = FogChannelFilter.new(
+    Fog::Logger[:warning] || $stderr,
+    /Unrecognized arguments: libvirt_ip_command/,
+  )
+end
+
 BOX          = "cloud-image/debian-12"
 VAGRANT_ROOT = File.expand_path(__dir__)
 FRAGMENT_DIR = File.join(VAGRANT_ROOT, ".vagrant", "rustible")
