@@ -11,6 +11,7 @@ mod describe;
 mod init;
 mod render;
 mod run;
+mod toolchain;
 mod transport;
 mod workspace;
 
@@ -239,7 +240,7 @@ async fn inventory(ws: Option<&Path>, cmd: InventoryCmd) -> Result<u8> {
 /// through one host-native build of the whole workspace and its
 /// `--check-vars` mode.
 async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result<u8> {
-    let cargo = Cargo::load(&ws.manifest()).await?;
+    let cargo = Cargo::load(ws).await?;
     cargo
         .build(None, &[])
         .await

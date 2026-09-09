@@ -483,7 +483,19 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
         "integration: building test target `{}` for {triple} (release)",
         spec.crate_name
     );
-    let out = Command::new(&cargo)
+    let mut cmd = Command::new(&cargo);
+    // The TLS provider (`ring`) compiles C, and cc-rs will not use the host's
+    // own compiler for a musl target unless it is named: without this it looks
+    // for `<arch>-linux-musl-gcc` and stops, even on a box with a perfectly
+    // good gcc. The target is always this machine's own architecture, so the
+    // host compiler's headers are the right ones and no sysroot is needed;
+    // cross-architecture builds are the `rustible` CLI's job, and it carries
+    // musl headers for them. Anything already in the environment wins.
+    let cc_var = format!("CC_{}", triple.replace('-', "_"));
+    if std::env::var_os(&cc_var).is_none_or(|v| v.is_empty()) {
+        cmd.env(&cc_var, host_c_compiler()?);
+    }
+    let out = cmd
         .args(["test", "--no-run", "--release", "--target", &triple])
         .arg("--manifest-path")
         .arg(&manifest)
@@ -522,6 +534,28 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
         t0.elapsed().as_secs_f64()
     );
     Ok(path)
+}
+
+/// This machine's C compiler: `CC`, else `cc`, else `gcc`, else `clang`.
+/// Named for the musl build of the test binary, which needs one because the
+/// TLS provider compiles C.
+fn host_c_compiler() -> std::result::Result<PathBuf, String> {
+    if let Some(cc) = std::env::var_os("CC").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(cc));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    ["cc", "gcc", "clang"]
+        .iter()
+        .find_map(|name| {
+            dirs.iter()
+                .map(|d| d.join(name))
+                .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+        })
+        .ok_or_else(|| {
+            "no C compiler on PATH (`cc`, `gcc` or `clang`). The integration harness              cross-compiles this test binary for musl, and Rustible's TLS provider (ring)              compiles C, so one is needed here; install clang (`sudo apt install clang`) or              set CC."
+                .to_string()
+        })
 }
 
 /// Find the `executable` of the `compiler-artifact` message for the test

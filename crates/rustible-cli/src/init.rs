@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::toolchain::Compilers;
 use crate::workspace::normalize;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -166,6 +167,14 @@ pub fn run(args: InitArgs) -> Result<()> {
     }
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
+
+    // A warning, not a failure: `init` compiles nothing, and a user who has
+    // just created a workspace would rather hear about a missing compiler now
+    // than at their first `playbook run` (vision 5.3, and
+    // `docs/plan/reports/C-TOOLCHAIN-SPIKE.md`).
+    if let Some(w) = Compilers::probe().init_warning() {
+        eprintln!("\n{w}");
+    }
 
     eprintln!(
         "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    rustible playbook run playbooks/hello.rs",
