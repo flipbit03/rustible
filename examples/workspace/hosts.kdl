@@ -56,3 +56,15 @@ group "lab" {
     host "local" connection="local"
     host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
 }
+
+// The machines `dev/vagrant/Vagrantfile` brings up, for
+// `playbooks/vagrant.rs`. `vagrant up` writes the real block, with this
+// checkout's key path and the address the provider handed out, to
+// `dev/vagrant/hosts.vagrant.kdl`; paste it in here, replacing this comment.
+// It is not committed because both of those name one developer's disk.
+//
+// group "vagrant" escalate="sudo" {
+//     host "vagrant-x86" addr="192.168.121.116" ssh_user="vagrant" port=22 {
+//         ssh_args "-i" "/path/to/rustible/dev/vagrant/.vagrant/machines/x86/libvirt/private_key" "-o" "IdentitiesOnly=yes" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null"
+//     }
+// }

@@ -1,0 +1,231 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Development machines for working on Rustible. Nothing here is needed to
+# *use* Rustible: a user needs rustup and clang and nothing else, and a
+# managed host needs nothing at all. This file exists so that a contributor
+# has a Linux machine to drive that is not somebody's personal VM.
+#
+#   cd dev/vagrant
+#   vagrant up                 # the machine matching this host's architecture
+#   vagrant up arm             # the aarch64 machine (see "What costs what")
+#
+# `vagrant up` writes dev/vagrant/hosts.vagrant.kdl, a ready inventory whose
+# `group "vagrant"` block is what examples/workspace/playbooks/vagrant.rs
+# targets. Copy that block into the hosts.kdl of the workspace you are
+# working in.
+#
+# What costs what
+# ---------------
+# A guest whose architecture matches the host, on a host with hardware
+# virtualisation, is accelerated and boots in seconds. Everything else is
+# qemu's TCG interpreter. Measured (see docs/plan/reports/VAGRANT-SPIKE.md):
+#
+#   x86_64 guest, x86_64 host, KVM or HVF ............ seconds
+#   x86_64 guest, x86_64 host, no /dev/kvm (TCG) ..... ~70 s to boot, usable
+#   aarch64 guest, Apple silicon host, HVF ........... ~20 s to boot, usable
+#   cross-architecture, any host (TCG) ............... minutes, see the report
+#
+# This file refuses nothing, but it says which of those you are about to get
+# before it starts, so a slow boot is a number you were told rather than a
+# mysterious hang.
+
+require "rbconfig"
+
+BOX          = "cloud-image/debian-12"
+VAGRANT_ROOT = File.expand_path(__dir__)
+FRAGMENT_DIR = File.join(VAGRANT_ROOT, ".vagrant", "rustible")
+INVENTORY    = File.join(VAGRANT_ROOT, "hosts.vagrant.kdl")
+
+# ---------------------------------------------------------------- host facts
+
+HOST_OS = case RbConfig::CONFIG["host_os"]
+          when /darwin/i then :macos
+          when /linux/i  then :linux
+          else                :other
+          end
+
+# Ruby reports Apple silicon as "arm64" and Linux as "aarch64"; normalise to
+# the names the Vagrant box registry uses.
+HOST_ARCH = case RbConfig::CONFIG["host_cpu"]
+            when /x86_64|amd64/i    then "amd64"
+            when /aarch64|arm64/i    then "arm64"
+            else RbConfig::CONFIG["host_cpu"]
+            end
+
+# Hardware virtualisation, asked of the machine rather than assumed.
+HOST_ACCEL =
+  case HOST_OS
+  when :linux then File.exist?("/dev/kvm") && File.readable?("/dev/kvm")
+  when :macos then `sysctl -n kern.hv_support 2>/dev/null`.strip == "1"
+  else             false
+  end
+
+# One provider per host platform. There is no single provider that works well
+# on both: vagrant-libvirt is Linux-only, and vagrant-qemu is the only free
+# provider that reaches Hypervisor.framework on Apple silicon.
+PROVIDER = HOST_OS == :macos ? :qemu : :libvirt
+
+# vagrant-qemu consumes boxes published in the *libvirt* format (both are
+# bare qcow2), so the box provider is "libvirt" on both platforms and only
+# the architecture varies.
+BOX_PROVIDER = "libvirt"
+
+MACHINES = {
+  "x86" => { arch: "amd64", qemu_arch: "x86_64",  libvirt_arch: "x86_64"  },
+  "arm" => { arch: "arm64", qemu_arch: "aarch64", libvirt_arch: "aarch64" },
+}.freeze
+
+# The machine whose architecture matches this host is the one `vagrant up`
+# with no argument brings up. The other is opt-in, because it is emulated.
+NATIVE = MACHINES.find { |_, m| m[:arch] == HOST_ARCH }&.first
+
+# --------------------------------------------------------------- diagnostics
+
+def accelerated?(machine)
+  HOST_ACCEL && MACHINES[machine][:arch] == HOST_ARCH
+end
+
+def speed_note(machine)
+  guest = MACHINES[machine][:arch]
+  if accelerated?(machine)
+    "accelerated (#{HOST_OS == :macos ? 'Hypervisor.framework' : 'KVM'}); expect a boot in seconds"
+  elsif guest == HOST_ARCH
+    "EMULATED: this host has no hardware virtualisation (#{HOST_OS == :linux ? 'no /dev/kvm' : 'kern.hv_support is 0'}), " \
+    "so qemu interprets every instruction. Boot takes about 70 s and the machine is then usable but slow"
+  else
+    "EMULATED ACROSS ARCHITECTURES: a #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
+    "supports. Boot takes many minutes. Use it to check that something works on #{guest}, not to work on it"
+  end
+end
+
+# ------------------------------------------------------- inventory generation
+#
+# Each machine drops a KDL fragment naming exactly what `vagrant ssh-config`
+# would have said, and the fragments are concatenated into one inventory. Per
+# machine rather than one shared file, so bringing up `arm` cannot lose the
+# entry `x86` wrote, and `vagrant destroy arm` takes only its own line away.
+
+def kdl_escape(str)
+  str.to_s.gsub("\\", "\\\\\\\\").gsub('"', '\\"')
+end
+
+def write_fragment(name, ssh)
+  require "fileutils"
+  FileUtils.mkdir_p(FRAGMENT_DIR)
+  key = Array(ssh[:private_key_path]).first
+  args = ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+  quoted = args.compact.map { |a| %("#{kdl_escape(a)}") }.join(" ")
+  # Built by hand rather than with a squiggly heredoc, which strips the
+  # leading indentation that makes the fragment sit inside the group block.
+  lines = [
+    %(    host "vagrant-#{name}" addr="#{kdl_escape(ssh[:host])}" ssh_user="#{kdl_escape(ssh[:username])}" port=#{ssh[:port]} {),
+    %(        ssh_args #{quoted}),
+    "    }",
+  ]
+  File.write(File.join(FRAGMENT_DIR, "#{name}.kdl"), lines.join("\n") + "\n")
+end
+
+def regenerate_inventory
+  fragments = Dir.glob(File.join(FRAGMENT_DIR, "*.kdl")).sort
+  if fragments.empty?
+    File.delete(INVENTORY) if File.exist?(INVENTORY)
+    return nil
+  end
+  body = fragments.map { |f| File.read(f) }.join
+  File.write(INVENTORY, <<~KDL)
+    // Generated by dev/vagrant/Vagrantfile on `vagrant up`. Do not edit: it is
+    // rewritten on every up, halt and destroy, and it is not tracked in git.
+    //
+    // Copy the `group "vagrant"` block below into the hosts.kdl of the
+    // workspace you are working in, then:
+    //
+    //     rustible --workspace examples/workspace playbook run playbooks/vagrant.rs
+
+    group "vagrant" escalate="sudo" {
+    #{body.chomp}
+    }
+  KDL
+  INVENTORY
+end
+
+# ------------------------------------------------------------------ the machines
+
+Vagrant.configure("2") do |config|
+  config.vm.box = BOX
+  config.vm.box_check_update = false
+
+  # Rustible ships a static binary over SSH and reads nothing from the host
+  # filesystem, so a shared folder buys nothing and costs an NFS or rsync
+  # dependency that the two providers do not solve the same way. Off on both,
+  # so the machines behave identically.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  MACHINES.each do |name, spec|
+    config.vm.define(name, autostart: name == NATIVE, primary: name == NATIVE) do |node|
+      node.vm.box_architecture = spec[:arch]
+      node.vm.hostname = "rustible-#{name}"
+
+      node.trigger.before :up do |t|
+        t.info = "machine '#{name}': #{spec[:arch]} guest on an #{HOST_ARCH} #{HOST_OS} host, #{PROVIDER} provider\n" \
+                 "  #{speed_note(name)}"
+      end
+
+      node.trigger.after :up do |t|
+        t.ruby do |_env, machine|
+          write_fragment(name, machine.ssh_info)
+          path = regenerate_inventory
+          puts "==> #{name}: inventory written to #{path}"
+        end
+      end
+
+      # A machine that is down must not be left in the inventory claiming to
+      # be reachable; a run against it would fail at connect with a confusing
+      # error rather than an obviously missing host.
+      [:destroy, :halt].each do |action|
+        node.trigger.after action do |t|
+          t.ruby do |_env, _machine|
+            frag = File.join(FRAGMENT_DIR, "#{name}.kdl")
+            File.delete(frag) if File.exist?(frag)
+            regenerate_inventory
+          end
+        end
+      end
+
+      node.vm.provider :libvirt do |lv|
+        # "kvm" is vagrant-libvirt's default and fails outright without
+        # /dev/kvm. Asking the machine means an unaccelerated host gets a slow
+        # boot instead of a refusal.
+        lv.driver = HOST_ACCEL && spec[:arch] == HOST_ARCH ? "kvm" : "qemu"
+        lv.cpus = 4
+        lv.memory = 2048
+        if spec[:libvirt_arch] != "x86_64"
+          # An aarch64 guest is not a PC: it needs the "virt" board, a CPU
+          # model TCG can produce, and UEFI, because there is no BIOS for it.
+          lv.machine_arch = spec[:libvirt_arch]
+          lv.machine_type = "virt"
+          lv.cpu_mode = "custom"
+          lv.cpu_model = "cortex-a57"
+          lv.loader = "/usr/share/AAVMF/AAVMF_CODE.fd"
+        end
+      end
+
+      node.vm.provider :qemu do |q|
+        q.arch = spec[:qemu_arch]
+        q.smp = 4
+        q.memory = "2048"
+        if accelerated?(name)
+          q.machine = "virt,accel=hvf,highmem=on"
+          q.cpu = "host"
+        elsif spec[:qemu_arch] == "aarch64"
+          q.machine = "virt,accel=tcg,highmem=on"
+          q.cpu = "cortex-a72"
+        else
+          q.machine = "q35,accel=tcg"
+          q.cpu = "qemu64"
+        end
+        q.net_device = "virtio-net-pci"
+      end
+    end
+  end
+end
