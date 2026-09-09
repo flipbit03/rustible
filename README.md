@@ -71,6 +71,10 @@ To check a machine before you rely on it:
 rustible toolchain check        # what this machine can build for, and how
 ```
 
+Its `--print-env` prints the compiler settings a build is given, ready for
+`eval`, which is useful when a cross-build fails and you want to see what
+Rustible actually handed to cargo.
+
 macOS already has it: the command line tools ship clang, so `xcode-select
 --install` is the whole story there.
 

@@ -20,8 +20,9 @@ pub struct CheckArgs {
     /// targets, which is every host Rustible can manage.
     #[arg(long = "target")]
     pub targets: Vec<String>,
-    /// Print the compiler environment as `KEY=VALUE` lines instead of a
-    /// report, for feeding to a build.
+    /// Print the compiler environment as `export KEY='value'` lines instead
+    /// of a report, ready for `eval`. Values contain spaces, so they are
+    /// quoted; do not split this output on whitespace.
     #[arg(long)]
     pub print_env: bool,
 }
@@ -62,8 +63,15 @@ pub fn run(ws: Option<&std::path::Path>, args: CheckArgs) -> Result<u8> {
     let env = env_for_build(&compilers, &targets, &cache_dir)?;
 
     if args.print_env {
+        // Shell-quoted and `export`-prefixed, so `eval "$(rustible toolchain
+        // check --print-env)"` is the whole recipe. A value like
+        // `-idirafter /path` has a space in it, and splitting that on
+        // whitespace produces an argument a shell then tries to execute.
         for (k, v) in &env {
-            println!("{k}={}", v.to_string_lossy());
+            println!(
+                "export {k}='{}'",
+                v.to_string_lossy().replace('\'', r"'\''")
+            );
         }
         return Ok(0);
     }

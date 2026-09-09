@@ -120,9 +120,9 @@ jobs:
           "$RUSTIBLE" toolchain check
           cd examples/workspace
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            env $("$RUSTIBLE" toolchain check --target "$t" --print-env | xargs) \
+            ( eval "$("$RUSTIBLE" toolchain check --target "$t" --print-env)"
               RUSTIBLE_PLAYBOOK=hello \
-              cargo build --features selected --profile dist --target "$t"
+                cargo build --features selected --profile dist --target "$t" )
             file "target/$t/dist/workspace"
           done
 
