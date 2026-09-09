@@ -378,6 +378,14 @@ that touches `.github/`, the branch was pushed over
 `git@github.com:flipbit03/rustible.git` rather than through the `gh` OAuth
 token, which has no `workflow` scope.
 
+`release.yml` cross-builds the CLI for both musl targets and looked like it
+would break, so I checked: **`rustible-cli` links no TLS at all.** It depends on
+`rustible-sdk` and `rustible-build`, not on `rustible-std`, so `ring` is not in
+its graph and the release build compiles no C. Verified by building it for both
+musl targets in a scrubbed environment with no `CC_*` set and no clang on
+`PATH`; both succeed. The release job needs no change, and its comment about
+pure Rust is still true of the binary it produces.
+
 ---
 
 ## Verification
