@@ -59,7 +59,8 @@ struct Cli {
     workspace: Option<PathBuf>,
     /// Inventory file, overriding the workspace's `inventory` setting. For
     /// running against machines that are not in the committed inventory, such
-    /// as the Vagrant guests `dev/vagrant` brings up.
+    /// as the Vagrant guests `dev/vagrant` brings up. A relative path is
+    /// relative to the current directory, not to `--workspace`.
     #[arg(long, global = true, value_name = "FILE")]
     inventory: Option<PathBuf>,
     #[command(subcommand)]

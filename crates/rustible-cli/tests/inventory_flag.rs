@@ -91,6 +91,41 @@ fn the_subcommands_own_file_flag_wins_over_the_global_one() {
     assert!(stdout(&out).contains("10.0.0.1"), "{}", stdout(&out));
 }
 
+/// A relative `--inventory` resolves against the current directory, not
+/// against `--workspace`. That agrees with `inventory show --file` and with
+/// how a playbook path is resolved: a path you typed means the path you typed.
+#[test]
+fn a_relative_path_is_relative_to_the_cwd_not_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let cwd = tmp.path().join("elsewhere");
+    fs::create_dir_all(ws.join("playbooks")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(ws.join("rustible.toml"), "").unwrap();
+    fs::write(ws.join("hosts.kdl"), "host \"inws\" addr=\"10.0.0.1\"\n").unwrap();
+    // Only in the cwd, deliberately not in the workspace.
+    fs::write(
+        cwd.join("other.kdl"),
+        "host \"outside\" addr=\"10.0.0.9\"\n",
+    )
+    .unwrap();
+
+    let out = rustible(
+        &cwd,
+        &[
+            "--workspace",
+            ws.to_str().unwrap(),
+            "--inventory",
+            "other.kdl",
+            "inventory",
+            "show",
+            "outside",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("10.0.0.9"), "{}", stdout(&out));
+}
+
 #[test]
 fn a_missing_inventory_file_is_reported_by_name() {
     let tmp = tempfile::tempdir().unwrap();
