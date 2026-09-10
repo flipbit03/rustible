@@ -139,8 +139,19 @@ are 2,000 and 2,600 lines, so read them for a specific question rather than
 for orientation.
 
 A new op is a module in `crates/rustible-std/src/`, declared with `pub mod
-<name>;` in that crate's `lib.rs`. A playbook reaches it as
-`rustible_std::<name>`.
+<name>;` in that crate's `lib.rs` — a file for a small op, a directory with a
+`mod.rs` for a family like `file` or `ssh`. That declaration is the only
+wiring: **ops are not re-exported through the `rustible` prelude**, which
+carries `Ctx`, `Result` and the macros and no operations at all. A playbook
+names the op's module itself, `use rustible_std::{apt, file};`, so nothing
+else has to be told the op exists.
+
+Two obligations beyond the code. Add a `docs/plan/DECISIONS.md` entry with its
+`Reverse:` clause for any decision a reader would otherwise have to
+reconstruct — the shape you rejected, a refusal you chose, a tool you drive
+and why. Adding an op that follows the existing pattern needs no entry. And if
+the vision doc does not cover the op, say so in the pull request and propose
+the amendment; do not edit `docs/01_VISION.md` yourself.
 
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
@@ -220,19 +231,57 @@ Every op in `rustible-std` does this; none has a separate unit-test file.
 ```rust
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rustible_sdk::backend::Fake;
+    use rustible_sdk::event::Collect;
+
     use super::*;
+
+    /// Every op's test module has this: a `System` over a `Fake`.
+    fn sys(fake: &Arc<Fake>) -> System {
+        System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
     // ---- pure ----
+
     #[test]
-    fn plan_appends_to_an_empty_file() { /* strings in, strings out */ }
+    fn plan_appends_to_an_empty_file() {
+        // Strings in, strings out. No Fake, no System.
+    }
+
     // ---- Fake ----
+
     #[test]
     fn change_then_apply_writes_exactly_what_the_plan_said() {
+        // `.with_file`, `.with_dir`, `.with_cmd(program, args, status, stdout)`
+        // build the box the op will see.
         let fake = Arc::new(Fake::new().with_file("/etc/thing", "before\n"));
-        // .with_cmd(program, args, status, stdout) plants a tool's answer;
-        // fake.content(path), fake.argvs() and fake.commands() read back.
+        let s = sys(&fake);
+        let op = Present::new("thing", "after");
+
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        // Assert the rendered diff verbatim: it is what a user reads.
+        assert_eq!(c.diff.render(), "thing:\n  /etc/thing: before -> after\n");
+
+        // `apply` takes the change `check` produced.
+        op.apply(&s, c).unwrap();
+
+        // Read the box back: `.content(path)`, `.argvs()`, `.commands()`.
+        assert_eq!(fake.content("/etc/thing").unwrap(), "after\n");
+
+        // And the op is now satisfied, which is idempotence at tier 2.
+        assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
     }
 }
 ```
+
+`Plan` is `Satisfied` or `Change`; a refusal is an `Err`, asserted on its
+message. `System::fake(fake.clone(), Arc::new(Collect::default()))` is the
+whole wiring, and `.with_check_mode(true)` on it gives you the dry `System`
+that check-mode tests need.
 
 **Tier 3 is one file per op** at `crates/rustible-std/tests/it_<op>.rs`. The
 name must use underscores: it is both the cargo `--test` target and the crate
@@ -240,12 +289,33 @@ name the harness reads at compile time. Each new file is another musl build,
 so prefer adding cases to one file over adding files.
 
 ```rust
+//! Docker integration test for `thing::Present` (vision 8, tier 3).
+
+use rustible::prelude::*;                        // Ctx, Result, ensure!, bail!
+use rustible::sdk::testing::changed_then_ok;
+use rustible_std::thing;
+
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn present_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
+    ctx.sys().mkdir_all("/etc/thing.d")?;        // everything through `sys`
+
     changed_then_ok(ctx, "the step name", || thing::Present::new("x"))?;
+    assert_eq!(ctx.sys().read_to_string("/etc/thing.d/x")?, "x\n");
+
+    // A refusal is asserted on its message, not its kind.
+    let err = ctx
+        .step("refuses without the directory", thing::Present::new("y"))
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("does not exist"), "{err}");
     Ok(())
 }
 ```
+
+Those three `use` lines are the whole preamble: `Ctx` and `Result` come from
+`rustible::prelude`, the helper from `rustible::sdk::testing`, and the op from
+`rustible_std`. The body runs *inside* the container, so `ctx.sys()` is a real
+system.
 
 - `images = [...]` runs stock images as-is. **`systemd_images = [...]`** boots
   the image with systemd as pid 1 first, and is what the systemd ops use; at
