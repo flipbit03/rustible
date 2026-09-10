@@ -255,8 +255,17 @@ def evict_foreign_box_volume(name, arch)
   volumes.each do |vol|
     puts "==> box volume #{vol} holds #{held || 'an unrecorded architecture'}; " \
          "removing it so the #{arch} disk is uploaded"
-    system("virsh", "-c", "qemu:///system", "vol-delete", vol, "--pool", "default",
-           out: File::NULL, err: File::NULL)
+    # A failed delete must not reach the stamp below. Writing it anyway would
+    # record an architecture the pool does not hold, and the next `up` would
+    # trust the stamp, skip the eviction, and boot the wrong disk -- which is
+    # precisely the silent failure this whole function exists to prevent.
+    next if system("virsh", "-c", "qemu:///system", "vol-delete", vol,
+                   "--pool", "default", out: File::NULL, err: File::NULL)
+
+    raise "could not delete box volume #{vol} from libvirt's default pool.\n" \
+          "Something is still using it. Check with:\n" \
+          "    virsh -c qemu:///system vol-list default\n" \
+          "    virsh -c qemu:///system list --all"
   end
 
   File.write(BOX_ARCH_STAMP, arch)
