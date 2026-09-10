@@ -104,16 +104,7 @@ rustible init infra && cd infra
 
 Treat it as an early preview rather than a stable release. The version is
 deliberately small: the public API is not frozen, and `0.1.0` is where that
-changes. Every milestone in the build plan is merged and `main` is green.
-
-To run against the repository instead of the registry — which you want if you
-are changing Rustible itself:
-
-```sh
-git clone git@github.com:flipbit03/rustible && cd rustible
-cargo install --path crates/rustible-cli
-rustible init --path-deps /path/to/rustible /path/to/workspace
-```
+changes.
 
 `docs/plan/PROGRESS.md` tracks what is built; the design is complete and
 vetted in `docs/01_VISION.md`.
@@ -309,8 +300,7 @@ Every change goes through a pull request, and eight CI jobs must be green.
 
 `docs/01_VISION.md` is the contract: architecture, the playbook model, the
 `System` handle, testing tiers, inventory and vars, check mode, error model.
-`docs/plan/DECISIONS.md` records every decision made while building, each with
-how to reverse it.
+`docs/plan/DECISIONS.md` records every decision made while building.
 
 ## License
 

@@ -8,7 +8,8 @@ nothing installed: no Python, no agent, no runtime.
 
 Read this file first, then `docs/01_VISION.md` for whatever you are about to
 touch. This file says how to work here; the vision doc says what the thing is
-and why.
+and why. `docs/DEVELOPING.md` is the third: how to set up the machines the
+tests need, per platform. Read it when a test tier needs one, not before.
 
 ## The contract
 
@@ -108,6 +109,15 @@ the code is malformed and the other says it is wrong, and a single red tick
 covering both is ambiguous. "Tier 4" and "the harness" are this repository's
 words for its own machinery; a job title that uses them tells a reader nothing
 about what broke or where it ran.
+
+To work against your checkout rather than the published crates — which is what
+you want when changing Rustible itself — build the CLI from the tree and point
+a workspace at it by path:
+
+```sh
+cargo install --path crates/rustible-cli
+rustible init --path-deps /path/to/rustible /path/to/workspace
+```
 
 Before pushing, run what CI runs:
 
