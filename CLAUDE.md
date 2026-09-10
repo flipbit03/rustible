@@ -173,9 +173,9 @@ cannot, and each costs more to run than the tier below it.
 | 3. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
 | 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | a minute, needs vagrant |
 
-The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`
-and two `jrei/systemd-*` images; the machine tier is one playbook on each of
-two architectures.
+The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
+`jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
+one playbook on each of two architectures.
 
 **All four tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
@@ -249,8 +249,12 @@ fn present_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 
 - `images = [...]` runs stock images as-is. **`systemd_images = [...]`** boots
   the image with systemd as pid 1 first, and is what the systemd ops use; at
-  least one of the two lists is required, and only the `jrei/systemd-*` family
-  is known to work.
+  least one of the two lists is required. The two that work are
+  `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`:
+
+  ```rust
+  #[rustible::integration_test(systemd_images = ["jrei/systemd-debian:12"])]
+  ```
 - `changed_then_ok(ctx, name, || op)` takes a **closure that rebuilds the op**,
   applies it twice, and requires `changed` then `ok`. It is the assertion the
   tier exists for.
