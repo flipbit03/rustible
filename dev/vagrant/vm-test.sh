@@ -62,9 +62,15 @@ assert_no_change() {
             printf "%s: %s\n", $1, substr($0, index($0, "failed:")) > "/dev/stderr"
             next
         }
+        # Columns: host ok changed would-change skipped failed warnings.
+        # `skipped` is deliberately not checked: ctx.skip() is legitimate
+        # playbook logic, not a failure. `would-change` is only ever nonzero
+        # under --check, which this script does not pass, but it is asserted
+        # anyway so that adding a --check pass later cannot pass vacuously.
         in_table && NF >= 7 {
             seen++
             if ($3 != 0) { printf "%s: %s changed on the second run\n", $1, $3 > "/dev/stderr"; bad = 1 }
+            if ($4 != 0) { printf "%s: %s would still change\n", $1, $4 > "/dev/stderr"; bad = 1 }
             if ($6 != 0) { printf "%s: %s failed\n", $1, $6 > "/dev/stderr"; bad = 1 }
         }
         END {
