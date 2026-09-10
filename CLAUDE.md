@@ -278,10 +278,18 @@ mod tests {
 }
 ```
 
-`Plan` is `Satisfied` or `Change`; a refusal is an `Err`, asserted on its
-message. `System::fake(fake.clone(), Arc::new(Collect::default()))` is the
-whole wiring, and `.with_check_mode(true)` on it gives you the dry `System`
-that check-mode tests need.
+`Plan` is `Satisfied` or `Change`; a refusal is an `Err`. Assert it on the
+message and not the kind, with the same `.chain()` the container tests use:
+
+```rust
+let err = op.check(&s).unwrap_err().chain();
+assert!(err.contains("no such group `wheel`"), "{err}");
+```
+
+`System::fake(fake.clone(), Arc::new(Collect::default()))` is the whole
+wiring. `with_check_mode(true)` is a consuming builder on it —
+`System::fake(..).with_check_mode(true)` — and gives you the dry `System` a
+check-mode test needs.
 
 **Tier 3 is one file per op** at `crates/rustible-std/tests/it_<op>.rs`. The
 name must use underscores: it is both the cargo `--test` target and the crate
