@@ -14,7 +14,7 @@ env:
 
 jobs:
   check:
-    name: Format, clippy, test
+    name: Test - unit & fake, lint, docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +48,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: Minimum supported Rust version
+    name: Build - MSRV 1.88
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   example-workspace:
-    name: Example workspace builds
+    name: Build - example workspace
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +77,7 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: macOS controller
+    name: Build - macOS controller
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +127,7 @@ jobs:
           done
 
   harness:
-    name: Container ops (Docker harness)
+    name: Test - Docker - Debian, Ubuntu, Alpine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,12 +165,13 @@ jobs:
   # qemu, which is what makes it the slowest job here and also the only
   # automated check that an operation behaves the same on another architecture.
   machine:
-    # The distribution is in the job name because this tier is
-    # distribution-specific in a way the container tier is not: one guest is
-    # one distro, where a single container job covers five images. `distro` is
-    # matrix data rather than a word in the name so that adding a second
-    # distribution cannot leave a job claiming to test something it does not.
-    name: Machine tier (${{ matrix.distro }}, ${{ matrix.arch }})
+    # Job names say the mechanism first, then what it ran against, because a
+    # reader of a CI run has none of this file's context: `Test - VM - Debian
+    # 12 - aarch64` says where it ran and on what, where "machine tier" said
+    # nothing. `distro` and `arch` are matrix data rather than words in the
+    # name, so adding a distribution cannot leave a job claiming to test
+    # something it does not.
+    name: Test - VM - ${{ matrix.distro }} - ${{ matrix.arch }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

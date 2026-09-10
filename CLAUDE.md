@@ -88,15 +88,22 @@ a public API, check that workspace too.
 Every change goes through a branch and a pull request, even a one-line doc
 fix. CI runs seven jobs on each, and all seven must be green:
 
+A job is named for the **mechanism** it runs the code with, then what it ran
+against, because the people reading a CI run do not have this file open:
+
 | job | what it protects |
 |---|---|
-| Format, clippy, test | the gate: `fmt`, `clippy -D warnings`, the suite, rustdoc |
-| Minimum supported Rust version | the floor stays **1.88** |
-| Example workspace builds | `examples/workspace`, which the cargo workspace never compiles |
-| macOS controller | the suite on macOS, and a cross-build for both Linux targets |
-| Container ops (Docker harness) | tier 3, the container runs |
-| Machine tier (Debian 12, x86_64) | tier 4 on a KVM-accelerated guest |
-| Machine tier (Debian 12, aarch64) | tier 4 on an emulated guest |
+| `Test - unit & fake, lint, docs` | tiers 1 and 2, and the lint gate |
+| `Build - MSRV 1.88` | the floor stays 1.88 |
+| `Build - example workspace` | `examples/workspace`, which the cargo workspace never compiles |
+| `Build - macOS controller` | the suite on macOS, and a cross-build for both Linux targets |
+| `Test - Docker - Debian, Ubuntu, Alpine` | tier 3 |
+| `Test - VM - Debian 12 - x86_64` | tier 4, on a KVM-accelerated guest |
+| `Test - VM - Debian 12 - aarch64` | tier 4, on an emulated guest |
+
+Keep that shape when adding a job. "Tier 4" and "the harness" are this
+repository's words for its own machinery; a job title that uses them tells a
+reader nothing about what broke or where it ran.
 
 Before pushing, run what CI runs:
 
@@ -378,10 +385,10 @@ Each of these has already produced a test that could not fail.
 
 `dev/vagrant/` holds two Debian 12 guests, `x86` and `arm`, from one
 multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS. The
-CI jobs name their distribution — `Machine tier (Debian 12, x86_64)` — because
+CI jobs name their distribution — `Test - VM - Debian 12 - x86_64` — because
 this tier is distribution-specific where the container tier is not: one guest
 is one distro. A second distribution means a second pair of jobs, and the
-name is matrix data so it cannot go stale.
+distro is matrix data so the name cannot go stale.
 `docs/DEVELOPING.md` is the per-platform setup. The loop:
 
 ```sh
