@@ -94,7 +94,7 @@ fix. CI runs seven jobs on each, and all seven must be green:
 | Minimum supported Rust version | the floor stays **1.88** |
 | Example workspace builds | `examples/workspace`, which the cargo workspace never compiles |
 | macOS controller | the suite on macOS, and a cross-build for both Linux targets |
-| Container ops (Docker harness) | tier 3, the 27 container runs |
+| Container ops (Docker harness) | tier 3, the container runs |
 | Machine tier (x86) | tier 4 on a KVM-accelerated guest |
 | Machine tier (arm) | tier 4 on an emulated aarch64 guest |
 
@@ -124,9 +124,23 @@ without documentation does not compile.
 
 ## Writing an operation
 
-The shape matters more than the code. Read `crates/rustible-std/src/systemd.rs`
-and `crates/rustible-std/src/user.rs` before writing a new one; they are the
-reference for voice and structure.
+The shape matters more than the code, and there is already a checklist for it:
+**`docs/06_BUILD_PLAN.md` section 4** lists what an op ships, from the builder
+to the harness test. Read that first.
+
+Then read one existing op end to end. **Start with
+`crates/rustible-std/src/sysctl.rs`** — at ~630 lines it is the smallest
+complete example, and it has every part: pure planning functions over file
+text, a `check` that composes a `Diff`, an `apply`, and a test module split
+into `// ---- pure ----` and `// ---- Fake ----`.
+`crates/rustible-std/src/ssh/authorized_keys.rs` is the model for anything
+that belongs to a user; `systemd.rs` and `user.rs` are the deepest but they
+are 2,000 and 2,600 lines, so read them for a specific question rather than
+for orientation.
+
+A new op is a module in `crates/rustible-std/src/`, declared with `pub mod
+<name>;` in that crate's `lib.rs`. A playbook reaches it as
+`rustible_std::<name>`.
 
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
@@ -159,9 +173,9 @@ cannot, and each costs more to run than the tier below it.
 | 3. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
 | 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | a minute, needs vagrant |
 
-Today that is 579 tests in tiers 1 and 2, **27 container runs** across
-`debian:12`, `ubuntu:24.04`, `alpine:3.20` and two `jrei/systemd-*` images,
-and one playbook on each of two architectures.
+The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`
+and two `jrei/systemd-*` images; the machine tier is one playbook on each of
+two architectures.
 
 **All four tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
@@ -194,6 +208,89 @@ while the thing is broken.
 
 If a new op needs nothing from tier 4, it does not need a tier-4 test. Say so
 in the pull request rather than adding a step to the playbook for symmetry.
+
+### Where tests go, and how to write them
+
+Choosing the tier is the judgement; this is the mechanism.
+
+**Tiers 1 and 2 live in the op's own file**, in a `#[cfg(test)] mod tests` at
+the bottom, split by a `// ---- pure ----` and a `// ---- Fake ----` banner.
+Every op in `rustible-std` does this; none has a separate unit-test file.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // ---- pure ----
+    #[test]
+    fn plan_appends_to_an_empty_file() { /* strings in, strings out */ }
+    // ---- Fake ----
+    #[test]
+    fn change_then_apply_writes_exactly_what_the_plan_said() {
+        let fake = Arc::new(Fake::new().with_file("/etc/thing", "before\n"));
+        // .with_cmd(program, args, status, stdout) plants a tool's answer;
+        // fake.content(path), fake.argvs() and fake.commands() read back.
+    }
+}
+```
+
+**Tier 3 is one file per op** at `crates/rustible-std/tests/it_<op>.rs`. The
+name must use underscores: it is both the cargo `--test` target and the crate
+name the harness reads at compile time. Each new file is another musl build,
+so prefer adding cases to one file over adding files.
+
+```rust
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn present_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
+    changed_then_ok(ctx, "the step name", || thing::Present::new("x"))?;
+    Ok(())
+}
+```
+
+- `images = [...]` runs stock images as-is. **`systemd_images = [...]`** boots
+  the image with systemd as pid 1 first, and is what the systemd ops use; at
+  least one of the two lists is required, and only the `jrei/systemd-*` family
+  is known to work.
+- `changed_then_ok(ctx, name, || op)` takes a **closure that rebuilds the op**,
+  applies it twice, and requires `changed` then `ok`. It is the assertion the
+  tier exists for.
+- Assert refusals on the message, not the error kind:
+  `.unwrap_err().chain()` and `assert!(err.contains(...))`.
+- `RUSTIBLE_INTEGRATION_IMAGES=debian:12` narrows a run while iterating; there
+  is a 600-second timeout per body.
+
+**Tier 4 is a step in `examples/workspace/playbooks/vagrant.rs`**, the one
+playbook `make vm-test` runs. There is no separate test file: the assertion is
+that the step is in that playbook and the second run reports `ok`.
+
+### Traps that make a test pass while proving nothing
+
+Each of these has already produced a test that could not fail.
+
+- **`Applied.predicted` is only ever true in check mode.** Asserting on a
+  prediction inside a tier-3 body is vacuous, because harness bodies run with
+  check mode off. A review found exactly this in a merged Alpine test. To test
+  a prediction, build a second dry `Ctx` over the same machine — see
+  `crates/rustible-std/tests/it_user_busybox.rs`.
+- **The `Fake` models files well and commands badly.** `spawn` returns the
+  *first* canned entry matching the program, and `with_cmd` consumes `self`,
+  so there is no way to make a command answer differently on a second call. An
+  op that reads its state with a command therefore cannot express
+  changed-then-ok at tier 2 at all. `sysctl.rs` works around it by mutating
+  the fake *filesystem* between the two checks. If you hit this, it is a
+  design signal: reading state through a file that `sys` can serve is more
+  testable than shelling out for it.
+- **`Fake::argvs()` drops stdin.** An op that pipes a payload into a tool must
+  assert with `fake.commands()` and read `CmdSpec.stdin`, or the test silently
+  ignores the entire payload.
+- **The harness images are minimal.** They are not "a Debian box": stock
+  `debian:12` has no `/etc/sysctl.d`, and several common tools are absent. If
+  the tool your op drives is not in the image, tier 3 cannot test the op
+  without first installing it — which is a test of `apt::Present` wearing your
+  op's clothes, and a reason to reach for tier 4 instead.
+- **The backend forces `LANG=C` and `LC_ALL=C`** on every command, which is
+  why parsers here do not defend against localised output. Do not add
+  defences the environment makes unnecessary, and do not rely on a locale.
 
 ### The machine tier
 
