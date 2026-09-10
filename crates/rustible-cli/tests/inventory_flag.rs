@@ -103,6 +103,37 @@ fn a_missing_inventory_file_is_reported_by_name() {
     assert!(stderr(&out).contains("nope.kdl"), "{}", stderr(&out));
 }
 
+/// Every subcommand that does not resolve hosts refuses the flag rather than
+/// accepting and ignoring it. `--inventory` is global so clap offers it
+/// everywhere; a flag that silently does nothing is how a run against the
+/// wrong machines gets reported as a success.
+#[test]
+fn subcommands_that_read_no_inventory_refuse_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    workspace(tmp.path());
+    for cmd in [
+        vec!["playbook", "list"],
+        vec!["playbook", "create", "playbooks/x.rs"],
+        vec!["toolchain", "check"],
+    ] {
+        let mut args = vec!["--inventory", "other.kdl"];
+        args.extend_from_slice(&cmd);
+        let out = rustible(tmp.path(), &args);
+        let label = cmd.join(" ");
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "`{label}` should have refused --inventory: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("--inventory"),
+            "`{label}`: {}",
+            stderr(&out)
+        );
+    }
+}
+
 #[test]
 fn init_refuses_the_flag_rather_than_ignoring_it() {
     let tmp = tempfile::tempdir().unwrap();

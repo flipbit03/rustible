@@ -95,24 +95,28 @@ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 ## Status
 
-Under active construction and **not released yet**. The crates on crates.io
-are `0.0.1` placeholders holding the names, so `cargo install rustible-cli`
-does not give you a working tool today. Build from this repository instead:
+Under active construction, and **`v0.0.2` is on crates.io and works**:
 
 ```sh
-git clone https://github.com/flipbit03/rustible && cd rustible
-cargo install --path crates/rustible-cli    # the `rustible` command
+cargo install rustible-cli      # the `rustible` command
+rustible init infra && cd infra
 ```
 
-A workspace built from a clone points at it:
+Treat it as an early preview rather than a stable release. The version is
+deliberately small: the public API is not frozen, and `0.1.0` is where that
+changes. Every milestone in the build plan is merged and `main` is green.
+
+To run against the repository instead of the registry — which you want if you
+are changing Rustible itself:
 
 ```sh
-rustible init --path-deps /path/to/rustible
+git clone git@github.com:flipbit03/rustible && cd rustible
+cargo install --path crates/rustible-cli
+rustible init --path-deps /path/to/rustible /path/to/workspace
 ```
 
-When 0.1.0 ships, `cargo install rustible-cli` and a plain `rustible init` are
-the whole install. `docs/plan/PROGRESS.md` tracks what is built; the design is
-complete and vetted in `docs/01_VISION.md`.
+`docs/plan/PROGRESS.md` tracks what is built; the design is complete and
+vetted in `docs/01_VISION.md`.
 
 ## Five minutes
 
@@ -276,6 +280,30 @@ The playbook binary never opens a socket. SSH is the orchestrator's business.
 | `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]` |
 | `rustible-build` | playbook discovery for the generated `build.rs` |
 | `rustible-github` | the example collection |
+
+## Developing
+
+`CLAUDE.md` is how to work in this repository — the rules, the layout, how to
+write an operation, and which of the four testing tiers a given test belongs
+in. `docs/DEVELOPING.md` is the per-platform setup for the ones that need a
+machine.
+
+```sh
+make                # fmt, clippy, unit and fake tests, rustdoc, example workspace
+make integration    # operations against real distributions, in Docker
+make vm-up          # a Debian guest matching this host's architecture
+make vm-test        # a playbook against that guest, twice; the second run must change nothing
+```
+
+Tests are in four tiers, each seeing something the one below it cannot: pure
+functions, ops against a `Fake` backend, ops against real distributions in
+containers, and a playbook against a real virtual machine over SSH. The last
+one exists because a container shares the host kernel and has no pid 1, so it
+cannot honestly test a `/proc/sys` write, a real init system, a real `sudo`,
+or the transport itself. All four run in CI, the machine tier on both
+x86_64 and aarch64.
+
+Every change goes through a pull request, and eight CI jobs must be green.
 
 ## Design
 
