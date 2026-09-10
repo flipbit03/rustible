@@ -86,7 +86,7 @@ a public API, check that workspace too.
 ## How to work
 
 Every change goes through a branch and a pull request, even a one-line doc
-fix. CI runs five jobs on each, and all five must be green:
+fix. CI runs seven jobs on each, and all seven must be green:
 
 | job | what it protects |
 |---|---|
@@ -95,6 +95,8 @@ fix. CI runs five jobs on each, and all five must be green:
 | Example workspace builds | `examples/workspace`, which the cargo workspace never compiles |
 | macOS controller | the suite on macOS, and a cross-build for both Linux targets |
 | Container ops (Docker harness) | tier 3, the 27 container runs |
+| Machine tier (x86) | tier 4 on a KVM-accelerated guest |
+| Machine tier (arm) | tier 4 on an emulated aarch64 guest |
 
 Before pushing, run what CI runs:
 
@@ -114,8 +116,8 @@ cargo build --manifest-path examples/workspace/Cargo.toml
 RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
 ```
 
-`make vm-test` is the one tier CI does not run. It is not part of this list
-and it is not optional when an op needs it; see "The machine tier".
+`make vm-test` is absent from that list only because it needs vagrant and a
+minute of your time. CI runs it on both architectures; see "The machine tier".
 
 `#![deny(missing_docs)]` is on in every library crate, so a new public item
 without documentation does not compile.
@@ -154,15 +156,18 @@ cannot, and each costs more to run than the tier below it.
 |---|---|---|---|
 | 1. pure | functions with no I/O | `cargo test` | free |
 | 2. fake | ops against the `Fake` backend | `cargo test` | free |
-| 3. container | ops against real distributions | `make integration`, **and CI** | seconds, needs docker |
-| 4. machine | a playbook against a real VM over SSH | `make vm-test`, **not CI** | a minute, needs vagrant |
+| 3. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
+| 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | a minute, needs vagrant |
 
 Today that is 579 tests in tiers 1 and 2, **27 container runs** across
 `debian:12`, `ubuntu:24.04`, `alpine:3.20` and two `jrei/systemd-*` images,
 and one playbook on each of two architectures.
 
-**Tiers 1–3 run in CI. Tier 4 does not** — see "The machine tier" below for
-why, and for what it is nonetheless expected to catch before you merge.
+**All four tiers run in CI**, the machine tier on both architectures.
+GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
+accelerated and the aarch64 one is interpreted by qemu. Run tier 4 locally
+anyway while writing an op: iterating against a machine you already have up
+beats waiting on a runner.
 
 ### Choosing a tier
 
@@ -238,9 +243,10 @@ Three things that will bite you:
   state tying a libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`;
   remove that first and the domain keeps running with nothing able to stop it.
   `make vm-orphans` finds them and prints the `virsh` commands.
-- **It is not in CI, and it is still expected of a new operation that needs
-  it.** Nothing enforces this. Say in the pull request which architecture you
-  ran it on, or say why the op needs nothing tier 4 provides.
+- **CI always starts from a destroyed machine; your laptop does not.** A
+  local `make vm-test` may be running against a guest that converged an hour
+  ago, which only exercises the satisfied path. `make vm-destroy` first, or
+  undo the change inside the guest, before trusting a local green.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.

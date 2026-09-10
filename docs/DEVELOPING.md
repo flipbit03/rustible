@@ -12,7 +12,8 @@ make vm-test        # the machine tier: needs vagrant
 
 ## The three tiers, and when the machine tier is required
 
-1. **Pure functions.** Parsers and planners. Always run.
+1. **Pure functions** and the **`Fake` backend**. Parsers, planners, and an
+   op's own behaviour. `cargo test`, always.
 2. **Containers** (`make integration`). Real distributions, real package
    managers, real `useradd`. They caught that `useradd` refuses to create a
    private group when one already carries the name, and that `chown` clears
@@ -22,14 +23,16 @@ make vm-test        # the machine tier: needs vagrant
    shares the host kernel, so `sysctl` writes are refused or leak to the host,
    and it has no pid 1 to ask about a unit.
 
-Tiers 1 and 2 run in CI. **Tier 3 does not**, and it is optional day to day.
+(`CLAUDE.md` counts four, splitting pure functions from the `Fake` backend,
+because choosing between those two matters when you are writing a test. Here
+they install the same way — they need nothing — so they are one line.)
 
-**Writing a new operation is where it stops being optional.** An operation is
-not proven by a fake that returns what the operation asked for. Bring up a
-machine, run the operation against it, run it again and watch it report `ok`,
-and say in the pull request which architecture you did that on. It is slower
-than you would like. It is also the only tier that has ever found the bugs
-that mattered.
+**All three run in CI**, the machine tier on both architectures. So why run it
+locally at all? Two reasons. Iterating against a machine you already have up
+is far faster than waiting for a runner. And a real machine in front of you is
+the only way to find out what an operation *should* do before you have written
+the assertion — which is the tier's actual value, and not something a green
+tick provides.
 
 ## What it costs
 
@@ -66,23 +69,47 @@ copy-on-write overlay that starts near zero and grows with what you install.
 
 The libvirt provider. On Debian or Ubuntu:
 
+Vagrant itself is **not in Ubuntu's archive** any more — the distribution
+dropped it after HashiCorp's licence change — so it comes from HashiCorp's own
+repository:
+
+```sh
+wget -qO- https://apt.releases.hashicorp.com/gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update
+sudo apt-get install -y vagrant
+```
+
+Then libvirt, qemu and the firmware, which *are* in the archive:
+
 ```sh
 sudo apt-get install -y \
-    vagrant vagrant-libvirt \
     libvirt-daemon-system libvirt-clients \
     qemu-system-x86 qemu-system-arm qemu-utils \
-    qemu-efi-aarch64 ovmf
-sudo usermod -aG libvirt "$USER"
+    qemu-efi-aarch64 ovmf dnsmasq-base \
+    ruby-dev libvirt-dev gcc make pkg-config
+vagrant plugin install vagrant-libvirt
+sudo usermod -aG libvirt,kvm "$USER"
 newgrp libvirt        # or log out and back in
 ```
 
+- **`vagrant-libvirt` is a Vagrant plugin, not an apt package.** `apt-get
+  install vagrant-libvirt` finds nothing. The `ruby-dev libvirt-dev gcc make
+  pkg-config` line is what lets the plugin build its native extension.
 - `qemu-system-arm` and `qemu-efi-aarch64` are what make the aarch64 machine
-  possible; without them `make vm-up-arm` fails at `up`.
+  possible; without them `make vm-up-arm` fails at `up`, naming the firmware.
+- `dnsmasq-base` is what libvirt's NAT network needs. Without it `vagrant up`
+  dies on `Unable to find 'dnsmasq' binary in $PATH`.
 - `libvirt-clients` provides `virsh`, which the Vagrantfile calls (see
-  "Switching architectures" below).
+  "On Linux it is one architecture at a time" below).
 - `newgrp libvirt` matters: the group is granted but not active in a shell
   that was already open, and `vagrant up` fails to connect to libvirt with a
   permission error that does not mention groups.
+
+This is the same sequence CI runs, so the documented path is the tested path.
 
 Check it:
 
@@ -175,6 +202,12 @@ rustible --workspace examples/workspace \
 nothing changed. That second run is the test. A first run that reports
 `changed` proves only that the operation did something; an operation that
 rewrites a correct file every time also reports `changed`.
+
+One difference from CI worth knowing: CI always starts from a freshly created
+machine, and your checkout does not. A local run against a guest that
+converged an hour ago exercises only the satisfied path and passes without
+proving anything. `make vm-destroy` first, or undo the change inside the guest,
+before you trust a local green.
 
 ## Troubleshooting
 
