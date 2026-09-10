@@ -165,7 +165,12 @@ jobs:
   # qemu, which is what makes it the slowest job here and also the only
   # automated check that an operation behaves the same on another architecture.
   machine:
-    name: Machine tier (${{ matrix.machine }})
+    # The distribution is in the job name because this tier is
+    # distribution-specific in a way the container tier is not: one guest is
+    # one distro, where a single container job covers five images. `distro` is
+    # matrix data rather than a word in the name so that adding a second
+    # distribution cannot leave a job claiming to test something it does not.
+    name: Machine tier (${{ matrix.distro }}, ${{ matrix.arch }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -173,9 +178,13 @@ jobs:
       matrix:
         include:
           - machine: x86
+            distro: Debian 12
+            arch: x86_64
             target: x86_64-unknown-linux-musl
             qemu: qemu-system-x86
           - machine: arm
+            distro: Debian 12
+            arch: aarch64
             target: aarch64-unknown-linux-musl
             # qemu-system-x86 as well: libvirt asks the host's own emulator for
             # the hypervisor version before it will do anything at all.

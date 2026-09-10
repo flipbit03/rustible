@@ -95,8 +95,8 @@ fix. CI runs seven jobs on each, and all seven must be green:
 | Example workspace builds | `examples/workspace`, which the cargo workspace never compiles |
 | macOS controller | the suite on macOS, and a cross-build for both Linux targets |
 | Container ops (Docker harness) | tier 3, the container runs |
-| Machine tier (x86) | tier 4 on a KVM-accelerated guest |
-| Machine tier (arm) | tier 4 on an emulated aarch64 guest |
+| Machine tier (Debian 12, x86_64) | tier 4 on a KVM-accelerated guest |
+| Machine tier (Debian 12, aarch64) | tier 4 on an emulated guest |
 
 Before pushing, run what CI runs:
 
@@ -377,7 +377,11 @@ Each of these has already produced a test that could not fail.
 ### The machine tier
 
 `dev/vagrant/` holds two Debian 12 guests, `x86` and `arm`, from one
-multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS.
+multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS. The
+CI jobs name their distribution — `Machine tier (Debian 12, x86_64)` — because
+this tier is distribution-specific where the container tier is not: one guest
+is one distro. A second distribution means a second pair of jobs, and the
+name is matrix data so it cannot go stale.
 `docs/DEVELOPING.md` is the per-platform setup. The loop:
 
 ```sh

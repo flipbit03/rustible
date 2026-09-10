@@ -989,8 +989,17 @@ Networking and anything async are also off `System` for now.
    each container. A typical test applies an op twice: first run `changed`,
    second run `ok`, and the system looks right. Static binaries drop into any
    image with no setup.
-4. **VMs (Vagrant or similar)** only for what Docker does badly: systemd units,
-   kernel modules, reboots. Deferred until such ops exist.
+4. **VMs (Vagrant)** for what Docker does badly, because a container shares the
+   host kernel and has no pid 1: writes to `/proc/sys`, a real init system, a
+   real `sudo`, and the SSH transport itself. `dev/vagrant/` holds a Debian 12
+   guest per architecture, x86_64 and aarch64, driven by vagrant-libvirt on
+   Linux and vagrant-qemu on macOS. `make vm-test` converges
+   `examples/workspace/playbooks/vagrant.rs` against whichever are up and
+   fails unless a second run reports nothing changed. CI runs both
+   architectures: GitHub's Linux runners expose `/dev/kvm`, so the x86_64
+   guest is accelerated and the aarch64 one is interpreted by qemu. This tier
+   is distribution-specific in a way tier 3 is not — one guest is one distro —
+   so a CI job names the distribution it covers.
 
 ## 9. Project layout and ecosystem
 
