@@ -92,7 +92,13 @@ vm-ssh:
 # dev/vagrant/.vagrant/, so removing that directory first orphans the domain:
 # it keeps running, holds its disk, and `vagrant destroy` can no longer see it.
 vm-orphans:
-	@doms=$$(virsh -c qemu:///system list --all --name 2>/dev/null | grep '^vagrant_' || true); \
+	@command -v virsh >/dev/null 2>&1 || { \
+		echo "virsh not found: this check is for the libvirt provider on Linux."; \
+		echo "The qemu provider (macOS) keeps each machine's disk in .vagrant/,"; \
+		echo "so there is no shared daemon to leave a domain behind in."; \
+		exit 0; \
+	}; \
+	doms=$$(virsh -c qemu:///system list --all --name 2>/dev/null | grep '^vagrant_' || true); \
 	known=$$(ls $(VAGRANT_DIR)/.vagrant/machines 2>/dev/null | sed 's/^/vagrant_/' || true); \
 	orphans=""; \
 	for d in $$doms; do \

@@ -283,8 +283,21 @@ jobs:
             virsh -c qemu:///system pool-autostart default
             virsh -c qemu:///system pool-start default
           fi
+          # `|| true` because starting an already-started network is an
+          # error, and both of these are idempotent in intent rather than in
+          # exit status. That hides a genuine failure, so assert the end state
+          # instead: without an active NAT network `vagrant up` fails much
+          # later, with an error about an IP address rather than a network.
           virsh -c qemu:///system net-start default || true
           virsh -c qemu:///system net-autostart default || true
+          virsh -c qemu:///system net-list --all
+          virsh -c qemu:///system net-info default | grep -q '^Active: *yes' \
+            || { echo "libvirt's default network is not active" >&2; exit 1; }
+
+          # Same reasoning one level down: the pool has to be usable, not just
+          # defined, or the box upload fails on a volume it cannot create.
+          virsh -c qemu:///system pool-info default | grep -q '^State: *running' \
+            || { echo "libvirt's default storage pool is not running" >&2; exit 1; }
 
       - name: Bring the machine up
         run: |
