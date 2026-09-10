@@ -181,7 +181,13 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
 - Everything the operation does to the machine goes through `sys`, including
-  reads, so the `Fake` is meaningful.
+  reads, so the `Fake` is meaningful. **`clippy.toml` enforces this**: an op
+  reaching for `std::fs` or `std::process::Command` fails the lint job, with
+  the `sys` method to use instead in the message. The crates that legitimately
+  own real I/O — `rustible-sdk`, which implements the `Local` backend,
+  `rustible-cli`, which runs on the operator's own machine, and build scripts
+  and CLI test harnesses — opt out at the crate level with a reason. Op crates
+  do not, and are already clean.
 
 ## Testing tiers
 

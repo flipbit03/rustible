@@ -4,6 +4,11 @@
 //! Vagrant guests, whose addresses and key paths belong to one developer's
 //! disk and are therefore not committed.
 
+// These drive the built `rustible` binary and lay out fixture workspaces on
+// the test machine. Vision 7.2's `sys` rule governs operations running on a
+// target, not a harness exercising the CLI; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};

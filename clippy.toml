@@ -1,0 +1,36 @@
+# Vision 7.2: "all file reads, writes, and process spawns go through `sys`,
+# reads included, otherwise the fake is one nobody hits." That rule is what the
+# whole `Fake` tier rests on, and until now it was enforced by review alone.
+#
+# This is a lint, not a wall. The crates that legitimately touch the real
+# filesystem -- `rustible-sdk`, which implements the `Local` backend the rest
+# of the world goes through, `rustible-cli`, which manages workspaces on the
+# operator's own machine, and `rustible-build`, a build-script helper -- opt
+# out at the crate level with a reason. The op crates do not, so an operation
+# reaching for `std::fs` or spawning a process itself fails the lint job.
+
+disallowed-types = [
+  { path = "std::fs::File", reason = "operations reach the filesystem through `sys`, so the Fake backend sees it (vision 7.2)" },
+  { path = "std::process::Command", reason = "operations spawn through `sys.cmd(..)`, so the Fake backend can canned-respond (vision 7.2)" },
+]
+
+disallowed-methods = [
+  { path = "std::fs::read", reason = "use `sys.read(..)` (vision 7.2)" },
+  { path = "std::fs::read_to_string", reason = "use `sys.read_to_string(..)` (vision 7.2)" },
+  { path = "std::fs::write", reason = "use `sys.write_atomic(..)` (vision 7.2)" },
+  { path = "std::fs::copy", reason = "use `sys` (vision 7.2)" },
+  { path = "std::fs::rename", reason = "use `sys` (vision 7.2)" },
+  { path = "std::fs::remove_file", reason = "use `sys.remove(..)` (vision 7.2)" },
+  { path = "std::fs::remove_dir", reason = "use `sys.remove(..)` (vision 7.2)" },
+  { path = "std::fs::remove_dir_all", reason = "use `sys.remove(..)` (vision 7.2)" },
+  { path = "std::fs::create_dir", reason = "use `sys.mkdir_all(..)` (vision 7.2)" },
+  { path = "std::fs::create_dir_all", reason = "use `sys.mkdir_all(..)` (vision 7.2)" },
+  { path = "std::fs::metadata", reason = "use `sys.stat(..)` (vision 7.2)" },
+  { path = "std::fs::symlink_metadata", reason = "use `sys.stat(..)` (vision 7.2)" },
+  { path = "std::fs::set_permissions", reason = "use `sys.set_mode(..)` (vision 7.2)" },
+  { path = "std::fs::read_dir", reason = "use `sys` (vision 7.2)" },
+  { path = "std::fs::read_link", reason = "use `sys` (vision 7.2)" },
+  { path = "std::fs::hard_link", reason = "use `sys` (vision 7.2)" },
+  { path = "std::fs::canonicalize", reason = "use `sys` (vision 7.2)" },
+  { path = "std::os::unix::fs::symlink", reason = "use `sys` (vision 7.2)" },
+]

@@ -3,6 +3,11 @@
 //! `examples/workspace`; after a version bump, `rustible init --refresh
 //! examples/workspace` brings the example's shims back in line.
 
+// These drive the built `rustible` binary and lay out fixture workspaces on
+// the test machine. Vision 7.2's `sys` rule governs operations running on a
+// target, not a harness exercising the CLI; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

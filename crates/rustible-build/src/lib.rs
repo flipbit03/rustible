@@ -13,6 +13,10 @@
 //! the variable is refused, so a stray export never narrows an IDE or CI build.
 
 #![deny(missing_docs)]
+// A build-script helper: it scans a workspace's `playbooks/` directory at
+// build time, on the operator's machine. Vision 7.2's `sys` rule is about
+// operations running on a target; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fmt;
 use std::path::{Path, PathBuf};

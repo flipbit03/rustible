@@ -6,6 +6,10 @@
 //! Exit codes: 0 ok; 1 the inventory, the vars, or a build is wrong; 2 a
 //! host failed; 3 the command line was wrong.
 
+// See the note in this crate's lib.rs: the CLI runs on the operator's own
+// machine, so vision 7.2's `sys` rule does not apply to it.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod create;
 mod describe;
 mod init;
