@@ -13,8 +13,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: Test - unit & fake, lint, docs
+  # Lint and tests are separate jobs because they answer different questions:
+  # one says the code is malformed, the other says it is wrong. A single job
+  # reporting both under one name makes a red tick ambiguous.
+  lint:
+    name: "Lint: fmt, clippy, docs"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,14 +34,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-check-cargo-
+          key: ci-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-lint-cargo-
 
       - run: cargo fmt --all --check
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - run: cargo test --workspace
 
       # `--lib` keeps the `rustible` facade crate's docs from colliding with
       # the `rustible` binary of rustible-cli in the output directory.
@@ -47,8 +48,30 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Tiers 1 and 2: pure functions and ops against the `Fake` backend.
+  check:
+    name: "Test: unit & fake"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-check-cargo-
+
+      - run: cargo test --workspace
+
   msrv:
-    name: Build - MSRV 1.88
+    name: "Build: MSRV 1.88"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +86,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   example-workspace:
-    name: Build - example workspace
+    name: "Build: example workspace"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +100,7 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: Build - macOS controller
+    name: "Build: macOS controller"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +150,7 @@ jobs:
           done
 
   harness:
-    name: Test - Docker - Debian, Ubuntu, Alpine
+    name: "Test: Docker (Debian/Ubuntu/Alpine)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -166,12 +189,12 @@ jobs:
   # automated check that an operation behaves the same on another architecture.
   machine:
     # Job names say the mechanism first, then what it ran against, because a
-    # reader of a CI run has none of this file's context: `Test - VM - Debian
-    # 12 - aarch64` says where it ran and on what, where "machine tier" said
+    # reader of a CI run has none of this file's context: `Test: VM (Debian
+    # 12/aarch64)` says where it ran and on what, where "machine tier" said
     # nothing. `distro` and `arch` are matrix data rather than words in the
     # name, so adding a distribution cannot leave a job claiming to test
     # something it does not.
-    name: Test - VM - ${{ matrix.distro }} - ${{ matrix.arch }}
+    name: "Test: VM (${{ matrix.distro }}/${{ matrix.arch }})"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
