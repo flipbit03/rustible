@@ -91,6 +91,14 @@ vm-ssh:
 # machines were destroyed. Vagrant tracks a domain through
 # dev/vagrant/.vagrant/, so removing that directory first orphans the domain:
 # it keeps running, holds its disk, and `vagrant destroy` can no longer see it.
+#
+# "Known" means the provider's `id` file exists, not that the directory does:
+# `vagrant destroy` leaves the machine directory behind and removes only `id`,
+# so keying on the directory would report a genuinely stranded domain as known.
+#
+# Domain names are not unique across checkouts -- two clones both call it
+# `vagrant_x86` -- so a second checkout's live machine shows up here. That is
+# why this prints commands instead of running them.
 vm-orphans:
 	@command -v virsh >/dev/null 2>&1 || { \
 		echo "virsh not found: this check is for the libvirt provider on Linux."; \
@@ -99,7 +107,10 @@ vm-orphans:
 		exit 0; \
 	}; \
 	doms=$$(virsh -c qemu:///system list --all --name 2>/dev/null | grep '^vagrant_' || true); \
-	known=$$(ls $(VAGRANT_DIR)/.vagrant/machines 2>/dev/null | sed 's/^/vagrant_/' || true); \
+	known=$$(for d in $(VAGRANT_DIR)/.vagrant/machines/*/; do \
+		m=$$(basename "$$d"); \
+		for p in "$$d"*/id; do [ -f "$$p" ] && echo "vagrant_$$m"; done; \
+	done 2>/dev/null | sort -u); \
 	orphans=""; \
 	for d in $$doms; do \
 		echo "$$known" | grep -qx "$$d" || orphans="$$orphans $$d"; \

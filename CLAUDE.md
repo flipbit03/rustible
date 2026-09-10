@@ -140,8 +140,8 @@ The shape matters more than the code, and there is already a checklist for it:
 to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
-`crates/rustible-std/src/sysctl.rs`** — at ~630 lines it is the smallest
-complete example, and it has every part: pure planning functions over file
+`crates/rustible-std/src/sysctl.rs`** — at ~630 lines it is short enough to
+finish and has every part: pure planning functions over file
 text, a `check` that composes a `Diff`, an `apply`, and a test module split
 into `// ---- pure ----` and `// ---- Fake ----`.
 `crates/rustible-std/src/ssh/authorized_keys.rs` is the model for anything
@@ -193,7 +193,7 @@ cannot, and each costs more to run than the tier below it.
 | 1. pure | functions with no I/O | `cargo test` | free |
 | 2. fake | ops against the `Fake` backend | `cargo test` | free |
 | 3. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
-| 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | a minute, needs vagrant |
+| 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | minutes, needs vagrant |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
@@ -270,8 +270,9 @@ mod tests {
 
     #[test]
     fn change_then_apply_writes_exactly_what_the_plan_said() {
-        // `.with_file`, `.with_dir`, `.with_cmd(program, args, status, stdout)`
-        // build the box the op will see.
+        // `.with_file`, `.with_dir` and
+        // `.with_cmd(program, Some(&["arg"]), status, stdout)` build the box
+        // the op will see; `None` for the args matches any argv.
         let fake = Arc::new(Fake::new().with_file("/etc/thing", "before\n"));
         let s = sys(&fake);
         let op = Present::new("thing", "after");
@@ -307,7 +308,10 @@ wiring. `with_check_mode(true)` is a consuming builder on it —
 `System::fake(..).with_check_mode(true)` — and gives you the dry `System` a
 check-mode test needs.
 
-**Tier 3 is one file per op** at `crates/rustible-std/tests/it_<op>.rs`. The
+**Tier 3 lives in `crates/rustible-std/tests/it_<op>.rs`** — usually one file
+per op, sometimes one per state or per toolset where the behaviour genuinely
+differs (`it_apt_present.rs` / `it_apt_absent.rs` / `it_apt_latest.rs`,
+`it_user_group.rs` / `it_user_busybox.rs`). The
 name must use underscores: it is both the cargo `--test` target and the crate
 name the harness reads at compile time. Each new file is another musl build,
 so prefer adding cases to one file over adding files.

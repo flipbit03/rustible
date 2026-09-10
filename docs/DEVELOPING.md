@@ -10,7 +10,7 @@ make vm-up          # a virtual machine
 make vm-test        # the machine tier: needs vagrant
 ```
 
-## The three tiers, and when the machine tier is required
+## The three tiers, and when to reach for the machine one
 
 1. **Pure functions** and the **`Fake` backend**. Parsers, planners, and an
    op's own behaviour. `cargo test`, always.

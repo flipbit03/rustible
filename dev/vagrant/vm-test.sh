@@ -48,15 +48,22 @@ run() {
         playbook run ${limit[@]+"${limit[@]}"} "$playbook"
 }
 
-# The summary table has two row shapes. A host that ran gets seven columns,
-# `host ok changed would-change skipped failed warnings`. A host that never got
-# as far as running -- a connect error, a build failure -- gets
-# `host  failed: <reason>` instead (render.rs), which is why matching on column
-# count alone is not enough: such a row would be skipped and the host counted
-# as fine.
+# The summary table has more than one row shape (render.rs). A host that ran
+# gets seven columns, `host ok changed would-change skipped failed warnings`,
+# optionally suffixed `  exit N` when the binary exited non-zero with no failed
+# step. A host that never got as far as running -- a connect error, a build
+# failure -- gets `host  failed: <reason>` instead. Matching on column count
+# alone is therefore not enough: both of the other shapes would slip through as
+# clean. `set -e` also catches a non-zero rustible, so the `exit N` arm is a
+# second line of defence rather than the only one.
 assert_no_change() {
     awk '
         /^host  *ok  *changed/ { in_table = 1; next }
+        in_table && /  exit [0-9]+$/ {
+            seen++; bad = 1
+            printf "%s: the run binary %s\n", $1, substr($0, index($0, "exit")) > "/dev/stderr"
+            next
+        }
         in_table && $2 == "failed:" {
             seen++; bad = 1
             printf "%s: %s\n", $1, substr($0, index($0, "failed:")) > "/dev/stderr"

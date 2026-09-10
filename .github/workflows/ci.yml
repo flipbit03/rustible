@@ -195,7 +195,11 @@ jobs:
     # name, so adding a distribution cannot leave a job claiming to test
     # something it does not.
     name: "Test: VM (${{ matrix.distro }}/${{ matrix.arch }})"
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the steps below name Ubuntu package names,
+    # the `libvirt` group, and the `libvirtd.socket` unit, all under
+    # `set -euo pipefail`. A silent runner bump should not be able to break
+    # this job in a way that reads as a Rustible failure.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -203,11 +207,13 @@ jobs:
         include:
           - machine: x86
             distro: Debian 12
+            box: cloud-image/debian-12
             arch: x86_64
             target: x86_64-unknown-linux-musl
             qemu: qemu-system-x86
           - machine: arm
             distro: Debian 12
+            box: cloud-image/debian-12
             arch: aarch64
             target: aarch64-unknown-linux-musl
             # qemu-system-x86 as well: libvirt asks the host's own emulator for
@@ -278,7 +284,9 @@ jobs:
           virsh -c qemu:///system version
           # vagrant-libvirt needs a 'default' storage pool and the NAT network;
           # neither is started on a fresh install.
-          if ! virsh -c qemu:///system pool-list --all | grep -q default; then
+          # `pool-list | grep -q` would do here, but grep exits on its first
+          # match and can SIGPIPE virsh, which under `pipefail` flips the test.
+          if ! virsh -c qemu:///system pool-info default >/dev/null 2>&1; then
             virsh -c qemu:///system pool-define-as default dir --target /var/lib/libvirt/images
             virsh -c qemu:///system pool-autostart default
             virsh -c qemu:///system pool-start default
@@ -300,10 +308,24 @@ jobs:
             || { echo "libvirt's default storage pool is not running" >&2; exit 1; }
 
       - name: Bring the machine up
+        env:
+          RUSTIBLE_VM_BOX: ${{ matrix.box }}
         run: |
           set -euo pipefail
           cd dev/vagrant
           vagrant up ${{ matrix.machine }}
+
+      - name: The guest is the architecture this job claims
+        run: |
+          set -euo pipefail
+          # Without this, `distro` and `arch` reach only the job's name, and a
+          # row claiming Fedora on aarch64 could green while booting Debian on
+          # x86_64. Assert against the domain libvirt actually started.
+          xml=$(virsh -c qemu:///system dumpxml vagrant_${{ matrix.machine }})
+          echo "$xml" | grep -q "arch='${{ matrix.arch }}'" \
+            || { echo "guest is not ${{ matrix.arch }}:"; echo "$xml" | grep "<type"; exit 1; }
+          echo "confirmed ${{ matrix.arch }}"
+
 
       - name: Report whether it was accelerated
         run: |

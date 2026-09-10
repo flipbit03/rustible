@@ -167,6 +167,12 @@ fn subcommands_that_read_no_inventory_refuse_the_flag() {
             stderr(&out)
         );
     }
+    // Refusing must also mean not acting: `playbook create` writes a file, so
+    // check it did not.
+    assert!(
+        !tmp.path().join("playbooks/x.rs").exists(),
+        "`playbook create` refused the flag but wrote the playbook anyway"
+    );
 }
 
 #[test]
