@@ -236,8 +236,12 @@ in the pull request rather than adding a step to the playbook for symmetry.
 Choosing the tier is the judgement; this is the mechanism.
 
 **Tiers 1 and 2 live in the op's own file**, in a `#[cfg(test)] mod tests` at
-the bottom, split by a `// ---- pure ----` and a `// ---- Fake ----` banner.
-Every op in `rustible-std` does this; none has a separate unit-test file.
+the bottom. Every module in `rustible-std` that has tests does this — all
+nineteen of them, the twentieth being `ssh/mod.rs`, which only re-exports —
+and none has a separate unit-test file. Inside it, separate the two tiers with a banner
+comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and
+`// ---- Fake ----`, which is the pair to copy; older modules use their own
+wording.
 
 ```rust
 #[cfg(test)]
@@ -249,7 +253,8 @@ mod tests {
 
     use super::*;
 
-    /// Every op's test module has this: a `System` over a `Fake`.
+    /// `System::fake(..)` is how every op reaches a `Fake`; several modules
+    /// wrap it in a local helper like this one because they call it often.
     fn sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
@@ -369,10 +374,18 @@ Each of these has already produced a test that could not fail.
   *first* canned entry matching the program, and `with_cmd` consumes `self`,
   so there is no way to make a command answer differently on a second call. An
   op that reads its state with a command therefore cannot express
-  changed-then-ok at tier 2 at all. `sysctl.rs` works around it by mutating
-  the fake *filesystem* between the two checks. If you hit this, it is a
-  design signal: reading state through a file that `sys` can serve is more
-  testable than shelling out for it.
+  changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
+  the second answer by writing into the Fake between the two checks — the
+  builders consume `self`, so this goes through the `Backend` trait, as
+  `sysctl.rs:630` does:
+
+  ```rust
+  rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"1\n")?;
+  ```
+
+  There is no equivalent for a command. If you hit that, it is a design
+  signal: reading state through a file that `sys` can serve is more testable
+  than shelling out for it.
 - **`Fake::argvs()` drops stdin.** An op that pipes a payload into a tool must
   assert with `fake.commands()` and read `CmdSpec.stdin`, or the test silently
   ignores the entire payload.

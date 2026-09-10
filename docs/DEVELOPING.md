@@ -57,8 +57,10 @@ architecture is interpreted, and why emulated x86_64 on a Mac beats it.
 Also install `qemu-efi-aarch64` before reaching for the aarch64 guest on
 Linux; `vagrant up` says so by name if it is missing.
 
-`vagrant up` prints which of these you are getting before it starts, so a slow
-boot is a number you were told rather than a mysterious hang.
+`vagrant up` says which of those three cases you are in before it starts, so a
+slow boot is something you were told about rather than a mysterious hang. It
+does not print a duration: the table above is two machines, and yours is not
+one of them.
 
 Disk: the box is ~841 MB unpacked under `~/.vagrant.d/boxes`, plus ~415 MB of
 it uploaded into libvirt's storage pool. Each machine's own disk is a
@@ -89,7 +91,7 @@ Then libvirt, qemu and the firmware, which *are* in the archive:
 sudo apt-get install -y \
     libvirt-daemon-system libvirt-clients \
     qemu-system-x86 qemu-system-arm qemu-utils \
-    qemu-efi-aarch64 ovmf dnsmasq-base \
+    qemu-efi-aarch64 ovmf dnsmasq-base ebtables iptables \
     ruby-dev libvirt-dev gcc make pkg-config
 vagrant plugin install vagrant-libvirt
 sudo usermod -aG libvirt,kvm "$USER"
@@ -109,7 +111,11 @@ newgrp libvirt        # or log out and back in
   that was already open, and `vagrant up` fails to connect to libvirt with a
   permission error that does not mention groups.
 
-This is the same sequence CI runs, so the documented path is the tested path.
+CI installs from the same repository and the same package list, so this route
+is exercised on every pull request. It is not byte-identical: CI passes
+`--no-install-recommends`, installs only the qemu for the architecture that
+job runs, and skips `ovmf` (x86 UEFI, which the guests here do not need but
+which costs nothing on a workstation).
 
 Check it:
 
