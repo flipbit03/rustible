@@ -346,12 +346,19 @@ fn package_name_from_dir(dir: &Path) -> Result<String> {
 /// Turn a directory name into a crate name the way `cargo new` would accept:
 /// anything but ASCII alphanumerics, `-` and `_` becomes `_`, and a leading
 /// digit gets a `_` prefix.
+///
+/// Also lowercased. A directory called `MyInfra` is an entirely reasonable
+/// thing to run `rustible init` in, and a package named `MyInfra` makes rustc
+/// warn `crate MyInfra should have a snake case name` on **every** build
+/// thereafter — a permanent papercut from a directory name. Cargo itself does
+/// not lowercase, but cargo is not generating a package whose builds a
+/// person will watch scroll past for months.
 pub fn sanitize_package_name(raw: &str) -> String {
     let mut name: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
+                c.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -474,6 +481,10 @@ mod tests {
         assert_eq!(sanitize_package_name("my infra.v2"), "my_infra_v2");
         assert_eq!(sanitize_package_name("2026"), "_2026");
         assert_eq!(sanitize_package_name("ação"), "a__o");
+        // Lowercased, so `rustible init MyInfra` does not leave rustc warning
+        // `crate MyInfra should have a snake case name` on every later build.
+        assert_eq!(sanitize_package_name("MyInfra"), "myinfra");
+        assert_eq!(sanitize_package_name("My-Infra"), "my-infra");
     }
 
     #[test]
