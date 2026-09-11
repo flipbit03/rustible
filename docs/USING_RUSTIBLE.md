@@ -107,6 +107,11 @@ infra/
 └── playbooks/         # one file per playbook
 ```
 
+Add whatever else you need — it is a normal Cargo package. A `files/`
+directory beside `playbooks/` is the usual place for content you
+`include_str!` into a playbook; `init` does not create one because it does not
+know whether you want it.
+
 Things worth knowing:
 
 - **Adding a playbook is adding a file** under `playbooks/`. `build.rs` scans
@@ -400,6 +405,8 @@ struct Vars {
     workers: u32,
     #[default = false]
     update_cache: bool,
+    #[default = "nginx"]
+    service: String,                   // strings too
     optional_note: Option<String>,     // Option = may be absent
 }
 
@@ -425,6 +432,11 @@ Rules:
   fails in a second.
 - ⚠️ **Vars are flat.** Scalars, lists and enums. A struct or a map field is a
   compile error — there is no nested `vars` tree.
+- **Precedence, nearest wins:** `--var` on the command line, then the host,
+  then the closest group, then outer groups, then `defaults`, then the
+  workspace-wide `vars { }` block. So a host setting `nginx_workers 8` beats
+  its group's `4`, which is the ordinary case. `rustible inventory show <host>`
+  prints the winner and where it came from.
 - `--var package=htop` overrides the inventory for one run. A value that looks
   like JSON is parsed as JSON.
 - `rustible inventory check` validates every playbook against every host it
@@ -452,6 +464,11 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
+⚠️ A host with `escalate="none"` under a playbook with `escalate = true` runs
+**unescalated**, with a note in the output saying so. It does not refuse and
+it does not fail — so a host you deliberately exempted stays exempt, and you
+are told each time.
+
 `sudo` must work without a password, or pass one:
 
 ```sh
@@ -472,19 +489,31 @@ An operation is one desired state. The naming rule:
 
 ### What exists
 
-| module | operations |
+| operation | how it starts |
 |---|---|
-| `apt` | `Present`, `Absent`, `Latest` |
-| `file` | `Copy`, `Directory`, `Symlink`, `Absent`, `Attrs`, `Line`, `Block` |
-| `user` | `Present`, `Absent` |
-| `group` | `Present`, `Absent`, `Membership` |
-| `ssh::authorized_keys` | `Present`, `Absent` |
-| `systemd` | `Enabled`, `Disabled`, `Running`, `Stopped`, `Restart`, `Reload`, `DaemonReload` |
-| `hostname` | `Is` |
-| `sysctl` | `Present` |
-| `http` | `Download` |
-| `archive` | `Extracted` |
-| `shell` | `Command` |
+| `apt::{Present, Absent, Latest}` | `::new(["nginx", "curl"])` — a list |
+| `file::Copy` | `::from_str(s)` / `::from_bytes(b)` / `::from_local_path(p)` → `.to(dest)` |
+| `file::Directory` | `::at(path)` |
+| `file::Symlink` | `::at(link)` → `.pointing_to(target)` |
+| `file::Absent` | `::at(path)` |
+| `file::Attrs` | `::at(path)` |
+| `file::Line` | `::in_path(file)` → `.set(line)` |
+| `file::Block` | `::in_path(file)` → `.set(block)` |
+| `user::{Present, Absent}` | `::new("deploy")` |
+| `group::{Present, Absent}` | `::new("docker")` |
+| `group::Membership` | `::new("docker")` |
+| `ssh::authorized_keys::{Present, Absent}` | `::for_user(&account)` / `::for_user_name("deploy")` → `.keys([..])` |
+| `systemd::{Enabled, Disabled, Running, Stopped, Restart, Reload}` | `::new("nginx")` |
+| `systemd::DaemonReload` | `::new()` |
+| `hostname::Is` | `::new("web1")` |
+| `sysctl::Present` | `::new("vm.swappiness", "60")` — the value is a string |
+| `http::Download` | `::get(url)` → `.to(dest)` |
+| `archive::Extracted` | `::from_path(src)` → `.to(dest)` |
+| `shell::Command` | `::new("program")` / `::sh("a \| b")` |
+
+⚠️ `systemd::Enabled::new("nginx")` only enables it. `.now(true)` starts it as
+well, which is usually what you want — otherwise add a separate
+`systemd::Running` step.
 
 **For the exact signature of any of them, read
 [docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/).**
@@ -515,6 +544,7 @@ So:
 apt::Present::new(["nginx", "curl"])
 systemd::Enabled::new("nginx").now(true)
 user::Present::new("deploy").shell("/bin/bash").groups(["docker"])
+user::Present::new("deploy").gid("www-data")     // primary group
 
 // needs a finisher
 file::Copy::from_str(CONF).to("/etc/nginx/nginx.conf").mode(0o644)
@@ -619,6 +649,12 @@ with `not found`. Put a `systemd::DaemonReload::new()` between them.
 **`owner` takes numeric ids**, never names: `.owner(uid: u32, gid: u32)`. Read
 them off a `user::Account` returned by an earlier step.
 
+**`user::Present` has two different group settings.** `.gid(..)` is the
+**primary** group and takes a gid, a group name, or a `group::Group` from an
+earlier step. `.groups([..])` is the **supplementary** list, and `.append(bool)`
+says whether it adds to the current set or replaces it. Both require the groups
+to exist already.
+
 **`apt` is the only package manager with operations.** `Pm::Dnf`, `Pm::Apk`
 and the rest exist as *facts* with nothing behind them, so guard:
 
@@ -634,6 +670,38 @@ ctx.as_root().step("x", op)?;           // fine
 let mut root = ctx.as_root();           // also fine
 let root = ctx.as_root(); root.step(..) // E0596: cannot borrow as mutable
 ```
+
+### Putting a variable into a config file
+
+There is no template operation and no Jinja. A playbook is Rust, so build the
+string in Rust and copy it:
+
+```rust
+#[rustible::vars]
+struct Vars {
+    #[default = 4]
+    nginx_workers: u32,
+}
+
+const NGINX_CONF: &str = "\
+user www-data;
+worker_processes {workers};
+events { worker_connections 768; }
+";
+
+#[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
+fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
+    let conf = NGINX_CONF.replace("{workers}", &vars.nginx_workers.to_string());
+    ctx.step("nginx.conf", file::Copy::from_str(&conf).to("/etc/nginx/nginx.conf"))?;
+    Ok(())
+}
+```
+
+`format!` works too, and for anything bigger, add a real template crate to
+your workspace with `cargo add` — it is an ordinary Cargo package, and the
+rendering happens on the target inside your playbook binary.
+
+⚠️ `from_str` takes `&str`, so a `String` you built is passed as `&conf`.
 
 ### When no operation fits
 
@@ -687,6 +755,14 @@ A host that never got as far as running gets a `failed: <reason>` row instead
 
 `--json` emits the raw event stream, one JSON object per line, for scripting.
 
+**Hosts run in parallel, and one failing does not stop the others.** Every
+host runs to completion; the summary says which failed, and the process exits
+`2`. There is no `serial:` or `any_errors_fatal:` — to roll a change out in
+batches, use `--limit` and run it more than once.
+
+⚠️ A `--limit` that selects nothing is an error, not an empty success, so a
+typo cannot look like a clean no-op deploy.
+
 ## 15. Check mode
 
 ```sh
@@ -707,6 +783,11 @@ Two things to know:
 
 An op that *can* predict does: `apt::Present` knows the candidate version,
 `file::Copy` knows the content it would write.
+
+**`.changed` is `true` in check mode** when the step would have changed
+something. So `if conf.changed { ... reload ... }` fires under `--check` too,
+and the reload appears as its own `would change` line. The dry run shows you
+the whole shape of the real run, conditionals included.
 
 ## 16. When something goes wrong
 
