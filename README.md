@@ -242,20 +242,7 @@ keys, and `github_ssh_keys_to_user`, a helper that runs it and
 let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
 ```
 
-Both are built on `rustible-sdk`, and so is yours. An op is two functions:
-
-```rust
-impl Op for MyOp {
-    type Output = MyReport;
-
-    fn check(&self, sys: &System) -> Result<Plan<MyReport>> { /* decide */ }
-    fn apply(&self, sys: &System, change: Change<MyReport>) -> Result<MyReport> { /* execute */ }
-}
-```
-
-Everything an op does to the machine goes through the `System` handle it is
-given. That is what lets the same op be tested against a fake filesystem in
-microseconds and against real distributions in containers.
+Both are built on `rustible-sdk`, which is what you use to write your own.
 
 ## How a run works
 
