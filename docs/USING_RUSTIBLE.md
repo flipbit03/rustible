@@ -159,8 +159,17 @@ Global flags, valid on either side of the subcommand:
 | `--workspace <DIR>` | the workspace root; default is to walk up from the cwd |
 | `--inventory <FILE>` | use this inventory instead of the workspace's |
 
-Exit codes: `0` success, `1` a step or host failed, `2` refused before running
-anything, `3` a usage error.
+Exit codes, which matter if you script this:
+
+| code | meaning |
+|---|---|
+| `0` | success |
+| `1` | refused before touching anything — bad inventory, missing var, build failure |
+| `2` | a host or step failed — **something may have been changed** |
+| `3` | bad command line |
+
+⚠️ `1` and `2` are the important distinction: `1` means the fleet was not
+touched, `2` means it is in a state you have to go and look at.
 
 ## 6. Describing machines: `hosts.kdl`
 
@@ -184,7 +193,29 @@ group "production" {
 }
 ```
 
-Four things that catch people out:
+### Host parameters
+
+Seven, and no others. Set any of them on a `host`, on a `group`, or on
+`defaults`; the nearest wins.
+
+| parameter | meaning | default |
+|---|---|---|
+| `addr` | hostname or address to connect to | none |
+| `connection` | `"ssh"` or `"local"` | `ssh` |
+| `ssh_user` | account ssh logs in as | your username |
+| `port` | ssh port | `22` |
+| `escalate` | `"sudo"`, `"doas"` or `"none"` | `sudo` |
+| `escalate_user` | account to escalate to | `root` |
+| `ssh_args` | extra arguments for `ssh` | none |
+
+```kdl
+host "db1" addr="10.0.2.50" port=2222 ssh_user="pgadmin"
+```
+
+Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
+`#false`.
+
+### Four things that catch people out
 
 - ⚠️ **There is no implicit `all` group.** `hosts = "all"` fails with
   `no host or group named 'all'` unless you define one. Ansible's most common
@@ -550,14 +581,76 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
+### Traps worth knowing before you use these
+
+**`file::Line` without `matching` grows the file.** With only `.set(..)`, the
+match is whole-line equality, so once the value differs from the one already
+there, nothing matches and a *second* line is appended — one more on every
+run. Give it a regex that matches the **old** value too:
+
+```rust
+file::Line::in_path("/etc/ssh/sshd_config")
+    .matching(r"^#?\s*PasswordAuthentication\b")
+    .set("PasswordAuthentication no")
+```
+
+Only the **first** match is rewritten, so a file that already has two such
+lines keeps the second. And ⚠️ an invalid regex **panics**; it is not an error
+you can catch.
+
+**Prerequisites are refused, never created.** Nothing creates a group, a home
+directory's parent, or a destination directory as a side effect. Sequence them:
+
+```rust
+ctx.step("docker group", group::Present::new("docker"))?;
+let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
+ctx.step("ssh dir", file::Directory::at(app.home.join(".ssh"))
+    .owner(app.uid, app.gid).mode(0o700))?;
+ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
+```
+
+The refusal happens in `check`, before anything is touched, and names the
+operation you wanted.
+
+**A new unit file is invisible until systemd re-reads.** Writing
+`/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
+with `not found`. Put a `systemd::DaemonReload::new()` between them.
+
+**`owner` takes numeric ids**, never names: `.owner(uid: u32, gid: u32)`. Read
+them off a `user::Account` returned by an earlier step.
+
+**`apt` is the only package manager with operations.** `Pm::Dnf`, `Pm::Apk`
+and the rest exist as *facts* with nothing behind them, so guard:
+
+```rust
+ensure!(f.package_manager == Pm::Apt, "{} uses {:?}", f.hostname, f.package_manager);
+```
+
+**`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
+Chain on the temporary, or bind it `mut`:
+
+```rust
+ctx.as_root().step("x", op)?;           // fine
+let mut root = ctx.as_root();           // also fine
+let root = ctx.as_root(); root.step(..) // E0596: cannot borrow as mutable
+```
+
 ### When no operation fits
 
 `shell::Command` exists, and always reports changed because Rustible cannot
 know what it did:
 
 ```rust
+// a program and its arguments -- no shell, no word splitting, no globbing
 ctx.step("regenerate", shell::Command::new("update-initramfs").arg("-u"))?;
+
+// when you genuinely need a shell
+ctx.step("pipeline", shell::Command::sh("apt-get update && apt-get upgrade -y"))?;
 ```
+
+⚠️ `new` takes a **program name**, not a command line.
+`shell::Command::new("apt-get update")` tries to execute a binary with a space
+in its name. `sh(script)` is `new("/bin/sh").args(["-c", script])`.
 
 Prefer a real operation where one exists: a `shell::Command` is never
 idempotent and never has a diff.
