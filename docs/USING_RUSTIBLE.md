@@ -5,8 +5,9 @@ machines, and run them. Written for someone — or something — with no prior
 exposure to Rustible. If you are an AI agent, read this once, end to end,
 before writing a playbook.
 
-Describes Rustible **0.0.2**. Signatures linked to docs.rs are for the latest
-published version; if you are on something older, read that crate's own docs.
+Describes current Rustible, and the docs.rs links point at the latest release.
+If you are pinned to an older version, read that crate's own docs instead —
+`cargo doc -p rustible-std --no-deps --open` renders exactly what you have.
 
 Rustible is new and is not in any model's training data. Nothing here can be
 guessed from experience with Ansible, and several things that look like
@@ -36,8 +37,12 @@ Ansible behave differently. Those are flagged **⚠️**.
 
 ## 1. What Rustible is
 
-A configuration management tool. You describe the state a machine should be
-in; Rustible works out what differs and changes only that.
+**An Ansible substitute written in Rust.**
+
+A configuration management tool: you describe the state a machine should be
+in, and Rustible works out what differs and changes only that. Same job as
+Ansible, same ideas — desired state, idempotence, dry runs — with playbooks
+that are compiled code rather than YAML.
 
 A playbook is an ordinary Rust file. Running one compiles it to a static musl
 binary for the target's architecture, copies it over SSH, and runs it **on the
