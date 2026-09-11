@@ -16,6 +16,12 @@ use clap::Args;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The version in the workspace manifest between releases. `release.yml`
+/// rewrites it from the tag at publish time, so a binary reporting this was
+/// built from a checkout and the crates.io versions it would write are the
+/// name-reservation ones.
+const PLACEHOLDER_VERSION: &str = "0.0.1";
+
 const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const BUILD_RS: &str = include_str!("../templates/build.rs.tmpl");
 const MAIN_RS: &str = include_str!("../templates/main.rs.tmpl");
@@ -149,7 +155,27 @@ pub fn run(args: InitArgs) -> Result<()> {
             }
             Deps::Path(checkout.clone())
         }
-        None => Deps::CratesIo,
+        None => {
+            // The workspace manifest carries PLACEHOLDER_VERSION and the
+            // release workflow rewrites it from the tag before publishing, so
+            // a binary still reporting it was built from a checkout rather
+            // than installed from crates.io. Its `{krate} = "<version>"` lines
+            // would then pin the workspace to the name-reservation releases,
+            // which contain almost nothing, and the failure arrives much later
+            // as a cargo error about a missing generated file.
+            if VERSION == PLACEHOLDER_VERSION {
+                eprintln!(
+                    "warning: this `rustible` was built from a checkout, so the workspace it \
+                     writes\n         would depend on rustible {PLACEHOLDER_VERSION}, which is a \
+                     name-reservation\n         release and does not work.\n\n         \
+                     Point it at your checkout instead:\n\n           \
+                     rustible init --path-deps /path/to/rustible {}\n\n         \
+                     Or install a published build: cargo install rustible-cli\n",
+                    dir.display()
+                );
+            }
+            Deps::CratesIo
+        }
     };
 
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -473,6 +499,27 @@ pub fn validate_package_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generated manifest pins whatever version this binary reports. A
+    /// release build reports the tag; a checkout build reports
+    /// `PLACEHOLDER_VERSION`, which is why `init` warns in that case.
+    #[test]
+    fn crates_io_deps_pin_this_binarys_own_version() {
+        let files = generate("rx", &Deps::CratesIo);
+        let manifest = files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .expect("a manifest");
+        let text = &manifest.contents;
+        assert!(
+            text.contains(&format!("rustible = \"{VERSION}\"")),
+            "manifest does not pin {VERSION}: {text}"
+        );
+        assert!(
+            !text.contains("rustible = \"0.0.0\""),
+            "a hardcoded version leaked into the template"
+        );
+    }
 
     #[test]
     fn sanitizes_directory_names() {
