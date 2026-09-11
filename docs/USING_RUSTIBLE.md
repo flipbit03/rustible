@@ -824,6 +824,11 @@ operation you wanted — `user`, `group` and `authorized_keys` all do.
 into a directory that does not exist fails at `apply`, after earlier steps have
 already changed the machine. Create the directory first.
 
+⚠️ Sequencing them correctly still does not make the pair above pass
+`--check` on a machine where `.ssh` is missing — `authorized_keys` stats the
+directory rather than consulting what the previous step promised. A real run
+converges; see §15.
+
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
 unpacked, so without a marker it reports `changed` every time — which is
@@ -1114,6 +1119,20 @@ satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
 `systemd::Reload` — never inspect anything, because they always report
 changed, so they pass a dry run against a unit that does not exist yet. That
 is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
+
+`ssh::authorized_keys` is the other one you will meet, and it stings because
+the remedy it names is the step you already wrote. It stats the `.ssh`
+directory itself, so a `file::Directory` one line above that *would* create it
+does not count:
+
+```
+FAILED at `keys`: /home/app/.ssh does not exist; ssh::authorized_keys does not
+create it (vision 6.7), ensure it first with file::Directory::at(..)...
+```
+
+The sequence in §13 is right and a real run converges; it is the dry run that
+cannot see it. `user::Membership` naming a group an earlier `group::Present`
+would create is *not* affected — it consults the registry and passes.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
