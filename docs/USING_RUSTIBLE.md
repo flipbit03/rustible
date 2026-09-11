@@ -298,7 +298,7 @@ The whole skeleton:
 
 ```rust
 use rustible::prelude::*;
-use rustible_std::{apt, file, systemd};
+use rustible_std::apt;
 
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
@@ -332,9 +332,17 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()>      // with vars = Vars
 ```
 
 ⚠️ It is called `main` but it is not a `main`. The macro rewrites it; the
-generated `src/main.rs` is the real entry point. Each `playbooks/*.rs` file is
-a module of that binary, so ordinary Rust rules apply: `use` what you need,
-and `pub fn` anything another file should see.
+generated `src/main.rs` is the real entry point.
+
+⚠️ **Playbooks cannot call each other.** The build script mounts each one
+under a mangled module name (`__pb_nginx_a1b2c3`), and a run compiles only the
+playbook you selected, so `crate::other_playbook::helper()` does not compile.
+Shared code goes in one of two places, both ordinary Rust:
+
+```rust
+use infra::render_config;   // src/lib.rs, by the package name in Cargo.toml
+mod helpers;                // a sibling file, declared inside this playbook
+```
 
 One playbook per file, and the path under `playbooks/` is the playbook's
 name — `playbooks/web/nginx.rs` is the playbook `web/nginx`, which is what
@@ -724,7 +732,7 @@ file::Copy::from_local_path(staged).to("/etc/nginx/nginx.conf")
 
 ```rust
 use rustible::prelude::*;
-use rustible_std::{apt, file, systemd, user};
+use rustible_std::{apt, file, group, systemd, user};
 
 const CONF: &str = include_str!("../files/nginx.conf");
 
@@ -734,6 +742,10 @@ fn main(ctx: &mut Ctx) -> Result<()> {
     ensure!(f.package_manager == Pm::Apt, "{} is not apt-based", f.hostname);
 
     ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
+
+    // The primary group first: `user::Present` resolves `.gid(3000)` against
+    // /etc/group and refuses if nothing carries it. See the traps below.
+    ctx.step("deploy group", group::Present::new("deploy").gid(3000))?;
 
     let deploy = ctx.step(
         "deploy user",
@@ -760,10 +772,13 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 
 ### Traps worth knowing before you use these
 
-**`file::Line` without `matching` grows the file.** With only `.set(..)`, the
-match is whole-line equality, so once the value differs from the one already
-there, nothing matches and a *second* line is appended — one more on every
-run. Give it a regex that matches the **old** value too:
+**`file::Line` without `matching` leaves the old line behind.** With only
+`.set(..)`, the match is whole-line equality, so it matches the value you are
+setting and nothing else. That is idempotent — the second run reports `ok` —
+but the line it was supposed to replace is still there, above the new one, and
+for a config file read top to bottom the stale one may be the one that wins.
+The file gains a line every time the *value* changes, not every time you run.
+Give it a regex that matches the **old** value too:
 
 ```rust
 file::Line::in_path("/etc/ssh/sshd_config")
@@ -1038,13 +1053,26 @@ Two things to know:
 An op that *can* predict does: `apt::Present` knows the candidate version,
 `file::Copy` knows the content it would write.
 
-**A dry run of a playbook that builds things from scratch works.** A step does
-not refuse because an earlier step's work has not happened yet: `--check` on a
-fresh host runs the whole playbook and reports every step as `would change`.
-A `user::Present` whose primary group an earlier `group::Present` would create
-is accepted, and a `file::Copy` into a directory an earlier step would create
-is accepted. What you do not get is *output* for steps that could not predict
-it, which is §9's `is_available()` guard.
+**A dry run mostly survives a fresh host.** A step does not refuse merely
+because an earlier step's work has not happened yet: a `user::Present` whose
+primary group an earlier `group::Present` would create is accepted, and a
+`file::Copy` into a directory an earlier step would create is accepted. What
+you do not get is *output* for steps that could not predict it, which is §9's
+`is_available()` guard.
+
+⚠️ **The exception is a step that must ask a tool about something a package
+would install.** Rustible records the groups, users and paths earlier steps
+would create, but it cannot make `systemctl` see a unit that does not exist
+until `apt` has run. So the §13 example — `apt::Present::new(["nginx"])`
+followed by `systemd::Enabled::new("nginx")` — fails under `--check` on a host
+that does not have nginx yet:
+
+```
+FAILED at `nginx enabled`: systemd::Enabled: unit `nginx` not found by `systemctl is-enabled`
+```
+
+That is a limit of the dry run rather than a fault in the playbook. Apply it
+for real once and `--check` is meaningful from then on.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,

@@ -12,17 +12,7 @@ needs nothing installed: no Python, no agent, no runtime.
 ```rust
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
-    let cadu = ctx.step(
-        "user cadu exists",
-        user::Present::new("cadu")
-            .shell("/bin/zsh")
-            .groups(["docker"]),
-    )?;
-
-    ctx.step(
-        "cadu's ssh keys are installed",
-        authorized_keys::Present::for_user(&cadu).keys([MY_KEY]),
-    )?;
+    ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
 
     let cfg = ctx.step(
         "nginx.conf is current",
@@ -44,13 +34,12 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 ```
 
 Every operation returns a typed struct describing what it found or made, and
-those values feed the operations after it. `cadu` here is an `Account`, with
-`uid`, `gid`, `home` and `groups` as real fields — which is why the next step
-takes `&cadu` rather than repeating the username and guessing the home
-directory. `cfg` is a `CopyReport`, and its `changed` is a `bool`, so a
-conditional reload is an ordinary `if` instead of a handler wired up by a
-`notify` string. All of it is checked at compile time: a misspelled field or
-a wrong type fails the build.
+those values feed the operations after it. `cfg` here is a `CopyReport`, and
+its `changed` is a `bool`, so a conditional reload is an ordinary `if` instead
+of a handler wired up by a `notify` string. `user::Present` returns an
+`Account` with `uid`, `gid` and `home` as real fields, so the step that wants
+a home directory is handed one rather than guessing it. All of it is checked
+at compile time: a misspelled field or a wrong type fails the build.
 
 ## Why
 
