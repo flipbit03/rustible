@@ -120,7 +120,7 @@ rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting t
 file under `playbooks/` carrying the attribute and registers it, so adding a
 playbook is adding a file.
 
-Describe your machines in `hosts.kdl` ([KDL format](docs/INVENTORY.md)).
+Describe your machines in `hosts.kdl` ([KDL format](docs/HOSTS_KDL_REFERENCE.md)).
 `init` starts you with this machine:
 
 ```kdl
@@ -143,7 +143,7 @@ group "web" {
 ```
 
 Seven parameters, variables at three levels, groups of groups, and how it is
-validated: **[docs/INVENTORY.md](docs/INVENTORY.md)**.
+validated: **[docs/HOSTS_KDL_REFERENCE.md](docs/HOSTS_KDL_REFERENCE.md)**.
 
 Fill in the playbook (`playbooks/hello.rs`):
 
@@ -292,7 +292,7 @@ The playbook binary never opens a socket. SSH is the orchestrator's business.
 |---|---|
 | [`CLAUDE.md`](CLAUDE.md) | how to work in this repository: the rules, writing an operation, the testing tiers and the `make` targets |
 | [`docs/01_VISION.md`](docs/01_VISION.md) | the contract: architecture, the playbook model, check mode, the error model |
-| [`docs/INVENTORY.md`](docs/INVENTORY.md) | the `hosts.kdl` reference |
+| [`docs/HOSTS_KDL_REFERENCE.md`](docs/HOSTS_KDL_REFERENCE.md) | describing your machines: parameters, variables, groups |
 | [`docs/DEVELOPING.md`](docs/DEVELOPING.md) | per-platform setup for the tests that need a machine |
 | [`docs/plan/DECISIONS.md`](docs/plan/DECISIONS.md) | every decision made while building |
 | [`docs/plan/PROGRESS.md`](docs/plan/PROGRESS.md) | what is built |

@@ -13,7 +13,7 @@ and why. The rest are read when you need them:
 | | |
 |---|---|
 | `docs/06_BUILD_PLAN.md` §4 | the checklist of what an operation ships |
-| `docs/INVENTORY.md` | the `hosts.kdl` reference: parameters, vars, groups |
+| `docs/HOSTS_KDL_REFERENCE.md` | describing machines: parameters, vars, groups |
 | `docs/DEVELOPING.md` | setting up the machines the machine tier needs |
 | `docs/plan/DECISIONS.md` | every decision, each with how to reverse it |
 | `docs/plan/PROGRESS.md` | the resume point |

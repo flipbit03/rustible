@@ -1,7 +1,7 @@
-# The inventory: `hosts.kdl`
+# `hosts.kdl` reference
 
-Your fleet, in [KDL](https://kdl.dev). One file, checked before a run touches
-anything.
+The machines Rustible manages, written in [KDL](https://kdl.dev). One file per
+workspace, checked before a run touches anything.
 
 KDL rather than YAML because nesting is braces. A misplaced space cannot
 silently reparent a host into another group.
