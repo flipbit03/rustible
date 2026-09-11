@@ -32,10 +32,14 @@ sends the next session hunting for work that is already done, or repeating it.
 
 ## The dependency rule
 
-**`rustup target add <triple>` plus `clang` is the entire set of dependencies
-for running Rustible, and that must never grow.** Not a preference, not a
-default to be revisited: it is the property the project exists to have. Target
-hosts need nothing at all, ever.
+**rustup plus `clang` is the entire set of dependencies for running Rustible,
+and that must never grow.** Not a preference, not a default to be revisited:
+it is the property the project exists to have. Target hosts need nothing at
+all, ever.
+
+The operator does not type `rustup target add` either — `Describe::build`
+calls `toolchain::ensure_targets_installed` first, because Rustible has
+already probed the hosts and knows which triples the run needs.
 
 This is what Ansible lost. Its modules need a Python interpreter on every
 target, and anything interesting needs more Python on top, so managing Docker

@@ -149,6 +149,11 @@ impl Cargo {
     /// rather than shown `cc-rs`'s message about a musl gcc (see
     /// [`crate::toolchain`]).
     pub async fn build(&self, selected: Option<&str>, triples: &[String]) -> Result<()> {
+        // Rustible probed the hosts, so it already knows which architectures
+        // this run needs. Making the operator work that out and run
+        // `rustup target add` themselves is busywork, and the error they get
+        // for not doing it is cargo's `can't find crate for \`core\``.
+        toolchain::ensure_targets_installed(triples)?;
         let env = toolchain::env_for_build(&self.compilers, triples, &self.cache_dir)?;
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.arg("build").arg("--manifest-path").arg(&self.manifest);

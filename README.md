@@ -78,8 +78,7 @@ Rustible keeps the parts that work — desired state, idempotence, readable runs
 
 ## Supported platforms
 
-Rustible runs **from** a controller and manages **targets**. They are not the
-same list.
+Rustible runs **from** a controller and manages **targets**.
 
 | | x86_64 | aarch64 |
 |---|---|---|
@@ -102,8 +101,8 @@ binary.
 cargo install rustible-cli
 ```
 
-That is the whole thing, and it requires **rustup and clang** on your machine
-only.
+That gives you the `rustible` binary, and it needs **rustup and clang** on
+your machine only.
 
 Clang is there because Rustible's TLS provider compiles a small amount of C.
 Most systems already have it:
@@ -113,13 +112,15 @@ sudo apt install clang        # Debian, Ubuntu; dnf, pacman and apk all have it
 xcode-select --install        # macOS: the command line tools ship clang
 ```
 
-Add the target architectures you manage:
+You do not add Rust targets by hand. Rustible probes your hosts, works out
+which architectures the run needs, and installs any missing ones with rustup
+before it builds:
 
-```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+```
+  installing rust target aarch64-unknown-linux-musl
 ```
 
-Check a machine before relying on it:
+To see what a machine can do before relying on it:
 
 ```sh
 rustible toolchain check      # what this machine can build for, and how
