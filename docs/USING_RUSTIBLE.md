@@ -114,6 +114,7 @@ infra/
 ├── rustible.toml      # workspace config: which inventory file
 ├── hosts.kdl          # the machines (§6)
 ├── build.rs           # generated shim: finds playbooks/. Do not edit.
+├── README.md          # yours: says what this is, and links this guide
 ├── .gitignore         # /target and /.rustible
 ├── .cargo/
 │   └── config.toml    # musl cross-linking via rust-lld. Do not edit.
@@ -141,9 +142,18 @@ Things worth knowing:
   by the package name, so in a workspace named `infra` that is `use infra::my_helper;`.
 - **It is a normal Cargo package.** `cargo add` a dependency, use any crate.
 
-⚠️ `rustible init` refuses only if a file it would write already exists, so
-running it inside an existing git clone with a `README.md` and a `LICENSE` is
-fine.
+⚠️ `rustible init` refuses only if one of the files it *generates* is already
+there, so running it inside an existing git clone is fine. `README.md`,
+`.gitignore` and `playbooks/.gitkeep` are not in that set: the README is
+written only when the directory has none and is never overwritten, and
+`.gitignore` is appended to. Your own `README.md` and `LICENSE` are left
+exactly as they are.
+
+The generated `README.md` exists to answer "what is this directory?" for
+whoever opens the repository next — including an agent that has never seen
+Rustible. It names the project and links this guide, which is enough to work
+from cold. It is yours once written; edit it freely, and `init --refresh`
+does not touch it.
 
 ## 5. The CLI
 

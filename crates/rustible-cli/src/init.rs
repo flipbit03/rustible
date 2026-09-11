@@ -30,6 +30,7 @@ const CARGO_CONFIG: &str = include_str!("../templates/cargo-config.toml");
 const HOSTS_KDL: &str = include_str!("../templates/hosts.kdl");
 const RUSTIBLE_TOML: &str = include_str!("../templates/rustible.toml");
 const GITIGNORE: &str = include_str!("../templates/gitignore");
+const README_MD: &str = include_str!("../templates/README.md.tmpl");
 
 /// The paths [`generate`] writes, in write order. Kept equal to `generate`'s
 /// own paths by a test; [`conflicts`] needs them before a package name or a
@@ -193,6 +194,7 @@ pub fn run(args: InitArgs) -> Result<()> {
     }
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
+    ensure_readme(dir, &name)?;
 
     // A warning, not a failure: `init` compiles nothing, and a user who has
     // just created a workspace would rather hear about a missing compiler now
@@ -321,6 +323,26 @@ fn ensure_gitignore(dir: &Path) -> Result<()> {
     fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
     eprintln!("    appended {} to .gitignore", missing.join(", "));
     Ok(())
+}
+
+/// Create `README.md` when the directory has none, and never touch one that
+/// is already there.
+///
+/// It is not in `GENERATED_PATHS`, so a clone that already has a README is
+/// still a valid `init` target and keeps its own — the same treatment
+/// `.gitignore` gets, and for the same reason: refusing would make `init`
+/// unusable in exactly the repositories people run it in.
+///
+/// The point of writing one at all is the link it carries. A workspace is
+/// nine files of shims and inventory with nothing saying what they are, so
+/// anyone — or any agent — landing in a shared repository has no way to learn
+/// what Rustible is or how to drive it. The README names the project and
+/// points at `docs/USING_RUSTIBLE.md`, which is enough to start from cold.
+fn ensure_readme(dir: &Path, name: &str) -> Result<()> {
+    if dir.join("README.md").symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    write_file(dir, "README.md", &README_MD.replace("{{name}}", name))
 }
 
 fn ensure_gitkeep(dir: &Path) -> Result<()> {
@@ -589,6 +611,50 @@ mod tests {
             assert!(shim.contents.contains("`playbooks/`"));
             assert!(shim.contents.contains("`src/lib.rs`"));
         }
+    }
+
+    #[test]
+    fn readme_is_written_when_absent_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        ensure_readme(dir, "myinfra").unwrap();
+        let written = fs::read_to_string(dir.join("README.md")).unwrap();
+        assert!(written.starts_with("# myinfra\n"), "{written}");
+        // The whole point: an agent landing here can find out what this is.
+        assert!(
+            written.contains(
+                "https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"
+            ),
+            "the guide link is the reason this file exists: {written}"
+        );
+        assert!(!written.contains("{{name}}"), "unsubstituted placeholder");
+
+        // A second run keeps whatever is there, including a user's own.
+        fs::write(dir.join("README.md"), "mine\n").unwrap();
+        ensure_readme(dir, "myinfra").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn a_clone_with_its_own_readme_is_still_a_valid_init_target() {
+        // README.md is deliberately outside GENERATED_PATHS. If it were in,
+        // `init` would refuse every repository that already has one, which is
+        // most of them.
+        assert!(
+            !GENERATED_PATHS.contains(&"README.md"),
+            "adding README.md to GENERATED_PATHS makes `init` refuse ordinary clones"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        assert!(conflicts(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_touch_the_readme() {
+        // `--refresh` rewrites the two shims and nothing else; the README is
+        // the user's once it exists.
+        assert!(shims().iter().all(|g| g.path != "README.md"));
     }
 
     #[test]

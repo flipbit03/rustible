@@ -78,6 +78,13 @@ fn regenerates_the_example_workspace() {
     assert!(dir.join("rustible.toml").is_file());
     assert!(dir.join("hosts.kdl").is_file());
     assert!(read(&dir, "src/lib.rs").contains("`workspace::helper()`"));
+    // The README is what tells a stranger -- or an agent -- what this
+    // directory is, so the link to the guide has to survive the wiring.
+    let readme = read(&dir, "README.md");
+    assert!(
+        readme.contains("https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"),
+        "{readme}"
+    );
 }
 
 /// A fresh clone is not a conflict: `init` writes into it and leaves the
