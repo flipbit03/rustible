@@ -602,6 +602,33 @@ The modules are `apt`, `archive`, `file`, `group`, `hostname`, `http`, `shell`,
 you cannot get that way — which shape to reach for, and what bites — is the
 rest of this section.
 
+### Operations from elsewhere
+
+`rustible-std` is not the only source of operations. A **collection** is an
+ordinary crate that depends on `rustible-sdk` and exports operations, so you
+add one the way you add any dependency:
+
+```sh
+cargo add rustible-github
+```
+
+```rust
+use rustible_github::github_ssh_keys_to_user;
+
+// fetches flipbit03's public keys from GitHub and puts them in cadu's
+// authorized_keys, as two visible steps
+let keys = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
+ctx.log(format!("{} key(s) added", keys.added.len()));
+```
+
+`rustible-github` is the worked example of a collection, and small enough to
+read end to end if you are writing your own. It exports `github::UserKeys` for
+the fetch on its own, `GithubSshKeysToUser` for the configurable form of the
+helper above, and a `Fetch` trait so the HTTP call can be faked in tests.
+
+There is no galaxy and no roles path: collections are crates, `cargo add`
+finds them, and `cargo` pins the version.
+
 ### The two builder shapes
 
 ⚠️ Most operations are `::new(...)` and are complete immediately. Operations
@@ -1028,8 +1055,8 @@ increasing order of effort:
    `System` handle it is given, which is what makes it testable.
 
 A collection is an ordinary crate that depends on `rustible-sdk` and exports
-operations; `cargo add` it and use it. `rustible-github` in this repository is
-a small worked example.
+operations; `cargo add` it and use it, as in "Operations from elsewhere"
+above. `rustible-github` is the worked example to copy the shape from.
 
 To contribute an operation to `rustible-std` itself, read
 [`CLAUDE.md`](../CLAUDE.md) — it covers the shape, where the tests go, and the
