@@ -1,4 +1,4 @@
-//! [`keys_to_user`] and [`KeysToUser`]: fetch a GitHub user's keys and put
+//! [`github_ssh_keys_to_user`] and [`GithubSshKeysToUser`]: fetch a GitHub user's keys and put
 //! them in a system user's `authorized_keys`.
 
 use std::sync::Arc;
@@ -27,46 +27,46 @@ use crate::user_keys::UserKeys;
 ///
 /// **Additive**: keys already in the file that GitHub does not list are
 /// left alone. This is the default because it can never lock anyone out;
-/// [`KeysToUser::exclusive`] gives the "exactly these" behaviour. Keys are
+/// [`GithubSshKeysToUser::exclusive`] gives the "exactly these" behaviour. Keys are
 /// installed with the comment `github:<gh_login>`, since the `.keys`
-/// endpoint strips comments; see [`KeysToUser::without_comment`].
+/// endpoint strips comments; see [`GithubSshKeysToUser::without_comment`].
 ///
 /// ```no_run
 /// use rustible_sdk::prelude::*;
-/// use rustible_github::keys_to_user;
+/// use rustible_github::github_ssh_keys_to_user;
 ///
 /// fn role(ctx: &mut Ctx) -> Result<()> {
-///     let r = keys_to_user(ctx, "flipbit03", "cadu")?;
+///     let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
 ///     if r.changed {
 ///         ctx.log(format!("added {} key(s) to {}", r.added.len(), r.path.display()));
 ///     }
 ///     Ok(())
 /// }
 /// ```
-pub fn keys_to_user(
+pub fn github_ssh_keys_to_user(
     ctx: &mut Ctx,
     gh_login: impl Into<String>,
     sys_user: impl Into<String>,
 ) -> Result<Applied<KeysReport>> {
-    KeysToUser::new(gh_login, sys_user).run(ctx)
+    GithubSshKeysToUser::new(gh_login, sys_user).run(ctx)
 }
 
-/// The configurable form of [`keys_to_user`]. Not an `Op` itself: it is a
+/// The configurable form of [`github_ssh_keys_to_user`]. Not an `Op` itself: it is a
 /// helper that runs two ops, which is how a collection composes behaviour
 /// without hiding steps from the report.
 ///
 /// ```no_run
 /// use rustible_sdk::prelude::*;
-/// use rustible_github::KeysToUser;
+/// use rustible_github::GithubSshKeysToUser;
 ///
 /// fn role(ctx: &mut Ctx) -> Result<()> {
 ///     // "Exactly the keys flipbit03 has on GitHub, nothing else."
-///     KeysToUser::new("flipbit03", "cadu").exclusive(true).run(ctx)?;
+///     GithubSshKeysToUser::new("flipbit03", "cadu").exclusive(true).run(ctx)?;
 ///     Ok(())
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct KeysToUser {
+pub struct GithubSshKeysToUser {
     gh_login: String,
     sys_user: String,
     exclusive: bool,
@@ -74,12 +74,12 @@ pub struct KeysToUser {
     fetch: Option<Arc<dyn Fetch>>,
 }
 
-impl KeysToUser {
+impl GithubSshKeysToUser {
     /// Keys of GitHub user `gh_login` for the system account `sys_user`.
     /// Additive, with the comment `github:<gh_login>`.
     pub fn new(gh_login: impl Into<String>, sys_user: impl Into<String>) -> Self {
         let gh_login = gh_login.into();
-        KeysToUser {
+        GithubSshKeysToUser {
             comment: Some(format!("github:{gh_login}")),
             gh_login,
             sys_user: sys_user.into(),
@@ -119,7 +119,7 @@ impl KeysToUser {
         self
     }
 
-    /// Run both steps. See [`keys_to_user`] for what they are.
+    /// Run both steps. See [`github_ssh_keys_to_user`] for what they are.
     pub fn run(self, ctx: &mut Ctx) -> Result<Applied<KeysReport>> {
         let mut lookup = UserKeys::of(&self.gh_login);
         if let Some(f) = &self.fetch {
@@ -223,7 +223,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
 
-        let r = KeysToUser::new("flipbit03", "cadu")
+        let r = GithubSshKeysToUser::new("flipbit03", "cadu")
             .fetch_with(canned.clone())
             .run(&mut ctx)
             .unwrap();
@@ -262,7 +262,7 @@ mod tests {
     }
 
     fn keys_to_user_via(ctx: &mut Ctx, fetch: Arc<Canned>) -> Result<Applied<KeysReport>> {
-        KeysToUser::new("flipbit03", "cadu")
+        GithubSshKeysToUser::new("flipbit03", "cadu")
             .fetch_with(fetch)
             .run(ctx)
     }
@@ -296,7 +296,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
 
-        let r = KeysToUser::new("flipbit03", "cadu")
+        let r = GithubSshKeysToUser::new("flipbit03", "cadu")
             .exclusive(true)
             .fetch_with(canned)
             .run(&mut ctx)
@@ -323,7 +323,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
 
-        let e = KeysToUser::new("flipbit03", "cadu")
+        let e = GithubSshKeysToUser::new("flipbit03", "cadu")
             .exclusive(true)
             .fetch_with(canned)
             .run(&mut ctx)
@@ -373,7 +373,7 @@ mod tests {
         let fake = Arc::new(fake_fs());
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
-        KeysToUser::new("flipbit03", "cadu")
+        GithubSshKeysToUser::new("flipbit03", "cadu")
             .comment("cadu via github")
             .fetch_with(canned.clone())
             .run(&mut ctx)
@@ -385,7 +385,7 @@ mod tests {
 
         let fake = Arc::new(fake_fs());
         let mut ctx = mk_ctx(&fake, &sink);
-        KeysToUser::new("flipbit03", "cadu")
+        GithubSshKeysToUser::new("flipbit03", "cadu")
             .without_comment()
             .fetch_with(canned)
             .run(&mut ctx)
@@ -403,7 +403,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
 
-        let e = KeysToUser::new("nobody-here", "cadu")
+        let e = GithubSshKeysToUser::new("nobody-here", "cadu")
             .fetch_with(canned)
             .run(&mut ctx)
             .unwrap_err()
@@ -429,7 +429,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let mut ctx = mk_ctx(&fake, &sink);
 
-        let e = KeysToUser::new("flipbit03", "nobody")
+        let e = GithubSshKeysToUser::new("flipbit03", "nobody")
             .fetch_with(canned)
             .run(&mut ctx)
             .unwrap_err()

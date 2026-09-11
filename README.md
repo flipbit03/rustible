@@ -71,10 +71,9 @@ Rustible keeps the parts that work — desired state, idempotence, readable runs
 | YAML tasks, Jinja templates | Rust functions, the compiler |
 | `when:` strings | `if` |
 | handlers and `notify` | `if step.changed { ... }` |
-| loops with `item` | `for` |
+| loops with `item` | just use `for` |
 | `register` + `set_fact` | the value the step returns |
 | Python on every target | one static binary, nothing preinstalled |
-| `--check` support per module | `check` is half of every op's definition |
 
 ## Supported platforms
 
@@ -89,8 +88,6 @@ Rustible runs **from** a controller and manages **targets**.
 
 A Mac is a first-class controller: it cross-builds playbook binaries for both
 Linux targets with the clang that Xcode's command line tools already provide.
-A Mac cannot be a target, because the operations speak apt, systemd and
-`/etc/passwd`; Rustible refuses it by name rather than failing later.
 
 Targets need nothing installed. The playbook arrives as one static musl
 binary.
@@ -103,19 +100,6 @@ cargo install rustible-cli
 
 That gives you the `rustible` binary. It needs **rustup and clang** on your
 machine, and nothing on the machines you manage.
-
-```sh
-sudo apt install clang        # Debian, Ubuntu; dnf, pacman and apk all have it
-xcode-select --install        # macOS: the command line tools ship clang
-```
-
-You do not add Rust targets by hand. Rustible probes your hosts, works out
-which architectures the run needs, and installs any missing ones with rustup
-before it builds:
-
-```
-  installing rust target aarch64-unknown-linux-musl
-```
 
 To see what a machine can do before relying on it:
 
@@ -136,8 +120,8 @@ rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting t
 file under `playbooks/` carrying the attribute and registers it, so adding a
 playbook is adding a file.
 
-Describe your machines in `hosts.kdl` (KDL, not YAML: nesting without
-indentation traps). `init` starts you with this machine:
+Describe your machines in `hosts.kdl` ([KDL format](docs/INVENTORY.md)).
+`init` starts you with this machine:
 
 ```kdl
 host "local" connection="local"
@@ -251,11 +235,11 @@ Two collections ship from this repository.
 
 **`rustible-github`** — a small collection showing what a third-party one
 looks like. It adds `github::UserKeys`, which fetches a GitHub user's public
-keys, and `keys_to_user`, a helper that runs it and
+keys, and `github_ssh_keys_to_user`, a helper that runs it and
 `ssh::authorized_keys::Present` as two visible steps:
 
 ```rust
-let r = keys_to_user(ctx, "flipbit03", "cadu")?;
+let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
 ```
 
 Both are built on `rustible-sdk`, and so is yours. An op is two functions:

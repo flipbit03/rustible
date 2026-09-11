@@ -15,7 +15,7 @@
 //! - [`UserKeys`]: a read-only op (a lookup, vision 6.5) returning a GitHub
 //!   user's public SSH keys from `https://github.com/<user>.keys` as typed
 //!   [`PublicKey`]s. It can never report `changed`.
-//! - [`keys_to_user`] and [`KeysToUser`]: the composition the Ansible
+//! - [`github_ssh_keys_to_user`] and [`GithubSshKeysToUser`]: the composition the Ansible
 //!   `ssh_keys_from_github` role does with `lookup('url', ...)`, `set_fact`,
 //!   `combine`, `product` and a loop over `ansible.posix.authorized_key`.
 //!   Here it is one function running two steps through `ctx.step`.
@@ -53,7 +53,7 @@
 //!             .mode(0o700))?;
 //!
 //!     // Two steps in the run output: the fetch (always `ok`) and the install.
-//!     let installed = github::keys_to_user(ctx, "flipbit03", "cadu")?;
+//!     let installed = github::github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
 //!     if installed.changed {
 //!         ctx.log(format!("installed {} GitHub key(s)", installed.added.len()));
 //!     }
@@ -73,7 +73,7 @@
 //! A GitHub login that does not exist (HTTP 404) **fails the step**, naming
 //! the user: a typo must not silently install nothing. A user who exists and
 //! has **no keys** is a successful step whose output is an empty `Vec`.
-//! [`KeysToUser`] adds one guard on top: in exclusive mode an empty list is
+//! [`GithubSshKeysToUser`] adds one guard on top: in exclusive mode an empty list is
 //! refused rather than emptying `authorized_keys`.
 //!
 //! `ureq` over `rustls` with the `ring` provider, taken from
@@ -86,12 +86,12 @@
 #![deny(missing_docs)]
 
 mod fetch;
-mod keys_to_user;
+mod github_ssh_keys_to_user;
 mod login;
 mod user_keys;
 
 pub use fetch::{Fetch, Https, MAX_BODY_BYTES, Response};
-pub use keys_to_user::{KeysToUser, keys_to_user};
+pub use github_ssh_keys_to_user::{GithubSshKeysToUser, github_ssh_keys_to_user};
 pub use login::validate_login;
 pub use user_keys::{KEYS_URL_BASE, UserKeys, parse_keys_body};
 
@@ -101,5 +101,5 @@ pub use user_keys::{KEYS_URL_BASE, UserKeys, parse_keys_body};
 pub use rustible_std::ssh::authorized_keys::PublicKey;
 
 /// Re-exported from `rustible_std::ssh::authorized_keys`: what
-/// [`keys_to_user`] returns (`added`, `removed`, `already_present`, `path`).
+/// [`github_ssh_keys_to_user`] returns (`added`, `removed`, `already_present`, `path`).
 pub use rustible_std::ssh::authorized_keys::KeysReport;
