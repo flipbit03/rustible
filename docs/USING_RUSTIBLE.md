@@ -114,6 +114,9 @@ infra/
 ├── rustible.toml      # workspace config: which inventory file
 ├── hosts.kdl          # the machines (§6)
 ├── build.rs           # generated shim: finds playbooks/. Do not edit.
+├── .gitignore         # /target and /.rustible
+├── .cargo/
+│   └── config.toml    # musl cross-linking via rust-lld. Do not edit.
 ├── src/
 │   ├── main.rs        # generated shim. Do not edit.
 │   └── lib.rs         # yours: shared helpers, roles
@@ -359,8 +362,9 @@ ctx.step(name: impl Into<String>, op: impl Op) -> Result<Applied<O::Output>>
 // Record that a step was deliberately not run. Shows as `skipped`.
 ctx.skip(name: impl Into<String>, reason: impl Into<String>)
 
-// Group steps under a heading in the output.
-ctx.section(name, |ctx| { ... })
+// Group steps under a heading in the output. The closure returns a Result,
+// so end it with `Ok(())` and use `?` on the section itself.
+ctx.section(name, |ctx| -> Result<T> { ... }) -> Result<T>
 
 // What this machine is (§10).
 ctx.facts() -> &Facts
@@ -563,16 +567,21 @@ Per-step escalation, which is what you want when only one thing needs root:
 ```rust
 #[rustible::playbook(hosts = "web")]              // not escalated by default
 fn main(ctx: &mut Ctx) -> Result<()> {
-    ctx.step("read something", file::Line::in_path("/tmp/x").set("y"))?;
+    ctx.step("my own scratch file", file::Line::in_path("/tmp/notes")
+        .create(true)
+        .set("hello"))?;
     ctx.as_root().step("nginx", apt::Present::new(["nginx"]))?;
     Ok(())
 }
 ```
 
 ⚠️ A host with `escalate="none"` under a playbook with `escalate = true` runs
-**unescalated**, with a note in the output saying so. It does not refuse and
-it does not fail — so a host you deliberately exempted stays exempt, and you
-are told each time.
+**unescalated**. It does not refuse and it does not fail, so a host you
+deliberately exempted stays exempt — but you are only told if you ask. The
+note is an orchestrator note, which means it appears under `-v` and not in a
+default run, and **never under `--json`** (§14). If something automated has to
+know, read the host's `escalate` out of the inventory rather than watching the
+output for it.
 
 **`escalate = true` needs passwordless `sudo`.** The orchestrator launches the
 whole binary behind `sudo -n`, which fails outright if a password is wanted,
@@ -786,6 +795,11 @@ file::Line::in_path("/etc/ssh/sshd_config")
     .set("PasswordAuthentication no")
 ```
 
+It also refuses a file that is not there — `/etc/x does not exist (use
+.create(true) to create it)` — because editing a line in a file you have not
+created is more often a typo than an intention. `.create(true)` before `.set`
+opts in.
+
 Only the **first** match is rewritten, so a file that already has two such
 lines keeps the second. And ⚠️ an invalid regex **panics**; it is not an error
 you can catch.
@@ -982,11 +996,13 @@ A host that never got as far as running gets a `failed: <reason>` row instead
 ### What a run costs
 
 The first run for a given architecture compiles the playbook into a static
-binary. On a small workspace that is about **30 seconds**; a second run that
-changes nothing is about **2 seconds**, because the binary is cached by source
-hash and is only rebuilt when the source changes, and only re-uploaded when
-the target does not already have that exact binary. Adding a second
-architecture adds one more build.
+binary, which is the slow part and the only slow part. After that the binary
+is cached by source hash: it is rebuilt only when the source changes, and
+re-uploaded only when the target does not already have that exact binary, so
+a run that changes nothing is dominated by the SSH round trip rather than by
+cargo. Adding a second architecture adds one more build, not one more
+per-run cost. `-v` prints the run's own timings — trust those over any number
+here, since the build is your controller's CPU and nobody else's.
 
 ### When a step fails
 
@@ -1027,9 +1043,14 @@ than a listing, so it tells you the file is sound, not who is in it.
 `--json` writes one object per line, each wrapping something in a `host` key:
 protocol frames arrive as `{"host":..,"frame":{"Event":{"StepStarted":{..}}}}`,
 and the orchestrator's own lines use `error`, `stderr`, `exit` or `fetched`
-instead. Events are nested under `frame.Event.<Variant>`, and the stream
-carries more than the renderer shows. Read one run with
-`rustible playbook run x --json | head` before writing against it.
+instead. Events are nested under `frame.Event.<Variant>`.
+
+The two views differ in both directions. The stream carries step detail the
+renderer summarises — and the renderer carries the orchestrator's **notes**,
+which the stream has no member for at all: the binary upload, and the
+`escalate="none"` note from §12. A script watching `--json` does not see them.
+Read one run with `rustible playbook run x --json | head` before writing
+against it.
 
 ## 15. Check mode
 
