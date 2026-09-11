@@ -69,6 +69,11 @@ solve, not a requirement to document.
   name is gone everywhere: the attribute, the inventory, the CLI, the code.
 - **Never publish to crates.io.** Releases are cut by tagging and publishing a
   GitHub release, which fires `.github/workflows/release.yml`.
+- **The tree's version is `0.0.0` and stays there.** Nobody can publish that,
+  so it means exactly "built from source, not released". `release.yml` rewrites
+  it from the tag at publish time and fails if any occurrence is missed, so a
+  version bump is a tag, never a commit. `rustible init` warns when a binary
+  still reporting `0.0.0` is about to write a workspace that depends on it.
 - **Release names are exactly `vX.Y.Z`.** No description, no suffix, no
   "v0.1.0 — the streaming release". The tag and the release title are the
   version and nothing else.

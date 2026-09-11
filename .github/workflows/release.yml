@@ -28,17 +28,19 @@ jobs:
           TAG="${{ github.event.release.tag_name }}"
           echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      # One `version = "0.0.1"` under [workspace.package] and one per
-      # inter-crate entry under [workspace.dependencies]: all of them move
-      # together, and the grep below is the proof that none was missed.
+      # The tree carries 0.0.0, which is not a version anyone can publish, so
+      # it means "built from source and not released". One under
+      # [workspace.package] and one per inter-crate entry under
+      # [workspace.dependencies]: they all move together, and the grep below
+      # is the proof that none was missed.
       - name: Patch the workspace version
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.VERSION }}"
-          sed -i "s/^version = \"0\.0\.1\"/version = \"${VERSION}\"/" Cargo.toml
-          sed -i "s/version = \"0\.0\.1\" }/version = \"${VERSION}\" }/" Cargo.toml
-          if grep -n '0\.0\.1' Cargo.toml; then
-            echo "::error::Cargo.toml still mentions 0.0.1 after patching"
+          sed -i "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/version = \"0\.0\.0\" }/version = \"${VERSION}\" }/" Cargo.toml
+          if grep -n '0\.0\.0' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
             exit 1
           fi
           cargo update --workspace

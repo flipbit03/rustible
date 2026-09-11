@@ -16,11 +16,11 @@ use clap::Args;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The version in the workspace manifest between releases. `release.yml`
-/// rewrites it from the tag at publish time, so a binary reporting this was
-/// built from a checkout and the crates.io versions it would write are the
-/// name-reservation ones.
-const PLACEHOLDER_VERSION: &str = "0.0.1";
+/// The version in the workspace manifest between releases. Nobody can publish
+/// `0.0.0`, so it means exactly one thing: built from source, not released.
+/// `release.yml` rewrites it from the tag at publish time, so a binary still
+/// reporting it came from a checkout.
+const PLACEHOLDER_VERSION: &str = "0.0.0";
 
 const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const BUILD_RS: &str = include_str!("../templates/build.rs.tmpl");
@@ -166,9 +166,9 @@ pub fn run(args: InitArgs) -> Result<()> {
             if VERSION == PLACEHOLDER_VERSION {
                 eprintln!(
                     "warning: this `rustible` was built from a checkout, so the workspace it \
-                     writes\n         would depend on rustible {PLACEHOLDER_VERSION}, which is a \
-                     name-reservation\n         release and does not work.\n\n         \
-                     Point it at your checkout instead:\n\n           \
+                     writes\n         would depend on rustible {PLACEHOLDER_VERSION}, which is \
+                     not published and\n         never will be, and cargo will refuse to \
+                     resolve it.\n\n         Point it at your checkout instead:\n\n           \
                      rustible init --path-deps /path/to/rustible {}\n\n         \
                      Or install a published build: cargo install rustible-cli\n",
                     dir.display()
@@ -511,14 +511,17 @@ mod tests {
             .find(|f| f.path == "Cargo.toml")
             .expect("a manifest");
         let text = &manifest.contents;
-        assert!(
-            text.contains(&format!("rustible = \"{VERSION}\"")),
-            "manifest does not pin {VERSION}: {text}"
-        );
-        assert!(
-            !text.contains("rustible = \"0.0.0\""),
-            "a hardcoded version leaked into the template"
-        );
+        // Every rustible dependency line carries this binary's own version,
+        // and none carries anything else — a hardcoded version in the template
+        // would show up here as a line that disagrees.
+        let pinned: Vec<&str> = text.lines().filter(|l| l.starts_with("rustible")).collect();
+        assert!(!pinned.is_empty(), "no rustible dependency lines: {text}");
+        for line in pinned {
+            assert!(
+                line.contains(&format!("\"{VERSION}\"")),
+                "`{line}` does not pin this binary's version ({VERSION})"
+            );
+        }
     }
 
     #[test]

@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "rustible"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "rustible-macros",
  "rustible-sdk",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-build"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-cli"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-github"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "rustible",
  "rustible-sdk",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-macros"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-sdk"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "rustible-std"
-version = "0.0.1"
+version = "0.0.0"
 dependencies = [
  "flate2",
  "lzma-rust2",
