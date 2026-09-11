@@ -242,7 +242,8 @@ keys, and `github_ssh_keys_to_user`, a helper that runs it and
 let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
 ```
 
-Both are built on `rustible-sdk`, which is what you use to write your own.
+Both are built on `rustible-sdk`, which is what you use to write your own
+operations and collections.
 
 ## How a run works
 
