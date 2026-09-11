@@ -51,6 +51,22 @@ fn group(g: &str) -> Source {
 
 // --- vision 10.2.2 ---------------------------------------------------------
 
+/// A `//` comment on the same line as a closing `}` must not swallow the node
+/// after it. kdl 6.5.0 did exactly that: the `host` below vanished and the
+/// document failed with "No closing '}' for child block". Fixed upstream in
+/// 6.7.0, so this pins the floor as much as the behaviour.
+#[test]
+fn a_comment_after_a_child_block_does_not_eat_the_next_node() {
+    let src =
+        "group \"w\" {\n    vars { n 4 }   // a comment\n    host \"h\" addr=\"10.0.0.1\"\n}\n";
+    let inv = Inventory::parse(src, "hosts.kdl").expect("should parse");
+    assert!(
+        inv.hosts.contains_key("h"),
+        "the host after the comment was swallowed: {:?}",
+        inv.hosts.keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn vision_example_loads() {
     let inv = load(VISION);

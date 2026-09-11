@@ -1,22 +1,41 @@
 # Rustible
 
-**Configuration management as real code. No more YAML hell.**
+**Configuration management as real code. No YAML.**
 
 Rustible is an independent replacement for Ansible. A playbook is an ordinary
 Rust file: typed operations, typed outputs, checked by the compiler and
-completed by your editor. When you run one, Rustible compiles it into a static
-binary for each target's architecture, ships it over SSH, runs it *there*, and
-streams `changed / ok / failed` back with dry-run and diffs built in. The
-target needs nothing installed: no Python, no agent, no runtime.
+completed by your editor. Running one compiles it into a static binary for
+each target's architecture, ships it over SSH, runs it *there*, and streams
+`changed / ok / failed` back, with dry run and diffs built in. The target
+needs nothing installed: no Python, no agent, no runtime.
 
 ```rust
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
-    let cadu = ctx.step("cadu exists", user::Present::new("cadu").shell("/bin/zsh").groups(["docker"]))?;
-    ctx.step("cadu's keys", authorized_keys::Present::for_user(&cadu).keys([MY_KEY]))?;
+    let cadu = ctx.step(
+        "user cadu exists",
+        user::Present::new("cadu")
+            .shell("/bin/zsh")
+            .groups(["docker"]),
+    )?;
 
-    let cfg = ctx.step("nginx.conf", file::Copy::from_str(NGINX_CONF).to("/etc/nginx/nginx.conf").mode(0o644))?;
-    ctx.step("nginx enabled", systemd::Enabled::new("nginx").now(true))?;
+    ctx.step(
+        "cadu's ssh keys are installed",
+        authorized_keys::Present::for_user(&cadu).keys([MY_KEY]),
+    )?;
+
+    let cfg = ctx.step(
+        "nginx.conf is current",
+        file::Copy::from_str(NGINX_CONF)
+            .to("/etc/nginx/nginx.conf")
+            .mode(0o644),
+    )?;
+
+    ctx.step(
+        "nginx is enabled and running",
+        systemd::Enabled::new("nginx").now(true),
+    )?;
+
     if cfg.changed {
         ctx.step("nginx reloaded", systemd::Reload::new("nginx"))?;
     }
@@ -24,19 +43,28 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
-`cadu` is a value. Its `uid`, `home` and `groups` are fields you can read in
-the next step. `cfg.changed` is a bool, not a handler with a `notify` string.
-A typo in a field name is a compile error, not a 40-minute run that fails on
-the last host.
+Every operation returns a typed struct describing what it found or made, and
+those values feed the operations after it. `cadu` here is an `Account`, with
+`uid`, `gid`, `home` and `groups` as real fields — which is why the next step
+takes `&cadu` rather than repeating the username and guessing the home
+directory. `cfg` is a `CopyReport`, and its `changed` is a `bool`, so a
+conditional reload is an ordinary `if` instead of a handler wired up by a
+`notify` string. All of it is checked at compile time: a misspelled field or a
+wrong type fails the build, not the last host of a long run.
 
 ## Why
 
-Ansible's YAML is a programming language that refuses to admit it: no types, no
-functions, `when:` strings evaluated as Python, and Jinja templating over
-whitespace-sensitive markup. Its execution model ships a Python module to the
-target for every task (AnsiballZ) and needs a compatible interpreter there.
-Rustible keeps what Ansible got right, desired state and idempotence and
-readable runs, and throws out both of those problems.
+Ansible expresses logic in YAML: conditionals are `when:` strings evaluated as
+Python, iteration is a `loop:` key, and values are Jinja templates rendered
+into whitespace-sensitive markup. None of it is type-checked, and mistakes
+surface at run time, on a host, partway through.
+
+Its execution model ships a Python module to the target for every task
+(AnsiballZ), so every machine you manage needs a compatible interpreter and
+whatever libraries the modules import.
+
+Rustible keeps the parts that work — desired state, idempotence, readable runs
+— and changes those two things.
 
 | Ansible | Rustible |
 |---|---|
@@ -48,66 +76,61 @@ readable runs, and throws out both of those problems.
 | Python on every target | one static binary, nothing preinstalled |
 | `--check` support per module | `check` is half of every op's definition |
 
+## Supported platforms
+
+Rustible runs **from** a controller and manages **targets**. They are not the
+same list.
+
+| | x86_64 | aarch64 |
+|---|---|---|
+| **Controller** — Linux | yes | yes |
+| **Controller** — macOS (Apple silicon) | — | yes |
+| **Target** — Linux, any libc | yes | yes |
+| **Target** — macOS, Windows, BSD | no | no |
+
+A Mac is a first-class controller: it cross-builds playbook binaries for both
+Linux targets with the clang that Xcode's command line tools already provide.
+A Mac cannot be a target, because the operations speak apt, systemd and
+`/etc/passwd`; Rustible refuses it by name rather than failing later.
+
+Targets need nothing installed. Not Python, not an agent, not a runtime — the
+playbook arrives as one static musl binary.
+
 ## Install
 
-**Two things: rustup and clang.** Nothing else, and nothing at all on the
-machines you manage.
-
-Rustible runs from **Linux (x86_64, aarch64) and macOS (Apple silicon)**, and
-manages **Linux hosts** on either architecture, any libc. A Mac is a
-first-class controller: it cross-builds playbook binaries for both Linux
-targets using the clang that Xcode's command line tools already provide, so
-there is nothing to install there. A Mac cannot be a *target*, because the
-operations speak apt, systemd and `/etc/passwd`; Rustible refuses it by name
-rather than failing later.
-
 ```sh
-sudo apt install clang          # Debian/Ubuntu; dnf, pacman and apk all have it too
+cargo install rustible-cli
 ```
 
-To check a machine before you rely on it:
+That is the whole thing, and it requires **rustup and clang** on your machine
+only.
+
+Clang is there because Rustible's TLS provider compiles a small amount of C.
+Most systems already have it:
 
 ```sh
-rustible toolchain check        # what this machine can build for, and how
+sudo apt install clang        # Debian, Ubuntu; dnf, pacman and apk all have it
+xcode-select --install        # macOS: the command line tools ship clang
 ```
 
-Its `--print-env` prints the compiler settings a build is given, ready for
-`eval`, which is useful when a cross-build fails and you want to see what
-Rustible actually handed to cargo.
-
-macOS already has it: the command line tools ship clang, so `xcode-select
---install` is the whole story there.
-
-Clang is there because Rustible's TLS provider (`ring`) compiles a small amount
-of C, and one clang cross-compiles for every architecture you might target.
-Rustible carries musl's own libc headers and sets the compiler flags itself, so
-there is no cross-gcc, no zig, no docker and no sysroot to install. If clang is
-missing, `rustible init` says so and `rustible playbook run` refuses with the
-package name rather than failing somewhere inside a build script. A build only
-needs clang to reach an architecture other than your own: an ordinary x86_64
-Linux box with `gcc` can build for itself.
-
-Targets are added with rustup as you need them:
+Add the target architectures you manage:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ```
 
-## Status
-
-Under active construction, and **`v0.0.2` is on crates.io and works**:
+Check a machine before relying on it:
 
 ```sh
-cargo install rustible-cli      # the `rustible` command
-rustible init infra && cd infra
+rustible toolchain check      # what this machine can build for, and how
 ```
 
-Treat it as an early preview rather than a stable release. The version is
-deliberately small: the public API is not frozen, and `0.1.0` is where that
-changes.
-
-`docs/plan/PROGRESS.md` tracks what is built; the design is complete and
-vetted in `docs/01_VISION.md`.
+Rustible carries musl's libc headers itself and sets the compiler flags, so
+there is no cross-gcc, no zig, no docker and no sysroot to install. If clang
+is missing, `rustible init` says so and `rustible playbook run` refuses with
+the package name rather than failing inside a build script. Clang is only
+needed to reach an architecture other than your own: an x86_64 Linux box with
+`gcc` can build for itself.
 
 ## Five minutes
 
@@ -142,6 +165,9 @@ group "web" {
     }
 }
 ```
+
+Seven parameters, variables at three levels, groups of groups, and how it is
+validated: **[docs/INVENTORY.md](docs/INVENTORY.md)**.
 
 Fill in the playbook (`playbooks/hello.rs`):
 
@@ -202,15 +228,23 @@ run. `--var package=htop` overrides the inventory.
 - **Every op defines both halves.** `check` decides what would change and
   produces the diff; `apply` executes that decision. Dry run and diff are not
   a per-module afterthought.
-- **Outputs chain.** A step returns what it found or made. In check mode, an
-  output an op cannot honestly predict is unavailable, and reading it says so
-  loudly instead of handing you a plausible lie.
+- **Outputs chain.** A step returns a typed value describing what it found or
+  made, and later steps use it. In check mode an op that cannot predict a
+  field leaves it unavailable, and reading it returns an error saying so
+  rather than a guess.
 - **Prerequisites are refused, not invented.** An op that manages a user does
   not create the group it references; it fails and names the op you wanted.
 
-## Operations
+## Operations and collections
 
-`rustible-std` ships the ops a real fleet needs:
+An operation is one desired state: `apt::Present`, `systemd::Enabled`,
+`user::Absent`. A **collection** is a library of them — an ordinary Rust crate
+that depends on `rustible-sdk` and implements its `Op` trait. You add one with
+`cargo add`. There is no galaxy, no roles directory, no path search order.
+
+Two collections ship from this repository.
+
+**`rustible-std`** — the operations a fleet needs, always available:
 
 | module | ops |
 |---|---|
@@ -220,15 +254,19 @@ run. `--var package=htop` overrides the inventory.
 | `ssh::authorized_keys` | `Present` (with `exclusive`), `Absent` |
 | `systemd` | `Enabled`, `Disabled`, `Running`, `Stopped`, `Restart`, `Reload`, `DaemonReload` |
 | `hostname`, `sysctl` | `Is`, `Present` |
+| `http`, `archive` | `Download`, `Extracted` |
 | `shell` | `Command` |
 
-## Collections are just crates
+**`rustible-github`** — a small collection showing what a third-party one
+looks like. It adds `github::UserKeys`, which fetches a GitHub user's public
+keys, and `keys_to_user`, a helper that runs it and
+`ssh::authorized_keys::Present` as two visible steps:
 
-A collection is a normal crate that depends on `rustible-sdk` and implements
-the `Op` trait. `rustible-github` is the worked example: it adds
-`github::UserKeys::of("flipbit03")` and composes it with
-`ssh::authorized_keys::Present`. To use someone's collection, `cargo add` it.
-No galaxy, no roles directory, no path search order.
+```rust
+let r = keys_to_user(ctx, "flipbit03", "cadu")?;
+```
+
+Both are built on `rustible-sdk`, and so is yours. An op is two functions:
 
 ```rust
 impl Op for MyOp {
@@ -240,8 +278,8 @@ impl Op for MyOp {
 ```
 
 Everything an op does to the machine goes through the `System` handle it is
-given, which is what lets ops be tested against a fake filesystem in
-microseconds and against real distros in containers.
+given. That is what lets the same op be tested against a fake filesystem in
+microseconds and against real distributions in containers.
 
 ## How a run works
 
@@ -266,11 +304,11 @@ The playbook binary never opens a socket. SSH is the orchestrator's business.
 |---|---|
 | `rustible-cli` | the `rustible` command |
 | `rustible` | the facade a playbook imports |
-| `rustible-sdk` | `Op`, `Ctx`, `System`, facts, protocol, testing |
+| `rustible-sdk` | everything you need to write your own collection: `Op`, `Ctx`, `System`, facts, protocol, testing |
 | `rustible-std` | the standard operations |
 | `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]` |
 | `rustible-build` | playbook discovery for the generated `build.rs` |
-| `rustible-github` | the example collection |
+| `rustible-github` | a collection, and the worked example of one |
 
 ## Developing
 
@@ -298,9 +336,14 @@ Every change goes through a pull request, and eight CI jobs must be green.
 
 ## Design
 
-`docs/01_VISION.md` is the contract: architecture, the playbook model, the
-`System` handle, testing tiers, inventory and vars, check mode, error model.
-`docs/plan/DECISIONS.md` records every decision made while building.
+| document | what it is |
+|---|---|
+| [`docs/01_VISION.md`](docs/01_VISION.md) | the contract: architecture, the playbook model, check mode, the error model |
+| [`docs/INVENTORY.md`](docs/INVENTORY.md) | the `hosts.kdl` reference |
+| [`docs/DEVELOPING.md`](docs/DEVELOPING.md) | per-platform setup for the tests that need a machine |
+| [`CLAUDE.md`](CLAUDE.md) | how to work in this repository |
+| [`docs/plan/DECISIONS.md`](docs/plan/DECISIONS.md) | every decision made while building |
+| [`docs/plan/PROGRESS.md`](docs/plan/PROGRESS.md) | what is built |
 
 ## License
 
