@@ -1081,19 +1081,32 @@ primary group an earlier `group::Present` would create is accepted, and a
 you do not get is *output* for steps that could not predict it, which is §9's
 `is_available()` guard.
 
-⚠️ **The exception is a step that must ask a tool about something a package
-would install.** Rustible records the groups, users and paths earlier steps
-would create, but it cannot make `systemctl` see a unit that does not exist
-until `apt` has run. So the §13 example — `apt::Present::new(["nginx"])`
-followed by `systemd::Enabled::new("nginx")` — fails under `--check` on a host
-that does not have nginx yet:
+⚠️ **The exception is a step whose check asks a *tool* instead of asking
+Rustible.** That cascade is a registry of what earlier steps announced they
+would create, and only the ops that write to it can be read out of it. An op
+that answers by shelling out sees the machine as it is now, not as the
+playbook will leave it — so it refuses, and the dry run reports a failure for
+something a real run would have handled.
 
-```
-FAILED at `nginx enabled`: systemd::Enabled: unit `nginx` not found by `systemctl is-enabled`
+`systemd::Enabled` is the one you will hit. Its check runs `systemctl
+is-enabled`, which knows nothing about a unit that has not arrived yet,
+whether it would come from a package:
+
+```rust
+apt::Present::new(["nginx"])            // then
+systemd::Enabled::new("nginx")          // FAILED: unit `nginx` not found
 ```
 
-That is a limit of the dry run rather than a fault in the playbook. Apply it
-for real once and `--check` is meaningful from then on.
+or from the step immediately before it, which is the usual way to ship a
+service:
+
+```rust
+file::Copy::from_str(UNIT).to("/etc/systemd/system/app.service")
+systemd::Enabled::new("app")            // FAILED: unit `app` not found
+```
+
+That is a limit of the dry run rather than a fault in the playbook. Apply once
+and `--check` is meaningful from then on.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
