@@ -436,7 +436,7 @@ ensure!(f.is_root, "this playbook needs root");
 | `init` | `Init` |
 | `cpus` | `u32` |
 | `memory_mb` | `u64` |
-| `user` | `String` — who the steps run as |
+| `user` | `String` — the process's user |
 | `is_root` | `bool` |
 
 The enums are all in the prelude. Match on them rather than on
@@ -471,8 +471,13 @@ if root_fs == "btrfs" { /* ... */ }
 prefer an operation to *change* something, because `sys` writes have no diff
 and no idempotence.
 
-⚠️ `is_root` answers on **identity, not process**: under escalation it is true
-because the steps run as root, even though the binary did not start that way.
+⚠️ **`facts.is_root` is about the process, not the identity a step will run
+as.** It is `getuid() == 0`. Under `escalate = true` the whole binary runs
+behind `sudo`, so it is true — but under `ctx.as_root()` in an otherwise
+unescalated playbook it stays **false**, even though that step will run as
+root. To ask whether the work will have privilege, use `ctx.sys().is_root()`,
+which accounts for a handle that switched identity. The `user` field has the
+same shape: it is the process's user, not necessarily the step's.
 
 ## 11. Variables
 
@@ -512,11 +517,14 @@ Rules:
 - A field with no `#[default]` and no `Option` is **required**. Every targeted
   host is checked **before anything is built or shipped**, so a missing var
   fails in a second.
-- ⚠️ **Vars are flat.** Scalars, lists and enums. A struct or a map field is a
-  compile error — there is no nested `vars` tree.
+- ⚠️ **Vars are flat.** Scalars, lists and enums; there is no nested `vars`
+  tree. A map field fails to compile; a struct field compiles and is then
+  rejected before the run with `var 'x' is an object; vars are flat scalars,
+  lists, or enums`.
 - **Precedence, nearest wins:** `--var` on the command line, then the host,
-  then the closest group, then outer groups, then `defaults`, then the
-  workspace-wide `vars { }` block. So a host setting `nginx_workers 8` beats
+  then the closest group, then outer groups, then the workspace-wide
+  `vars { }` block. ⚠️ `defaults` is for **parameters only** — a `vars` block
+  inside it is a load error, not a silently ignored one. So a host setting `nginx_workers 8` beats
   its group's `4`, which is the ordinary case. `rustible inventory show <host>`
   prints the winner and where it came from.
 - `--var package=htop` overrides the inventory for one run. A value that looks
@@ -643,13 +651,15 @@ content — return a builder that finishes by naming the second:
 | `file::Symlink` | `at(link)` | `.pointing_to(target)` |
 | `file::Line` | `in_path(file)` | `.set(line)` |
 | `file::Block` | `in_path(file)` | `.set(block)` |
-| everything else | `new(...)` | — nothing, it is already the op |
+| `ssh::authorized_keys::*` | `for_user(&acct)` / `for_user_name(n)` | `.keys([..])` |
+| `user::Membership` | `of(&acct)` / `of_name(n)` | `.in_group(&g)` / `.in_group_named(n)` |
 
-That list is short and you can regenerate it yourself:
+⚠️ **The constructor is not always `new`.** `file::Directory`, `file::Absent`
+and `file::Attrs` start at `at(path)`; `user::Existing` is `named(..)`. When in
+doubt, grep the module rather than guessing:
 
 ```sh
-grep -rn "pub fn to(self\|pub fn set(self\|pub fn pointing_to(self" \
-  ~/.cargo/registry/src/*/rustible-std-*/src/
+grep -n "pub fn" ~/.cargo/registry/src/*/rustible-std-*/src/file/directory.rs
 ```
 
 ⚠️ A finisher turns the builder into the operation, so anything on the
@@ -667,7 +677,7 @@ user::Present::new("deploy").gid("www-data")     // primary group
 
 // needs a finisher
 file::Copy::from_str(CONF).to("/etc/nginx/nginx.conf").mode(0o644)
-http::Download::get(URL).checksum("sha256:...").to("/tmp/x")
+http::Download::get(URL).to("/tmp/x").checksum("sha256:...")
 file::Line::in_path("/etc/hosts").set("10.0.0.1 db")
 ```
 
