@@ -98,7 +98,9 @@ rustible toolchain check
 
 ## 4. The workspace
 
-A workspace is a Cargo package with a particular shape. Create one:
+A **Rustible workspace** is a Cargo package with a particular shape: your
+playbooks, your inventory, and the two generated shims that tie them together.
+To create one:
 
 ```sh
 rustible init infra && cd infra
