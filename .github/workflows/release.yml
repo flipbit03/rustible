@@ -124,12 +124,23 @@ jobs:
           TAG="${{ github.event.release.tag_name }}"
           echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # Same patch as the publish job, and the same guard. Without the guard
+      # a stale pattern matches nothing, the tree keeps 0.0.0, and the release
+      # ships binaries reporting the "built from source, not released"
+      # sentinel: `rustible init` then warns on every run and writes a
+      # workspace depending on 0.0.0, which cargo cannot resolve.
+      # `sed -i''` rather than `sed -i` because this job also runs on macOS.
       - name: Patch the workspace version
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.VERSION }}"
-          sed -i'' -e "s/^version = \"0\.0\.1\"/version = \"${VERSION}\"/" Cargo.toml
-          sed -i'' -e "s/version = \"0\.0\.1\" }/version = \"${VERSION}\" }/" Cargo.toml
+          sed -i'' -e "s/^version = \"0\.0\.0\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i'' -e "s/version = \"0\.0\.0\" }/version = \"${VERSION}\" }/" Cargo.toml
+          if grep -n '0\.0\.0' Cargo.toml; then
+            echo "::error::Cargo.toml still mentions 0.0.0 after patching"
+            exit 1
+          fi
+          grep -n "^version" Cargo.toml
 
       # `rust-lld` plus the self-contained musl crt ships with rustup, so no
       # musl-tools and no cross-compiler: the code is pure Rust all the way
