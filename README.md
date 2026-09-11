@@ -107,6 +107,23 @@ To see what a machine can do before relying on it:
 rustible toolchain check      # what this machine can build for, and how
 ```
 
+## Point your agent at this
+
+Rustible is new, so an AI agent has no prior knowledge of it. Give it this and
+it can create a workspace, write playbooks, manage an inventory and run them:
+
+```
+Rustible is a Rust-based replacement for Ansible. Read
+https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md
+to understand how to write playbooks and operate it, then help me with my
+infrastructure.
+```
+
+[`docs/USING_RUSTIBLE.md`](docs/USING_RUSTIBLE.md) is written for a reader
+with no exposure to Rustible: the workspace layout, the CLI, the inventory,
+the playbook API, every operation, and the traps that catch people who expect
+Ansible.
+
 ## Five minutes
 
 ```sh
@@ -280,6 +297,7 @@ The playbook binary never opens a socket. SSH is the orchestrator's business.
 |---|---|
 | [`CLAUDE.md`](CLAUDE.md) | how to work in this repository: the rules, writing an operation, the testing tiers and the `make` targets |
 | [`docs/01_VISION.md`](docs/01_VISION.md) | the contract: architecture, the playbook model, check mode, the error model |
+| [`docs/USING_RUSTIBLE.md`](docs/USING_RUSTIBLE.md) | operating Rustible: workspace, playbooks, operations, the CLI |
 | [`docs/HOSTS_KDL_REFERENCE.md`](docs/HOSTS_KDL_REFERENCE.md) | describing your machines: parameters, variables, groups |
 | [`docs/DEVELOPING.md`](docs/DEVELOPING.md) | per-platform setup for the tests that need a machine |
 | [`docs/plan/DECISIONS.md`](docs/plan/DECISIONS.md) | every decision made while building |
