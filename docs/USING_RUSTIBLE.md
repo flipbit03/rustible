@@ -1014,7 +1014,7 @@ increasing order of effort:
 
 1. **`shell::Command`** — fine for a one-off, never idempotent.
 2. **A helper function** in `src/lib.rs` that composes existing operations.
-   This is Rustible's equivalent of a role:
+   This is Rustible's equivalent of an Ansible role:
    ```rust
    pub fn nginx_site(ctx: &mut Ctx, name: &str, conf: &str) -> Result<()> {
        ctx.step(format!("{name} config"), file::Copy::from_str(conf)
