@@ -10,9 +10,10 @@ make vm-up          # a virtual machine
 make vm-test        # the machine tier: needs vagrant
 ```
 
-## The three tiers, and when the machine tier is required
+## The three tiers, and when to reach for the machine one
 
-1. **Pure functions.** Parsers and planners. Always run.
+1. **Pure functions** and the **`Fake` backend**. Parsers, planners, and an
+   op's own behaviour. `cargo test`, always.
 2. **Containers** (`make integration`). Real distributions, real package
    managers, real `useradd`. They caught that `useradd` refuses to create a
    private group when one already carries the name, and that `chown` clears
@@ -22,14 +23,16 @@ make vm-test        # the machine tier: needs vagrant
    shares the host kernel, so `sysctl` writes are refused or leak to the host,
    and it has no pid 1 to ask about a unit.
 
-Tiers 1 and 2 run in CI. **Tier 3 does not**, and it is optional day to day.
+(`CLAUDE.md` counts four, splitting pure functions from the `Fake` backend,
+because choosing between those two matters when you are writing a test. Here
+they install the same way — they need nothing — so they are one line.)
 
-**Writing a new operation is where it stops being optional.** An operation is
-not proven by a fake that returns what the operation asked for. Bring up a
-machine, run the operation against it, run it again and watch it report `ok`,
-and say in the pull request which architecture you did that on. It is slower
-than you would like. It is also the only tier that has ever found the bugs
-that mattered.
+**All three run in CI**, the machine tier on both architectures. So why run it
+locally at all? Two reasons. Iterating against a machine you already have up
+is far faster than waiting for a runner. And a real machine in front of you is
+the only way to find out what an operation *should* do before you have written
+the assertion — which is the tier's actual value, and not something a green
+tick provides.
 
 ## What it costs
 
@@ -54,8 +57,10 @@ architecture is interpreted, and why emulated x86_64 on a Mac beats it.
 Also install `qemu-efi-aarch64` before reaching for the aarch64 guest on
 Linux; `vagrant up` says so by name if it is missing.
 
-`vagrant up` prints which of these you are getting before it starts, so a slow
-boot is a number you were told rather than a mysterious hang.
+`vagrant up` says which of those three cases you are in before it starts, so a
+slow boot is something you were told about rather than a mysterious hang. It
+does not print a duration: the table above is two machines, and yours is not
+one of them.
 
 Disk: the box is ~841 MB unpacked under `~/.vagrant.d/boxes`, plus ~415 MB of
 it uploaded into libvirt's storage pool. Each machine's own disk is a
@@ -66,23 +71,51 @@ copy-on-write overlay that starts near zero and grows with what you install.
 
 The libvirt provider. On Debian or Ubuntu:
 
+Vagrant itself is **not in Ubuntu's archive** any more — the distribution
+dropped it after HashiCorp's licence change — so it comes from HashiCorp's own
+repository:
+
+```sh
+wget -qO- https://apt.releases.hashicorp.com/gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update
+sudo apt-get install -y vagrant
+```
+
+Then libvirt, qemu and the firmware, which *are* in the archive:
+
 ```sh
 sudo apt-get install -y \
-    vagrant vagrant-libvirt \
     libvirt-daemon-system libvirt-clients \
     qemu-system-x86 qemu-system-arm qemu-utils \
-    qemu-efi-aarch64 ovmf
-sudo usermod -aG libvirt "$USER"
+    qemu-efi-aarch64 ovmf dnsmasq-base ebtables iptables \
+    ruby-dev libvirt-dev gcc make pkg-config
+vagrant plugin install vagrant-libvirt
+sudo usermod -aG libvirt,kvm "$USER"
 newgrp libvirt        # or log out and back in
 ```
 
+- **`vagrant-libvirt` is a Vagrant plugin, not an apt package.** `apt-get
+  install vagrant-libvirt` finds nothing. The `ruby-dev libvirt-dev gcc make
+  pkg-config` line is what lets the plugin build its native extension.
 - `qemu-system-arm` and `qemu-efi-aarch64` are what make the aarch64 machine
-  possible; without them `make vm-up-arm` fails at `up`.
+  possible; without them `make vm-up-arm` fails at `up`, naming the firmware.
+- `dnsmasq-base` is what libvirt's NAT network needs. Without it `vagrant up`
+  dies on `Unable to find 'dnsmasq' binary in $PATH`.
 - `libvirt-clients` provides `virsh`, which the Vagrantfile calls (see
-  "Switching architectures" below).
+  "On Linux it is one architecture at a time" below).
 - `newgrp libvirt` matters: the group is granted but not active in a shell
   that was already open, and `vagrant up` fails to connect to libvirt with a
   permission error that does not mention groups.
+
+CI installs from the same repository and the same package list, so this route
+is exercised on every pull request. It is not byte-identical: CI passes
+`--no-install-recommends`, installs only the qemu for the architecture that
+job runs, and skips `ovmf` (x86 UEFI, which the guests here do not need but
+which costs nothing on a workstation).
 
 Check it:
 
@@ -124,14 +157,30 @@ Defined in `dev/vagrant/Vagrantfile`: `x86` and `arm`, both Debian 12 from
 difference between them is a difference in architecture and nothing else.
 
 ```sh
-make vm-up          # the one matching this host: the fast one
+make vm-up          # the one matching this host's architecture
 make vm-up-x86
 make vm-up-arm
-make vm-status
+make vm-status      # what is up, and the inventory that names it
+make vm-ssh         # a shell inside it (make vm-ssh M=arm to pick one)
 make vm-test        # run the playbook against whatever is up, twice
 make vm-halt        # stop, keep the disks
 make vm-destroy     # delete them
+make vm-orphans     # domains left behind by a deleted checkout
 ```
+
+`make vm-up` with no suffix brings up **the guest whose architecture matches
+this host** — `x86` on an x86_64 machine, `arm` on Apple silicon — and only
+that one. It is the fastest guest available to you, though not necessarily an
+accelerated one: a host without hardware virtualisation interprets its own
+architecture too (63 s in the table above). It is also the machine `vagrant
+ssh` and `make vm-ssh` reach without being told which.
+
+The other architecture is always emulated, so it never starts by accident:
+ask for it by name with `make vm-up-arm` or `make vm-up-x86`.
+
+Once one is up, a shell in it is `make vm-ssh`, and you have passwordless
+`sudo` there. It is an ordinary Debian box: install things, break things,
+`make vm-destroy` and start again.
 
 `vagrant up` writes `dev/vagrant/hosts.vagrant.kdl`, a complete inventory of
 the machines that are running, and rewrites it on every `up`, `halt` and
@@ -145,10 +194,26 @@ To limit a run to one machine:
 make vm-test HOSTS=vagrant-arm
 ```
 
+To drive the machines with `rustible` directly — a dry run, more verbosity, a
+playbook of your own — point it at that inventory rather than editing a
+tracked file:
+
+```sh
+rustible --workspace examples/workspace \
+         --inventory dev/vagrant/hosts.vagrant.kdl \
+         playbook run vagrant --check -v
+```
+
 `make vm-test` runs the playbook twice and fails unless the second run reports
 nothing changed. That second run is the test. A first run that reports
 `changed` proves only that the operation did something; an operation that
 rewrites a correct file every time also reports `changed`.
+
+One difference from CI worth knowing: CI always starts from a freshly created
+machine, and your checkout does not. A local run against a guest that
+converged an hour ago exercises only the satisfied path and passes without
+proving anything. `make vm-destroy` first, or undo the change inside the guest,
+before you trust a local green.
 
 ## Troubleshooting
 
@@ -184,6 +249,13 @@ did *not* bring up last, see the paragraph above.
 50023) so the inventory can name them. A Vagrant machine left over in another
 checkout holds them: `vagrant global-status --prune` finds it, and
 `vagrant destroy <id>` releases it.
+
+**A machine is running but Vagrant says `not created`.** The state tying a
+libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`, so deleting a
+checkout — or removing a git worktree — before destroying its machines leaves
+a domain running that nothing tracks. It keeps its disk and `vagrant destroy`
+can no longer see it. `make vm-orphans` lists any and prints the `virsh`
+commands to remove them. **Destroy the machines before deleting a checkout.**
 
 **Locale complaints on `vagrant ssh`.** Fixed: the Vagrantfile pins `LC_ALL`
 and `LANG` for the connection, because OpenSSH forwards them by default and

@@ -13,20 +13,20 @@ exclude = ["examples/workspace"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.1"
+version = "0.0.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/flipbit03/rustible"
 homepage = "https://github.com/flipbit03/rustible"
 authors = ["Carlos Eduardo <cadu@cadu.dev>"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [workspace.dependencies]
-rustible = { path = "crates/rustible", version = "0.0.1" }
-rustible-sdk = { path = "crates/rustible-sdk", version = "0.0.1" }
-rustible-macros = { path = "crates/rustible-macros", version = "0.0.1" }
-rustible-build = { path = "crates/rustible-build", version = "0.0.1" }
-rustible-std = { path = "crates/rustible-std", version = "0.0.1" }
-rustible-github = { path = "crates/rustible-github", version = "0.0.1" }
+rustible = { path = "crates/rustible", version = "0.0.0" }
+rustible-sdk = { path = "crates/rustible-sdk", version = "0.0.0" }
+rustible-macros = { path = "crates/rustible-macros", version = "0.0.0" }
+rustible-build = { path = "crates/rustible-build", version = "0.0.0" }
+rustible-std = { path = "crates/rustible-std", version = "0.0.0" }
+rustible-github = { path = "crates/rustible-github", version = "0.0.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

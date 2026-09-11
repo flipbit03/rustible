@@ -20,23 +20,72 @@
 #
 # What costs what
 # ---------------
-# A guest whose architecture matches the host, on a host with hardware
-# virtualisation, is accelerated and boots in seconds. Everything else is
-# qemu's TCG interpreter. Measured (see docs/plan/reports/VAGRANT-SPIKE.md):
-#
-#   x86_64 guest, x86_64 host, KVM or HVF ............ seconds
-#   aarch64 guest, Apple silicon host, HVF ........... 17 s
-#   x86_64 guest, Apple silicon host, TCG ............ 37 s
-#   x86_64 guest, x86_64 host, no /dev/kvm (TCG) ..... 63 s
-#   aarch64 guest, x86_64 host, no /dev/kvm (TCG) .... 103 s, box upload included
+# All of it spawns fast: every combination is a boot, not a build, and none of
+# them is worth making a coffee over. A guest whose architecture matches the
+# host, on a host with hardware virtualisation, is accelerated and is the
+# quickest; everything else runs on qemu's TCG interpreter and is slower to
+# boot and noticeably slower to work in.
 #
 # This file refuses nothing, but it says which of those you are about to get
-# before it starts, so a slow boot is a number you were told rather than a
-# mysterious hang.
+# before it starts, so a slow boot is something you were told about rather
+# than a mysterious hang.
 
 require "rbconfig"
 
-BOX          = "cloud-image/debian-12"
+# ---------------------------------------------------------------- fog's noise
+#
+# vagrant-libvirt 0.12.2 opens every connection with `libvirt_ip_command`
+# (driver.rb), and fog-libvirt 0.15.0 recognizes only `libvirt_username` and
+# `libvirt_password`, so fog-core warns `Unrecognized arguments:
+# libvirt_ip_command` on *every* vagrant command. It is a version skew between
+# two third-party gems, nothing here can stop it being passed, and it says
+# nothing a developer can act on -- vagrant-libvirt finds guest addresses
+# through libvirt's own DHCP leases regardless.
+#
+# So drop that one line and let every other fog warning through, rather than
+# silencing the channel: a fog warning we have not seen before is worth
+# reading.
+# fog-core is not loaded yet when this file is parsed -- vagrant-libvirt pulls
+# it in when it first connects -- so ask for it by name. It is on the plugin
+# gem path either way, and if that ever stops being true the warning comes
+# back rather than anything breaking.
+begin
+  require "fog/core"
+rescue LoadError
+  # No fog, no fog warnings to filter.
+end
+
+if defined?(Fog::Logger)
+  class FogChannelFilter
+    def initialize(io, silence)
+      @io = io
+      @silence = silence
+    end
+
+    # Fog::Logger.write asks the channel this to decide on colour codes.
+    def tty?
+      @io.tty?
+    end
+
+    def write(message)
+      return message.bytesize if @silence.match?(message)
+      @io.write(message)
+    end
+  end
+
+  # Anchored: fog joins every unrecognised argument into one line, so an
+  # unanchored match would also silence a line that mentioned a second,
+  # genuinely new argument alongside this one.
+  Fog::Logger[:warning] = FogChannelFilter.new(
+    Fog::Logger[:warning] || $stderr,
+    /\A\[fog\]\[WARNING\] Unrecognized arguments: libvirt_ip_command\n\z/,
+  )
+end
+
+# Overridable so CI's matrix can name a distribution and actually get it; a
+# job titled "Debian 12" that boots something else is the failure this exists
+# to prevent. Default is what a developer gets with no environment set.
+BOX          = ENV.fetch("RUSTIBLE_VM_BOX", "cloud-image/debian-12")
 VAGRANT_ROOT = File.expand_path(__dir__)
 FRAGMENT_DIR = File.join(VAGRANT_ROOT, ".vagrant", "rustible")
 INVENTORY    = File.join(VAGRANT_ROOT, "hosts.vagrant.kdl")
@@ -103,6 +152,11 @@ MACHINES = {
 # The machine whose architecture matches this host is the one `vagrant up`
 # with no argument brings up. The other is opt-in, because it is emulated.
 NATIVE = MACHINES.find { |_, m| m[:arch] == HOST_ARCH }&.first
+if NATIVE.nil?
+  warn "==> this host is #{HOST_ARCH}, which neither machine matches: " \
+       "`vagrant up` with no argument will start nothing. " \
+       "Name one instead, `vagrant up x86` or `vagrant up arm`."
+end
 
 # --------------------------------------------------------------- diagnostics
 
@@ -113,13 +167,13 @@ end
 def speed_note(machine)
   guest = MACHINES[machine][:arch]
   if accelerated?(machine)
-    "accelerated (#{HOST_OS == :macos ? 'Hypervisor.framework' : 'KVM'}); expect a boot in seconds"
+    "accelerated (#{HOST_OS == :macos ? 'Hypervisor.framework' : 'KVM'})"
   elsif guest == HOST_ARCH
     "EMULATED: this host has no hardware virtualisation (#{HOST_OS == :linux ? 'no /dev/kvm' : 'kern.hv_support is 0'}), " \
-    "so qemu interprets every instruction. Boot takes about 70 s and the machine is then usable but slow"
+    "so qemu interprets every instruction. It still boots quickly; it is slow to work in"
   else
-    "EMULATED ACROSS ARCHITECTURES: a #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
-    "supports. Boot takes 40 s to 2 min; work inside it is slower than that suggests"
+    "EMULATED ACROSS ARCHITECTURES: an #{guest} guest on an #{HOST_ARCH} host is interpreted by qemu whatever the host " \
+    "supports. It still boots quickly; it is slow to work in"
   end
 end
 
@@ -138,8 +192,13 @@ def write_fragment(name, ssh)
   require "fileutils"
   FileUtils.mkdir_p(FRAGMENT_DIR)
   key = Array(ssh[:private_key_path]).first
+  # `compact` would drop a nil key and leave a dangling `-i`, so ssh would read
+  # the next `-o` as the identity filename. A box with no key is a box this
+  # inventory cannot describe.
+  raise "machine '#{name}' has no private key; rustible needs one to reach it" if key.nil?
+
   args = ["-i", key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
-  quoted = args.compact.map { |a| %("#{kdl_escape(a)}") }.join(" ")
+  quoted = args.map { |a| %("#{kdl_escape(a)}") }.join(" ")
   # Built by hand rather than with a squiggly heredoc, which strips the
   # leading indentation that makes the fragment sit inside the group block.
   lines = [
@@ -184,6 +243,15 @@ end
 def evict_foreign_box_volume(name, arch)
   require "fileutils"
   FileUtils.mkdir_p(FRAGMENT_DIR)
+
+  # A machine that already exists is standing on this volume: its disk is a
+  # copy-on-write overlay whose backing file *is* the box volume. Its disk is
+  # also, by construction, already the right architecture -- it booted. So
+  # there is nothing to evict, and evicting would unlink the backing file of a
+  # live overlay. `created_machines` cannot answer this, because it excludes
+  # the machine being brought up in order to answer the *other* question.
+  return if File.exist?(File.join(VAGRANT_ROOT, ".vagrant", "machines", name, PROVIDER.to_s, "id"))
+
   held = File.exist?(BOX_ARCH_STAMP) ? File.read(BOX_ARCH_STAMP).strip : nil
   return if held == arch
 
@@ -212,8 +280,17 @@ def evict_foreign_box_volume(name, arch)
   volumes.each do |vol|
     puts "==> box volume #{vol} holds #{held || 'an unrecorded architecture'}; " \
          "removing it so the #{arch} disk is uploaded"
-    system("virsh", "-c", "qemu:///system", "vol-delete", vol, "--pool", "default",
-           out: File::NULL, err: File::NULL)
+    # A failed delete must not reach the stamp below. Writing it anyway would
+    # record an architecture the pool does not hold, and the next `up` would
+    # trust the stamp, skip the eviction, and boot the wrong disk -- which is
+    # precisely the silent failure this whole function exists to prevent.
+    next if system("virsh", "-c", "qemu:///system", "vol-delete", vol,
+                   "--pool", "default", out: File::NULL, err: File::NULL)
+
+    raise "could not delete box volume #{vol} from libvirt's default pool.\n" \
+          "Something is still using it. Check with:\n" \
+          "    virsh -c qemu:///system vol-list default\n" \
+          "    virsh -c qemu:///system list --all"
   end
 
   File.write(BOX_ARCH_STAMP, arch)
@@ -349,15 +426,16 @@ Vagrant.configure("2") do |config|
         q.arch = spec[:qemu_arch]
         q.smp = 4
         q.memory = "2048"
-        if accelerated?(name)
-          q.machine = "virt,accel=hvf,highmem=on"
-          q.cpu = "host"
-        elsif spec[:qemu_arch] == "aarch64"
-          q.machine = "virt,accel=tcg,highmem=on"
-          q.cpu = "cortex-a72"
+        # Board first, acceleration second. The other order gives an x86_64
+        # guest the "virt" board on an Intel Mac, because it is accelerated
+        # there -- and "virt" is an ARM board that x86_64 qemu will not start.
+        accel = accelerated?(name) ? "hvf" : "tcg"
+        if spec[:qemu_arch] == "aarch64"
+          q.machine = "virt,accel=#{accel},highmem=on"
+          q.cpu = accelerated?(name) ? "host" : "cortex-a72"
         else
-          q.machine = "q35,accel=tcg"
-          q.cpu = "qemu64"
+          q.machine = "q35,accel=#{accel}"
+          q.cpu = accelerated?(name) ? "host" : "qemu64"
         end
         q.net_device = "virtio-net-pci"
         q.ssh_port = spec[:ssh_port].to_s

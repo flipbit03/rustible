@@ -10,6 +10,11 @@
 //! This writes `$OUT_DIR/musl_headers.rs`, one `include_bytes!` per header, and
 //! `src/toolchain.rs` includes it.
 
+// A build script: it runs on the operator's own machine at build time, so
+// vision 7.2's rule that operations reach the filesystem through `sys` does
+// not apply. See clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::path::{Path, PathBuf};
 
 fn main() {

@@ -421,6 +421,13 @@ fn read_existing(sys: &System, path: &Path) -> Result<Option<String>> {
 /// The parent directory (`~/.ssh` in the user forms) must already exist;
 /// the vision's playbook ensures it with `file::Directory` in its own step.
 /// A symlinked parent is fine (`stat_follow`).
+///
+/// The refusal is worded differently under `--check`. Nothing registers a
+/// planned directory the way `group::Present` registers a planned group, so
+/// this `stat_follow` sees the machine as it is and reports a directory an
+/// earlier step would create as missing. Telling the author to "ensure it
+/// first with `file::Directory`" is then advice they have already taken, and
+/// sends them looking for a bug in a playbook that is correct.
 fn check_parent(sys: &System, resolved: &Resolved) -> Result<()> {
     let parent = match &resolved.ssh_dir {
         Some(d) => d.clone(),
@@ -432,6 +439,14 @@ fn check_parent(sys: &System, resolved: &Resolved) -> Result<()> {
     match sys.stat_follow(&parent)? {
         Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => Ok(()),
         Some(_) => bail!("{} exists and is not a directory", parent.display()),
+        None if sys.check_mode() => bail!(
+            "{} does not exist; ssh::authorized_keys does not create it (vision 6.7). \
+             Under --check a directory an earlier step would create is still reported \
+             missing, because this op stats the real filesystem. If a step in this run \
+             creates it, the real run converges and there is nothing to fix; if not, \
+             ensure it with file::Directory::at(..).mode(0o700).owner(..)",
+            parent.display()
+        ),
         None => bail!(
             "{} does not exist; ssh::authorized_keys does not create it (vision 6.7), \
              ensure it first with file::Directory::at(..).mode(0o700).owner(..)",
@@ -1163,6 +1178,35 @@ mod tests {
             "{err}"
         );
         assert!(fake.file("/home/cadu/.ssh").is_none());
+    }
+
+    #[test]
+    fn under_check_the_missing_ssh_dir_refusal_does_not_blame_the_author() {
+        // A `file::Directory` one step earlier reports `would change` but
+        // creates nothing, and no registry records it, so this op still sees
+        // the directory as missing. The real-run wording tells the author to
+        // "ensure it first with file::Directory", which under --check is the
+        // step they already wrote; saying that sends them hunting for a bug
+        // in a correct playbook.
+        let fake = fake_with_user();
+        let sys = fake_sys(&fake).with_check_mode(true);
+        let err = Present::for_user_name("cadu")
+            .keys([K1])
+            .check(&sys)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("/home/cadu/.ssh does not exist"), "{err}");
+        assert!(err.contains("--check"), "names the dry run: {err}");
+        assert!(
+            err.contains("the real run converges"),
+            "says the playbook may be fine: {err}"
+        );
+        // The real-run imperative must not be the advice offered here.
+        assert!(
+            !err.contains("ensure it first with"),
+            "must not give advice the author has already taken: {err}"
+        );
     }
 
     #[test]

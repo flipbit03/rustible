@@ -16,6 +16,12 @@ use clap::Args;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The version in the workspace manifest between releases. Nobody can publish
+/// `0.0.0`, so it means exactly one thing: built from source, not released.
+/// `release.yml` rewrites it from the tag at publish time, so a binary still
+/// reporting it came from a checkout.
+const PLACEHOLDER_VERSION: &str = "0.0.0";
+
 const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const BUILD_RS: &str = include_str!("../templates/build.rs.tmpl");
 const MAIN_RS: &str = include_str!("../templates/main.rs.tmpl");
@@ -24,6 +30,7 @@ const CARGO_CONFIG: &str = include_str!("../templates/cargo-config.toml");
 const HOSTS_KDL: &str = include_str!("../templates/hosts.kdl");
 const RUSTIBLE_TOML: &str = include_str!("../templates/rustible.toml");
 const GITIGNORE: &str = include_str!("../templates/gitignore");
+const README_MD: &str = include_str!("../templates/README.md.tmpl");
 
 /// The paths [`generate`] writes, in write order. Kept equal to `generate`'s
 /// own paths by a test; [`conflicts`] needs them before a package name or a
@@ -149,7 +156,27 @@ pub fn run(args: InitArgs) -> Result<()> {
             }
             Deps::Path(checkout.clone())
         }
-        None => Deps::CratesIo,
+        None => {
+            // The workspace manifest carries PLACEHOLDER_VERSION and the
+            // release workflow rewrites it from the tag before publishing, so
+            // a binary still reporting it was built from a checkout rather
+            // than installed from crates.io. Its `{krate} = "<version>"` lines
+            // would then pin the workspace to the name-reservation releases,
+            // which contain almost nothing, and the failure arrives much later
+            // as a cargo error about a missing generated file.
+            if VERSION == PLACEHOLDER_VERSION {
+                eprintln!(
+                    "warning: this `rustible` was built from a checkout, so the workspace it \
+                     writes\n         would depend on rustible {PLACEHOLDER_VERSION}, which is \
+                     not published and\n         never will be, and cargo will refuse to \
+                     resolve it.\n\n         Point it at your checkout instead:\n\n           \
+                     rustible init --path-deps /path/to/rustible {}\n\n         \
+                     Or install a published build: cargo install rustible-cli\n",
+                    dir.display()
+                );
+            }
+            Deps::CratesIo
+        }
     };
 
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -167,6 +194,7 @@ pub fn run(args: InitArgs) -> Result<()> {
     }
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
+    ensure_readme(dir, &name)?;
 
     // A warning, not a failure: `init` compiles nothing, and a user who has
     // just created a workspace would rather hear about a missing compiler now
@@ -297,6 +325,26 @@ fn ensure_gitignore(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create `README.md` when the directory has none, and never touch one that
+/// is already there.
+///
+/// It is not in `GENERATED_PATHS`, so a clone that already has a README is
+/// still a valid `init` target and keeps its own — the same treatment
+/// `.gitignore` gets, and for the same reason: refusing would make `init`
+/// unusable in exactly the repositories people run it in.
+///
+/// The point of writing one at all is the link it carries. A workspace is
+/// nine files of shims and inventory with nothing saying what they are, so
+/// anyone — or any agent — landing in a shared repository has no way to learn
+/// what Rustible is or how to drive it. The README names the project and
+/// points at `docs/USING_RUSTIBLE.md`, which is enough to start from cold.
+fn ensure_readme(dir: &Path, name: &str) -> Result<()> {
+    if dir.join("README.md").symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    write_file(dir, "README.md", &README_MD.replace("{{name}}", name))
+}
+
 fn ensure_gitkeep(dir: &Path) -> Result<()> {
     if dir.join("playbooks/.gitkeep").exists() {
         return Ok(());
@@ -346,12 +394,19 @@ fn package_name_from_dir(dir: &Path) -> Result<String> {
 /// Turn a directory name into a crate name the way `cargo new` would accept:
 /// anything but ASCII alphanumerics, `-` and `_` becomes `_`, and a leading
 /// digit gets a `_` prefix.
+///
+/// Also lowercased. A directory called `MyInfra` is an entirely reasonable
+/// thing to run `rustible init` in, and a package named `MyInfra` makes rustc
+/// warn `crate MyInfra should have a snake case name` on **every** build
+/// thereafter — a permanent papercut from a directory name. Cargo itself does
+/// not lowercase, but cargo is not generating a package whose builds a
+/// person will watch scroll past for months.
 pub fn sanitize_package_name(raw: &str) -> String {
     let mut name: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
+                c.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -467,6 +522,30 @@ pub fn validate_package_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The generated manifest pins whatever version this binary reports. A
+    /// release build reports the tag; a checkout build reports
+    /// `PLACEHOLDER_VERSION`, which is why `init` warns in that case.
+    #[test]
+    fn crates_io_deps_pin_this_binarys_own_version() {
+        let files = generate("rx", &Deps::CratesIo);
+        let manifest = files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .expect("a manifest");
+        let text = &manifest.contents;
+        // Every rustible dependency line carries this binary's own version,
+        // and none carries anything else — a hardcoded version in the template
+        // would show up here as a line that disagrees.
+        let pinned: Vec<&str> = text.lines().filter(|l| l.starts_with("rustible")).collect();
+        assert!(!pinned.is_empty(), "no rustible dependency lines: {text}");
+        for line in pinned {
+            assert!(
+                line.contains(&format!("\"{VERSION}\"")),
+                "`{line}` does not pin this binary's version ({VERSION})"
+            );
+        }
+    }
+
     #[test]
     fn sanitizes_directory_names() {
         assert_eq!(sanitize_package_name("my_infra"), "my_infra");
@@ -474,6 +553,10 @@ mod tests {
         assert_eq!(sanitize_package_name("my infra.v2"), "my_infra_v2");
         assert_eq!(sanitize_package_name("2026"), "_2026");
         assert_eq!(sanitize_package_name("ação"), "a__o");
+        // Lowercased, so `rustible init MyInfra` does not leave rustc warning
+        // `crate MyInfra should have a snake case name` on every later build.
+        assert_eq!(sanitize_package_name("MyInfra"), "myinfra");
+        assert_eq!(sanitize_package_name("My-Infra"), "my-infra");
     }
 
     #[test]
@@ -528,6 +611,49 @@ mod tests {
             assert!(shim.contents.contains("`playbooks/`"));
             assert!(shim.contents.contains("`src/lib.rs`"));
         }
+    }
+
+    #[test]
+    fn readme_is_written_when_absent_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        ensure_readme(dir, "myinfra").unwrap();
+        let written = fs::read_to_string(dir.join("README.md")).unwrap();
+        assert!(written.starts_with("# myinfra\n"), "{written}");
+        // The whole point: an agent landing here can find out what this is.
+        assert!(
+            written
+                .contains("https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"),
+            "the guide link is the reason this file exists: {written}"
+        );
+        assert!(!written.contains("{{name}}"), "unsubstituted placeholder");
+
+        // A second run keeps whatever is there, including a user's own.
+        fs::write(dir.join("README.md"), "mine\n").unwrap();
+        ensure_readme(dir, "myinfra").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn a_clone_with_its_own_readme_is_still_a_valid_init_target() {
+        // README.md is deliberately outside GENERATED_PATHS. If it were in,
+        // `init` would refuse every repository that already has one, which is
+        // most of them.
+        assert!(
+            !GENERATED_PATHS.contains(&"README.md"),
+            "adding README.md to GENERATED_PATHS makes `init` refuse ordinary clones"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("README.md"), "theirs\n").unwrap();
+        assert!(conflicts(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_touch_the_readme() {
+        // `--refresh` rewrites the two shims and nothing else; the README is
+        // the user's once it exists.
+        assert!(shims().iter().all(|g| g.path != "README.md"));
     }
 
     #[test]

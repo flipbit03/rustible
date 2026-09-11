@@ -13,8 +13,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: Format, clippy, test
+  # Lint and tests are separate jobs because they answer different questions:
+  # one says the code is malformed, the other says it is wrong. A single job
+  # reporting both under one name makes a red tick ambiguous.
+  lint:
+    name: "Lint: fmt, clippy, docs"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,14 +34,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-check-cargo-
+          key: ci-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-lint-cargo-
 
       - run: cargo fmt --all --check
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - run: cargo test --workspace
 
       # `--lib` keeps the `rustible` facade crate's docs from colliding with
       # the `rustible` binary of rustible-cli in the output directory.
@@ -47,23 +48,46 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  msrv:
-    name: Minimum supported Rust version
+  # Tiers 1 and 2: pure functions and ops against the `Fake` backend.
+  check:
+    name: "Test: unit & fake"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Kept in step with `rust-version` in the workspace manifest. Let-chains
-      # need 1.88, so this is a real floor, not a guess. `ring` (the TLS
-      # provider, see rustible-std::tls) declares a far lower MSRV than that,
-      # unlike the `graviola` it replaced, which forced 1.89.
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-check-cargo-
+
+      - run: cargo test --workspace
+
+  msrv:
+    name: "Build: MSRV 1.95"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Kept in step with `rust-version` in the workspace manifest. The floor
+      # is set by `kdl`, which declares 1.95 from 6.6.0 onward; the version
+      # below that mis-parses a comment on the same line as a closing brace
+      # and silently drops the node after it. Let-chains in the CLI need 1.88,
+      # so that is the floor this would fall back to.
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95
 
       - run: cargo check --workspace --all-targets
 
   example-workspace:
-    name: Example workspace builds
+    name: "Build: example workspace"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +101,7 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: macOS controller
+    name: "Build: macOS controller"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +151,7 @@ jobs:
           done
 
   harness:
-    name: Container ops (Docker harness)
+    name: "Test: Docker (Debian/Ubuntu/Alpine)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,3 +178,171 @@ jobs:
         run: cargo test -p rustible-std --tests
         env:
           RUSTIBLE_INTEGRATION: "1"
+
+  # Tier 4, the machine tier: a real virtual machine over a real SSH transport,
+  # with a real init system, a real sudo, and a live /proc/sys. A container has
+  # none of those -- it shares the host kernel, so `it_sysctl_present.rs` has to
+  # run with `.apply_now(false)` and assert only on the drop-in file.
+  #
+  # GitHub's Linux runners expose /dev/kvm, so the x86_64 guest is genuinely
+  # accelerated (`<domain type='kvm'>`); the aarch64 guest is interpreted by
+  # qemu, which is what makes it the slowest job here and also the only
+  # automated check that an operation behaves the same on another architecture.
+  machine:
+    # Job names say the mechanism first, then what it ran against, because a
+    # reader of a CI run has none of this file's context: `Test: VM (Debian
+    # 12/aarch64)` says where it ran and on what, where "machine tier" said
+    # nothing. `distro` and `arch` are matrix data rather than words in the
+    # name, so adding a distribution cannot leave a job claiming to test
+    # something it does not.
+    name: "Test: VM (${{ matrix.distro }}/${{ matrix.arch }})"
+    # Pinned, not `ubuntu-latest`: the steps below name Ubuntu package names,
+    # the `libvirt` group, and the `libvirtd.socket` unit, all under
+    # `set -euo pipefail`. A silent runner bump should not be able to break
+    # this job in a way that reads as a Rustible failure.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - machine: x86
+            distro: Debian 12
+            box: cloud-image/debian-12
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+            qemu: qemu-system-x86
+          - machine: arm
+            distro: Debian 12
+            box: cloud-image/debian-12
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+            # qemu-system-x86 as well: libvirt asks the host's own emulator for
+            # the hypervisor version before it will do anything at all.
+            qemu: qemu-system-x86 qemu-system-arm qemu-efi-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      # The dependency rule, on a runner: a musl target plus clang. Nothing
+      # below installs a cross-gcc, a zig, or a docker image to build in.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-machine-${{ matrix.machine }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-machine-${{ matrix.machine }}-cargo-
+
+      - name: Install vagrant, libvirt and qemu
+        run: |
+          set -euo pipefail
+          # Ubuntu dropped the vagrant package after HashiCorp's licence
+          # change, so it comes from HashiCorp's own apt repo. A developer on
+          # Ubuntu 24.04 has to do the same; docs/DEVELOPING.md says so.
+          wget -qO- https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
+          sudo apt-get update -qq
+          # dnsmasq-base is what libvirt's NAT network needs; without it
+          # `vagrant up` dies on "Unable to find 'dnsmasq' binary in $PATH".
+          sudo apt-get install -y -qq --no-install-recommends \
+            vagrant \
+            libvirt-daemon-system libvirt-clients \
+            ${{ matrix.qemu }} qemu-utils \
+            dnsmasq-base ebtables iptables \
+            ruby-dev libvirt-dev gcc make pkg-config
+          # vagrant-libvirt is a Vagrant plugin, not an apt package.
+          vagrant plugin install vagrant-libvirt
+
+      - name: Open /dev/kvm and the libvirt socket
+        run: |
+          set -euo pipefail
+          # The libvirt group only exists once the package is installed, so
+          # this cannot move above that step. Group membership does not reach a
+          # shell that is already running, and `sg` asks for a password when it
+          # is not yet live, so widen the socket instead -- this runner is
+          # destroyed when the job ends.
+          sudo usermod -aG kvm,libvirt "$USER"
+          sudo chmod 0666 /dev/kvm
+          # Ubuntu socket-activates libvirt, so the unix_sock_* settings in
+          # libvirtd.conf are never read: the socket unit owns the permissions.
+          sudo mkdir -p /etc/systemd/system/libvirtd.socket.d
+          printf '[Socket]\nSocketMode=0666\n' \
+            | sudo tee /etc/systemd/system/libvirtd.socket.d/override.conf > /dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl stop libvirtd.service libvirtd.socket
+          sudo systemctl start libvirtd.socket
+          # Prove the runner itself reaches libvirt, with no sudo and no sg.
+          # If this fails everything after it is meaningless.
+          virsh -c qemu:///system version
+          # vagrant-libvirt needs a 'default' storage pool and the NAT network;
+          # neither is started on a fresh install.
+          # `pool-list | grep -q` would do here, but grep exits on its first
+          # match and can SIGPIPE virsh, which under `pipefail` flips the test.
+          if ! virsh -c qemu:///system pool-info default >/dev/null 2>&1; then
+            virsh -c qemu:///system pool-define-as default dir --target /var/lib/libvirt/images
+            virsh -c qemu:///system pool-autostart default
+            virsh -c qemu:///system pool-start default
+          fi
+          # `|| true` because starting an already-started network is an
+          # error, and both of these are idempotent in intent rather than in
+          # exit status. That hides a genuine failure, so assert the end state
+          # instead: without an active NAT network `vagrant up` fails much
+          # later, with an error about an IP address rather than a network.
+          virsh -c qemu:///system net-start default || true
+          virsh -c qemu:///system net-autostart default || true
+          virsh -c qemu:///system net-list --all
+          virsh -c qemu:///system net-info default | grep -q '^Active: *yes' \
+            || { echo "libvirt's default network is not active" >&2; exit 1; }
+
+          # Same reasoning one level down: the pool has to be usable, not just
+          # defined, or the box upload fails on a volume it cannot create.
+          virsh -c qemu:///system pool-info default | grep -q '^State: *running' \
+            || { echo "libvirt's default storage pool is not running" >&2; exit 1; }
+
+      - name: Bring the machine up
+        env:
+          RUSTIBLE_VM_BOX: ${{ matrix.box }}
+        run: |
+          set -euo pipefail
+          cd dev/vagrant
+          vagrant up ${{ matrix.machine }}
+
+      - name: The guest is the architecture this job claims
+        run: |
+          set -euo pipefail
+          # Without this, `distro` and `arch` reach only the job's name, and a
+          # row claiming Fedora on aarch64 could green while booting Debian on
+          # x86_64. Assert against the domain libvirt actually started.
+          xml=$(virsh -c qemu:///system dumpxml vagrant_${{ matrix.machine }})
+          echo "$xml" | grep -q "arch='${{ matrix.arch }}'" \
+            || { echo "guest is not ${{ matrix.arch }}:"; echo "$xml" | grep "<type"; exit 1; }
+          echo "confirmed ${{ matrix.arch }}"
+
+
+      - name: Report whether it was accelerated
+        run: |
+          # `type='kvm'` means /dev/kvm was usable; `type='qemu'` means every
+          # instruction is interpreted. Printed rather than asserted: the
+          # aarch64 guest is legitimately interpreted on an x86_64 runner.
+          virsh -c qemu:///system dumpxml vagrant_${{ matrix.machine }} \
+            | grep -E "<domain type" || true
+
+      # Runs the playbook twice and fails unless the second run changes
+      # nothing. The second run is the test.
+      - name: make vm-test
+        run: make vm-test
+
+      - name: Machine state on failure
+        if: failure()
+        run: |
+          virsh -c qemu:///system list --all || true
+          cd dev/vagrant && vagrant status || true

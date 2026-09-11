@@ -18,7 +18,8 @@ group "web" ssh_user="deploy" {         // group-level parameter
     }
     host "web1" addr="10.0.1.11"
     host "web2" addr="10.0.1.12" {
-        vars { nginx_workers 8 }        // host-level override
+        // host-level override
+        vars { nginx_workers 8 }
     }
 }
 

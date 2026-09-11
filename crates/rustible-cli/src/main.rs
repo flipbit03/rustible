@@ -6,6 +6,10 @@
 //! Exit codes: 0 ok; 1 the inventory, the vars, or a build is wrong; 2 a
 //! host failed; 3 the command line was wrong.
 
+// See the note in this crate's lib.rs: the CLI runs on the operator's own
+// machine, so vision 7.2's `sys` rule does not apply to it.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod create;
 mod describe;
 mod init;
@@ -59,7 +63,8 @@ struct Cli {
     workspace: Option<PathBuf>,
     /// Inventory file, overriding the workspace's `inventory` setting. For
     /// running against machines that are not in the committed inventory, such
-    /// as the Vagrant guests `dev/vagrant` brings up.
+    /// as the Vagrant guests `dev/vagrant` brings up. A relative path is
+    /// relative to the current directory, not to `--workspace`.
     #[arg(long, global = true, value_name = "FILE")]
     inventory: Option<PathBuf>,
     #[command(subcommand)]
@@ -148,6 +153,21 @@ async fn main() {
     std::process::exit(code as i32);
 }
 
+/// `--inventory` is global so it can be written on either side of the
+/// subcommand, which means clap offers it to subcommands that do not read an
+/// inventory at all. Refusing there is better than accepting and ignoring: a
+/// flag that silently does nothing is how a run against the wrong machines
+/// gets reported as a success.
+fn reject_inventory(inventory: &Option<PathBuf>, cmd: &str) -> Result<()> {
+    match inventory {
+        Some(_) => Err(usage(format!(
+            "--inventory does not apply to `{cmd}`; it names the inventory a \
+             run resolves hosts from, and `{cmd}` resolves none"
+        ))),
+        None => Ok(()),
+    }
+}
+
 async fn dispatch(cli: Cli) -> Result<u8> {
     let ws = cli.workspace.as_deref();
     let inventory_override = cli.inventory.clone();
@@ -158,9 +178,7 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                     "--workspace does not apply to `init`; give the directory as its argument",
                 ));
             }
-            if inventory_override.is_some() {
-                return Err(usage("--inventory does not apply to `init`"));
-            }
+            reject_inventory(&inventory_override, "init")?;
             init::run(args).map(|()| 0)
         }
         Cmd::Playbook { cmd } => match cmd {
@@ -171,10 +189,12 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 run::run(&ws, &inv, args).await
             }
             PlaybookCmd::List => {
+                reject_inventory(&inventory_override, "playbook list")?;
                 let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
                 list(&ws)
             }
             PlaybookCmd::Create(mut args) => {
+                reject_inventory(&inventory_override, "playbook create")?;
                 // A relative path belongs to the workspace the user named,
                 // not to the current directory.
                 if let Some(root) = ws
@@ -187,7 +207,10 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Cmd::Inventory { cmd } => inventory(ws, inventory_override, cmd).await,
         Cmd::Toolchain { cmd } => match cmd {
-            ToolchainCmd::Check(args) => toolchain_cmd::run(ws, args),
+            ToolchainCmd::Check(args) => {
+                reject_inventory(&inventory_override, "toolchain check")?;
+                toolchain_cmd::run(ws, args)
+            }
         },
     }
 }

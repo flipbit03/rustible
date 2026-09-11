@@ -19,7 +19,7 @@ pub const KEYS_URL_BASE: &str = "https://github.com";
 /// `lookup('url', 'https://github.com/<user>.keys')` plus `set_fact`, or
 /// `ansible.posix.authorized_key` with `key: https://github.com/<user>.keys`
 /// when the keys are only going into `authorized_keys` (see
-/// [`keys_to_user`](crate::keys_to_user) for that case).
+/// [`github_ssh_keys_to_user`](crate::github_ssh_keys_to_user) for that case).
 ///
 /// ```no_run
 /// use rustible_sdk::prelude::*;

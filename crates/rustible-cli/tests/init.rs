@@ -3,6 +3,11 @@
 //! `examples/workspace`; after a version bump, `rustible init --refresh
 //! examples/workspace` brings the example's shims back in line.
 
+// These drive the built `rustible` binary and lay out fixture workspaces on
+// the test machine. Vision 7.2's `sys` rule governs operations running on a
+// target, not a harness exercising the CLI; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -73,6 +78,13 @@ fn regenerates_the_example_workspace() {
     assert!(dir.join("rustible.toml").is_file());
     assert!(dir.join("hosts.kdl").is_file());
     assert!(read(&dir, "src/lib.rs").contains("`workspace::helper()`"));
+    // The README is what tells a stranger -- or an agent -- what this
+    // directory is, so the link to the guide has to survive the wiring.
+    let readme = read(&dir, "README.md");
+    assert!(
+        readme.contains("https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"),
+        "{readme}"
+    );
 }
 
 /// A fresh clone is not a conflict: `init` writes into it and leaves the

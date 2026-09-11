@@ -4,6 +4,11 @@
 //! Vagrant guests, whose addresses and key paths belong to one developer's
 //! disk and are therefore not committed.
 
+// These drive the built `rustible` binary and lay out fixture workspaces on
+// the test machine. Vision 7.2's `sys` rule governs operations running on a
+// target, not a harness exercising the CLI; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -91,6 +96,41 @@ fn the_subcommands_own_file_flag_wins_over_the_global_one() {
     assert!(stdout(&out).contains("10.0.0.1"), "{}", stdout(&out));
 }
 
+/// A relative `--inventory` resolves against the current directory, not
+/// against `--workspace`. That agrees with `inventory show --file` and with
+/// how a playbook path is resolved: a path you typed means the path you typed.
+#[test]
+fn a_relative_path_is_relative_to_the_cwd_not_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let cwd = tmp.path().join("elsewhere");
+    fs::create_dir_all(ws.join("playbooks")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(ws.join("rustible.toml"), "").unwrap();
+    fs::write(ws.join("hosts.kdl"), "host \"inws\" addr=\"10.0.0.1\"\n").unwrap();
+    // Only in the cwd, deliberately not in the workspace.
+    fs::write(
+        cwd.join("other.kdl"),
+        "host \"outside\" addr=\"10.0.0.9\"\n",
+    )
+    .unwrap();
+
+    let out = rustible(
+        &cwd,
+        &[
+            "--workspace",
+            ws.to_str().unwrap(),
+            "--inventory",
+            "other.kdl",
+            "inventory",
+            "show",
+            "outside",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("10.0.0.9"), "{}", stdout(&out));
+}
+
 #[test]
 fn a_missing_inventory_file_is_reported_by_name() {
     let tmp = tempfile::tempdir().unwrap();
@@ -101,6 +141,43 @@ fn a_missing_inventory_file_is_reported_by_name() {
     );
     assert!(!out.status.success());
     assert!(stderr(&out).contains("nope.kdl"), "{}", stderr(&out));
+}
+
+/// Every subcommand that does not resolve hosts refuses the flag rather than
+/// accepting and ignoring it. `--inventory` is global so clap offers it
+/// everywhere; a flag that silently does nothing is how a run against the
+/// wrong machines gets reported as a success.
+#[test]
+fn subcommands_that_read_no_inventory_refuse_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    workspace(tmp.path());
+    for cmd in [
+        vec!["playbook", "list"],
+        vec!["playbook", "create", "playbooks/x.rs"],
+        vec!["toolchain", "check"],
+    ] {
+        let mut args = vec!["--inventory", "other.kdl"];
+        args.extend_from_slice(&cmd);
+        let out = rustible(tmp.path(), &args);
+        let label = cmd.join(" ");
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "`{label}` should have refused --inventory: {}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("--inventory"),
+            "`{label}`: {}",
+            stderr(&out)
+        );
+    }
+    // Refusing must also mean not acting: `playbook create` writes a file, so
+    // check it did not.
+    assert!(
+        !tmp.path().join("playbooks/x.rs").exists(),
+        "`playbook create` refused the flag but wrote the playbook anyway"
+    );
 }
 
 #[test]
