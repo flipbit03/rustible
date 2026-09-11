@@ -186,9 +186,9 @@ Exit codes, which matter if you script this:
 | code | meaning |
 |---|---|
 | `0` | success |
-| `1` | refused before touching anything — bad inventory, missing var, build failure |
+| `1` | refused before touching anything — a bad inventory, a missing var, a build failure |
 | `2` | a host or step failed — **something may have been changed** |
-| `3` | bad command line |
+| `3` | the command line, the playbook name, or the hosts it names could not be resolved |
 
 ⚠️ `1` and `2` are the important distinction: `1` means the fleet was not
 touched, `2` means it is in a state you have to go and look at.
@@ -226,7 +226,7 @@ Seven, and no others. Set any of them on a `host`, on a `group`, or on
 
 | parameter | meaning | default |
 |---|---|---|
-| `addr` | hostname or address to connect to | none |
+| `addr` | hostname or address to connect to | none — **required** unless `connection="local"` |
 | `connection` | `"ssh"` or `"local"` | `ssh` |
 | `ssh_user` | account ssh logs in as | your username |
 | `port` | ssh port | `22` |
@@ -257,7 +257,7 @@ Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
 ### Four things that catch people out
 
 - ⚠️ **There is no implicit `all` group.** `hosts = "all"` fails with
-  `no host or group named 'all'` unless you define one. Ansible's most common
+  ``no host or group named `all` `` unless you define one. Ansible's most common
   idiom does not exist here. Either define `group "all" { members ... }` or
   name a real group.
 - ⚠️ **`escalate` on a host is a *method*** (`"sudo"`, `"doas"`, `"none"`),
@@ -281,9 +281,9 @@ host "jump" addr="10.0.0.2" {
 If `ssh user@host` works from your shell, Rustible works.
 
 There is no vault. Keep secrets out of `hosts.kdl` and bring them in at run
-time: `ctx.local_secret(path)` uploads a file from the controller and redacts
-it from every diff and log, and `--escalate-password-env` reads the sudo
-password from the environment (§12).
+time with `ctx.local_secret(path)` (§8). ⚠️ The redaction is a property of the
+`Secret` type, not of everything you do with it: `as_str()` hands back the
+plaintext, and whatever you then log or pass as an argument is on you.
 
 Validate before running:
 
@@ -306,6 +306,10 @@ fn main(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 ```
+
+⚠️ **`authorized_keys` is nested**: it is `rustible_std::ssh::authorized_keys`,
+so the import is `use rustible_std::ssh::authorized_keys;`.
+`use rustible_std::authorized_keys;` does not compile.
 
 ⚠️ **Two import lines, and you need both.** `rustible::prelude::*` gives you
 `Ctx`, `Result`, `Facts`, `bail!`, `ensure!` and the `Op` machinery. It does
@@ -332,7 +336,9 @@ generated `src/main.rs` is the real entry point. Each `playbooks/*.rs` file is
 a module of that binary, so ordinary Rust rules apply: `use` what you need,
 and `pub fn` anything another file should see.
 
-One playbook per file, and the filename is the playbook's name.
+One playbook per file, and the path under `playbooks/` is the playbook's
+name — `playbooks/web/nginx.rs` is the playbook `web/nginx`, which is what
+`rustible playbook list` prints and what `run` takes.
 
 ## 8. `Ctx`: everything a playbook can do
 
@@ -365,16 +371,18 @@ ctx.as_escalated()     -> Ctx
 
 // Files, between controller and target.
 ctx.local_file(path) -> Result<PathBuf>   // upload a controller file, get its remote path
-ctx.local_secret(path) -> Result<Secret>  // same, but redacted everywhere
+ctx.local_secret(path) -> Result<Secret>  // read into memory, never to disk
 ctx.fetch(remote, local_dest) -> Result<()>  // download from the target
 
 // The escape hatch: run something no op covers.
 ctx.sys() -> &System
 ```
 
-⚠️ `ctx.local_file` and `ctx.local_secret` are how a playbook uses a file that
-lives on the **controller** — a TLS key, a config template you build locally.
-The playbook binary runs on the target and cannot see your disk otherwise.
+⚠️ Both reach a file that lives on the **controller** — the binary runs on the
+target and cannot see your disk otherwise — but they differ. `local_file`
+uploads it and gives you a path on the target. `local_secret` streams the bytes
+into memory and gives you a `Secret`: nothing is written to the target's disk,
+it is zeroized on drop, and its `Debug` prints `Secret(<n> bytes)`.
 
 ## 9. Reading what a step returns
 
@@ -400,8 +408,10 @@ ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 
 ⚠️ **That `Deref` panics in check mode** when the step would have changed and
 the op could not predict its output. `user::Present` on an account that does
-not exist yet predicts only when you supply both `.uid()` and `.gid()` —
-otherwise it will not invent them. A playbook that must survive `--check`
+not exist yet predicts only when it can know every field: `.uid()`, `.gid()`,
+and a shell it can determine — on BusyBox (Alpine) there is no default to read,
+so `.shell()` is needed there too. A `.gid("name")` naming a group an earlier
+step would create also does not predict, because there is no gid yet. A playbook that must survive `--check`
 guards it:
 
 ```rust
@@ -438,9 +448,6 @@ ensure!(f.is_root, "this playbook needs root");
 | `memory_mb` | `u64` |
 | `user` | `String` — the process's user |
 | `is_root` | `bool` |
-
-The enums are all in the prelude. Match on them rather than on
-`distro_version` strings:
 
 The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude, and
 each ends in an `Other(String)` carrying whatever Rustible read and did not
@@ -559,14 +566,21 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 it does not fail — so a host you deliberately exempted stays exempt, and you
 are told each time.
 
-`sudo` must work without a password, or pass one:
+**`escalate = true` needs passwordless `sudo`.** The orchestrator launches the
+whole binary behind `sudo -n`, which fails outright if a password is wanted,
+before the playbook starts.
+
+`--escalate-password-env` does **not** change that. It supplies a password to
+the per-step helper — `ctx.as_root()` and `ctx.as_user()` — inside an
+otherwise unescalated playbook:
 
 ```sh
 RUSTIBLE_SUDO=hunter2 rustible playbook run site --escalate-password-env RUSTIBLE_SUDO
 ```
 
 The password travels in the start frame, never on a command line, and is
-zeroized after use.
+zeroized after use. ⚠️ `doas` cannot take a password this way at all and is
+refused; configure it for passwordless use.
 
 ## 13. Operations
 
@@ -605,8 +619,8 @@ cargo doc -p rustible-std --no-deps --open
 **3. [docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/)**,
 the same thing on the web.
 
-The modules are `apt`, `archive`, `file`, `group`, `hostname`, `http`, `shell`,
-`ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
+The modules carrying operations are `apt`, `archive`, `file`, `group`,
+`hostname`, `http`, `shell`, `ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
 you cannot get that way — which shape to reach for, and what bites — is the
 rest of this section.
 
@@ -630,9 +644,9 @@ ctx.log(format!("{} key(s) added", keys.added.len()));
 ```
 
 `rustible-github` is the worked example of a collection, and small enough to
-read end to end if you are writing your own. It exports `github::UserKeys` for
-the fetch on its own, `GithubSshKeysToUser` for the configurable form of the
-helper above, and a `Fetch` trait so the HTTP call can be faked in tests.
+read end to end if you are writing your own. It also exports `rustible_github::UserKeys` for the fetch on its own,
+`GithubSshKeysToUser` for the configurable form of the helper above, and a
+`Fetch` trait so the HTTP call can be faked in tests.
 
 There is no galaxy and no roles path: collections are crates, `cargo add`
 finds them, and `cargo` pins the version.
@@ -685,7 +699,7 @@ file::Line::in_path("/etc/hosts").set("10.0.0.1 db")
 op to a variable and calling a method on it will not compile the way you
 expect.
 
-⚠️ **The apt operations take a list; everything else takes one name.**
+⚠️ **The apt operations take a list where most others take one name.**
 `apt::Present::new(["nginx"])` — with the brackets, even for a single package.
 `apt::Present::new("nginx")` does not compile. Every other constructor
 (`user::Present::new`, `systemd::Enabled::new`, `group::Present::new`,
@@ -723,7 +737,11 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 
     let deploy = ctx.step(
         "deploy user",
-        user::Present::new("deploy").shell("/bin/bash").groups(["www-data"]),
+        user::Present::new("deploy")
+            .uid(3000)                    // uid and gid so --check can predict
+            .gid(3000)
+            .shell("/bin/bash")
+            .groups(["www-data"]),
     )?;
     ctx.log(format!("deploy is uid {}", deploy.uid));
 
@@ -763,13 +781,19 @@ directory's parent, or a destination directory as a side effect. Sequence them:
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
 let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
-ctx.step("ssh dir", file::Directory::at(app.home.join(".ssh"))
-    .owner(app.uid, app.gid).mode(0o700))?;
-ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
+// `app` is only readable when the op could predict it, so guard for --check
+if app.is_available() {
+    ctx.step("ssh dir", file::Directory::at(app.home.join(".ssh"))
+        .owner(app.uid, app.gid).mode(0o700))?;
+    ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
+}
 ```
 
-The refusal happens in `check`, before anything is touched, and names the
-operation you wanted.
+Most of these refuse in `check`, before anything is touched, naming the
+operation you wanted — `user`, `group` and `authorized_keys` all do.
+⚠️ `file::Copy` is the exception: it looks only at the destination, so a copy
+into a directory that does not exist fails at `apply`, after earlier steps have
+already changed the machine. Create the directory first.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -977,16 +1001,20 @@ typo cannot look like a clean no-op deploy.
 its `hosts` attribute and resolve that name against the inventory:
 
 ```sh
-rustible inventory check        # lists every group and host it loaded
-rustible inventory show web1    # confirms one host resolves as you expect
+rustible inventory show web1    # one host, resolved, with the source of each value
 ```
+
+`rustible inventory check` reports counts (`ok (4 hosts, 3 groups)`) rather
+than a listing, so it tells you the file is sound, not who is in it.
 
 `--check` also tells you, but it builds and connects first.
 
-The `--json` stream is the same event sequence the renderer consumes — step
-start and finish, diffs, logs, and a final summary object. Read one run with
-`rustible playbook run x --json | head` before writing against it; the field
-names are the ones in `rustible_sdk::event`.
+`--json` writes one object per line, each wrapping something in a `host` key:
+protocol frames arrive as `{"host":..,"frame":{"Event":{"StepStarted":{..}}}}`,
+and the orchestrator's own lines use `error`, `stderr`, `exit` or `fetched`
+instead. Events are nested under `frame.Event.<Variant>`, and the stream
+carries more than the renderer shows. Read one run with
+`rustible playbook run x --json | head` before writing against it.
 
 ## 15. Check mode
 
@@ -1002,9 +1030,10 @@ Two things to know:
 - ⚠️ **An output that cannot be honestly predicted is unavailable.** An op
   that would create a user does not invent a uid. Reading such an output
   fails — and via `Deref`, panics (§9). Guard with `.is_available()`.
-- ⚠️ **`apt::Latest` refreshes the package lists even in check mode**, because
-  its answer is read from them. It is the one place `--check` is not entirely
-  read-only, and the run warns when it happens. This matches Ansible.
+- ⚠️ **`apt::Latest::update_cache(..)` refreshes the package lists even in
+  check mode**, because its answer is read from them. That is the one place
+  `--check` is not entirely read-only, and the run says so when it happens.
+  Without `.update_cache(..)` — the default — a dry run writes nothing.
 
 An op that *can* predict does: `apt::Present` knows the candidate version,
 `file::Copy` knows the content it would write.
@@ -1026,13 +1055,13 @@ the whole shape of the real run, conditionals included.
 
 | symptom | cause |
 |---|---|
-| `no host or group named 'all'` | there is no implicit `all` group (§6) |
-| `cannot find type Present in this scope` | missing `use rustible_std::apt;` (§7) |
+| ``no host or group named `all` `` | there is no implicit `all` group (§6); exits 3 |
+| `cannot find module or crate 'apt' in this scope` | missing `use rustible_std::apt;` (§7) |
 | a step panics under `--check` only | `Deref` on an unavailable output (§9, §15) |
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
-| `X is required but not set` | a `Vars` field with no `#[default]` and no value in the inventory |
-| `sudo: a password is required` | passwordless sudo is not set up; use `--escalate-password-env` (§12) |
-| `cargo build failed` mentioning `cc-rs` | no clang on the controller (§3) |
+| ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
+| `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |
+| ``no `clang` on PATH, and this playbook has to be built for …`` | install clang on the controller (§3) |
 | a host is absent from the run | the playbook's `hosts` does not match it; check `rustible inventory show <host>` |
 
 Useful first moves:
