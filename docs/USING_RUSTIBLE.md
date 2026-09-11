@@ -1108,6 +1108,13 @@ systemd::Enabled::new("app")            // FAILED: unit `app` not found
 That is a limit of the dry run rather than a fault in the playbook. Apply once
 and `--check` is meaningful from then on.
 
+It is the *state* operations that do this. `systemd::Enabled` and
+`systemd::Running` have to look the unit up to know whether they are
+satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
+`systemd::Reload` — never inspect anything, because they always report
+changed, so they pass a dry run against a unit that does not exist yet. That
+is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
+
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
 and the reload appears as its own `would change` line. The dry run shows you
