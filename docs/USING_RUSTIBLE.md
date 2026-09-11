@@ -820,8 +820,7 @@ rendering happens on the target inside your playbook binary.
 
 ### When no operation fits
 
-`shell::Command` exists, and always reports changed because Rustible cannot
-know what it did:
+`shell::Command` runs something Rustible has no operation for:
 
 ```rust
 // a program and its arguments -- no shell, no word splitting, no globbing
@@ -835,8 +834,42 @@ ctx.step("pipeline", shell::Command::sh("apt-get update && apt-get upgrade -y"))
 `shell::Command::new("apt-get update")` tries to execute a binary with a space
 in its name. `sh(script)` is `new("/bin/sh").args(["-c", script])`.
 
-Prefer a real operation where one exists: a `shell::Command` is never
-idempotent and never has a diff.
+**Making it idempotent.** On its own a command reports `changed` every run,
+because Rustible cannot know what it did. Three builders fix that, and the
+first two are Ansible's by the same names:
+
+| builder | behaviour |
+|---|---|
+| `.creates(path)` | skip, reporting `ok`, if `path` **exists** |
+| `.removes(path)` | skip, reporting `ok`, if `path` **does not exist** |
+| `.changed_when(\|out\| ...)` | run, then decide from the output whether it counted as a change |
+
+```rust
+// runs once; afterwards the marker exists and the step reports ok
+ctx.step("bootstrap the database",
+    shell::Command::sh("initdb -D /var/lib/pg").creates("/var/lib/pg/PG_VERSION"))?;
+
+// only tears down when there is something to tear down
+ctx.step("drop the socket",
+    shell::Command::new("rm").arg("/run/app.sock").removes("/run/app.sock"))?;
+
+// runs every time, but only counts as changed when it did something
+ctx.step("sync",
+    shell::Command::new("rsync").args(["-a", "src/", "dst/"])
+        .changed_when(|out| !out.stdout.is_empty()))?;
+```
+
+⚠️ `.changed_when` still **runs** the command — there is no other way to know
+what it would do — so it makes the report honest, not the command safe. Use
+`.creates` / `.removes` when you want the command skipped entirely. And in
+check mode a `changed_when` step reports `would change` either way, because
+the command does not run there.
+
+Other useful builders: `.cwd(dir)` (Ansible's `chdir`), `.env(k, v)`,
+`.stdin(bytes)`.
+
+Prefer a real operation where one exists: `shell::Command` has no diff, and
+`.creates` is a marker rather than a description of the state you wanted.
 
 ## 14. Running, and reading the output
 
