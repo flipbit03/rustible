@@ -432,8 +432,22 @@ ensure!(f.is_root, "this playbook needs root");
 | `user` | `String` — who the steps run as |
 | `is_root` | `bool` |
 
-The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude. Match
-on them rather than on `distro_version` strings.
+The enums are all in the prelude. Match on them rather than on
+`distro_version` strings:
+
+The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude, and
+each ends in an `Other(String)` carrying whatever Rustible read and did not
+recognise — a tuple variant, so it is `Distro::Other(_)` in a pattern. Match
+rather than comparing `distro_version` strings, and get the variant names from
+the source (see "Finding an operation" below):
+
+```rust
+match &f.distro {
+    Distro::Debian | Distro::Ubuntu => { /* apt */ }
+    Distro::Alpine => { /* apk */ }
+    other => bail!("unsupported distribution: {other:?}"),
+}
+```
 
 **There are no custom facts.** That list is all of them, and there is no
 `setup` module or local-facts directory. To answer anything else, ask the
@@ -548,39 +562,38 @@ An operation is one desired state. The naming rule:
 - **Things that are genuinely actions get verbs** and always report changed:
   `systemd::Restart`, `systemd::Reload`, `shell::Command`.
 
-### What exists
+### Finding an operation
 
-| operation | how it starts |
-|---|---|
-| `apt::{Present, Absent, Latest}` | `::new(["nginx", "curl"])` — a list |
-| `file::Copy` | `::from_str(s)` / `::from_bytes(b)` / `::from_local_path(p)` → `.to(dest)` |
-| `file::Directory` | `::at(path)` |
-| `file::Symlink` | `::at(link)` → `.pointing_to(target)` |
-| `file::Absent` | `::at(path)` |
-| `file::Attrs` | `::at(path)` |
-| `file::Line` | `::in_path(file)` → `.set(line)` |
-| `file::Block` | `::in_path(file)` → `.set(block)` |
-| `user::{Present, Absent}` | `::new("deploy")` |
-| `group::{Present, Absent}` | `::new("docker")` |
-| `group::Membership` | `::new("docker")` |
-| `ssh::authorized_keys::{Present, Absent}` | `::for_user(&account)` / `::for_user_name("deploy")` → `.keys([..])` |
-| `systemd::{Enabled, Disabled, Running, Stopped, Restart, Reload}` | `::new("nginx")` |
-| `systemd::DaemonReload` | `::new()` |
-| `hostname::Is` | `::new("web1")` |
-| `sysctl::Present` | `::new("vm.swappiness", "60")` — the value is a string |
-| `http::Download` | `::get(url)` → `.to(dest)` |
-| `archive::Extracted` | `::from_path(src)` → `.to(dest)` |
-| `shell::Command` | `::new("program")` / `::sh("a \| b")` |
+This guide does not list the operations or their signatures. It would be out
+of date the day an operation is added, and a stale signature is worse than no
+signature. Three ways to get the real thing, in the order to reach for them:
 
-⚠️ `systemd::Enabled::new("nginx")` only enables it. `.now(true)` starts it as
-well, which is usually what you want — otherwise add a separate
-`systemd::Running` step.
+**1. The source, on your own disk.** `rustible-std` is an ordinary dependency
+of your workspace, so cargo has already vendored it:
 
-**For the exact signature of any of them, read
-[docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/).**
-Every operation, every builder method and every output type is documented
-there, generated from the source, so it is never out of date. This guide
-teaches the shapes; docs.rs has the specifics.
+```sh
+ls ~/.cargo/registry/src/*/rustible-std-*/src/        # the modules
+grep -n "^pub struct" ~/.cargo/registry/src/*/rustible-std-*/src/systemd.rs
+grep -n "pub fn" ~/.cargo/registry/src/*/rustible-std-*/src/apt.rs
+```
+
+Every public item is documented with a `///` comment above it, including what
+it refuses to do and why. This is the fastest and most reliable route, and it
+works offline.
+
+**2. Rendered docs, locally.** From your workspace:
+
+```sh
+cargo doc -p rustible-std --no-deps --open
+```
+
+**3. [docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/)**,
+the same thing on the web.
+
+The modules are `apt`, `archive`, `file`, `group`, `hostname`, `http`, `shell`,
+`ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
+you cannot get that way — which shape to reach for, and what bites — is the
+rest of this section.
 
 ### The two builder shapes
 
@@ -597,6 +610,17 @@ content — return a builder that finishes by naming the second:
 | `file::Line` | `in_path(file)` | `.set(line)` |
 | `file::Block` | `in_path(file)` | `.set(block)` |
 | everything else | `new(...)` | — nothing, it is already the op |
+
+That list is short and you can regenerate it yourself:
+
+```sh
+grep -rn "pub fn to(self\|pub fn set(self\|pub fn pointing_to(self" \
+  ~/.cargo/registry/src/*/rustible-std-*/src/
+```
+
+⚠️ A finisher turns the builder into the operation, so anything on the
+*operation* is chained **after** it — `archive::Extracted::from_path(x).to(d).creates(m)`,
+not `.creates(m).to(d)`.
 
 So:
 
@@ -702,6 +726,29 @@ ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
 
 The refusal happens in `check`, before anything is touched, and names the
 operation you wanted.
+
+**`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
+Nothing about a directory full of files tells it the archive was already
+unpacked, so without a marker it reports `changed` every time — which is
+otherwise the signature of a bug. Give it a path that exists only after a
+successful extraction, relative to the destination:
+
+```rust
+ctx.step("app extracted", archive::Extracted::from_path(TARBALL)
+    .to("/opt/app")                // .to() first: it produces the operation
+    .creates("bin/app")            // then report ok when /opt/app/bin/app exists
+    .owner(svc.uid, svc.gid))?;
+```
+
+⚠️ Note the order. `.to()` is the finisher that turns the builder into the
+operation, and `.creates()` and `.owner()` are on the operation, so they come
+**after** it. The same is true of `http::Download`.
+
+⚠️ **Set ownership on the extraction, not only on the directory.** `.owner()`
+on `Extracted` chowns **every extracted file and directory**. Creating
+`/opt/app` owned by a service account and then extracting into it as root
+leaves a correctly-owned directory full of root-owned files, and the run
+reports `ok` for the directory step while it happens.
 
 **A new unit file is invisible until systemd re-reads.** Writing
 `/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
@@ -884,6 +931,14 @@ Two things to know:
 
 An op that *can* predict does: `apt::Present` knows the candidate version,
 `file::Copy` knows the content it would write.
+
+**A dry run of a playbook that builds things from scratch works.** A step does
+not refuse because an earlier step's work has not happened yet: `--check` on a
+fresh host runs the whole playbook and reports every step as `would change`.
+A `user::Present` whose primary group an earlier `group::Present` would create
+is accepted, and a `file::Copy` into a directory an earlier step would create
+is accepted. What you do not get is *output* for steps that could not predict
+it, which is §9's `is_available()` guard.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
