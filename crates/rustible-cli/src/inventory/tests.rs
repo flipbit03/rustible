@@ -51,19 +51,24 @@ fn group(g: &str) -> Source {
 
 // --- vision 10.2.2 ---------------------------------------------------------
 
-/// A `//` comment on the same line as a closing `}` must not swallow the node
-/// after it. kdl 6.5.0 did exactly that: the `host` below vanished and the
-/// document failed with "No closing '}' for child block". Fixed upstream in
-/// 6.7.0, so this pins the floor as much as the behaviour.
+/// Pins a known upstream defect so it cannot change unnoticed: in kdl 6.5.0 a
+/// `//` comment on the same line as a closing `}` swallows the node after it,
+/// and the document fails to parse. Fixed in kdl 6.6.0, which we cannot take
+/// because every version from there on requires rustc 1.95 against our 1.88
+/// floor (see DECISIONS). `docs/INVENTORY.md` tells readers to put such a
+/// comment on its own line.
+///
+/// When the MSRV moves, this test flips: take the kdl bump, drop the
+/// `expect_err`, and assert the host survives.
 #[test]
-fn a_comment_after_a_child_block_does_not_eat_the_next_node() {
+fn a_comment_after_a_child_block_currently_eats_the_next_node() {
     let src =
         "group \"w\" {\n    vars { n 4 }   // a comment\n    host \"h\" addr=\"10.0.0.1\"\n}\n";
-    let inv = Inventory::parse(src, "hosts.kdl").expect("should parse");
+    let err = Inventory::parse(src, "hosts.kdl")
+        .expect_err("kdl now parses this: take the bump and flip this test");
     assert!(
-        inv.hosts.contains_key("h"),
-        "the host after the comment was swallowed: {:?}",
-        inv.hosts.keys().collect::<Vec<_>>()
+        format!("{err:?}").contains("closing"),
+        "unexpected error: {err:?}"
     );
 }
 

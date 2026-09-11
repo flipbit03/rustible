@@ -49,8 +49,8 @@ those values feed the operations after it. `cadu` here is an `Account`, with
 takes `&cadu` rather than repeating the username and guessing the home
 directory. `cfg` is a `CopyReport`, and its `changed` is a `bool`, so a
 conditional reload is an ordinary `if` instead of a handler wired up by a
-`notify` string. All of it is checked at compile time: a misspelled field or a
-wrong type fails the build, not the last host of a long run.
+`notify` string. All of it is checked at compile time: a misspelled field or
+a wrong type fails the build.
 
 ## Why
 
@@ -93,8 +93,8 @@ Linux targets with the clang that Xcode's command line tools already provide.
 A Mac cannot be a target, because the operations speak apt, systemd and
 `/etc/passwd`; Rustible refuses it by name rather than failing later.
 
-Targets need nothing installed. Not Python, not an agent, not a runtime — the
-playbook arrives as one static musl binary.
+Targets need nothing installed. The playbook arrives as one static musl
+binary.
 
 ## Install
 
@@ -140,7 +140,7 @@ rustible init                                # Cargo.toml, build.rs, src/, hosts
 rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting this machine
 ```
 
-`rustible init` writes a Cargo package, not a config tree. `src/main.rs` and
+`rustible init` writes a Cargo package. `src/main.rs` and
 `build.rs` are generated shims you rarely open: the build script finds every
 file under `playbooks/` carrying the attribute and registers it, so adding a
 playbook is adding a file.
@@ -161,7 +161,8 @@ group "web" {
     vars { nginx_workers 4 }
     host "web1" addr="10.0.1.11"
     host "web2" addr="10.0.1.12" {
-        vars { nginx_workers 8 }     // host beats group
+        // host beats group
+        vars { nginx_workers 8 }
     }
 }
 ```
@@ -215,8 +216,8 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { /* ... */ }
 ```
 
 Every host's vars are validated against that struct **before** anything is
-built or shipped, so a missing var fails in a second, not halfway through a
-run. `--var package=htop` overrides the inventory.
+built or shipped, so a missing var fails in a second. `--var package=htop`
+overrides the inventory.
 
 ## The model
 
@@ -232,7 +233,7 @@ run. `--var package=htop` overrides the inventory.
   made, and later steps use it. In check mode an op that cannot predict a
   field leaves it unavailable, and reading it returns an error saying so
   rather than a guess.
-- **Prerequisites are refused, not invented.** An op that manages a user does
+- **Prerequisites are refused.** An op that manages a user does
   not create the group it references; it fails and names the op you wanted.
 
 ## Operations and collections

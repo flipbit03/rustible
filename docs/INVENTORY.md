@@ -3,8 +3,8 @@
 Your fleet, in [KDL](https://kdl.dev). One file, checked before a run touches
 anything.
 
-KDL rather than YAML because nesting is braces, not indentation: a misplaced
-space cannot silently reparent a host into another group.
+KDL rather than YAML because nesting is braces. A misplaced space cannot
+silently reparent a host into another group.
 
 Validate it any time with:
 
@@ -45,7 +45,8 @@ group "web" {
     vars { nginx_workers 4 }
     host "web1" addr="10.0.1.11"
     host "web2" addr="10.0.1.12" {
-        vars { nginx_workers 8 }         // host beats group
+        // host beats group
+        vars { nginx_workers 8 }
     }
 }
 
@@ -97,12 +98,16 @@ Using both spellings on one node is a load error.
 Three levels, nearest wins: workspace `vars`, then group, then host.
 
 ```kdl
-vars { timezone "Europe/Berlin" }        // all hosts
+// every host
+vars { timezone "Europe/Berlin" }
 
 group "web" {
-    vars { nginx_workers 4 }             // this group
+    // this group
+    vars { nginx_workers 4 }
+
     host "web2" addr="10.0.1.12" {
-        vars { nginx_workers 8 }         // this host
+        // this host
+        vars { nginx_workers 8 }
     }
 }
 ```
@@ -120,7 +125,7 @@ vars {
 
 A playbook declares what it needs with `#[rustible::vars]`, and **every**
 target host is validated against that struct before anything is built or
-shipped — so a missing or mistyped var fails in a second, not halfway through.
+shipped, so a missing or mistyped var fails in a second.
 `--var name=value` on the command line overrides the inventory.
 
 ## Groups of groups, and cherry-picking
@@ -157,7 +162,30 @@ KDL's `/-` disables the next node, children included:
 }
 ```
 
-`//` and `/* */` work as you expect.
+`//` and `/* */` work as you expect, with one exception.
+
+**Put a `//` comment on its own line, never on the same line as a closing
+`}`.** The KDL parser we are pinned to swallows the node that follows:
+
+```kdl
+group "web" {
+    vars { nginx_workers 4 }   // this comment eats the host below
+    host "web1" addr="10.0.1.11"
+}
+```
+
+That file fails to load with `No closing '}' for child block`. Write it as:
+
+```kdl
+group "web" {
+    // this is fine
+    vars { nginx_workers 4 }
+    host "web1" addr="10.0.1.11"
+}
+```
+
+The bug is upstream and fixed in a newer `kdl`, which needs a Rust newer than
+this project's floor. `rustible inventory check` catches it either way.
 
 ## Pointing at a different file
 
