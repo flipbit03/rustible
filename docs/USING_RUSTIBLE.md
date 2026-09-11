@@ -1120,19 +1120,21 @@ satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
 changed, so they pass a dry run against a unit that does not exist yet. That
 is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
 
-`ssh::authorized_keys` is the other one you will meet, and it stings because
-the remedy it names is the step you already wrote. It stats the `.ssh`
+`ssh::authorized_keys` is the other one you will meet. It stats the `.ssh`
 directory itself, so a `file::Directory` one line above that *would* create it
-does not count:
+does not count — and the refusal says so rather than telling you to add the
+step you already wrote:
 
 ```
 FAILED at `keys`: /home/app/.ssh does not exist; ssh::authorized_keys does not
-create it (vision 6.7), ensure it first with file::Directory::at(..)...
+create it (vision 6.7). Under --check a directory an earlier step would create
+is still reported missing, because this op stats the real filesystem. If a step
+in this run creates it, the real run converges and there is nothing to fix; if
+not, ensure it with file::Directory::at(..).mode(0o700).owner(..)
 ```
 
-The sequence in §13 is right and a real run converges; it is the dry run that
-cannot see it. `user::Membership` naming a group an earlier `group::Present`
-would create is *not* affected — it consults the registry and passes.
+`user::Membership` naming a group an earlier `group::Present` would create is
+*not* affected — it consults the registry and passes.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
