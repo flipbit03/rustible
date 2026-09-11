@@ -286,38 +286,14 @@ The playbook binary never opens a socket. SSH is the orchestrator's business.
 | `rustible-build` | playbook discovery for the generated `build.rs` |
 | `rustible-github` | a collection, and the worked example of one |
 
-## Developing
-
-`CLAUDE.md` is how to work in this repository — the rules, the layout, how to
-write an operation, and which of the four testing tiers a given test belongs
-in. `docs/DEVELOPING.md` is the per-platform setup for the ones that need a
-machine.
-
-```sh
-make                # fmt, clippy, unit and fake tests, rustdoc, example workspace
-make integration    # operations against real distributions, in Docker
-make vm-up          # a Debian guest matching this host's architecture
-make vm-test        # a playbook against that guest, twice; the second run must change nothing
-```
-
-Tests are in four tiers, each seeing something the one below it cannot: pure
-functions, ops against a `Fake` backend, ops against real distributions in
-containers, and a playbook against a real virtual machine over SSH. The last
-one exists because a container shares the host kernel and has no pid 1, so it
-cannot honestly test a `/proc/sys` write, a real init system, a real `sudo`,
-or the transport itself. All four run in CI, the machine tier on both
-x86_64 and aarch64.
-
-Every change goes through a pull request, and eight CI jobs must be green.
-
-## Design
+## Documentation
 
 | document | what it is |
 |---|---|
+| [`CLAUDE.md`](CLAUDE.md) | how to work in this repository: the rules, writing an operation, the testing tiers and the `make` targets |
 | [`docs/01_VISION.md`](docs/01_VISION.md) | the contract: architecture, the playbook model, check mode, the error model |
 | [`docs/INVENTORY.md`](docs/INVENTORY.md) | the `hosts.kdl` reference |
 | [`docs/DEVELOPING.md`](docs/DEVELOPING.md) | per-platform setup for the tests that need a machine |
-| [`CLAUDE.md`](CLAUDE.md) | how to work in this repository |
 | [`docs/plan/DECISIONS.md`](docs/plan/DECISIONS.md) | every decision made while building |
 | [`docs/plan/PROGRESS.md`](docs/plan/PROGRESS.md) | what is built |
 
