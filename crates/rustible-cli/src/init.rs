@@ -623,9 +623,8 @@ mod tests {
         assert!(written.starts_with("# myinfra\n"), "{written}");
         // The whole point: an agent landing here can find out what this is.
         assert!(
-            written.contains(
-                "https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"
-            ),
+            written
+                .contains("https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md"),
             "the guide link is the reason this file exists: {written}"
         );
         assert!(!written.contains("{{name}}"), "unsubstituted placeholder");
