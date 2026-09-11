@@ -71,17 +71,18 @@ jobs:
       - run: cargo test --workspace
 
   msrv:
-    name: "Build: MSRV 1.88"
+    name: "Build: MSRV 1.95"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Kept in step with `rust-version` in the workspace manifest. Let-chains
-      # need 1.88, so this is a real floor, not a guess. `ring` (the TLS
-      # provider, see rustible-std::tls) declares a far lower MSRV than that,
-      # unlike the `graviola` it replaced, which forced 1.89.
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      # Kept in step with `rust-version` in the workspace manifest. The floor
+      # is set by `kdl`, which declares 1.95 from 6.6.0 onward; the version
+      # below that mis-parses a comment on the same line as a closing brace
+      # and silently drops the node after it. Let-chains in the CLI need 1.88,
+      # so that is the floor this would fall back to.
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95
 
       - run: cargo check --workspace --all-targets
 

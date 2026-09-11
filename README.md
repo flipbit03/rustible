@@ -64,7 +64,7 @@ Its execution model ships a Python module to the target for every task
 whatever libraries the modules import.
 
 Rustible keeps the parts that work — desired state, idempotence, readable runs
-— and changes those two things.
+— and changes what does not.
 
 | Ansible | Rustible |
 |---|---|
@@ -101,11 +101,8 @@ binary.
 cargo install rustible-cli
 ```
 
-That gives you the `rustible` binary, and it needs **rustup and clang** on
-your machine only.
-
-Clang is there because Rustible's TLS provider compiles a small amount of C.
-Most systems already have it:
+That gives you the `rustible` binary. It needs **rustup and clang** on your
+machine, and nothing on the machines you manage.
 
 ```sh
 sudo apt install clang        # Debian, Ubuntu; dnf, pacman and apk all have it
@@ -125,13 +122,6 @@ To see what a machine can do before relying on it:
 ```sh
 rustible toolchain check      # what this machine can build for, and how
 ```
-
-Rustible carries musl's libc headers itself and sets the compiler flags, so
-there is no cross-gcc, no zig, no docker and no sysroot to install. If clang
-is missing, `rustible init` says so and `rustible playbook run` refuses with
-the package name rather than failing inside a build script. Clang is only
-needed to reach an architecture other than your own: an x86_64 Linux box with
-`gcc` can build for itself.
 
 ## Five minutes
 

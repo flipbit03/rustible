@@ -162,30 +162,7 @@ KDL's `/-` disables the next node, children included:
 }
 ```
 
-`//` and `/* */` work as you expect, with one exception.
-
-**Put a `//` comment on its own line, never on the same line as a closing
-`}`.** The KDL parser we are pinned to swallows the node that follows:
-
-```kdl
-group "web" {
-    vars { nginx_workers 4 }   // this comment eats the host below
-    host "web1" addr="10.0.1.11"
-}
-```
-
-That file fails to load with `No closing '}' for child block`. Write it as:
-
-```kdl
-group "web" {
-    // this is fine
-    vars { nginx_workers 4 }
-    host "web1" addr="10.0.1.11"
-}
-```
-
-The bug is upstream and fixed in a newer `kdl`, which needs a Rust newer than
-this project's floor. `rustible inventory check` catches it either way.
+`//` and `/* */` work as you expect.
 
 ## Pointing at a different file
 

@@ -100,7 +100,7 @@ against, because the people reading a CI run do not have this file open:
 |---|---|
 | `Lint: fmt, clippy, docs` | the code is well-formed and documented |
 | `Test: unit & fake` | tiers 1 and 2 |
-| `Build: MSRV 1.88` | the floor stays 1.88 |
+| `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
 | `Build: macOS controller` | the suite on macOS, and a cross-build for both Linux targets |
 | `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |

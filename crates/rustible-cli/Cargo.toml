@@ -25,6 +25,6 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 openssh = { version = "0.11", features = ["native-mux"] }
 sha2 = "0.10"
-kdl = "6.5.0"
+kdl = "6.7.1"
 toml = "1"
 tempfile.workspace = true
