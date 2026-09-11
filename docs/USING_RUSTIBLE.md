@@ -5,6 +5,9 @@ machines, and run them. Written for someone — or something — with no prior
 exposure to Rustible. If you are an AI agent, read this once, end to end,
 before writing a playbook.
 
+Describes Rustible **0.0.2**. Signatures linked to docs.rs are for the latest
+published version; if you are on something older, read that crate's own docs.
+
 Rustible is new and is not in any model's training data. Nothing here can be
 guessed from experience with Ansible, and several things that look like
 Ansible behave differently. Those are flagged **⚠️**.
@@ -57,6 +60,9 @@ The concepts carry over. The syntax does not.
 | handlers and `notify:` | `if step.changed { ... }` |
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
+| `ignore_errors` / `failed_when` | match on the `Result` — see §14 |
+| `--tags` / `--skip-tags` | separate playbooks, or an `if` on a var |
+| custom facts | `ctx.sys()` — see §10 |
 | module docs on docs.ansible.com | [docs.rs/rustible-std](https://docs.rs/rustible-std) |
 
 ⚠️ **Do not transliterate a YAML playbook.** Ansible's `set_fact`, `include_role`
@@ -141,7 +147,11 @@ rustible inventory check                # the inventory, and every playbook's va
 rustible toolchain check                # what this machine can build for
 ```
 
-`<PLAYBOOK>` is either a path (`playbooks/web.rs`) or the name (`web`).
+`<PLAYBOOK>` is either a path (`playbooks/site.rs`) or the name (`site`).
+⚠️ That name is the **file** under `playbooks/`, not a group. Examples here
+use a playbook called `site` targeting a group called `web`, so the two are
+telling apart; if you name them the same, `rustible playbook run web` is still
+the playbook.
 ⚠️ A path is resolved against your **current directory**, not the workspace,
 so the name form is safer from a script.
 
@@ -193,8 +203,12 @@ group "web" {
     host "web2" addr="10.0.1.12"
 }
 
+group "db" {
+    host "db1" addr="10.0.2.11"
+}
+
 group "production" {
-    members "web" "db"
+    members "web" "db"        // a group of groups
 }
 ```
 
@@ -217,6 +231,19 @@ Seven, and no others. Set any of them on a `host`, on a `group`, or on
 host "db1" addr="10.0.2.50" port=2222 ssh_user="pgadmin"
 ```
 
+A host can also carry its own `vars` block, which is how one machine overrides
+its group:
+
+```kdl
+group "web" {
+    vars { nginx_workers 4 }
+    host "web1" addr="10.0.1.11"
+    host "web2" addr="10.0.1.12" {
+        vars { nginx_workers 8 }      // this host only
+    }
+}
+```
+
 Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
 `#false`.
 
@@ -231,6 +258,25 @@ Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
 - ⚠️ **`addr` cannot be inherited.** It is host-only; setting it on a group or
   on `defaults` is a load error.
 - ⚠️ **`ssh_args` does not merge.** The nearest level that sets it wins whole.
+
+### SSH, and secrets
+
+There is no `ssh_key` parameter. Rustible shells out to your `ssh`, so it uses
+your agent, your `~/.ssh/config` and your known-hosts exactly as a manual
+`ssh` would. Anything else goes through `ssh_args`:
+
+```kdl
+host "jump" addr="10.0.0.2" {
+    ssh_args "-i" "/home/me/.ssh/deploy_ed25519" "-o" "IdentitiesOnly=yes"
+}
+```
+
+If `ssh user@host` works from your shell, Rustible works.
+
+There is no vault. Keep secrets out of `hosts.kdl` and bring them in at run
+time: `ctx.local_secret(path)` uploads a file from the controller and redacts
+it from every diff and log, and `--escalate-password-env` reads the sudo
+password from the environment (§12).
 
 Validate before running:
 
@@ -389,6 +435,21 @@ ensure!(f.is_root, "this playbook needs root");
 The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude. Match
 on them rather than on `distro_version` strings.
 
+**There are no custom facts.** That list is all of them, and there is no
+`setup` module or local-facts directory. To answer anything else, ask the
+machine yourself through `ctx.sys()`:
+
+```rust
+let out = ctx.sys().cmd("findmnt").args(["-no", "FSTYPE", "/"]).run()?;
+let root_fs = String::from_utf8_lossy(&out.stdout).trim().to_string();
+if root_fs == "btrfs" { /* ... */ }
+```
+
+`ctx.sys()` is the same handle operations use — `read_to_string`, `exists`,
+`stat`, `cmd`, `write_atomic`, `mkdir_all`. Reach for it to *decide* something;
+prefer an operation to *change* something, because `sys` writes have no diff
+and no idempotence.
+
 ⚠️ `is_root` answers on **identity, not process**: under escalation it is true
 because the steps run as root, even though the binary did not start that way.
 
@@ -472,7 +533,7 @@ are told each time.
 `sudo` must work without a password, or pass one:
 
 ```sh
-RUSTIBLE_SUDO=hunter2 rustible playbook run web --escalate-password-env RUSTIBLE_SUDO
+RUSTIBLE_SUDO=hunter2 rustible playbook run site --escalate-password-env RUSTIBLE_SUDO
 ```
 
 The password travels in the start frame, never on a command line, and is
@@ -726,7 +787,7 @@ idempotent and never has a diff.
 ## 14. Running, and reading the output
 
 ```sh
-rustible playbook run web
+rustible playbook run site
 ```
 
 Each step is a line:
@@ -755,6 +816,31 @@ A host that never got as far as running gets a `failed: <reason>` row instead
 
 `--json` emits the raw event stream, one JSON object per line, for scripting.
 
+### What a run costs
+
+The first run for a given architecture compiles the playbook into a static
+binary. On a small workspace that is about **30 seconds**; a second run that
+changes nothing is about **2 seconds**, because the binary is cached by source
+hash and is only rebuilt when the source changes, and only re-uploaded when
+the target does not already have that exact binary. Adding a second
+architecture adds one more build.
+
+### When a step fails
+
+`ctx.step(...)?` propagates, so by default the first failure stops that host.
+To carry on regardless, handle the `Result` like any other:
+
+```rust
+if let Err(e) = ctx.step("optional thing", op) {
+    ctx.warn(format!("skipping: {e}"));
+}
+```
+
+⚠️ **That continues the playbook, but the step is still counted as failed**,
+the host still reports `failed` in the summary, and the run still exits `2`.
+There is no `ignore_errors` that makes a failure invisible — you can decide
+what to do next, not whether it happened.
+
 **Hosts run in parallel, and one failing does not stop the others.** Every
 host runs to completion; the summary says which failed, and the process exits
 `2`. There is no `serial:` or `any_errors_fatal:` — to roll a change out in
@@ -763,10 +849,25 @@ batches, use `--limit` and run it more than once.
 ⚠️ A `--limit` that selects nothing is an error, not an empty success, so a
 typo cannot look like a clean no-op deploy.
 
+**To see which machines a playbook would touch** before touching them, read
+its `hosts` attribute and resolve that name against the inventory:
+
+```sh
+rustible inventory check        # lists every group and host it loaded
+rustible inventory show web1    # confirms one host resolves as you expect
+```
+
+`--check` also tells you, but it builds and connects first.
+
+The `--json` stream is the same event sequence the renderer consumes — step
+start and finish, diffs, logs, and a final summary object. Read one run with
+`rustible playbook run x --json | head` before writing against it; the field
+names are the ones in `rustible_sdk::event`.
+
 ## 15. Check mode
 
 ```sh
-rustible playbook run web --check
+rustible playbook run site --check
 ```
 
 Nothing is modified. Steps report `would change` instead of `changed`, with
@@ -807,8 +908,8 @@ Useful first moves:
 ```sh
 rustible inventory check                 # inventory + every playbook's vars
 rustible inventory show web1             # what web1 resolves to, and from where
-rustible playbook run web --check -v     # what would change, with diffs
-rustible playbook run web -vv            # every command executed
+rustible playbook run site --check -v    # what would change, with diffs
+rustible playbook run site -vv           # every command executed
 ```
 
 ## 17. Writing your own operation
