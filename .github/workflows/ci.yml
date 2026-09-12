@@ -20,7 +20,7 @@ jobs:
     name: "Lint: fmt, clippy, docs"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -28,7 +28,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -53,13 +53,13 @@ jobs:
     name: "Test: unit & fake"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -74,7 +74,7 @@ jobs:
     name: "Build: MSRV 1.95"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Kept in step with `rust-version` in the workspace manifest. The floor
       # is set by `kdl`, which declares 1.95 from 6.6.0 onward; the version
@@ -90,7 +90,7 @@ jobs:
     name: "Build: example workspace"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
     name: "Build: macOS controller"
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # A mac is a supported *controller*: it builds the CLI natively and
       # cross-builds playbook binaries for the Linux musl targets. It is never
@@ -117,7 +117,7 @@ jobs:
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -154,7 +154,7 @@ jobs:
     name: "Test: Docker (Debian/Ubuntu/Alpine)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -162,7 +162,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -221,7 +221,7 @@ jobs:
             # the hypervisor version before it will do anything at all.
             qemu: qemu-system-x86 qemu-system-arm qemu-efi-aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The dependency rule, on a runner: a musl target plus clang. Nothing
       # below installs a cross-gcc, a zig, or a docker image to build in.
@@ -231,7 +231,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
