@@ -117,7 +117,7 @@ Ansible.
 
 ```sh
 mkdir infra && cd infra && git init
-rustible init                                # Cargo.toml, build.rs, src/, hosts.kdl, rustible.toml
+rustible init                                # Cargo.toml, build.rs, src/, hosts.kdl, rustible.toml, README.md
 rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting this machine
 ```
 

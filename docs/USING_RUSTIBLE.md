@@ -66,13 +66,17 @@ The concepts carry over. The syntax does not.
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
 | `ignore_errors` / `failed_when` | match on the `Result` — see §14 |
+| a `roles/` entry, reused | a function in `src/lib.rs` — see §7 |
+| `include_tasks:`, used once | statements in the playbook — see §7 |
 | `--tags` / `--skip-tags` | separate playbooks, or an `if` on a var |
 | custom facts | `ctx.sys()` — see §10 |
 | module docs on docs.ansible.com | [docs.rs/rustible-std](https://docs.rs/rustible-std) |
 
-⚠️ **Do not transliterate a YAML playbook.** Ansible's `set_fact`, `include_role`
-and `delegate_to` have no equivalent because Rust already has `let`, function
-calls, and — for delegation — a separate playbook.
+⚠️ **Do not transliterate a YAML playbook.** Ansible's `set_fact` and
+`delegate_to` have no equivalent because Rust already has `let` and — for
+delegation — a separate playbook. `include_role` and `include_tasks` are both
+function calls in principle, but they are not the same thing in practice: see
+"Where the code goes" in §7 before you decide what becomes a function.
 
 ## 3. Install
 
@@ -120,7 +124,7 @@ infra/
 │   └── config.toml    # musl cross-linking via rust-lld. Do not edit.
 ├── src/
 │   ├── main.rs        # generated shim. Do not edit.
-│   └── lib.rs         # yours: shared helpers, roles
+│   └── lib.rs         # yours: what more than one playbook needs
 └── playbooks/         # one file per playbook
 ```
 
@@ -137,9 +141,11 @@ Things worth knowing:
 - **`src/main.rs` and `build.rs` are generated shims.** Do not edit them. If
   they drift after an upgrade, `rustible init --refresh .` rewrites exactly
   those two.
-- **`src/lib.rs` is yours.** Put shared helpers there — a function taking
-  `&mut Ctx` is Rustible's equivalent of an Ansible role. Playbooks reach it
-  by the package name, so in a workspace named `infra` that is `use infra::my_helper;`.
+- **`src/lib.rs` is yours**, for what a *second* playbook needs. A function
+  taking `&mut Ctx` is the unit of reuse below a collection. Playbooks reach it
+  by the package name, so in a workspace named `infra` that is
+  `use infra::my_helper;`. It is *not* where a playbook's steps live by
+  default — see "Where the code goes" in §7.
 - **It is a normal Cargo package.** `cargo add` a dependency, use any crate.
 
 ⚠️ `rustible init` refuses only if one of the files it *generates* is already
@@ -360,6 +366,131 @@ mod helpers;                // a sibling file, declared inside this playbook
 One playbook per file, and the path under `playbooks/` is the playbook's
 name — `playbooks/web/nginx.rs` is the playbook `web/nginx`, which is what
 `rustible playbook list` prints and what `run` takes.
+
+### Where the code goes: the playbook, or `src/lib.rs`
+
+**A playbook is the readable record of what happens to a machine.** Someone
+opening it — a colleague at 2am, you in six months, an agent asked to change
+one thing — should be able to read down the page and see the run. Keeping that
+true is the one rule here. Everything below follows from it.
+
+So **steps go in the playbook by default**, and `src/lib.rs` is earned, not
+assumed. A helper there is a good thing when it is pulling its weight; it is a
+cost when it is only moving code out of sight.
+
+**`lib.rs` is earned by a second playbook, and by nothing else.** That is the
+whole trigger. It is the only thing `lib.rs` can do that a function in the
+playbook file cannot, and moving code there before a second playbook exists
+buys nothing and costs the reader a file.
+
+A second playbook *permits* the move; it does not compel it. The rule above
+still outranks it: if lifting a shared sequence would leave the playbooks that
+used it saying nothing, leave it where it is and accept the repetition. Three
+plays that each install an account, its `~/.ssh`, its GitHub keys and a deploy
+key have a genuinely common shape — and hoisting the whole of it turns all
+three into two statements apiece. Share the parts that are incidental to the
+story (`ssh_dir`, `caddy_vhost`), and let each play keep the steps that *are*
+its story.
+
+Everything else that makes you want a function is served by a function **in
+the playbook file**, which is the next heading. Repeating a group of steps
+three times inside one play is a good reason for a function — and a bad reason
+to move it to `lib.rs`, because nothing else can call it yet. Wanting a name
+for a policy (`harden_ssh`) is the same: the name is worth having wherever the
+function lives, and it lives next to its only caller until there is a second
+one.
+
+Then the check that catches the common mistake: **called once, takes nothing
+but `ctx`, and its name just restates its own body — inline it.**
+`setup_nginx()` holding install-then-config-then-enable, inside a playbook
+whose whole purpose is nginx, is that. `harden_ssh()` is not.
+
+Both of these read well, and both are fine:
+
+```rust
+// Everything inline. The default, and never wrong.
+ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
+ctx.step("nginx.conf", file::Copy::from_str(CONF).to(NGINX_CONF))?;
+ctx.step("nginx enabled", systemd::Enabled::new("nginx").now(true))?;
+
+// Helpers, with the playbook still saying what happens.
+ctx.step("base packages", apt::Present::new(["curl", "ufw"]))?;
+harden_ssh(ctx)?;                       // in lib.rs: four playbooks call it
+deploy_app(ctx, "v1.2.3")?;             // in lib.rs: two do
+ctx.step("firewall enabled", systemd::Enabled::new("ufw").now(true))?;
+```
+
+This one does not, because `setup_web_server` is in `src/lib.rs` and this
+playbook is its only caller:
+
+```rust
+use infra::setup_web_server;
+
+#[rustible::playbook(hosts = "web", escalate = true)]
+fn main(ctx: &mut Ctx) -> Result<()> {
+    setup_web_server(ctx)               // ⚠️ what does this do? another file knows
+}
+```
+
+The same three words written as a `fn` lower down *this* file would be fine —
+see below. It is the trip to `lib.rs`, for one caller, that costs the reader.
+
+⚠️ **The failure to avoid is a playbook that no longer tells you anything.**
+It happens a step at a time: each extraction looks tidy, and at the end the
+playbook is two lines and the machine's actual behaviour lives somewhere else.
+If the playbook has become shorter than the list of things it does, extract
+less. If a playbook is *long* rather than unreadable, group it with
+`ctx.section(..)` (§8), which keeps the steps on the page.
+
+**Converting an Ansible repository?** Ansible already draws this line, and you
+can follow it mechanically:
+
+| Ansible | where it goes |
+|---|---|
+| a `roles/` entry used by several playbooks | a `lib.rs` function — this is the reuse it was for |
+| `include_tasks: subtasks/10_foo.yaml`, used once | **inline it into the playbook** |
+
+`include_tasks` is how a YAML file gets split when it grows, not a reuse
+mechanism. A Rust file does not have YAML's length problem, so those subtasks
+become ordinary statements in the playbook, in the order they ran. Turning
+each one into a `lib.rs` function reproduces the file-splitting without the
+reason for it, and costs you the readable playbook.
+
+**A plain `fn` further down the playbook file is not an extraction, and it is
+where most helpers belong.** The unit that has to stay readable is the *file*,
+not `main`. Use one when a play reads better as named phases, and use one when
+a play does the same thing several times — three sites, three mounts, three
+accounts — with no other playbook needing it. Either way you still open one
+file and read down it:
+
+```rust
+fn main(ctx: &mut Ctx) -> Result<()> {
+    base_packages(ctx)?;                // each of these is a `fn` in
+    cadu_account(ctx)?;                 // this same file, below
+    qemu(ctx)?;
+    Ok(())
+}
+```
+
+That is the same *shape* as the antipattern above and none of its cost,
+because nothing moved out of sight. The damage comes from the jump to another
+file, not from the existence of a function. If you find yourself wanting that
+structure, prefer this over `lib.rs` until a second playbook actually needs
+the code.
+
+One more place, for bulk rather than for steps: **a sibling file declared
+inside the playbook**, `mod helpers;` (§7 above). That is for material that
+belongs to one playbook and nothing else — a long config template, a parser.
+It keeps that out of the way without pretending it is shared.
+
+| where | what belongs there |
+|---|---|
+| the playbook | the steps, in order — the default |
+| `ctx.section(..)` | grouping a long playbook, without moving anything at all |
+| a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
+| `mod helpers;` | bulk private to this one playbook |
+| `src/lib.rs` | a **second playbook** needs it |
+| a collection crate (§13) | reuse across workspaces or teams |
 
 ## 8. `Ctx`: everything a playbook can do
 
@@ -1179,8 +1310,10 @@ If `rustible-std` has no operation for something, you have three options, in
 increasing order of effort:
 
 1. **`shell::Command`** — fine for a one-off, never idempotent.
-2. **A helper function** in `src/lib.rs` that composes existing operations.
-   This is Rustible's equivalent of an Ansible role:
+2. **A helper function** that composes existing operations. It lives in the
+   playbook that uses it, and moves to `src/lib.rs` once a *second* playbook
+   needs it (§7). Note the parameters: a helper worth having is one the caller
+   configures.
    ```rust
    pub fn nginx_site(ctx: &mut Ctx, name: &str, conf: &str) -> Result<()> {
        ctx.step(format!("{name} config"), file::Copy::from_str(conf)
