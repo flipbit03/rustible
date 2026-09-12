@@ -14,6 +14,44 @@ use super::error::{LineIndex, LoadError, LoadErrors};
 use super::model::{Connection, Escalate, Group, Host, HostParams, Inventory, Scalar, VarBag};
 use super::resolve::Conflict;
 
+/// Reject a `ssh_user` or `escalate_user` that cannot name an account.
+///
+/// These reach `ssh -l` and `sudo -u` as argv elements, and the escalation
+/// prefix additionally reaches a shell in the cancel and cleanup scripts,
+/// where `transport::escalation_words` quotes every word. So this is not what
+/// stops an injection — the quoting is. What it stops is a value that is
+/// wrong reaching the target at all, turning a confusing `sudo -u` failure on
+/// every host at run time into one load error naming the node.
+///
+/// The rule is deliberately **identical to `rustible_std::group::validate_name`**
+/// rather than stricter. `escalate_user` may name an account `user::Present`
+/// created, so a stricter rule here would let a playbook create an account
+/// the inventory then refuses to escalate to. The two crates cannot share the
+/// function — `rustible-cli` does not depend on `rustible-std` — so they are
+/// kept in step by this note and the tests below.
+fn validate_account_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if name.starts_with('-') {
+        return Err(format!(
+            "is `{}`, which starts with `-` and would be read as a flag",
+            name.escape_default()
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| *c == ':' || *c == ',' || c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "is `{}`, which contains `{}`; an account name cannot contain `:`, `,`, whitespace or control characters",
+            name.escape_default(),
+            bad.escape_default()
+        ));
+    }
+    Ok(())
+}
+
 /// Parse `src` (read from `file`, which is only used in messages).
 pub fn parse(src: &str, file: &str) -> Result<Inventory, LoadErrors> {
     let index = LineIndex::new(src);
@@ -495,8 +533,18 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            "ssh_user" => params.ssh_user = Some(want_string!("a string")),
-            "escalate_user" => params.escalate_user = Some(want_string!("a string")),
+            "ssh_user" | "escalate_user" => {
+                let s = want_string!("a string");
+                if let Err(why) = validate_account_name(&s) {
+                    self.err(at, format!("parameter `{key}` on {owner} {why}"));
+                    return false;
+                }
+                if key == "ssh_user" {
+                    params.ssh_user = Some(s);
+                } else {
+                    params.escalate_user = Some(s);
+                }
+            }
             "port" => match v {
                 KdlValue::Integer(i) => match u16::try_from(*i) {
                     Ok(p) => params.port = Some(p),
