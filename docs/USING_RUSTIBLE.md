@@ -406,19 +406,25 @@ ctx.step("nginx enabled", systemd::Enabled::new("nginx").now(true))?;
 
 // Helpers, with the playbook still saying what happens.
 ctx.step("base packages", apt::Present::new(["curl", "ufw"]))?;
-harden_ssh(ctx)?;                       // used by four playbooks
-deploy_app(ctx, "v1.2.3")?;             // parameterised
+harden_ssh(ctx)?;                       // in lib.rs: four playbooks call it
+deploy_app(ctx, "v1.2.3")?;             // in lib.rs: two do
 ctx.step("firewall enabled", systemd::Enabled::new("ufw").now(true))?;
 ```
 
-This one does not:
+This one does not, because `setup_web_server` is in `src/lib.rs` and this
+playbook is its only caller:
 
 ```rust
+use infra::setup_web_server;
+
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
-    setup_web_server(ctx)               // ⚠️ what does this do? open a second file
+    setup_web_server(ctx)               // ⚠️ what does this do? another file knows
 }
 ```
+
+The same three words written as a `fn` lower down *this* file would be fine —
+see below. It is the trip to `lib.rs`, for one caller, that costs the reader.
 
 ⚠️ **The failure to avoid is a playbook that no longer tells you anything.**
 It happens a step at a time: each extraction looks tidy, and at the end the
@@ -463,16 +469,16 @@ file, not from the existence of a function. If you find yourself wanting that
 structure, prefer this over `lib.rs` until a second playbook actually needs
 the code.
 
-There is a third place, between the two: **a sibling file declared inside the
-playbook**, `mod helpers;` (§7 above). That is for bulk that belongs to one
-playbook and nothing else — a long config template, a parser. It keeps the
-material out of the way without pretending it is shared.
+One more place, for bulk rather than for steps: **a sibling file declared
+inside the playbook**, `mod helpers;` (§7 above). That is for material that
+belongs to one playbook and nothing else — a long config template, a parser.
+It keeps that out of the way without pretending it is shared.
 
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
+| `ctx.section(..)` | grouping a long playbook, without moving anything at all |
 | a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
-| `ctx.section(..)` | grouping a long playbook, without moving anything out of it |
 | `mod helpers;` | bulk private to this one playbook |
 | `src/lib.rs` | a **second playbook** needs it |
 | a collection crate (§13) | reuse across workspaces or teams |
