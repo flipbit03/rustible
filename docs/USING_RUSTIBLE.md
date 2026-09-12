@@ -141,7 +141,7 @@ Things worth knowing:
 - **`src/main.rs` and `build.rs` are generated shims.** Do not edit them. If
   they drift after an upgrade, `rustible init --refresh .` rewrites exactly
   those two.
-- **`src/lib.rs` is yours**, for what more than one playbook needs. A function
+- **`src/lib.rs` is yours**, for what a *second* playbook needs. A function
   taking `&mut Ctx` is the unit of reuse below a collection. Playbooks reach it
   by the package name, so in a workspace named `infra` that is
   `use infra::my_helper;`. It is *not* where a playbook's steps live by
@@ -378,16 +378,20 @@ So **steps go in the playbook by default**, and `src/lib.rs` is earned, not
 assumed. A helper there is a good thing when it is pulling its weight; it is a
 cost when it is only moving code out of sight.
 
-A helper has earned `lib.rs` if **any one** of these is true:
+**`lib.rs` is earned by a second playbook, and by nothing else.** That is the
+whole trigger. It is the only thing `lib.rs` can do that a function in the
+playbook file cannot, and moving code there before a second playbook exists
+buys nothing and costs the reader a file.
 
-- **A second playbook needs it.** The plain reuse case, and the strongest one.
-- **It is called more than once with different arguments** — `nginx_site(ctx,
-  "api")` and `nginx_site(ctx, "www")`. That is reuse inside one playbook.
-- **It names a policy a reader already understands** — `harden_ssh`,
-  `join_tailnet`. The name raises the level; the reader does not need to open
-  it to know what happened.
+Everything else that makes you want a function is served by a function **in
+the playbook file**, which is the next heading. Repeating a group of steps
+three times inside one play is a good reason for a function — and a bad reason
+to move it to `lib.rs`, because nothing else can call it yet. Wanting a name
+for a policy (`harden_ssh`) is the same: the name is worth having wherever the
+function lives, and it lives next to its only caller until there is a second
+one.
 
-And the check that catches the common mistake: **called once, takes nothing
+Then the check that catches the common mistake: **called once, takes nothing
 but `ctx`, and its name just restates its own body — inline it.**
 `setup_nginx()` holding install-then-config-then-enable, inside a playbook
 whose whole purpose is nginx, is that. `harden_ssh()` is not.
@@ -437,10 +441,12 @@ become ordinary statements in the playbook, in the order they ran. Turning
 each one into a `lib.rs` function reproduces the file-splitting without the
 reason for it, and costs you the readable playbook.
 
-**A plain `fn` further down the playbook file is not an extraction.** The unit
-that has to stay readable is the *file*, not `main`. A long play may read
-better as a `main` that names its phases, with those phases written out below
-it — you still open one file and read down it:
+**A plain `fn` further down the playbook file is not an extraction, and it is
+where most helpers belong.** The unit that has to stay readable is the *file*,
+not `main`. Use one when a play reads better as named phases, and use one when
+a play does the same thing several times — three sites, three mounts, three
+accounts — with no other playbook needing it. Either way you still open one
+file and read down it:
 
 ```rust
 fn main(ctx: &mut Ctx) -> Result<()> {
@@ -465,10 +471,10 @@ material out of the way without pretending it is shared.
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
-| a `fn` lower in the playbook file | naming the phases of a long play, without leaving the file |
+| a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
 | `ctx.section(..)` | grouping a long playbook, without moving anything out of it |
 | `mod helpers;` | bulk private to this one playbook |
-| `src/lib.rs` | a second caller, a parameterised repeat, or a named policy |
+| `src/lib.rs` | a **second playbook** needs it |
 | a collection crate (§13) | reuse across workspaces or teams |
 
 ## 8. `Ctx`: everything a playbook can do
@@ -1289,10 +1295,10 @@ If `rustible-std` has no operation for something, you have three options, in
 increasing order of effort:
 
 1. **`shell::Command`** — fine for a one-off, never idempotent.
-2. **A helper function** in `src/lib.rs` that composes existing operations —
-   once a second playbook needs it, or you are calling it repeatedly with
-   different arguments (§7). Note the parameters: a helper worth having is one
-   the caller configures.
+2. **A helper function** that composes existing operations. It lives in the
+   playbook that uses it, and moves to `src/lib.rs` once a *second* playbook
+   needs it (§7). Note the parameters: a helper worth having is one the caller
+   configures.
    ```rust
    pub fn nginx_site(ctx: &mut Ctx, name: &str, conf: &str) -> Result<()> {
        ctx.step(format!("{name} config"), file::Copy::from_str(conf)
