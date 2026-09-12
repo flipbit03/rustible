@@ -437,6 +437,26 @@ become ordinary statements in the playbook, in the order they ran. Turning
 each one into a `lib.rs` function reproduces the file-splitting without the
 reason for it, and costs you the readable playbook.
 
+**A plain `fn` further down the playbook file is not an extraction.** The unit
+that has to stay readable is the *file*, not `main`. A long play may read
+better as a `main` that names its phases, with those phases written out below
+it — you still open one file and read down it:
+
+```rust
+fn main(ctx: &mut Ctx) -> Result<()> {
+    base_packages(ctx)?;                // each of these is a `fn` in
+    cadu_account(ctx)?;                 // this same file, below
+    qemu(ctx)?;
+    Ok(())
+}
+```
+
+That is the same *shape* as the antipattern above and none of its cost,
+because nothing moved out of sight. The damage comes from the jump to another
+file, not from the existence of a function. If you find yourself wanting that
+structure, prefer this over `lib.rs` until a second playbook actually needs
+the code.
+
 There is a third place, between the two: **a sibling file declared inside the
 playbook**, `mod helpers;` (§7 above). That is for bulk that belongs to one
 playbook and nothing else — a long config template, a parser. It keeps the
@@ -445,6 +465,7 @@ material out of the way without pretending it is shared.
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
+| a `fn` lower in the playbook file | naming the phases of a long play, without leaving the file |
 | `ctx.section(..)` | grouping a long playbook, without moving anything out of it |
 | `mod helpers;` | bulk private to this one playbook |
 | `src/lib.rs` | a second caller, a parameterised repeat, or a named policy |
