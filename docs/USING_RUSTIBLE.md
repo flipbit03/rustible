@@ -383,6 +383,15 @@ whole trigger. It is the only thing `lib.rs` can do that a function in the
 playbook file cannot, and moving code there before a second playbook exists
 buys nothing and costs the reader a file.
 
+A second playbook *permits* the move; it does not compel it. The rule above
+still outranks it: if lifting a shared sequence would leave the playbooks that
+used it saying nothing, leave it where it is and accept the repetition. Three
+plays that each install an account, its `~/.ssh`, its GitHub keys and a deploy
+key have a genuinely common shape — and hoisting the whole of it turns all
+three into two statements apiece. Share the parts that are incidental to the
+story (`ssh_dir`, `caddy_vhost`), and let each play keep the steps that *are*
+its story.
+
 Everything else that makes you want a function is served by a function **in
 the playbook file**, which is the next heading. Repeating a group of steps
 three times inside one play is a good reason for a function — and a bad reason
