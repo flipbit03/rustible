@@ -912,3 +912,68 @@ host "h" connection="local" { vars { x 3 } }"#,
         r.sources.overridden_vars
     );
 }
+
+// --- account names -------------------------------------------------------
+
+/// `escalate_user` and `ssh_user` name accounts. A value that cannot be one
+/// is a load error naming the node, rather than a `sudo -u` failure that
+/// arrives at run time, once per host, after the fleet has been connected to.
+#[test]
+fn an_unusable_escalate_user_is_a_load_error() {
+    one_error(
+        "host \"h\" addr=\"10.0.0.1\" escalate_user=\"x; touch /tmp/pwned #\"\n",
+        1,
+        26,
+        "parameter `escalate_user` on host `h`",
+    );
+}
+
+#[test]
+fn an_unusable_ssh_user_is_a_load_error() {
+    let errs = errors("host \"h\" addr=\"10.0.0.1\" ssh_user=\"a b\"\n");
+    assert_eq!(errs.len(), 1, "{:?}", errs);
+    assert!(
+        errs[0].message.contains("parameter `ssh_user` on host `h`"),
+        "{}",
+        errs[0].message
+    );
+}
+
+#[test]
+fn an_account_name_that_is_only_a_flag_is_refused() {
+    // `sudo -u -x` would read the value as an option.
+    let errs = errors("host \"h\" addr=\"10.0.0.1\" escalate_user=\"-x\"\n");
+    assert!(
+        errs[0].message.contains("would be read as a flag"),
+        "{}",
+        errs[0].message
+    );
+}
+
+/// The check must never be *stricter* than the account names Rustible itself
+/// can create, or a playbook could make an account with `user::Present` that
+/// the inventory then refuses to escalate to. `rustible-cli` cannot call
+/// `rustible_std::group::validate_name` (it does not depend on that crate),
+/// so the property is pinned here by the shapes real systems use: a trailing
+/// `$` is a Samba machine account, and dots, dashes and digits are ordinary.
+#[test]
+fn names_that_user_present_can_create_are_all_accepted() {
+    for name in [
+        "deploy",
+        "deploy-svc",
+        "deploy_svc",
+        "deploy.svc",
+        "svc1",
+        "WINBOX$",
+        "_systemd",
+        "a",
+    ] {
+        let src = format!("host \"h\" addr=\"10.0.0.1\" escalate_user=\"{name}\"\n");
+        let inv = load(&src);
+        assert_eq!(
+            inv.hosts["h"].params.escalate_user.as_deref(),
+            Some(name),
+            "`{name}` should be a usable account name"
+        );
+    }
+}

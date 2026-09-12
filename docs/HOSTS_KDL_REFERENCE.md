@@ -75,11 +75,15 @@ from.
 | `escalate_user` | account to escalate to | `root` |
 | `ssh_args` | extra arguments for `ssh` | none |
 
-Two rules worth knowing:
+Three rules worth knowing:
 
 - **`addr` is host-only.** An address names one machine, so it cannot be
   inherited; setting it on a group or on `defaults` is a load error. Every
   host whose resolved `connection` is `ssh` must have one.
+- **`ssh_user` and `escalate_user` must be usable account names.** They are
+  rejected at load — naming the node — if they are empty, start with `-`, or
+  contain `:`, `,`, whitespace or control characters, so a typo is one error
+  here rather than a `sudo -u` failure on every host mid-run.
 - **`ssh_args` does not merge.** The nearest level that sets it wins whole.
   Write one argument as a property, several as a child node:
 
