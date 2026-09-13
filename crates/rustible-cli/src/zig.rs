@@ -109,13 +109,6 @@ impl Located {
         }
     }
 
-    /// The zig binary, wherever it came from.
-    pub fn path(&self) -> &Path {
-        match self {
-            Located::Env(p) | Located::Found(p) | Located::Cached(p) | Located::Fetched(p) => p,
-        }
-    }
-
     /// One line for `rustible toolchain install`.
     pub fn describe(&self) -> String {
         match self {
