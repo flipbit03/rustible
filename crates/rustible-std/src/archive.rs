@@ -726,6 +726,16 @@ impl Op for Extracted {
     type Output = ExtractReport;
 
     fn check(&self, sys: &System) -> Result<Plan<ExtractReport>> {
+        // Portable. archive::Extracted is a pure-Rust extractor writing through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!(
+                "archive::Extracted has no implementation for {}",
+                other.name()
+            ),
+        }
         if let Some(marker) = self.marker()
             && sys.exists(&marker)?
         {

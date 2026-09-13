@@ -79,6 +79,13 @@ impl Op for Symlink {
     type Output = SymlinkReport;
 
     fn check(&self, sys: &System) -> Result<Plan<SymlinkReport>> {
+        // Portable. file::Symlink creates a POSIX symlink through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Symlink has no implementation for {}", other.name()),
+        }
         let target = self.target.display().to_string();
         let mut changes = vec![];
         match sys.stat(&self.link)? {

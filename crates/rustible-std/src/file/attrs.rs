@@ -74,6 +74,13 @@ impl Op for Attrs {
     type Output = AttrsReport;
 
     fn check(&self, sys: &System) -> Result<Plan<AttrsReport>> {
+        // Portable. file::Attrs sets POSIX mode and owner through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Attrs has no implementation for {}", other.name()),
+        }
         let Some(stat) = sys.stat(&self.path)? else {
             bail!(
                 "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",

@@ -294,11 +294,23 @@ impl Unit {
     /// The half of [`Unit::guard`] that is about the host and the manager
     /// rather than the unit: systemd as init, and root unless `--user`.
     fn guard_manager(&self, sys: &System, op: &str) -> Result<()> {
+        // Explicit, though `Init::Systemd` already implies Linux: this op
+        // reads `/proc/1/comm`'s answer and drives `systemctl`, and a reader
+        // of the refusal should not have to know that the init check covers
+        // the kernel too.
+        match sys.facts().os {
+            Os::Linux => {}
+            ref other => bail!(
+                "systemd::{op} manages systemd units and runs on Linux only; this host is {}",
+                other.name()
+            ),
+        }
         if sys.facts().init != Init::Systemd {
             bail!(
                 "systemd::{op} needs systemd, but this host's init is {}",
                 match &sys.facts().init {
                     Init::OpenRc => "OpenRC".to_string(),
+                    Init::Launchd => "launchd".to_string(),
                     Init::Other(name) => format!("`{name}`"),
                     Init::Systemd => unreachable!(),
                 }
@@ -1135,6 +1147,28 @@ mod tests {
 
     fn sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// Facts for a mac.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// launchd is pid 1 on a mac, so the init check would refuse anyway;
+    /// the OS check is asserted because it is the one a reader of the
+    /// message is owed.
+    #[test]
+    fn systemd_refuses_a_mac_on_the_os() {
+        let fake = Arc::new(Fake::new());
+        let s = macos(sys(&fake));
+        let err = Enabled::new("sshd").check(&s).unwrap_err().chain();
+        assert!(err.contains("runs on Linux only"), "{err}");
+        assert!(err.contains("macos"), "{err}");
     }
 
     fn not_root(s: System) -> System {

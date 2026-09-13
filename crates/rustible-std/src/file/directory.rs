@@ -64,6 +64,13 @@ impl Op for Directory {
     type Output = DirReport;
 
     fn check(&self, sys: &System) -> Result<Plan<DirReport>> {
+        // Portable. file::Directory creates a directory through `sys` and sets mode and owner.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Directory has no implementation for {}", other.name()),
+        }
         let mut changes = vec![];
         let stat = sys.stat_follow(&self.path)?;
         let created = match &stat {

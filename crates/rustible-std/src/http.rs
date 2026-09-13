@@ -481,6 +481,13 @@ impl Op for Download {
     type Output = DownloadReport;
 
     fn check(&self, sys: &System) -> Result<Plan<DownloadReport>> {
+        // Portable. http::Download is pure-Rust HTTP and TLS writing a file through `sys`; `ring` cross-compiles for Darwin.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("http::Download has no implementation for {}", other.name()),
+        }
         validate_url(&self.url).map_err(Error::msg)?;
         let checksum = self.parsed_checksum()?;
         let (stat, state) = self.content_state(sys, checksum.as_ref())?;

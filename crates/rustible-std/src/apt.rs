@@ -222,13 +222,36 @@ fn update_cache_if_stale(sys: &System, max_age: Duration) -> Result<bool> {
     Ok(true)
 }
 
-/// Refuse early on a non-apt host or without root (vision 6.8).
+/// The host's package managers, for a refusal message: named if there are
+/// any, said plainly if there are none.
+fn describe_pms(sys: &System) -> String {
+    let pms = &sys.facts().package_managers;
+    if pms.is_empty() {
+        format!("none that rustible knows ({:?})", sys.facts().distro)
+    } else {
+        format!("{pms:?} ({:?})", sys.facts().distro)
+    }
+}
+
+/// Refuse early on a host this op cannot serve: the wrong kernel, no apt, or
+/// no root (vision 6.8).
 fn require_apt_root(sys: &System, op: &str) -> Result<()> {
-    if sys.facts().package_manager != Pm::Apt {
+    // The OS check is not redundant with the apt check below. `Pm::Apt` means
+    // `/usr/bin/apt-get` exists, which is a strong hint and not a promise:
+    // this op also drives `dpkg-query` and reads Debian's own layout, and it
+    // says so here rather than failing further in on a host that borrowed the
+    // binary.
+    match sys.facts().os {
+        Os::Linux => {}
+        ref other => bail!(
+            "apt::{op} manages Debian packages and runs on Linux only; this host is {}",
+            other.name()
+        ),
+    }
+    if !sys.facts().has_pm(&Pm::Apt) {
         bail!(
-            "apt::{op} needs apt, but this host uses {:?} ({:?})",
-            sys.facts().package_manager,
-            sys.facts().distro
+            "apt::{op} needs apt, but this host has {}",
+            describe_pms(sys)
         );
     }
     if !sys.is_root() {
@@ -665,6 +688,41 @@ mod tests {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
+    /// Facts for a mac.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// The OS gate is not the same claim as the apt gate, so it is asserted
+    /// separately: a mac with Homebrew has a package manager, just not this
+    /// one, and the refusal should say which assumption failed.
+    #[test]
+    fn apt_refuses_a_mac_on_the_os_not_on_the_manager() {
+        let fake = Arc::new(Fake::new());
+        let s = macos(sys(&fake));
+        let err = Present::new(["mc"]).check(&s).unwrap_err().chain();
+        assert!(err.contains("runs on Linux only"), "{err}");
+        assert!(err.contains("macos"), "{err}");
+    }
+
+    /// A Linux box with brew but no apt still gets the apt refusal, and it
+    /// names what the host actually has rather than "Other".
+    #[test]
+    fn apt_names_the_managers_the_host_does_have() {
+        let fake = Arc::new(Fake::new());
+        let mut facts = sys(&fake).facts().clone();
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        let s = sys(&fake).with_facts(facts);
+        let err = Present::new(["mc"]).check(&s).unwrap_err().chain();
+        assert!(err.contains("needs apt"), "{err}");
+        assert!(err.contains("Brew"), "{err}");
+    }
+
     fn non_root(fake: &Arc<Fake>) -> System {
         let mut facts = sys(fake).facts().clone();
         facts.is_root = false;
@@ -674,7 +732,7 @@ mod tests {
 
     fn alpine(fake: &Arc<Fake>) -> System {
         let mut facts = sys(fake).facts().clone();
-        facts.package_manager = Pm::Apk;
+        facts.package_managers = [Pm::Apk].into_iter().collect();
         facts.distro = Distro::Alpine;
         sys(fake).with_facts(facts)
     }

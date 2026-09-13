@@ -184,6 +184,13 @@ impl Op for Line {
     type Output = LineReport;
 
     fn check(&self, sys: &System) -> Result<Plan<LineReport>> {
+        // Portable. file::Line edits file text through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Line has no implementation for {}", other.name()),
+        }
         let text = super::read_text_or_empty(sys, &self.path, self.create)?;
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {

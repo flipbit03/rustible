@@ -13,7 +13,7 @@ use rustible_std::apt;
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn latest_refreshes_the_cache_in_check(ctx: &mut Ctx) -> Result<()> {
-    assert_eq!(ctx.facts().package_manager, Pm::Apt);
+    assert!(ctx.facts().has_pm(&Pm::Apt));
 
     // Stock images ship without package lists, so apt names no candidate.
     let policy = |ctx: &mut Ctx| -> Result<apt::Policy> {

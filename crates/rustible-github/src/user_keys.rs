@@ -164,7 +164,19 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
 impl Op for UserKeys {
     type Output = Vec<PublicKey>;
 
-    fn check(&self, _sys: &System) -> Result<Plan<Vec<PublicKey>>> {
+    fn check(&self, sys: &System) -> Result<Plan<Vec<PublicKey>>> {
+        // Portable. github::UserKeys is an HTTPS GET parsed in Rust; nothing
+        // touches the host but the network, which is why `sys` is otherwise
+        // unused here. Declared anyway, as the worked example for a
+        // collection: the supported set is a claim the author makes, not
+        // something a reader infers from the absence of a check.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!(
+                "github::UserKeys has no implementation for {}",
+                other.name()
+            ),
+        }
         validate_login(&self.login)?;
         let url = self.url();
         let resp = self.fetcher().get(&url)?;

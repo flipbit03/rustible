@@ -359,6 +359,26 @@ impl Target {
                 })
             }
             Target::User(name) => {
+                // The only variant of this op that is not portable, and the
+                // reason the refusal lives here rather than on `Present` and
+                // `Absent`: `Target::File` and `Target::Account` are plain
+                // file work and run on macOS today. Naming the working
+                // alternative matters, because the caller has one.
+                match sys.facts().os {
+                    Os::Linux => {}
+                    Os::Macos => bail!(
+                        "ssh::authorized_keys cannot look `{name}` up in /etc/passwd on macOS, \
+                         where that file lists only system services and the accounts live in \
+                         Open Directory. Pass the account directly with \
+                         `for_account(home, uid, gid)`, which works here"
+                    ),
+                    ref other => bail!(
+                        "ssh::authorized_keys looks users up in /etc/passwd, which rustible \
+                         only trusts on Linux; this host is {}. Pass the account directly \
+                         with `for_account(home, uid, gid)`",
+                        other.name()
+                    ),
+                }
                 // /etc/passwd only (vision 7.4 and 13 plan the user ops around
                 // it); NSS-only accounts (LDAP, SSSD, homed) are a known limit,
                 // recorded in DECISIONS.md.
@@ -994,6 +1014,62 @@ mod tests {
 
     fn fake_sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// Facts for a mac.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// The refusal is on the *variant*, not the op: only the name lookup
+    /// reads `/etc/passwd`, and a mac's copy of that file describes only
+    /// system services. The message has to name the form that does work,
+    /// because the caller has one.
+    #[test]
+    fn the_name_lookup_refuses_a_mac_and_names_for_account() {
+        let fake = fake_with_user();
+        let s = macos(fake_sys(&fake));
+        let err = Present::for_user_name("cadu")
+            .keys([K1])
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("Open Directory"), "{err}");
+        assert!(err.contains("for_account(home, uid, gid)"), "{err}");
+    }
+
+    /// And the other half: `for_account` is plain file work and runs on a mac
+    /// today. Measured against a real one — it wrote and removed a key in
+    /// `/Users/cadu/.ssh/authorized_keys`. Gating the whole op on the OS
+    /// would have deleted this.
+    #[test]
+    fn for_account_still_works_on_a_mac() {
+        // `.ssh` has to exist: this op refuses to create a home's parent or
+        // its `.ssh` (vision 6.7). On the real mac it was already there.
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/Users/cadu")
+                .with_dir("/Users/cadu/.ssh"),
+        );
+        let s = macos(fake_sys(&fake));
+        let op = Present::for_account("/Users/cadu", 501, 20).keys([K1]);
+
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&s, c).unwrap();
+        assert!(
+            fake.content("/Users/cadu/.ssh/authorized_keys")
+                .unwrap()
+                .contains(K1)
+        );
+        // Idempotent on the second pass, on the same platform.
+        assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
     }
 
     fn fake_with_user() -> Arc<Fake> {

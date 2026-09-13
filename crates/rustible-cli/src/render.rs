@@ -122,7 +122,7 @@ impl<W: Write> Renderer<W> {
                         f.distro,
                         f.distro_version,
                         f.arch,
-                        f.package_manager,
+                        f.package_managers,
                         f.cpus,
                         f.memory_mb,
                         f.user

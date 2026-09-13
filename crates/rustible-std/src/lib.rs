@@ -5,6 +5,7 @@
 
 pub mod apt;
 pub mod archive;
+pub mod brew;
 pub mod file;
 pub mod group;
 pub mod hostname;

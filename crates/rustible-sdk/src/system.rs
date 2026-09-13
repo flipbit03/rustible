@@ -202,7 +202,7 @@ impl System {
             arch: crate::facts::Arch::X86_64,
             kernel: "6.1.0-fake".into(),
             hostname: "fake".into(),
-            package_manager: crate::facts::Pm::Apt,
+            package_managers: [crate::facts::Pm::Apt].into_iter().collect(),
             init: crate::facts::Init::Systemd,
             cpus: 2,
             memory_mb: 2048,

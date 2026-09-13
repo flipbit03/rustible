@@ -150,6 +150,10 @@ fn env_for_build_with(
     }
 
     for triple in triples {
+        if triple.ends_with("-apple-darwin") {
+            darwin_env(compilers, triple, &mut env, existing)?;
+            continue;
+        }
         if !triple.ends_with("-linux-musl") {
             // Not a target this module knows how to configure. cargo and
             // cc-rs are left to their own devices rather than guessing.
@@ -243,6 +247,129 @@ fn env_for_build_with(
         bail!(needs_clang(&unservable, compilers));
     }
     Ok(env)
+}
+
+/// The environment one `*-apple-darwin` triple needs.
+///
+/// On a mac this is nothing at all: the host toolchain *is* the Apple
+/// toolchain, `cc` links Mach-O, and `xcrun` finds the SDK. Both Darwin
+/// triples are served, so an Apple-silicon controller builds for an Intel
+/// mac without being told anything.
+///
+/// From Linux it takes two things and no new program:
+///
+/// - **A Mach-O linker.** `rust-lld` ships inside the rustup toolchain and
+///   is `ld64.lld` when told to be, so the linker costs nothing to install.
+///   It is named by absolute path because it is not on `PATH`.
+/// - **A macOS SDK**, named by `SDKROOT`. This is the one thing Rustible
+///   cannot carry: Apple's SDK is not redistributable, so the operator
+///   points at one taken from a mac they own. `usr/lib` (the `.tbd` link
+///   stubs) and `usr/include` are the parts used; roughly 40 MB of the
+///   302 MB SDK.
+///
+/// `SDKROOT` is read by both halves of the build — `cc-rs` turns it into
+/// `-isysroot` and `rustc` into the linker's library path — so it is
+/// required here and passed through untouched.
+fn darwin_env(
+    compilers: &Compilers,
+    triple: &str,
+    env: &mut BTreeMap<String, OsString>,
+    existing: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return Ok(());
+    }
+    let Some(clang) = &compilers.clang else {
+        bail!(
+            "building for {triple} needs clang: it is the only compiler here that can \
+             target Darwin, and ring (the TLS provider) compiles C.\n    {INSTALL_CLANG}"
+        );
+    };
+    // Both halves are checked, because they fail at different times and
+    // only one of them fails legibly: without `usr/lib` the *linker* cannot
+    // resolve `-lSystem`, and without `usr/include` *ring* dies on
+    // `'TargetConditionals.h' file not found` from inside a build script,
+    // three screens of cc-rs output later.
+    let sdk = existing("SDKROOT").map(PathBuf::from).filter(|p| {
+        p.join("usr/lib/libSystem.tbd").exists()
+            && p.join("usr/include/TargetConditionals.h").exists()
+    });
+    let Some(sdk) = sdk else {
+        bail!(macos_sdk_missing(triple));
+    };
+    let cc_var = format!("CC_{}", triple.replace('-', "_"));
+    if existing(&cc_var).is_none() {
+        env.insert(cc_var, clang.clone().into_os_string());
+    }
+    let up = triple.replace('-', "_").to_uppercase();
+    let linker_var = format!("CARGO_TARGET_{up}_LINKER");
+    if existing(&linker_var).is_none() {
+        let lld = rust_lld().with_context(|| {
+            format!("finding the rust-lld that links {triple}; is this a rustup toolchain?")
+        })?;
+        env.insert(linker_var, lld.into_os_string());
+        // `rust-lld` is a multi-flavour driver; this is what makes it
+        // `ld64.lld`. It goes on the cargo target's own rustflags rather
+        // than `RUSTFLAGS`, which would apply to build scripts too.
+        env.insert(
+            format!("CARGO_TARGET_{up}_RUSTFLAGS"),
+            OsString::from("-Clinker-flavor=ld64.lld"),
+        );
+    }
+    // Passed through so `toolchain check --print-env` prints a complete,
+    // self-contained environment rather than one that silently depends on
+    // the caller's shell.
+    env.insert("SDKROOT".into(), sdk.into_os_string());
+    Ok(())
+}
+
+/// The message a Linux controller gets when it has no macOS SDK to link
+/// against. It names the copy, because that is the whole of the work.
+fn macos_sdk_missing(triple: &str) -> String {
+    format!(
+        "building for {triple} from a non-Apple machine needs a macOS SDK, and \
+         `SDKROOT` does not name a usable one (it needs usr/lib/libSystem.tbd for the \
+         linker and usr/include/TargetConditionals.h for ring).\n\
+         \n\
+         Apple's SDK is not redistributable, so Rustible cannot carry it. Copy it \
+         once from a mac you own:\n\
+         \n    ssh <mac> 'cd $(xcrun --show-sdk-path) && tar czf - usr/lib usr/include' \\\n\
+         \x20     | tar xzf - -C ~/.local/share/rustible/MacOSX.sdk\n\
+         \n    export SDKROOT=~/.local/share/rustible/MacOSX.sdk\n\
+         \n\
+         Nothing else is installed: the Mach-O linker is the rust-lld already \
+         inside your rustup toolchain."
+    )
+}
+
+/// The `rust-lld` inside the running toolchain, which is `ld64.lld` when
+/// invoked with the Darwin flavour. Not on `PATH` by design, so it is found
+/// through `rustc --print sysroot`.
+fn rust_lld() -> Result<PathBuf> {
+    let out = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .context("running `rustc --print sysroot`")?;
+    if !out.status.success() {
+        bail!("`rustc --print sysroot` failed");
+    }
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let host = host_triple().context("asking rustc for its host triple")?;
+    let lld = sysroot.join("lib/rustlib").join(&host).join("bin/rust-lld");
+    if !lld.exists() {
+        bail!("no rust-lld at {}", lld.display());
+    }
+    Ok(lld)
+}
+
+/// The triple `rustc` itself runs on, from `rustc -vV`.
+fn host_triple() -> Result<String> {
+    let out = Command::new("rustc").arg("-vV").output()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(|s| s.trim().to_string())
+        .context("no `host:` line in `rustc -vV`")
 }
 
 /// Add any of `triples` that rustup does not already have, so a fleet with an
@@ -491,6 +618,66 @@ mod tests {
             clang: clang.map(PathBuf::from),
             host_cc: cc.map(PathBuf::from),
         }
+    }
+
+    /// A directory shaped enough like a macOS SDK to satisfy the guard.
+    fn fake_sdk(dir: &Path) -> PathBuf {
+        let sdk = dir.join("MacOSX.sdk");
+        std::fs::create_dir_all(sdk.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(sdk.join("usr/include")).unwrap();
+        std::fs::write(sdk.join("usr/lib/libSystem.tbd"), "").unwrap();
+        std::fs::write(sdk.join("usr/include/TargetConditionals.h"), "").unwrap();
+        sdk
+    }
+
+    /// A Darwin target from a mac needs nothing configured: the host
+    /// toolchain is the Apple toolchain. From anywhere else it needs a
+    /// Mach-O linker and an SDK, and both are named here.
+    #[test]
+    fn darwin_from_a_mac_needs_nothing_and_elsewhere_needs_an_sdk() {
+        let t = tempfile::tempdir().unwrap();
+        let sdk = fake_sdk(t.path());
+        let c = compilers(Some("/usr/bin/clang"), None);
+        let triples = ["aarch64-apple-darwin".to_string()];
+        let env = env_for_build_with(&c, &triples, t.path(), &|k| {
+            (k == "SDKROOT").then(|| sdk.clone().into_os_string())
+        })
+        .unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(env.is_empty(), "{env:?}");
+        } else {
+            assert_eq!(
+                env["CC_aarch64_apple_darwin"],
+                OsString::from("/usr/bin/clang")
+            );
+            assert_eq!(env["SDKROOT"], sdk.into_os_string());
+            assert_eq!(
+                env["CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS"],
+                OsString::from("-Clinker-flavor=ld64.lld")
+            );
+            let lld = env["CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"].to_string_lossy();
+            assert!(lld.ends_with("rust-lld"), "{lld}");
+        }
+    }
+
+    /// Half an SDK is refused by the same message as none, because the half
+    /// that is missing fails deep inside a build script otherwise.
+    #[test]
+    fn a_darwin_target_refuses_an_incomplete_sdk() {
+        if cfg!(target_os = "macos") {
+            return; // A mac never consults SDKROOT here.
+        }
+        let t = tempfile::tempdir().unwrap();
+        let sdk = fake_sdk(t.path());
+        std::fs::remove_file(sdk.join("usr/include/TargetConditionals.h")).unwrap();
+        let c = compilers(Some("/usr/bin/clang"), None);
+        let err = env_for_build_with(&c, &["aarch64-apple-darwin".to_string()], t.path(), &|k| {
+            (k == "SDKROOT").then(|| sdk.clone().into_os_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("TargetConditionals.h"), "{err}");
+        assert!(err.contains("not redistributable"), "{err}");
     }
 
     fn other_musl_triple() -> String {

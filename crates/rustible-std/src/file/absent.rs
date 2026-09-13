@@ -58,6 +58,13 @@ impl Op for Absent {
     type Output = AbsentReport;
 
     fn check(&self, sys: &System) -> Result<Plan<AbsentReport>> {
+        // Portable. file::Absent removes a path through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Absent has no implementation for {}", other.name()),
+        }
         let Some(stat) = sys.stat(&self.path)? else {
             return Ok(Plan::Satisfied(self.report(false)));
         };

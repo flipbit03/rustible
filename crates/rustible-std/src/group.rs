@@ -112,10 +112,46 @@ impl Tools {
         if has("/bin/busybox") || has("/usr/sbin/adduser") {
             return Tools::BusyBox;
         }
-        match sys.facts().distro {
-            Distro::Alpine => Tools::BusyBox,
+        // Neither family's binaries are here, so this is the distro's
+        // convention rather than an observation. Spelled out per OS: a mac
+        // reaches this only if `require_passwd_db` was not called first, and
+        // answering `Shadow` there is how `user::Present` came to go looking
+        // for a `useradd` that macOS has never had.
+        match (&sys.facts().os, &sys.facts().distro) {
+            (Os::Linux, Distro::Alpine) => Tools::BusyBox,
+            (Os::Linux, _) => Tools::Shadow,
+            // Not reachable through an op: every caller gates first. The
+            // value is the Linux convention, not a claim about this host.
             _ => Tools::Shadow,
         }
+    }
+}
+
+/// Refuse a host whose account database is not `/etc/passwd` and
+/// `/etc/group`.
+///
+/// On macOS those two files exist and describe nothing: the accounts live in
+/// Open Directory, and `/etc/passwd` there lists only `root`, `daemon`,
+/// `nobody` and the `_service` users. Reading them would report a real
+/// account as absent, so every op in `user` and `group` — and
+/// `ssh::authorized_keys`'s name lookup, which is `user::Existing` inlined —
+/// asks this first. Measured on macOS 26.3; see
+/// `docs/plan/reports/MACOS-TARGET-SPIKE.md`.
+pub(crate) fn require_passwd_db(sys: &System, op: &str) -> Result<()> {
+    match sys.facts().os {
+        Os::Linux => Ok(()),
+        Os::Macos => bail!(
+            "{op} reads /etc/passwd and /etc/group, and on macOS those are not this host's \
+             account database: accounts live in Open Directory and those files list only \
+             system services, so a real account would be reported absent. Rustible has no \
+             Darwin implementation for account management; drive `dscl` through \
+             shell::Command until it does"
+        ),
+        ref other => bail!(
+            "{op} reads /etc/passwd and /etc/group as this host's account database, which \
+             rustible only knows to be true on Linux; this host is {}",
+            other.name()
+        ),
     }
 }
 
@@ -297,6 +333,7 @@ impl Op for Present {
     type Output = Group;
 
     fn check(&self, sys: &System) -> Result<Plan<Group>> {
+        require_passwd_db(sys, "group::Present")?;
         require_root(sys, "group::Present")?;
         let Inspection { current, changes } = self.inspect(sys)?;
         if changes.is_empty() {
@@ -420,6 +457,7 @@ impl Op for Absent {
     type Output = Removed;
 
     fn check(&self, sys: &System) -> Result<Plan<Removed>> {
+        require_passwd_db(sys, "group::Absent")?;
         require_root(sys, "group::Absent")?;
         validate_name("group", &self.name)?;
         let text = sys.read_to_string("/etc/group")?;
@@ -528,10 +566,36 @@ mod tests {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
+    /// Facts for a mac: the platform each op in this file has to refuse.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// `/etc/group` on a mac carries a `staff:*:20:root` line while the real
+    /// membership is elsewhere, so `group::Absent("staff")` used to reach for
+    /// `groupdel`. Measured on macOS 26.3.
+    #[test]
+    fn group_ops_refuse_a_mac() {
+        let fake = Arc::new(base());
+        let s = macos(fake_sys(&fake));
+        for err in [
+            Present::new("staff").check(&s).unwrap_err().chain(),
+            Absent::new("staff").check(&s).unwrap_err().chain(),
+        ] {
+            assert!(err.contains("Open Directory"), "{err}");
+            assert!(err.contains("/etc/group"), "{err}");
+        }
+    }
+
     fn alpine(sys: System) -> System {
         let mut facts = sys.facts().clone();
         facts.distro = Distro::Alpine;
-        facts.package_manager = Pm::Apk;
+        facts.package_managers = [Pm::Apk].into_iter().collect();
         sys.with_facts(facts)
     }
 

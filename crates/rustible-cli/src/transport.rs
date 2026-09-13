@@ -143,13 +143,25 @@ pub fn master_argv(ctl: &Path, log: &Path, target: &SshTarget) -> Vec<String> {
     argv
 }
 
-/// `uname -sm` output to the musl triple the binary is built for.
+/// `uname -sm` output to the triple the binary is built for.
+///
+/// Linux hosts get musl, which is what makes the shipped binary need nothing
+/// on the far side. Darwin has no such choice: every macOS binary links
+/// `libSystem` dynamically, and that is fine because `libSystem` is the
+/// operating system, present on every mac by definition. The dependency rule
+/// is unharmed — the target still installs nothing.
 pub fn triple_for(uname: &str) -> Result<String> {
     Ok(match uname.trim() {
         "Linux x86_64" => "x86_64-unknown-linux-musl".into(),
         "Linux aarch64" => "aarch64-unknown-linux-musl".into(),
+        // `uname -m` on a mac says `arm64`, not `aarch64`.
+        "Darwin arm64" => "aarch64-apple-darwin".into(),
+        "Darwin x86_64" => "x86_64-apple-darwin".into(),
         other => {
-            bail!("unsupported target {other:?}; rustible builds for Linux x86_64 and aarch64")
+            bail!(
+                "unsupported target {other:?}; rustible builds for Linux x86_64 and aarch64, \
+                 and macOS arm64 and x86_64"
+            )
         }
     })
 }
@@ -618,7 +630,9 @@ mod tests {
             triple_for("Linux aarch64").unwrap(),
             "aarch64-unknown-linux-musl"
         );
-        assert!(triple_for("Darwin arm64").is_err());
+        assert_eq!(triple_for("Darwin arm64").unwrap(), "aarch64-apple-darwin");
+        assert_eq!(triple_for("Darwin x86_64").unwrap(), "x86_64-apple-darwin");
+        assert!(triple_for("FreeBSD amd64").is_err());
     }
 
     #[test]
@@ -628,26 +642,20 @@ mod tests {
     }
 
     /// Probing the machine the tests run on. Split by platform because the
-    /// probe answers what the machine *is*: a Linux host is a target Rustible
-    /// builds for, and a mac is a controller that Rustible refuses to target
-    /// (vision 5.3: Linux musl only). Both halves are the product behaving
-    /// correctly, so both are asserted rather than one being skipped.
+    /// probe answers what the machine *is*, and the two answers differ: a
+    /// Linux host is a musl target, a mac is a Darwin one.
     #[tokio::test]
     async fn local_probe_and_exists() {
         let t = Transport::Local;
         assert!(t.exists("/bin/sh").await.unwrap());
         assert!(!t.exists("/definitely/not/here").await.unwrap());
 
-        let probed = t.probe().await;
+        let p = t.probe().await.unwrap();
+        assert!(p.home.starts_with('/'));
         if cfg!(target_os = "linux") {
-            let p = probed.unwrap();
-            assert!(p.home.starts_with('/'));
             assert!(p.triple.ends_with("-unknown-linux-musl"));
         } else {
-            // A mac can drive Rustible; it cannot be driven by it.
-            let e = probed.unwrap_err().to_string();
-            assert!(e.contains("unsupported target"), "{e}");
-            assert!(e.contains("Linux"), "{e}");
+            assert!(p.triple.ends_with("-apple-darwin"));
         }
     }
 }

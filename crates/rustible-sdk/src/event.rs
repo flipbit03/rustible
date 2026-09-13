@@ -393,7 +393,7 @@ impl<W: Write + Send> EventSink for Compact<W> {
             Event::Facts(f) => writeln!(
                 w,
                 "facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
-                f.distro, f.distro_version, f.arch, f.package_manager, f.cpus, f.memory_mb, f.user
+                f.distro, f.distro_version, f.arch, f.package_managers, f.cpus, f.memory_mb, f.user
             ),
             Event::SectionStarted { name, .. } => writeln!(w, "section: {name}"),
             Event::SectionFinished { .. } | Event::StepStarted { .. } => Ok(()),

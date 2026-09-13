@@ -92,6 +92,25 @@ impl Op for Is {
     type Output = HostnameReport;
 
     fn check(&self, sys: &System) -> Result<Plan<HostnameReport>> {
+        // Measured on macOS 26.3: without this, `Is` created an
+        // /etc/hostname that macOS never reads, ran `hostname` (which does not
+        // survive a reboot), reported `changed`, and reported `ok` on the next
+        // run while scutil's three names were untouched.
+        match sys.facts().os {
+            Os::Linux => {}
+            Os::Macos => bail!(
+                "hostname::Is sets the Linux hostname (/etc/hostname plus the kernel's), and \
+                 macOS keeps none of that: it ignores /etc/hostname and holds three separate \
+                 names through scutil (HostName, LocalHostName, ComputerName). Running this \
+                 here would report success having changed nothing that survives a reboot; \
+                 drive `scutil` through shell::Command until rustible has a Darwin \
+                 implementation"
+            ),
+            ref other => bail!(
+                "hostname::Is sets the hostname the Linux way; this host is {}",
+                other.name()
+            ),
+        }
         if let Err(why) = validate_hostname(&self.name) {
             bail!("hostname::Is: {why}");
         }
@@ -165,6 +184,31 @@ mod tests {
 
     fn sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// Facts for a mac: the platform each op in this file has to refuse.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// Measured on macOS 26.3 before this gate: `Is` created an
+    /// `/etc/hostname` that macOS never reads, reported `changed`, and left
+    /// scutil's three names untouched.
+    #[test]
+    fn refuses_a_mac_and_names_scutil() {
+        let fake = Arc::new(Fake::new());
+        let s = macos(sys(&fake));
+        let err = Is::new("cadumac").check(&s).unwrap_err().chain();
+        assert!(err.contains("hostname::Is"), "{err}");
+        assert!(err.contains("scutil"), "{err}");
+        assert!(err.contains("LocalHostName"), "{err}");
+        // And nothing was written on the way to refusing.
+        assert!(fake.content("/etc/hostname").is_none());
     }
 
     fn openrc(fake: &Arc<Fake>) -> System {

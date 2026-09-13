@@ -211,6 +211,13 @@ impl Op for Block {
     type Output = BlockReport;
 
     fn check(&self, sys: &System) -> Result<Plan<BlockReport>> {
+        // Portable. file::Block edits file text through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Block has no implementation for {}", other.name()),
+        }
         if !self.marker.contains("{mark}") {
             bail!("Block marker {:?} does not contain {{mark}}", self.marker);
         }
