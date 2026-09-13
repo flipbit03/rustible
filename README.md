@@ -85,14 +85,14 @@ binary; a macOS one as a Mach-O linked against nothing but `libSystem`.
 cargo install rustible-cli
 ```
 
-On your machine you need:
+On the machine you run `rustible` from (the controller) you need:
 
 - rustup
 - a C compiler (`cc`, `gcc` or `clang`)
 - `curl`
 
 zig is installed automatically, into `~/.cache/rustible`, if it is not already
-present. The machines you manage need nothing.
+present. The machines you manage (the targets) need nothing.
 
 To see what a machine can do before relying on it:
 

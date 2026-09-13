@@ -86,7 +86,7 @@ On the machine you run Rustible *from* (the controller):
 cargo install rustible-cli
 ```
 
-On your machine: rustup, a C compiler (`cc`, `gcc` or `clang` — cargo uses
+On the controller: rustup, a C compiler (`cc`, `gcc` or `clang` — cargo uses
 it for the workspace, as in any Rust project with a C dependency), and `curl`.
 zig is fetched automatically into `~/.cache/rustible/zig/` on the first build
 (about 50 MB, checksum-verified); a zig already on `PATH`, or one named by
