@@ -203,6 +203,8 @@ configure on a mac; linker + SDK elsewhere; an incomplete SDK refused).
 `rustible toolchain check --target aarch64-apple-darwin` reports it. The
 *default* target list is left as the two musl triples on purpose: adding
 Darwin would make `toolchain check` fail on every machine without an SDK.
+(`toolchain check` was later deleted altogether under M8, along with the SDK
+path it reported on; only `toolchain install` remains.)
 
 ---
 
@@ -935,7 +937,6 @@ ssh <mac> 'cd $(xcrun --show-sdk-path) && tar czf - usr/lib usr/include' \
 export SDKROOT=~/.local/share/rustible/MacOSX.sdk
 
 cargo install --path crates/rustible-cli
-rustible toolchain check --target aarch64-apple-darwin      # says what it will use
 
 cat > /tmp/hosts.mac.kdl <<'KDL'
 defaults escalate="sudo"
