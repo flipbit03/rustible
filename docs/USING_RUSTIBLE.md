@@ -94,19 +94,25 @@ one named by `RUSTIBLE_ZIG`, is used instead and nothing is fetched.
 `rustible toolchain install` does the fetch ahead of time. Managed machines
 need nothing.
 
-**Your editor is a different program.** `rustible` never needs a C compiler,
-but rust-analyzer and a bare `cargo check` drive cargo directly, and `ring`'s
-build script compiles a little C either way — so on a machine with no `cc`
-at all, the editor sees an error from `ring` until it is given the zig
-`rustible` uses:
+**You also need a local C compiler — for cargo, not for `rustible`.** Two
+different programs build in a workspace, and they use two different
+toolchains:
+
+| who is building | toolchain | needs |
+|---|---|---|
+| `rustible playbook run` — the binaries shipped to your targets | zig, fetched by `rustible` | nothing you install |
+| cargo run directly — rust-analyzer, `cargo check`, `cargo test`, `cargo build` | your machine's C compiler | `cc`, `gcc` or `clang` on `PATH` |
+
+Both compile `ring`'s small amount of C. `rustible` does it through zig so
+that it can cross-compile for every target without a matrix of compilers;
+cargo on its own does it through whatever `cc` your machine has, like any
+Rust project with a C dependency. Every developer machine that has ever built
+C has one. If you want cargo to use `rustible`'s zig instead, start it from a
+shell that has the environment:
 
 ```sh
-eval "$(rustible toolchain check --print-env)"   # then start the editor from this shell
+eval "$(rustible toolchain check --print-env)"
 ```
-
-Every developer machine that has ever built C has a `cc`, so this only comes
-up on a box set up from rustup alone. It is recorded as a known gap; the fix
-that removes the step is planned, not shipped.
 
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.

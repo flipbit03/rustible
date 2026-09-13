@@ -60,6 +60,12 @@ wins and nothing is fetched. `cargo-zigbuild` is a library dependency of
 `rustible-cli`, not a program anyone installs. `rustible toolchain install`
 fetches deliberately, ahead of the first run.
 
+That rule is about *running Rustible*. A workspace under cargo directly —
+rust-analyzer, `cargo check`, `cargo test` — is an ordinary Rust project with
+a C dependency (`ring`) and wants the machine's own C compiler, as it always
+did; zig is `rustible`'s toolchain for the binaries it ships, not a
+replacement for the developer's `cc`. The guide's §3 says so to users.
+
 The operator does not type `rustup target add` either — `Cargo::build`
 calls `toolchain::ensure_targets_installed` first, because Rustible has
 already probed the hosts and knows which triples the run needs.

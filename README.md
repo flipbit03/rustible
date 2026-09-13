@@ -93,6 +93,12 @@ That gives you the `rustible` binary. It needs **rustup** on your machine —
 and `curl`, which it uses once to fetch the pinned zig release it compiles
 with into `~/.cache/rustible` — and nothing on the machines you manage.
 
+Your **editor** and a bare `cargo check`/`cargo test` in a workspace are a
+different matter: they run cargo directly, and `ring` compiles a little C, so
+they want a local C compiler (`cc`, `gcc` or `clang`) like any Rust project
+with a C dependency. zig is what `rustible` uses for *its* builds — the
+cross-compiled binaries it ships — not a replacement for your machine's `cc`.
+
 To see what a machine can do before relying on it:
 
 ```sh
