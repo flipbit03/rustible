@@ -184,7 +184,7 @@ impl Cargo {
         let mut std_cmd = b
             .build_command()
             .context("preparing the zig-backed cargo build")?;
-        self.wire_host_linker(&mut std_cmd)?;
+        wire_host_linker(&self.host, &mut std_cmd)?;
         let mut cmd = tokio::process::Command::from(std_cmd);
         match selected {
             Some(name) => {
@@ -202,50 +202,48 @@ impl Cargo {
     }
 }
 
-impl Cargo {
-    /// Point the *host* linker at zig too, so build scripts and proc-macros
-    /// stop needing a system `cc`.
-    ///
-    /// Those are host artifacts, and cargo links them with the host's linker
-    /// regardless of `--target`. cargo-zigbuild only ever wires the target
-    /// triple, so on a cross build every build script still links with `cc`;
-    /// and when host == target it goes further and turns cargo's
-    /// `target-applies-to-host` off through a nightly-channel override — for
-    /// glibc-versioned host triples like `x86_64-unknown-linux-gnu.2.17`,
-    /// which Rustible never builds — so even there the host linker is `cc`.
-    /// Measured on M8 step 2: with no `cc` on `PATH`, `serde_core`'s build
-    /// script failed with "linker `cc` not found" while ring's C compiled
-    /// fine.
-    ///
-    /// The fix is the same for both cases: a zig wrapper for the host triple
-    /// in `CARGO_TARGET_<HOST>_LINKER`, which stable cargo applies to host
-    /// artifacts, and the override removed so that it can.
-    fn wire_host_linker(&self, cmd: &mut std::process::Command) -> Result<()> {
-        let config = cargo_config2::Config::load().context("loading cargo config for zig")?;
-        let host = cargo_zigbuild::zig::prepare_zig_linker(&self.host, &config)
-            .with_context(|| format!("preparing zig as the linker for host {}", self.host))?;
-        let env_host = self.host.replace('-', "_");
-        cmd.env(
-            format!("CARGO_TARGET_{}_LINKER", env_host.to_uppercase()),
-            &host.cc,
-        );
-        // A build script that compiles C for the host (rare; cc-rs builds
-        // for TARGET) gets zig as well.
-        cmd.env(format!("CC_{env_host}"), &host.cc);
-        cmd.env(format!("CXX_{env_host}"), &host.cxx);
-        for var in [
-            "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS",
-            "CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST",
-            "CARGO_TARGET_APPLIES_TO_HOST",
-        ] {
-            cmd.env_remove(var);
-        }
-        Ok(())
+/// Point the *host* linker at zig too, so build scripts and proc-macros
+/// stop needing a system `cc`.
+///
+/// Those are host artifacts, and cargo links them with the host's linker
+/// regardless of `--target`. cargo-zigbuild only ever wires the target
+/// triple, so on a cross build every build script still links with `cc`;
+/// and when host == target it goes further and turns cargo's
+/// `target-applies-to-host` off through a nightly-channel override — for
+/// glibc-versioned host triples like `x86_64-unknown-linux-gnu.2.17`,
+/// which Rustible never builds — so even there the host linker is `cc`.
+/// Measured on M8 step 2: with no `cc` on `PATH`, `serde_core`'s build
+/// script failed with "linker `cc` not found" while ring's C compiled
+/// fine.
+///
+/// The fix is the same for both cases: a zig wrapper for the host triple
+/// in `CARGO_TARGET_<HOST>_LINKER`, which stable cargo applies to host
+/// artifacts, and the override removed so that it can.
+pub fn wire_host_linker(host_triple: &str, cmd: &mut std::process::Command) -> Result<()> {
+    let config = cargo_config2::Config::load().context("loading cargo config for zig")?;
+    let host = cargo_zigbuild::zig::prepare_zig_linker(host_triple, &config)
+        .with_context(|| format!("preparing zig as the linker for host {host_triple}"))?;
+    let env_host = host_triple.replace('-', "_");
+    cmd.env(
+        format!("CARGO_TARGET_{}_LINKER", env_host.to_uppercase()),
+        &host.cc,
+    );
+    // A build script that compiles C for the host (rare; cc-rs builds
+    // for TARGET) gets zig as well.
+    cmd.env(format!("CC_{env_host}"), &host.cc);
+    cmd.env(format!("CXX_{env_host}"), &host.cxx);
+    for var in [
+        "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS",
+        "CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST",
+        "CARGO_TARGET_APPLIES_TO_HOST",
+    ] {
+        cmd.env_remove(var);
     }
+    Ok(())
 }
 
 /// The triple `rustc` itself runs on, from `rustc -vV`'s `host:` line.
-fn host_triple() -> Result<String> {
+pub fn host_triple() -> Result<String> {
     let out = std::process::Command::new("rustc")
         .arg("-vV")
         .output()

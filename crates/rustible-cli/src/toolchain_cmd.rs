@@ -1,27 +1,32 @@
-//! `rustible toolchain`: what this machine can build for, and the environment
-//! it would use.
+//! `rustible toolchain check`: which zig a build would use, and the
+//! environment it would hand cargo.
 //!
-//! Playbook binaries are cross-compiled here and shipped to the target, so
-//! "can this machine build for that host" is a question with a real answer,
-//! and one worth asking before a run rather than during it. `check` answers
-//! it; `--print-env` shows the compiler settings [`crate::toolchain`] would
-//! hand to cargo, which is what a build actually uses.
+//! The environment is the point. It is the same one `playbook run` gives
+//! cargo — the same `cargo_zigbuild::Build`, the same host-linker wiring —
+//! so `eval "$(rustible toolchain check --target <t> --print-env)"` followed
+//! by a plain `cargo build --target <t>` is a Rustible build without the
+//! run around it. CI uses that to cross-build where there is no host to ship
+//! to, and an operator can use it to give rust-analyzer or a bare `cargo`
+//! the zig that `rustible` would use, on a machine with no other C compiler.
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Args;
 
-use crate::toolchain::{Compilers, env_for_build, host_musl_triple};
-use crate::workspace::Workspace;
+use crate::describe::{host_triple, wire_host_linker};
+use crate::toolchain::ensure_targets_installed;
+use crate::zig;
 
 /// Arguments for `rustible toolchain check`.
 #[derive(Args, Debug)]
 pub struct CheckArgs {
-    /// Target triple to check, repeatable. Defaults to both Linux musl
-    /// targets, which is every host Rustible can manage.
+    /// Target triple to check, repeatable. Defaults to every target Rustible
+    /// can manage: both Linux musl triples and both macOS ones.
     #[arg(long = "target")]
     pub targets: Vec<String>,
-    /// Print the compiler environment as `export KEY='value'` lines instead
-    /// of a report, ready for `eval`. Values contain spaces, so they are
+    /// Print the build environment as `export KEY='value'` lines instead of
+    /// a report, ready for `eval`. Values contain spaces, so they are
     /// quoted; do not split this output on whitespace.
     #[arg(long)]
     pub print_env: bool,
@@ -29,111 +34,116 @@ pub struct CheckArgs {
 
 /// The targets to check when none were named: everything Rustible manages.
 fn default_targets() -> Vec<String> {
-    vec![
-        "x86_64-unknown-linux-musl".to_string(),
-        "aarch64-unknown-linux-musl".to_string(),
+    [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
     ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
-/// Run `rustible toolchain check`.
-///
-/// Exits 0 when every target can be built for, and fails with the same
-/// message a run would give otherwise, so the answer here and the answer
-/// during `playbook run` cannot disagree.
-pub fn run(ws: Option<&std::path::Path>, args: CheckArgs) -> Result<u8> {
+/// Run `rustible toolchain check`. zig was provisioned in `main` before the
+/// runtime started (that is where the environment can be exported soundly);
+/// provisioning again here is a cache hit and gives the report its first line.
+pub fn run(_ws: Option<&Path>, args: CheckArgs) -> Result<u8> {
     let targets = if args.targets.is_empty() {
         default_targets()
     } else {
         args.targets.clone()
     };
-    let compilers = Compilers::probe();
+    ensure_targets_installed(&targets)?;
+    let host = host_triple()?;
+    let located = zig::provision(&|line| eprintln!("  {line}"))?;
 
-    // The headers are unpacked into the workspace cache when there is a
-    // workspace, and into a temporary directory when there is not, so this
-    // works outside one.
-    let tmp;
-    let cache_dir = match Workspace::discover(ws) {
-        Ok(w) => w.cache_dir(),
-        Err(_) => {
-            tmp = tempfile::tempdir().context("creating a temporary cache directory")?;
-            tmp.path().to_path_buf()
-        }
-    };
-
-    let env = env_for_build(&compilers, &targets, &cache_dir)?;
+    // One environment per target, because the wrapper scripts are per
+    // target. Printed in target order, so `--target a --target b` gives a's
+    // block then b's; a reader who wants one target names one.
+    let mut blocks = Vec::new();
+    for target in &targets {
+        let mut b = cargo_zigbuild::Build::new(None);
+        b.enable_zig_ar = true;
+        b.cargo.common.target = vec![target.clone()];
+        let mut cmd = b
+            .build_command()
+            .with_context(|| format!("preparing the zig-backed build for {target}"))?;
+        wire_host_linker(&host, &mut cmd)?;
+        let mut env: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        // The compiler and linker wrappers are scripts with the zig path
+        // baked in, but `ar` is this binary reached through a symlink, with
+        // nothing baked in: it finds zig from the environment. `playbook run`
+        // inherits that from `main`; a shell that `eval`s this output has
+        // to be given it too, or every `ring` archive step dies with
+        // "Failed to find zig".
+        env.push((
+            "CARGO_ZIGBUILD_ZIG_COMMAND".into(),
+            located.path().to_string_lossy().into_owned(),
+        ));
+        blocks.push((target.clone(), env));
+    }
 
     if args.print_env {
         // Shell-quoted and `export`-prefixed, so `eval "$(rustible toolchain
-        // check --print-env)"` is the whole recipe. A value like
-        // `-idirafter /path` has a space in it, and splitting that on
-        // whitespace produces an argument a shell then tries to execute.
-        for (k, v) in &env {
-            println!(
-                "export {k}='{}'",
-                v.to_string_lossy().replace('\'', r"'\''")
-            );
+        // check --print-env)"` is the whole recipe. Values contain spaces.
+        for (_, env) in &blocks {
+            for (k, v) in env {
+                println!("export {k}='{}'", shell_quote(v));
+            }
         }
         return Ok(0);
     }
 
+    println!("{}", located.describe());
     println!("this machine builds for:");
     for t in &targets {
         println!("    {t}");
     }
-    println!();
-    match (&compilers.clang, &compilers.host_cc) {
-        (Some(c), _) => println!("clang:  {}", c.display()),
-        (None, Some(cc)) => println!(
-            "clang:  not found; {} serves {} alone",
-            cc.display(),
-            host_musl_triple()
-        ),
-        (None, None) => println!("clang:  not found, and no other compiler either"),
-    }
-    if env.is_empty() {
-        println!("cargo needs nothing set for these targets");
-    } else {
-        println!("\ncargo is given:");
-        for (k, v) in &env {
-            println!("    {k}={}", v.to_string_lossy());
+    for (target, env) in &blocks {
+        println!("\n{target}: cargo is given");
+        for (k, v) in env {
+            println!("    {k}={v}");
         }
     }
     Ok(0)
+}
+
+/// Escape for a single-quoted shell string.
+fn shell_quote(s: &str) -> String {
+    s.replace('\'', r"'\''")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Named targets win over the default pair, and the default pair is
-    /// every host Rustible can manage.
+    /// Named targets win over the defaults, and the defaults are every host
+    /// Rustible can manage — Linux and macOS, both architectures.
     #[test]
     fn defaults_are_every_manageable_target() {
         let d = default_targets();
-        assert_eq!(d.len(), 2);
-        assert!(d.iter().all(|t| t.ends_with("-unknown-linux-musl")));
-        assert!(d.iter().any(|t| t.starts_with("x86_64")));
-        assert!(d.iter().any(|t| t.starts_with("aarch64")));
+        assert_eq!(d.len(), 4);
+        assert!(d.iter().any(|t| t == "x86_64-unknown-linux-musl"));
+        assert!(d.iter().any(|t| t == "aarch64-unknown-linux-musl"));
+        assert!(d.iter().any(|t| t == "aarch64-apple-darwin"));
+        assert!(d.iter().any(|t| t == "x86_64-apple-darwin"));
     }
 
-    /// The environment this prints is the environment a build is given: the
-    /// command exists so CI and a puzzled operator see the same thing
-    /// `playbook run` would use, rather than a second implementation that
-    /// can drift from it.
+    /// A value with a quote in it survives `eval`: the first CI recipe split
+    /// `--print-env` on whitespace and executed a path. Quoting is the fix
+    /// and it has to hold for the one character single quotes cannot hold.
     #[test]
-    fn print_env_is_what_a_build_gets() {
-        let t = tempfile::tempdir().unwrap();
-        let compilers = Compilers::probe();
-        let targets = default_targets();
-        let direct = env_for_build(&compilers, &targets, t.path());
-        // Whatever the machine can or cannot do, the command agrees with the
-        // builder: both succeed or both fail with the same message.
-        match direct {
-            Ok(env) => assert!(
-                env.keys()
-                    .all(|k| k.starts_with("CC_") || k.starts_with("CFLAGS_"))
-            ),
-            Err(e) => assert!(e.to_string().contains("clang"), "{e}"),
-        }
+    fn quoting_survives_a_single_quote() {
+        assert_eq!(shell_quote("-idirafter /a b"), "-idirafter /a b");
+        assert_eq!(shell_quote("it's"), r"it'\''s");
     }
 }

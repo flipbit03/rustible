@@ -106,11 +106,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # A mac is a supported *controller*: it builds the CLI natively and
-      # cross-builds playbook binaries for the Linux musl targets. It is never
-      # a target (vision 5.3, Linux musl only), which is why the local probe
-      # refuses it. Xcode's command line tools ship the clang that ring needs,
-      # so nothing is installed here.
+      # A mac is a supported controller and, since M8, a supported target.
+      # Nothing but Rust is installed here: the C toolchain is the zig that
+      # `rustible` fetches into its own cache on first use, and the cache
+      # step below is what keeps that from being a 50 MB download per run.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -126,16 +125,20 @@ jobs:
           key: ci-macos-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-macos-cargo-
 
-      - run: clang --version
+      - name: Cache the zig rustible fetches
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rustible/zig
+          key: ci-macos-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - run: cargo test --workspace
 
-      # The property that matters: a mac produces a Linux playbook binary,
-      # with Apple clang and the musl headers the CLI carries. The compiler
-      # environment comes from `rustible toolchain check --print-env`, which
-      # is the same code `playbook run` uses; calling cargo directly here
-      # would set nothing and fail on `x86_64-linux-musl-gcc`, which is the
-      # error that whole module exists to prevent.
+      # The property that matters: a mac produces a Linux playbook binary.
+      # The environment comes from `rustible toolchain check --print-env`,
+      # which is the same `cargo_zigbuild::Build` and host-linker wiring
+      # `playbook run` uses; calling cargo directly here would set nothing
+      # and fail on `x86_64-linux-musl-gcc`, which is the error zig exists to
+      # prevent. `toolchain check` also fetches zig if the cache above missed.
       - name: Cross-build a playbook for both Linux targets
         run: |
           set -euo pipefail
@@ -149,6 +152,59 @@ jobs:
                 cargo build --features selected --profile dist --target "$t" )
             file "target/$t/dist/workspace"
           done
+
+      # And a mac as a *target*: the runner drives itself over the local
+      # transport, which builds `aarch64-apple-darwin` through zig, ships the
+      # binary to itself, and gathers Darwin facts. There is no macOS
+      # container, so this is the only automated check of that path
+      # (docs/plan/reports/MACOS-TARGET-SPIKE.md).
+      - name: Run a playbook against this mac
+        run: |
+          set -euo pipefail
+          RUSTIBLE=$PWD/target/release/rustible
+          "$RUSTIBLE" --workspace examples/workspace playbook run hello -v
+
+  # FreeBSD is not a target Rustible's operations know yet, but the binary
+  # comes for free now — zig carries FreeBSD's libc — and this is what stops
+  # that claim from rotting. When the ops learn `pw` and `pkg`, this job is
+  # where the target is already proven to build.
+  freebsd:
+    name: "Build: cross-compile (FreeBSD/x86_64)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-freebsd-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-freebsd-cargo-
+
+      - name: Cache the zig rustible fetches
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rustible/zig
+          key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
+
+      - name: Cross-build a playbook for FreeBSD
+        run: |
+          set -euo pipefail
+          cargo build --release -p rustible-cli
+          RUSTIBLE=$PWD/target/release/rustible
+          cd examples/workspace
+          ( eval "$("$RUSTIBLE" toolchain check --target x86_64-unknown-freebsd --print-env)"
+            RUSTIBLE_PLAYBOOK=hello \
+              cargo build --features selected --profile dist --target x86_64-unknown-freebsd )
+          file target/x86_64-unknown-freebsd/dist/workspace | tee /dev/stderr | grep -q FreeBSD
 
   harness:
     name: "Test: Docker (Debian/Ubuntu/Alpine)"
@@ -223,8 +279,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The dependency rule, on a runner: a musl target plus clang. Nothing
-      # below installs a cross-gcc, a zig, or a docker image to build in.
+      # The dependency rule, on a runner: rustup, and the zig `rustible`
+      # fetches for itself with the runner's curl. No cross-gcc, no clang, no
+      # docker image to build in; `make vm-test` below is an ordinary
+      # `rustible playbook run`.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -239,6 +297,12 @@ jobs:
             target
           key: ci-machine-${{ matrix.machine }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-machine-${{ matrix.machine }}-cargo-
+
+      - name: Cache the zig rustible fetches
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rustible/zig
+          key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - name: Install vagrant, libvirt and qemu
         run: |

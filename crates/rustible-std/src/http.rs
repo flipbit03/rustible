@@ -9,8 +9,8 @@
 //! `ring` detects CPU features at runtime and falls back to baseline code, so
 //! there is no instruction-set floor and no pre-flight: the binary this op
 //! ships in runs on any x86-64 or aarch64 target. It does compile a little C,
-//! which the operator's machine needs a `clang` for (vision 5.3); the target
-//! host still needs nothing at all.
+//! which zig does on the operator's machine (vision 5.3, M8); the target host
+//! still needs nothing at all.
 //!
 //! `check` never touches the network. It decides from the file on disk
 //! whether a download is due, so a dry run is fast and honest (vision 12).

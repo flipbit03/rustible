@@ -4,8 +4,9 @@
 //! rustls's own `ring` feature, and it is the only provider in the tree: there
 //! is no fallback and no runtime downgrade.
 //!
-//! `ring` compiles a small amount of C, which is why an operator needs a
-//! `clang` on `PATH` to cross-build a playbook binary (vision 5.3). What that
+//! `ring` compiles a small amount of C, which is why a C toolchain exists in
+//! the dependency rule at all — zig, fetched by `rustible` (vision 5.3, M8).
+//! What that
 //! buys is runtime CPU feature detection: ring dispatches on CPUID and falls
 //! back to baseline x86-64 code, so a playbook binary runs on any x86-64 or
 //! aarch64 machine rather than requiring a fixed instruction-set floor. The

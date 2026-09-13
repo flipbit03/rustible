@@ -173,18 +173,42 @@ fn dispatch_as_tool() -> Option<Result<()>> {
     })
 }
 
-/// The subcommands that build a playbook binary, and so need a zig before
-/// they start. Everything else — `init`, `playbook list`, `inventory show` —
-/// must not cause a 51 MB download.
-fn builds(cmd: &Cmd) -> bool {
-    matches!(
-        cmd,
-        Cmd::Playbook {
-            cmd: PlaybookCmd::Run(_)
-        } | Cmd::Inventory {
-            cmd: InventoryCmd::Check { .. }
+/// Whether zig should be provisioned for this invocation, decided before the
+/// runtime starts and before anything expensive.
+///
+/// Only the subcommands that build need a zig: `playbook run`, `inventory
+/// check` (it builds every playbook to check their vars), and `toolchain
+/// check` (it prepares the build environment). `init`, `playbook list` and
+/// `inventory show` must never cause a 51 MB download. And neither must a
+/// typo: an invocation `dispatch` is about to refuse for a stray
+/// `--inventory`, or one that names a file that is not there, is answered
+/// with that refusal and nothing else. The checks here mirror the cheap
+/// early failures in `dispatch`; the real errors still come from there.
+///
+/// This is also what keeps the unit tests off the network: they run the
+/// real binary with a missing inventory and a misplaced flag, and neither
+/// gets as far as a fetch.
+fn needs_zig(cli: &Cli) -> bool {
+    let inventory_exists = |explicit: Option<&PathBuf>| -> bool {
+        match explicit {
+            Some(p) => p.is_file(),
+            None => Workspace::discover(cli.workspace.as_deref())
+                .map(|ws| ws.inventory_path().is_file())
+                .unwrap_or(false),
         }
-    )
+    };
+    match &cli.cmd {
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Run(_),
+        } => inventory_exists(cli.inventory.as_ref()),
+        Cmd::Inventory {
+            cmd: InventoryCmd::Check { file },
+        } => inventory_exists(file.as_ref().or(cli.inventory.as_ref())),
+        Cmd::Toolchain {
+            cmd: ToolchainCmd::Check(_),
+        } => cli.inventory.is_none(),
+        _ => false,
+    }
 }
 
 fn main() {
@@ -207,7 +231,7 @@ fn main() {
     // reason: cargo-zigbuild learns where zig is from the process
     // environment, and setting that is only sound while this is the only
     // thread. It is, until the runtime below is built.
-    if builds(&cli.cmd) {
+    if needs_zig(&cli) {
         match zig::provision(&|line| eprintln!("  {line}")) {
             Ok(located) => {
                 if let Some(path) = located.export() {
