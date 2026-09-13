@@ -91,8 +91,9 @@ On the machine you run `rustible` from (the controller) you need:
 - a C compiler (`cc`, `gcc` or `clang`)
 - `curl`
 
-zig is installed automatically, into `~/.cache/rustible`, if it is not already
-present. The machines you manage (the targets) need nothing.
+zig (which cross-compiles playbooks for the target architectures) is installed
+automatically into `~/.cache/rustible` if it is not already present. The
+machines you manage (the targets) need nothing.
 
 ## Point your agent at this
 
