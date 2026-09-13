@@ -44,8 +44,9 @@ in, and Rustible works out what differs and changes only that. Same job as
 Ansible, same ideas — desired state, idempotence, dry runs — with playbooks
 that are compiled code rather than YAML.
 
-A playbook is an ordinary Rust file. Running one compiles it to a static musl
-binary for the target's architecture, copies it over SSH, and runs it **on the
+A playbook is an ordinary Rust file. Running one compiles it to a single
+self-contained binary for the target's architecture — static musl on Linux, a
+Mach-O linked only against `libSystem` on macOS — copies it over SSH, and runs it **on the
 target**. The binary streams results back. Targets need nothing installed: no
 Python, no agent, no runtime.
 
@@ -123,8 +124,6 @@ infra/
 ├── build.rs           # generated shim: finds playbooks/. Do not edit.
 ├── README.md          # yours: says what this is, and links this guide
 ├── .gitignore         # /target and /.rustible
-├── .cargo/
-│   └── config.toml    # musl cross-linking via rust-lld. Do not edit.
 ├── src/
 │   ├── main.rs        # generated shim. Do not edit.
 │   └── lib.rs         # yours: what more than one playbook needs
@@ -788,7 +787,7 @@ cargo doc -p rustible-std --no-deps --open
 **3. [docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/)**,
 the same thing on the web.
 
-The modules carrying operations are `apt`, `archive`, `file`, `group`,
+The modules carrying operations are `apt`, `archive`, `brew`, `file`, `group`,
 `hostname`, `http`, `shell`, `ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
 you cannot get that way — which shape to reach for, and what bites — is the
 rest of this section.
@@ -834,7 +833,7 @@ content — return a builder that finishes by naming the second:
 | `file::Symlink` | `at(link)` | `.pointing_to(target)` |
 | `file::Line` | `in_path(file)` | `.set(line)` |
 | `file::Block` | `in_path(file)` | `.set(block)` |
-| `ssh::authorized_keys::*` | `for_user(&acct)` / `for_user_name(n)` | `.keys([..])` |
+| `ssh::authorized_keys::*` | `for_user(&acct)` / `for_user_name(n)` / `for_account(home, uid, gid)` / `in_file(path)` | `.keys([..])` |
 | `user::Membership` | `of(&acct)` / `of_name(n)` | `.in_group(&g)` / `.in_group_named(n)` |
 
 ⚠️ **The constructor is not always `new`.** `file::Directory`, `file::Absent`

@@ -101,7 +101,7 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: "Build: macOS controller"
+    name: "Test: macOS (controller and target)"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5

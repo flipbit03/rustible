@@ -15,10 +15,10 @@
 //! Broadwell or AMD Zen; `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` measures
 //! both. Nothing here needs a CPU pre-flight, and there is none.
 //!
-//! The compiler requirement is a *build-time* one, on the operator's machine.
-//! The `rustible` CLI checks for it before the build and supplies the C
-//! compiler and, on `x86_64-unknown-linux-musl`, the libc headers itself, so
-//! nobody exports an environment variable by hand.
+//! The compiler requirement is a *build-time* one, on the operator's machine,
+//! and it is zig's: every playbook build goes through `cargo-zigbuild`, and
+//! `rustible` fetches the pinned zig into its own cache, so nobody chooses a
+//! compiler or exports an environment variable by hand.
 //!
 //! ## Using it from a collection
 //!

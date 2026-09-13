@@ -494,8 +494,8 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
     // links, and `cargo-zigbuild` has no business in a playbook binary. So
     // the container tier is a *developer* requirement, like docker beside
     // it — a C compiler on the machine running `make integration` — and not
-    // a user one; `rustible` itself asks nothing of the operator but rustup,
-    // zig (fetched for them) and curl (M8). No sysroot is set and none is
+    // a user one; `rustible` itself asks the operator only for rustup, a C
+    // compiler for cargo's own use, and curl, and fetches zig itself (M8). No sysroot is set and none is
     // needed: the target is always this machine's own architecture, so the
     // compiler's default libc headers are at least the right one, and ring
     // reaches only `memcpy`, `memset`, `assert` and the types in `stdlib.h`

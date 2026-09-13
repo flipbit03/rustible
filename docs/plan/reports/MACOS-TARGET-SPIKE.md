@@ -960,7 +960,7 @@ the code that read it, see the status note at the top.)
 **Linux controller:** nothing. `clang` (already required by the dependency
 rule) and `rsync` were present; the linker is rustup's own `rust-lld`. Two
 rustup *targets* were added, which is `rustup target add` and therefore inside
-the rule — and in a real run `Describe::build` adds them itself:
+the rule — and in a real run `Cargo::build` adds them itself:
 
 ```
 rustup target add aarch64-apple-darwin   # was already installed here

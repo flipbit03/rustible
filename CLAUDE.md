@@ -1,8 +1,9 @@
 # Rustible
 
 An independent replacement for Ansible. A playbook is an ordinary Rust file
-with typed operations and typed outputs. Running one compiles it into a static
-musl binary per target architecture, ships it over SSH, runs it *there*, and
+with typed operations and typed outputs. Running one compiles it into one
+self-contained binary per target — static musl on Linux, a Mach-O linked only
+against `libSystem` on macOS — ships it over SSH, runs it *there*, and
 streams `changed / ok / failed` back with dry run and diffs. The target needs
 nothing installed: no Python, no agent, no runtime.
 
@@ -40,10 +41,13 @@ sends the next session hunting for work that is already done, or repeating it.
 
 ## The dependency rule
 
-**rustup plus zig plus `curl` is the entire set of dependencies for running
-Rustible, and that must never grow.** Not a preference, not a default to be
+**rustup, a C compiler, and `curl` is the entire set of dependencies on the
+controller, and that must never grow.** Not a preference, not a default to be
 revisited: it is the property the project exists to have. Target hosts need
-nothing at all, ever.
+nothing at all, ever. zig is not on that list because `rustible` fetches it
+itself; the C compiler is not `rustible`'s but cargo's, for a workspace under
+`cargo check`, `cargo test` or rust-analyzer, as in any Rust project with a C
+dependency.
 
 zig is the C toolchain: `ring` (TLS) compiles a little C, and zig compiles
 and links it for every target, carrying its own libc for each, so there is no
@@ -54,10 +58,6 @@ use with the machine's `curl`, verified against a SHA-256 in
 wins. `cargo-zigbuild` is a library dependency, not a program anyone installs.
 The CLI links no TLS of its own, so `cargo install rustible-cli` needs no C
 compiler.
-
-The rule is about running Rustible. A workspace under cargo directly
-(rust-analyzer, `cargo check`, `cargo test`) is an ordinary Rust project with a
-C dependency and wants the machine's own C compiler.
 
 The operator does not type `rustup target add` either — `Cargo::build`
 calls `toolchain::ensure_targets_installed` first, because Rustible has
@@ -80,8 +80,9 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
 
 - **`escalate`, never `become`.** `become` is a reserved Rust keyword and the
   name is gone everywhere: the attribute, the inventory, the CLI, the code.
-- **Never publish to crates.io.** Releases are cut by tagging and publishing a
-  GitHub release, which fires `.github/workflows/release.yml`.
+- **Never run `cargo publish` by hand.** Releases are cut by tagging and
+  publishing a GitHub release, which fires `.github/workflows/release.yml`;
+  that workflow is the only thing that publishes to crates.io.
 - **The tree's version is `0.0.0` and stays there.** Nobody can publish that,
   so it means exactly "built from source, not released". `release.yml` rewrites
   it from the tag at publish time and fails if any occurrence is missed, so a
@@ -128,7 +129,7 @@ against, because the people reading a CI run do not have this file open:
 | `Test: unit & fake` | tiers 1 and 2 |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Build: macOS controller` | the suite on macOS, and three playbooks run against the runner itself as a target |
+| `Test: macOS (controller and target)` | the suite on macOS, and three playbooks run against the runner itself as a target |
 | `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |
 | `Test: VM (Debian 12/x86_64)` | tier 4, on a KVM-accelerated guest |
 | `Test: VM (Debian 12/aarch64)` | tier 4, on an emulated guest |
@@ -180,7 +181,7 @@ The shape matters more than the code, and there is already a checklist for it:
 to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
-`crates/rustible-std/src/sysctl.rs`** — at ~630 lines it is short enough to
+`crates/rustible-std/src/sysctl.rs`** — at ~680 lines it is short enough to
 finish and has every part: pure planning functions over file
 text, a `check` that composes a `Diff`, an `apply`, and a test module split
 into `// ---- pure ----` and `// ---- Fake ----`.
@@ -283,8 +284,8 @@ Choosing the tier is the judgement; this is the mechanism.
 
 **Tiers 1 and 2 live in the op's own file**, in a `#[cfg(test)] mod tests` at
 the bottom. Every module in `rustible-std` that has tests does this — all
-nineteen of them, the twentieth being `ssh/mod.rs`, which only re-exports —
-and none has a separate unit-test file. Inside it, separate the two tiers with a banner
+twenty of them; `lib.rs` and `ssh/mod.rs` only re-export — and none has a
+separate unit-test file. Inside it, separate the two tiers with a banner
 comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and
 `// ---- Fake ----`, which is the pair to copy; older modules use their own
 wording.
@@ -427,7 +428,7 @@ Each of these has already produced a test that could not fail.
   changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
   the second answer by writing into the Fake between the two checks — the
   builders consume `self`, so this goes through the `Backend` trait, as
-  `sysctl.rs:630` does:
+  `sysctl.rs:674` does:
 
   ```rust
   rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"1\n")?;
@@ -539,5 +540,5 @@ carry an explicit `Linux | Macos` match; `brew` is the mac's package op.
 `docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement.
 
 Operations run on the target, including lookups (vision 5.1), so
-`github::UserKeys` needs network egress from the target rather than from the
+`rustible_github::UserKeys` needs network egress from the target rather than from the
 controller.

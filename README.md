@@ -240,10 +240,12 @@ Two collections ship from this repository.
 | `shell` | `Command` |
 
 Every operation declares where it runs and refuses other platforms by name.
-On macOS, `file`, `shell`, `http`, `archive` and `brew` run; the rest refuse.
+On macOS `file`, `shell`, `http`, `archive` and `brew` run, and
+`ssh::authorized_keys` runs when given the account rather than a name to look
+up; the rest refuse.
 
 **`rustible-github`** — a small collection showing what a third-party one
-looks like. It adds `github::UserKeys`, which fetches a GitHub user's public
+looks like. It adds `rustible_github::UserKeys`, which fetches a GitHub user's public
 keys, and `github_ssh_keys_to_user`, a helper that runs it and
 `ssh::authorized_keys::Present` as two visible steps:
 

@@ -29,8 +29,9 @@ person or an agent does it.
    code-review pass against the brief. Merging is Cadu's call at milestone
    boundaries and can be delegated inside a milestone.
 6. **Trying things happens on a branch or in the scratchpad**, never on `main`.
-7. **Pure Rust, transitively** (vision 5.3). A PR that adds a crate bundling C
-   is rejected.
+7. **No crate that bundles a C *library*** (`openssl-sys`, `libgit2-sys`) —
+   vision 5.3; the fix is the pure-Rust alternative. A crate that compiles a
+   little C of its own, like `ring`, is fine: zig compiles it for every target.
 
 ## 2. Milestones and their dependency graph
 

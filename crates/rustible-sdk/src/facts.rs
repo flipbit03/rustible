@@ -165,11 +165,13 @@ pub struct Facts {
     /// binary's target.
     pub arch: Arch,
     /// `/proc/sys/kernel/osrelease`, trimmed: the running kernel's release
-    /// string, `6.1.0-13-amd64`. Empty when `/proc` cannot be read.
+    /// string, `6.1.0-13-amd64`. Empty when `/proc` cannot be read. On
+    /// macOS, `kern.osrelease` from the single `sysctl` call.
     pub kernel: String,
     /// `/proc/sys/kernel/hostname`, falling back to `/etc/hostname`. The
     /// name the kernel holds, not a resolved FQDN and not the inventory's
-    /// name for the host; empty when neither source reads.
+    /// name for the host; empty when neither source reads. On macOS,
+    /// `kern.hostname` from the single `sysctl` call.
     pub hostname: String,
     /// Every package manager found on the box; see [`Pm`]. Empty when there
     /// is none Rustible knows. Ask with [`Facts::has_pm`] rather than
@@ -180,11 +182,14 @@ pub struct Facts {
     pub init: Init,
     /// Logical CPUs, counted as the `processor` lines in `/proc/cpuinfo`,
     /// so hyperthreads count separately and cgroup limits are invisible.
-    /// Never zero: an unreadable `/proc/cpuinfo` reports 1.
+    /// Never zero: an unreadable `/proc/cpuinfo` reports 1. On macOS,
+    /// `hw.ncpu` from the single `sysctl` call.
     pub cpus: u32,
     /// `MemTotal` from `/proc/meminfo`, converted from kibibytes by integer
     /// division. Memory the kernel can hand out, a little under the RAM
-    /// physically installed; 0 when `/proc/meminfo` does not read.
+    /// physically installed; 0 when `/proc/meminfo` does not read. On
+    /// macOS, `hw.memsize` from the single `sysctl` call, in bytes, so the
+    /// installed RAM rather than what the kernel can hand out.
     pub memory_mb: u64,
     /// The account this process runs as: `$USER` when set, otherwise the
     /// name `/etc/passwd` gives for `getuid()`, otherwise the numeric uid

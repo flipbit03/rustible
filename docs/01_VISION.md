@@ -287,8 +287,10 @@ took 4.5 s).
 
 - **Linux targets are `*-unknown-linux-musl` only.** Static musl binaries run
   on any Linux regardless of libc version.
-- **Rustible's toolchain is rustup plus zig, and `curl` to fetch the zig
-  (DECIDED 2026-09-07, AMENDED 2026-09-08, AMENDED AGAIN 2026-09-13, M8).**
+- **The controller needs rustup, a C compiler, and `curl`; zig is fetched by
+  `rustible` itself (DECIDED 2026-09-07, AMENDED 2026-09-08, AMENDED AGAIN
+  2026-09-13, M8).** The C compiler is cargo's, for a workspace under
+  `cargo check`, `cargo test` or rust-analyzer, not `rustible`'s.
   `rustup target add <triple>` is done for the operator, and so is zig: the
   CLI fetches the pinned release into `~/.cache/rustible/zig/<version>/` on
   first use, verified against a checksum in its own source, with the `curl`
@@ -329,12 +331,6 @@ took 4.5 s).
   is the measurement and section 6 is why the ops that read `/etc/passwd`
   refuse it by name. Windows targets are deferred. FreeBSD and NetBSD binaries
   build (zig carries their libc; measured 2026-09-13) and wait for operations.
-
-Environment facts recorded 2026-09-05 on the primary dev box: rustc 1.97.1,
-targets installed: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and
-since 2026-09-06 `aarch64-unknown-linux-musl`. No zig, no `cross`, no sccache.
-Docker present. The ARM Linux VM (`cadu-cogram-vm-arm`, Ubuntu 24.04 aarch64,
-reachable via Tailscale, passwordless SSH as `cadu`) is the aarch64 test target.
 
 ### 5.4 Transport (DECIDED for MVP)
 
@@ -1615,14 +1611,14 @@ sent up once in the `Facts` frame. No lazy facts, no dynamic facts.
 
 ```rust
 pub struct Facts {
-    pub os: Os,                  // Linux for now
-    pub distro: Distro,          // Debian, Ubuntu, Alpine, Fedora, Rhel, Arch, Other(String)
+    pub os: Os,                  // Linux, Macos, Other(String)
+    pub distro: Distro,          // Debian, Ubuntu, Alpine, Fedora, Rhel, Arch, Macos, Other(String)
     pub distro_version: String,  // "12", "24.04", "3.20"
     pub arch: Arch,              // X86_64, Aarch64, Other(String)
     pub kernel: String,
     pub hostname: String,
-    pub package_manager: Pm,     // Apt, Dnf, Apk, Pacman, Zypper, Other(String)
-    pub init: Init,              // Systemd, OpenRc, Other(String)
+    pub package_managers: BTreeSet<Pm>, // every one found; ask with has_pm(). Apt, Dnf, Apk, Pacman, Zypper, Brew
+    pub init: Init,              // Systemd, OpenRc, Launchd, Other(String)
     pub cpus: u32,
     pub memory_mb: u64,
     pub user: String,            // who the binary runs as

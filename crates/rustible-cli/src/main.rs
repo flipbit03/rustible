@@ -1,5 +1,6 @@
 //! The `rustible` command (vision doc section 3): `init`, `playbook
-//! run|list|create`, `inventory show|check`. Noun first, then verb. The
+//! run|list|create`, `inventory show|check`, `toolchain install`. Noun
+//! first, then verb. The
 //! orchestrator pipeline is `run.rs`; the inventory is the library half
 //! (`rustible_cli::inventory`).
 //!
