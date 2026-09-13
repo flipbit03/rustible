@@ -30,7 +30,9 @@ use crate::secret::Secret;
 /// Bumped on every incompatible frame change. 2: `Start.playbook`, `Failed.cmd`.
 /// 3: file streaming frames (`FileRequest`, `FileChunk`, `FileDenied`,
 /// `FetchChunk`), `Start.escalate_password`, base64 byte fields.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: `Facts.package_managers` (a set) replaces `package_manager`, `Pm::Other`
+/// is gone, and `Os`, `Distro`, `Pm`, `Init` gain the macOS variants.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;

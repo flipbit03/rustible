@@ -102,9 +102,14 @@ pub fn validate_formula(name: &str) -> std::result::Result<(), String> {
             "`{name}` starts with a dash, which brew reads as an option"
         ));
     }
+    if name.contains('/') {
+        return Err(format!(
+            "`{name}` names a tap or a cask; brew::Present and brew::Absent manage formulae by              their bare name, because `brew list --formula` reports nothing else"
+        ));
+    }
     if let Some(bad) = name
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || "-_.+@/".contains(*c)))
+        .find(|c| !(c.is_ascii_alphanumeric() || "-_.+@".contains(*c)))
     {
         return Err(format!(
             "`{name}` contains {bad:?}, which is not legal in a formula name"
@@ -432,7 +437,8 @@ mod tests {
     fn formula_names_that_are_refused() {
         assert!(validate_formula("nethack").is_ok());
         assert!(validate_formula("openssl@3").is_ok());
-        assert!(validate_formula("homebrew/cask/firefox").is_ok());
+        let err = validate_formula("homebrew/cask/firefox").unwrap_err();
+        assert!(err.contains("tap or a cask"), "{err}");
         assert!(validate_formula("").unwrap_err().contains("empty"));
         assert!(validate_formula("--force").unwrap_err().contains("dash"));
         assert!(validate_formula("a b").unwrap_err().contains("not legal"));

@@ -185,12 +185,15 @@ fn dispatch_as_tool() -> Option<Result<()>> {
 /// real binary with a missing inventory and a misplaced flag, and neither
 /// gets as far as a fetch.
 fn needs_zig(cli: &Cli) -> bool {
+    // No workspace, no build: `playbook run` refuses and `inventory check`
+    // validates the file alone, so neither needs a zig.
+    let Ok(workspace) = Workspace::discover(cli.workspace.as_deref()) else {
+        return false;
+    };
     let inventory_exists = |explicit: Option<&PathBuf>| -> bool {
         match explicit {
             Some(p) => p.is_file(),
-            None => Workspace::discover(cli.workspace.as_deref())
-                .map(|ws| ws.inventory_path().is_file())
-                .unwrap_or(false),
+            None => workspace.inventory_path().is_file(),
         }
     };
     match &cli.cmd {
@@ -527,16 +530,55 @@ mod tests {
         ])));
         assert!(!needs_zig(&cli(&["inventory", "check", "--file", missing])));
 
-        // The real thing.
-        assert!(needs_zig(&cli(&[
+        // The inventory is there, but no workspace is: `playbook run`
+        // refuses and `inventory check` validates the file without building,
+        // so a fetch here would be 51 MB for nothing.
+        let ws = tmp.path().to_str().unwrap();
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
             "--inventory",
             inv,
             "playbook",
             "run",
             "x"
         ])));
-        assert!(needs_zig(&cli(&["--inventory", inv, "inventory", "check"])));
-        assert!(needs_zig(&cli(&["inventory", "check", "--file", inv])));
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
+
+        // The real thing.
+        std::fs::write(tmp.path().join("rustible.toml"), "").unwrap();
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "inventory",
+            "check"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
     }
 
     /// With no `--inventory`, `playbook run` needs a workspace to find the

@@ -217,7 +217,8 @@ fn fetch_with(
     // vendored musl headers used to be: the rename is atomic, a concurrent
     // run's finished work is never destroyed, and the scratch carries this
     // pid so two fetchers never share one.
-    let scratch = root.with_extension(format!("tmp.{}", std::process::id()));
+    let scratch = scratch_for(root, std::process::id());
+    sweep_scratch(root);
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
     let tarball = scratch.join("zig.tar.xz");
@@ -230,6 +231,18 @@ fn fetch_with(
         .args([
             "--fail",
             "--location",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--retry",
+            "3",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "120",
             "--silent",
             "--show-error",
             "--output",
@@ -255,21 +268,35 @@ fn fetch_with(
     std::fs::write(scratch.join(STAMP), format!("zig {ZIG_VERSION}\n"))
         .with_context(|| format!("writing the stamp in {}", scratch.display()))?;
 
+    let bin = install_into(&scratch, root)?;
+    announce(&format!("zig {ZIG_VERSION} installed at {}", bin.display()));
+    Ok(bin)
+}
+
+/// Where a fetch by `pid` unpacks: beside `root`, named for it.
+fn scratch_for(root: &Path, pid: u32) -> PathBuf {
+    let mut name = root.as_os_str().to_os_string();
+    name.push(format!(".tmp.{pid}"));
+    PathBuf::from(name)
+}
+
+/// Move a complete, unpacked `scratch` to `root`. `rename` is atomic and will
+/// not replace a directory, so whatever is at `root` and is not a working
+/// install is cleared first — a fetch that died half way, or a stamp with no
+/// `zig` behind it, which would otherwise be refetched and refused forever.
+/// A working install is kept and ours discarded: another run finished first.
+fn install_into(scratch: &Path, root: &Path) -> Result<PathBuf> {
     if let Some(parent) = root.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // A fetch that died half way leaves a directory with no stamp, and
-    // `rename` will not replace a directory. Clear that wreckage; a complete
-    // one is left alone.
-    if root.exists() && !root.join(STAMP).is_file() {
+    if root.exists() && binary_in(root).is_none() {
         let _ = std::fs::remove_dir_all(root);
     }
-    match std::fs::rename(&scratch, root) {
+    match std::fs::rename(scratch, root) {
         Ok(()) => {}
-        Err(_) if root.join(STAMP).is_file() => {
-            // Another run finished first; ours is surplus.
-            let _ = std::fs::remove_dir_all(&scratch);
+        Err(_) if binary_in(root).is_some() => {
+            let _ = std::fs::remove_dir_all(scratch);
         }
         Err(e) => {
             return Err(e).with_context(|| {
@@ -281,9 +308,36 @@ fn fetch_with(
             });
         }
     }
-    let bin = binary_in(root).context("zig went missing between unpacking and installing")?;
-    announce(&format!("zig {ZIG_VERSION} installed at {}", bin.display()));
-    Ok(bin)
+    binary_in(root).context("zig went missing between unpacking and installing")
+}
+
+/// Remove scratch directories fetches left behind — a run killed mid-unpack
+/// leaves ~380 MB that nothing else ever looks at. Anything older than an
+/// hour is abandoned; a live fetch is minutes old at most.
+fn sweep_scratch(root: &Path) {
+    let Some(parent) = root.parent() else { return };
+    let Some(stem) = root.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!("{stem}.tmp.");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|n| n.starts_with(&prefix)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age > std::time::Duration::from_secs(3600));
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// The `zig` binary inside an unpacked release: the tarball carries one
@@ -435,6 +489,77 @@ mod tests {
         assert!(is_executable(&bin));
         // Nothing but the release directory was written.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// A stamp with no `zig` behind it (a partial `rm`, a lost mode bit) is
+    /// not a finished install: the next fetch replaces it instead of
+    /// refusing on every run.
+    #[test]
+    fn install_replaces_a_stamped_root_with_no_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("zig").join(ZIG_VERSION);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(STAMP), "zig\n").unwrap();
+        let scratch = scratch_for(&root, 1);
+        unpack_tar_xz(&fake_release()[..], &scratch).unwrap();
+        std::fs::write(scratch.join(STAMP), "zig\n").unwrap();
+
+        let bin = install_into(&scratch, &root).unwrap();
+        assert!(
+            bin.starts_with(&root) && is_executable(&bin),
+            "{}",
+            bin.display()
+        );
+        assert!(!scratch.exists());
+    }
+
+    /// A working install at `root` wins over ours, and ours is removed.
+    #[test]
+    fn install_keeps_a_finished_root_and_discards_the_surplus() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("zig").join(ZIG_VERSION);
+        unpack_tar_xz(&fake_release()[..], &root).unwrap();
+        std::fs::write(root.join(STAMP), "zig\n").unwrap();
+        let theirs = binary_in(&root).unwrap();
+        std::fs::write(&theirs, "#!/bin/sh\necho theirs\n").unwrap();
+        let scratch = scratch_for(&root, 2);
+        unpack_tar_xz(&fake_release()[..], &scratch).unwrap();
+
+        let bin = install_into(&scratch, &root).unwrap();
+        assert_eq!(bin, theirs);
+        assert_eq!(
+            std::fs::read_to_string(&bin).unwrap(),
+            "#!/bin/sh\necho theirs\n"
+        );
+        assert!(!scratch.exists());
+    }
+
+    /// Ctrl-C mid-unpack leaves a scratch nothing collects by itself; the
+    /// next fetch does, and leaves a fetch that may still be running alone.
+    #[test]
+    fn sweep_removes_stale_scratch_and_keeps_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("zig").join(ZIG_VERSION);
+        let stale = scratch_for(&root, 111);
+        let live = scratch_for(&root, 222);
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(
+            stale
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("0.15.2.tmp.")
+        );
+
+        sweep_scratch(&root);
+        assert!(!stale.exists());
+        assert!(live.exists());
     }
 
     #[test]

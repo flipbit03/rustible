@@ -731,7 +731,7 @@ let pkgs = ctx.step("Install nginx and curl",
 ctx.step("Remove apache2", apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
 ctx.step("Keep openssl current", apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
 ```
-All three refuse early on a non-Debian box using `facts.package_manager`, and
+All three refuse early on a non-Debian box using `facts.has_pm(&Pm::Apt)`, and
 all three need root.
 
 `Present` `check`: `dpkg-query -W` per name, build the missing set, `Satisfied`
@@ -1491,7 +1491,7 @@ struct Vars { domain: String, #[default = 4] workers: u32 }
 
 #[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
-    if ctx.facts().package_manager != Pm::Apt {
+    if !ctx.facts().has_pm(&Pm::Apt) {
         bail!("this playbook only knows Debian-likes, got {:?}", ctx.facts().distro);
     }
     ctx.step("nginx present", apt::Present::new(["nginx"]))?;

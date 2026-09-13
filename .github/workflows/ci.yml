@@ -161,6 +161,7 @@ jobs:
           run macbrew -v
           run macbrew | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
           run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *0 *1 *0 *0 *0 *0'
+          run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
 
   harness:
     name: "Test: Docker (Debian/Ubuntu/Alpine)"
