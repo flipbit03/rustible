@@ -33,27 +33,14 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
-Every operation returns a typed struct describing what it found or made, and
-those values feed the operations after it. `cfg` here is a `CopyReport`, and
-its `changed` is a `bool`, so a conditional reload is an ordinary `if` instead
-of a handler wired up by a `notify` string. `user::Present` returns an
-`Account` with `uid`, `gid` and `home` as real fields, so the step that wants
-a home directory is handed one rather than guessing it. All of it is checked
-at compile time: a misspelled field or a wrong type fails the build.
+Every operation returns a typed struct, and those values feed the steps after
+it: `cfg.changed` is a `bool`, so the reload is an `if`, not a handler. A
+misspelled field or a wrong type fails the build.
 
 ## Why
 
-Ansible expresses logic in YAML: conditionals are `when:` strings evaluated as
-Python, iteration is a `loop:` key, and values are Jinja templates rendered
-into whitespace-sensitive markup. None of it is type-checked, and mistakes
-surface at run time, on a host, partway through.
-
-Its execution model ships a Python module to the target for every task
-(AnsiballZ), so every machine you manage needs a compatible interpreter and
-whatever libraries the modules import.
-
-Rustible keeps the parts that work — desired state, idempotence, readable runs
-— and changes what does not.
+Rustible keeps the parts of Ansible that work — desired state, idempotence,
+readable runs — and changes what does not.
 
 | Ansible | Rustible |
 |---|---|
@@ -119,11 +106,6 @@ mkdir infra && cd infra && git init
 rustible init                                # Cargo.toml, build.rs, src/, hosts.kdl, rustible.toml, README.md
 rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting this machine
 ```
-
-`rustible init` writes a Cargo package. `src/main.rs` and
-`build.rs` are generated shims you rarely open: the build script finds every
-file under `playbooks/` carrying the attribute and registers it, so adding a
-playbook is adding a file.
 
 Describe your machines in `hosts.kdl` ([KDL format](docs/HOSTS_KDL_REFERENCE.md)).
 `init` starts you with this machine:

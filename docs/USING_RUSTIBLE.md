@@ -371,43 +371,18 @@ name — `playbooks/web/nginx.rs` is the playbook `web/nginx`, which is what
 
 ### Where the code goes: the playbook, or `src/lib.rs`
 
-**A playbook is the readable record of what happens to a machine.** Someone
-opening it — a colleague at 2am, you in six months, an agent asked to change
-one thing — should be able to read down the page and see the run. Keeping that
-true is the one rule here. Everything below follows from it.
+**A playbook is the readable record of what happens to a machine**: open it
+and read down the page. So steps go in the playbook by default, and
+**`src/lib.rs` is earned by a second playbook, and by nothing else.** Moving
+code there before a second caller exists buys nothing and costs the reader a
+file. A second playbook permits the move, it does not compel it: share the
+incidental parts (`ssh_dir`, `caddy_vhost`) and let each play keep the steps
+that are its story.
 
-So **steps go in the playbook by default**, and `src/lib.rs` is earned, not
-assumed. A helper there is a good thing when it is pulling its weight; it is a
-cost when it is only moving code out of sight.
-
-**`lib.rs` is earned by a second playbook, and by nothing else.** That is the
-whole trigger. It is the only thing `lib.rs` can do that a function in the
-playbook file cannot, and moving code there before a second playbook exists
-buys nothing and costs the reader a file.
-
-A second playbook *permits* the move; it does not compel it. The rule above
-still outranks it: if lifting a shared sequence would leave the playbooks that
-used it saying nothing, leave it where it is and accept the repetition. Three
-plays that each install an account, its `~/.ssh`, its GitHub keys and a deploy
-key have a genuinely common shape — and hoisting the whole of it turns all
-three into two statements apiece. Share the parts that are incidental to the
-story (`ssh_dir`, `caddy_vhost`), and let each play keep the steps that *are*
-its story.
-
-Everything else that makes you want a function is served by a function **in
-the playbook file**, which is the next heading. Repeating a group of steps
-three times inside one play is a good reason for a function — and a bad reason
-to move it to `lib.rs`, because nothing else can call it yet. Wanting a name
-for a policy (`harden_ssh`) is the same: the name is worth having wherever the
-function lives, and it lives next to its only caller until there is a second
-one.
-
-Then the check that catches the common mistake: **called once, takes nothing
-but `ctx`, and its name just restates its own body — inline it.**
-`setup_nginx()` holding install-then-config-then-enable, inside a playbook
-whose whole purpose is nginx, is that. `harden_ssh()` is not.
-
-Both of these read well, and both are fine:
+The check for the common mistake: **called once, takes nothing but `ctx`, and
+its name restates its body — inline it.** `setup_nginx()` inside a playbook
+whose whole purpose is nginx is that; `harden_ssh()` called from four
+playbooks is not.
 
 ```rust
 // Everything inline. The default, and never wrong.
@@ -418,72 +393,30 @@ ctx.step("nginx enabled", systemd::Enabled::new("nginx").now(true))?;
 // Helpers, with the playbook still saying what happens.
 ctx.step("base packages", apt::Present::new(["curl", "ufw"]))?;
 harden_ssh(ctx)?;                       // in lib.rs: four playbooks call it
-deploy_app(ctx, "v1.2.3")?;             // in lib.rs: two do
 ctx.step("firewall enabled", systemd::Enabled::new("ufw").now(true))?;
 ```
 
-This one does not, because `setup_web_server` is in `src/lib.rs` and this
-playbook is its only caller:
+⚠️ The failure to avoid, one extraction at a time:
 
 ```rust
 use infra::setup_web_server;
 
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
-    setup_web_server(ctx)               // ⚠️ what does this do? another file knows
+    setup_web_server(ctx)               // what does this do? another file knows
 }
 ```
 
-The same three words written as a `fn` lower down *this* file would be fine —
-see below. It is the trip to `lib.rs`, for one caller, that costs the reader.
+**A plain `fn` further down the playbook file is not an extraction.** Use one
+to name the phases of a long play, or for a group repeated within it; the
+file still reads top to bottom. A long playbook that is merely long gets
+`ctx.section(..)` (§8). Bulk private to one playbook — a template, a parser —
+goes in a sibling file declared with `mod helpers;` (§7).
 
-⚠️ **The failure to avoid is a playbook that no longer tells you anything.**
-It happens a step at a time: each extraction looks tidy, and at the end the
-playbook is two lines and the machine's actual behaviour lives somewhere else.
-If the playbook has become shorter than the list of things it does, extract
-less. If a playbook is *long* rather than unreadable, group it with
-`ctx.section(..)` (§8), which keeps the steps on the page.
-
-**Converting an Ansible repository?** Ansible already draws this line, and you
-can follow it mechanically:
-
-| Ansible | where it goes |
-|---|---|
-| a `roles/` entry used by several playbooks | a `lib.rs` function — this is the reuse it was for |
-| `include_tasks: subtasks/10_foo.yaml`, used once | **inline it into the playbook** |
-
-`include_tasks` is how a YAML file gets split when it grows, not a reuse
-mechanism. A Rust file does not have YAML's length problem, so those subtasks
-become ordinary statements in the playbook, in the order they ran. Turning
-each one into a `lib.rs` function reproduces the file-splitting without the
-reason for it, and costs you the readable playbook.
-
-**A plain `fn` further down the playbook file is not an extraction, and it is
-where most helpers belong.** The unit that has to stay readable is the *file*,
-not `main`. Use one when a play reads better as named phases, and use one when
-a play does the same thing several times — three sites, three mounts, three
-accounts — with no other playbook needing it. Either way you still open one
-file and read down it:
-
-```rust
-fn main(ctx: &mut Ctx) -> Result<()> {
-    base_packages(ctx)?;                // each of these is a `fn` in
-    cadu_account(ctx)?;                 // this same file, below
-    qemu(ctx)?;
-    Ok(())
-}
-```
-
-That is the same *shape* as the antipattern above and none of its cost,
-because nothing moved out of sight. The damage comes from the jump to another
-file, not from the existence of a function. If you find yourself wanting that
-structure, prefer this over `lib.rs` until a second playbook actually needs
-the code.
-
-One more place, for bulk rather than for steps: **a sibling file declared
-inside the playbook**, `mod helpers;` (§7 above). That is for material that
-belongs to one playbook and nothing else — a long config template, a parser.
-It keeps that out of the way without pretending it is shared.
+**Converting an Ansible repository?** A `roles/` entry used by several
+playbooks is a `lib.rs` function; an `include_tasks:` file used once is
+inlined into the playbook, in the order it ran. `include_tasks` split YAML
+because YAML got long; a Rust file does not have that problem.
 
 | where | what belongs there |
 |---|---|
