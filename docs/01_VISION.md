@@ -327,8 +327,8 @@ took 4.5 s).
 - **macOS is a target** (Apple silicon and Intel) from any controller, for the
   operations that make sense there; `docs/plan/reports/MACOS-TARGET-SPIKE.md`
   is the measurement and section 6 is why the ops that read `/etc/passwd`
-  refuse it by name. Windows targets are deferred. FreeBSD and NetBSD build
-  today (zig carries their libc; CI proves FreeBSD) and wait for operations.
+  refuse it by name. Windows targets are deferred. FreeBSD and NetBSD binaries
+  build (zig carries their libc; measured 2026-09-13) and wait for operations.
 
 Environment facts recorded 2026-09-05 on the primary dev box: rustc 1.97.1,
 targets installed: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and

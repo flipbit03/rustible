@@ -154,7 +154,7 @@ fn subcommands_that_read_no_inventory_refuse_the_flag() {
     for cmd in [
         vec!["playbook", "list"],
         vec!["playbook", "create", "playbooks/x.rs"],
-        vec!["toolchain", "check"],
+        vec!["toolchain", "install"],
     ] {
         let mut args = vec!["--inventory", "other.kdl"];
         args.extend_from_slice(&cmd);

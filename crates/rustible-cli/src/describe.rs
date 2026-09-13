@@ -219,7 +219,7 @@ impl Cargo {
 /// The fix is the same for both cases: a zig wrapper for the host triple
 /// in `CARGO_TARGET_<HOST>_LINKER`, which stable cargo applies to host
 /// artifacts, and the override removed so that it can.
-pub fn wire_host_linker(host_triple: &str, cmd: &mut std::process::Command) -> Result<()> {
+fn wire_host_linker(host_triple: &str, cmd: &mut std::process::Command) -> Result<()> {
     let config = cargo_config2::Config::load().context("loading cargo config for zig")?;
     let host = cargo_zigbuild::zig::prepare_zig_linker(host_triple, &config)
         .with_context(|| format!("preparing zig as the linker for host {host_triple}"))?;
@@ -243,7 +243,7 @@ pub fn wire_host_linker(host_triple: &str, cmd: &mut std::process::Command) -> R
 }
 
 /// The triple `rustc` itself runs on, from `rustc -vV`'s `host:` line.
-pub fn host_triple() -> Result<String> {
+fn host_triple() -> Result<String> {
     let out = std::process::Command::new("rustc")
         .arg("-vV")
         .output()

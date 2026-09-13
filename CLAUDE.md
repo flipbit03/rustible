@@ -117,7 +117,7 @@ a public API, check that workspace too.
 ## How to work
 
 Every change goes through a branch and a pull request, even a one-line doc
-fix. CI runs nine jobs on each, and all nine must be green:
+fix. CI runs eight jobs on each, and all eight must be green:
 
 A job is named for the **mechanism** it runs the code with, then what it ran
 against, because the people reading a CI run do not have this file open:
@@ -128,8 +128,7 @@ against, because the people reading a CI run do not have this file open:
 | `Test: unit & fake` | tiers 1 and 2 |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Build: macOS controller` | the suite on macOS, a cross-build for both Linux targets, and a playbook run against the runner itself |
-| `Build: cross-compile (FreeBSD/x86_64)` | zig carries FreeBSD's libc, so the binary comes free; this keeps that claim true |
+| `Build: macOS controller` | the suite on macOS, and three playbooks run against the runner itself as a target |
 | `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |
 | `Test: VM (Debian 12/x86_64)` | tier 4, on a KVM-accelerated guest |
 | `Test: VM (Debian 12/aarch64)` | tier 4, on an emulated guest |
@@ -521,10 +520,6 @@ the hidden `rustible zig` subcommand and the `argv[0]` dispatch at the top of
 the describe build passes `--target <host>` like every other, or cargo-zigbuild
 leaves the C compiler alone; and build scripts link with the *host* linker, so
 `wire_host_linker` points that at zig too.
-
-`rustible toolchain check --print-env` prints the build environment as
-`export` lines; `eval` them and a plain `cargo build --target <t>` is a
-Rustible build. CI cross-builds that way.
 
 The container-tier harness (`rustible-sdk::testing`) is the one build not on
 zig, on purpose — every playbook links the SDK. It uses the developer's C

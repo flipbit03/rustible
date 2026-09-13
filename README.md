@@ -98,7 +98,6 @@ To see what a machine can do before relying on it:
 
 ```sh
 rustible toolchain install    # fetch zig now rather than at the first run
-rustible toolchain check      # which zig a build uses, and what cargo is given
 ```
 
 ## Point your agent at this

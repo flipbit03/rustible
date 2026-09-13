@@ -16,7 +16,6 @@ mod init;
 mod render;
 mod run;
 mod toolchain;
-mod toolchain_cmd;
 mod transport;
 mod workspace;
 mod zig;
@@ -105,9 +104,6 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum ToolchainCmd {
-    /// Check that this machine can build for the given targets, and show the
-    /// compiler environment a build would use.
-    Check(toolchain_cmd::CheckArgs),
     /// Fetch the zig release Rustible builds with into its cache, ahead of
     /// the first `playbook run`, and say where it is. Does nothing when a
     /// zig is already on this machine: RUSTIBLE_ZIG, PATH, or the cache.
@@ -176,9 +172,8 @@ fn dispatch_as_tool() -> Option<Result<()>> {
 /// Whether zig should be provisioned for this invocation, decided before the
 /// runtime starts and before anything expensive.
 ///
-/// Only the subcommands that build need a zig: `playbook run`, `inventory
-/// check` (it builds every playbook to check their vars), and `toolchain
-/// check` (it prepares the build environment). `init`, `playbook list` and
+/// Only the subcommands that build need a zig: `playbook run` and `inventory
+/// check` (it builds every playbook to check their vars). `init`, `playbook list` and
 /// `inventory show` must never cause a 51 MB download. And neither must a
 /// typo: an invocation `dispatch` is about to refuse for a stray
 /// `--inventory`, or one that names a file that is not there, is answered
@@ -204,9 +199,6 @@ fn needs_zig(cli: &Cli) -> bool {
         Cmd::Inventory {
             cmd: InventoryCmd::Check { file },
         } => inventory_exists(file.as_ref().or(cli.inventory.as_ref())),
-        Cmd::Toolchain {
-            cmd: ToolchainCmd::Check(_),
-        } => cli.inventory.is_none(),
         _ => false,
     }
 }
@@ -318,10 +310,6 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Cmd::Inventory { cmd } => inventory(ws, inventory_override, cmd).await,
         Cmd::Toolchain { cmd } => match cmd {
-            ToolchainCmd::Check(args) => {
-                reject_inventory(&inventory_override, "toolchain check")?;
-                toolchain_cmd::run(ws, args)
-            }
             ToolchainCmd::Install => {
                 reject_inventory(&inventory_override, "toolchain install")?;
                 zig::install()
@@ -538,14 +526,6 @@ mod tests {
         ])));
         assert!(!needs_zig(&cli(&["inventory", "check", "--file", missing])));
 
-        // Builds, but `--inventory` is refused for it.
-        assert!(!needs_zig(&cli(&[
-            "--inventory",
-            inv,
-            "toolchain",
-            "check"
-        ])));
-
         // The real thing.
         assert!(needs_zig(&cli(&[
             "--inventory",
@@ -556,7 +536,6 @@ mod tests {
         ])));
         assert!(needs_zig(&cli(&["--inventory", inv, "inventory", "check"])));
         assert!(needs_zig(&cli(&["inventory", "check", "--file", inv])));
-        assert!(needs_zig(&cli(&["toolchain", "check"])));
     }
 
     /// With no `--inventory`, `playbook run` needs a workspace to find the

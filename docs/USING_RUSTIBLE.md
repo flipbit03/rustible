@@ -91,18 +91,10 @@ it for the workspace, as in any Rust project with a C dependency), and `curl`.
 zig is fetched automatically into `~/.cache/rustible/zig/` on the first build
 (about 50 MB, checksum-verified); a zig already on `PATH`, or one named by
 `RUSTIBLE_ZIG`, is used instead. `rustible toolchain install` fetches it ahead
-of time. To make a bare `cargo` or rust-analyzer use that zig too:
-`eval "$(rustible toolchain check --print-env)"`. Managed machines need
-nothing.
+of time. Managed machines need nothing.
 
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.
-
-Check a machine before relying on it:
-
-```sh
-rustible toolchain check
-```
 
 **Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon or Intel.
 **Targets:** Linux x86_64 and aarch64, any libc; and macOS, Apple silicon or
@@ -181,7 +173,6 @@ rustible playbook run <PLAYBOOK>        # build, ship, run
 rustible inventory show <HOST>          # one host, fully resolved
 rustible inventory check                # the inventory, and every playbook's vars
 rustible toolchain install              # fetch zig now, not at the first run
-rustible toolchain check                # which zig a build uses, and what cargo is given
 ```
 
 `<PLAYBOOK>` is either a path (`playbooks/site.rs`) or the name (`site`).

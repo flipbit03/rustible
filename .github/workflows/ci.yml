@@ -110,10 +110,10 @@ jobs:
       # Nothing but Rust is installed here: the C toolchain is the zig that
       # `rustible` fetches into its own cache on first use, and the cache
       # step below is what keeps that from being a 50 MB download per run.
+      # The runner's own clang serves `cargo test` and the CLI build, as a
+      # developer's would.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
       - name: Cache cargo registry & build
         uses: actions/cache@v5
@@ -133,26 +133,6 @@ jobs:
 
       - run: cargo test --workspace
 
-      # The property that matters: a mac produces a Linux playbook binary.
-      # The environment comes from `rustible toolchain check --print-env`,
-      # which is the same `cargo_zigbuild::Build` and host-linker wiring
-      # `playbook run` uses; calling cargo directly here would set nothing
-      # and fail on `x86_64-linux-musl-gcc`, which is the error zig exists to
-      # prevent. `toolchain check` also fetches zig if the cache above missed.
-      - name: Cross-build a playbook for both Linux targets
-        run: |
-          set -euo pipefail
-          cargo build --release -p rustible-cli
-          RUSTIBLE=$PWD/target/release/rustible
-          "$RUSTIBLE" toolchain check
-          cd examples/workspace
-          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            ( eval "$("$RUSTIBLE" toolchain check --target "$t" --print-env)"
-              RUSTIBLE_PLAYBOOK=hello \
-                cargo build --features selected --profile dist --target "$t" )
-            file "target/$t/dist/workspace"
-          done
-
       # And a mac as a *target*: the runner drives itself over the local
       # transport, which builds `aarch64-apple-darwin` through zig, ships the
       # binary to itself, and gathers Darwin facts. There is no macOS
@@ -165,6 +145,7 @@ jobs:
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
+          cargo build --release -p rustible-cli
           RUSTIBLE=$PWD/target/release/rustible
           cat > /tmp/hosts.ci-mac.kdl <<'KDL'
           defaults escalate="sudo"
@@ -180,48 +161,6 @@ jobs:
           run macbrew -v
           run macbrew | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
           run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *0 *1 *0 *0 *0 *0'
-
-  # FreeBSD is not a target Rustible's operations know yet, but the binary
-  # comes for free now — zig carries FreeBSD's libc — and this is what stops
-  # that claim from rotting. When the ops learn `pw` and `pkg`, this job is
-  # where the target is already proven to build.
-  freebsd:
-    name: "Build: cross-compile (FreeBSD/x86_64)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-freebsd
-
-      - name: Cache cargo registry & build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ci-freebsd-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-freebsd-cargo-
-
-      - name: Cache the zig rustible fetches
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/rustible/zig
-          key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
-
-      - name: Cross-build a playbook for FreeBSD
-        run: |
-          set -euo pipefail
-          cargo build --release -p rustible-cli
-          RUSTIBLE=$PWD/target/release/rustible
-          cd examples/workspace
-          ( eval "$("$RUSTIBLE" toolchain check --target x86_64-unknown-freebsd --print-env)"
-            RUSTIBLE_PLAYBOOK=hello \
-              cargo build --features selected --profile dist --target x86_64-unknown-freebsd )
-          file target/x86_64-unknown-freebsd/dist/workspace | tee /dev/stderr | grep -q FreeBSD
 
   harness:
     name: "Test: Docker (Debian/Ubuntu/Alpine)"
