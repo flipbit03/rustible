@@ -90,6 +90,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ToolchainCmd,
     },
+    /// Hidden: the compiler and linker shim that cargo-zigbuild's wrapper
+    /// scripts exec. The wrappers name whatever `env::current_exe()` was when
+    /// they were written, and in Rustible that is this binary, so every C
+    /// compile and every link in a playbook build comes back through here as
+    /// `rustible zig cc …` (M8).
+    #[command(hide = true)]
+    Zig {
+        #[command(subcommand)]
+        cmd: cargo_zigbuild::Zig,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -212,6 +222,10 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 toolchain_cmd::run(ws, args)
             }
         },
+        // A failing zig child exits this process with the child's own code,
+        // so a failed link is a failed `rustible zig cc`, which is a failed
+        // cargo, which is a failed build. Nothing is swallowed on the way.
+        Cmd::Zig { cmd } => cmd.execute().map(|()| 0),
     }
 }
 

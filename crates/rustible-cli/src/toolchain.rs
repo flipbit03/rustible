@@ -505,24 +505,6 @@ fn no_compiler_at_all() -> String {
     )
 }
 
-/// Attach the clang hint to a failed build when the machine has no clang, so
-/// a `cc-rs` failure that escaped the pre-flight is never read bare.
-///
-/// The pre-flight refuses the builds it knows cannot work, so anything that
-/// still fails inside `cc-rs` is a compiler that exists but did not do the
-/// job. Naming clang is only useful when there is none, so the note is added
-/// only then, and it says "if" rather than claiming to know the cause.
-pub fn build_failure_hint(compilers: &Compilers) -> Option<String> {
-    if compilers.clang.is_some() {
-        return None;
-    }
-    Some(format!(
-        "note: if the output above mentions `cc-rs`, a missing `*-linux-musl-gcc`, or a \
-         header that was not found, the cause is that this machine has no clang and \
-         Rustible's TLS provider (ring) compiles C. Install it with:\n    {INSTALL_CLANG}"
-    ))
-}
-
 /// Write the vendored musl headers into `<cache_dir>/musl-headers/<version>-x86_64`
 /// and return that directory, which is a sysroot: it holds `include/`.
 ///
@@ -916,18 +898,6 @@ mod tests {
         }
         let w = compilers(None, None).init_warning().unwrap();
         assert!(w.contains("No playbook will build"), "{w}");
-    }
-
-    /// The hint is attached to a build failure only where clang would be the
-    /// answer; with clang installed a failed build is about something else.
-    #[test]
-    fn the_build_hint_appears_only_without_clang() {
-        assert_eq!(
-            build_failure_hint(&compilers(Some("/usr/bin/clang"), None)),
-            None
-        );
-        let h = build_failure_hint(&compilers(None, Some("/usr/bin/cc"))).unwrap();
-        assert!(h.contains("cc-rs") && h.contains("clang"), "{h}");
     }
 
     /// Whatever the operator put in the environment is what runs: neither the

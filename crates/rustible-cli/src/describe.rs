@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::toolchain::{self, Compilers};
+use crate::toolchain;
 use crate::workspace::Workspace;
 
 /// One playbook's `--describe` entry: what the attribute said and the
@@ -38,11 +38,6 @@ pub struct Cargo {
     pub manifest: PathBuf,
     pub target_dir: PathBuf,
     pub bin: String,
-    /// The workspace cache, where the vendored musl headers are unpacked.
-    pub cache_dir: PathBuf,
-    /// What this machine can compile C with. Probed once: `PATH` does not
-    /// change under a running command, and every build consults it.
-    pub compilers: Compilers,
 }
 
 #[derive(Deserialize)]
@@ -123,8 +118,6 @@ impl Cargo {
             manifest: manifest.to_path_buf(),
             target_dir: md.target_directory,
             bin,
-            cache_dir: ws.cache_dir(),
-            compilers: Compilers::probe(),
         })
     }
 
@@ -143,48 +136,44 @@ impl Cargo {
     /// the editor does. `triples` empty means the host target, dev profile;
     /// otherwise `--profile dist` with one `--target` per triple.
     ///
-    /// Every build in Rustible funnels through here, which is why the C
-    /// toolchain pre-flight lives here too: the TLS provider compiles C, and
-    /// a machine that cannot do it should be told which package to install
-    /// rather than shown `cc-rs`'s message about a musl gcc (see
-    /// [`crate::toolchain`]).
+    /// Every build in Rustible funnels through here, and every one goes
+    /// through zig (M8): `cargo_zigbuild::Build` hands back a `cargo build`
+    /// command whose `-C linker=` and `CC_<triple>` point at wrapper scripts
+    /// that exec `rustible zig cc …`. zig carries its own libc for every
+    /// target Rustible ships to, so there is no compiler to choose, no
+    /// header set to vendor and no SDK to obtain.
     pub async fn build(&self, selected: Option<&str>, triples: &[String]) -> Result<()> {
         // Rustible probed the hosts, so it already knows which architectures
         // this run needs. Making the operator work that out and run
         // `rustup target add` themselves is busywork, and the error they get
         // for not doing it is cargo's `can't find crate for \`core\``.
         toolchain::ensure_targets_installed(triples)?;
-        let env = toolchain::env_for_build(&self.compilers, triples, &self.cache_dir)?;
-        let mut cmd = tokio::process::Command::new("cargo");
-        cmd.arg("build").arg("--manifest-path").arg(&self.manifest);
-        cmd.envs(&env);
-        if let Some(name) = selected {
-            cmd.args(["--features", "selected"])
-                .env("RUSTIBLE_PLAYBOOK", name);
-        } else {
-            cmd.env_remove("RUSTIBLE_PLAYBOOK");
+
+        let mut b = cargo_zigbuild::Build::new(Some(self.manifest.clone()));
+        if selected.is_some() {
+            b.cargo.common.features = vec!["selected".into()];
         }
         if !triples.is_empty() {
-            cmd.args(["--profile", "dist"]);
-            for t in triples {
-                cmd.args(["--target", t]);
+            b.cargo.common.profile = Some("dist".into());
+            b.cargo.common.target = triples.to_vec();
+        }
+        // This is where zig is located and the wrappers written; a machine
+        // with no zig fails here, by name, before cargo runs.
+        let std_cmd = b
+            .build_command()
+            .context("preparing the zig-backed cargo build")?;
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        match selected {
+            Some(name) => {
+                cmd.env("RUSTIBLE_PLAYBOOK", name);
+            }
+            None => {
+                cmd.env_remove("RUSTIBLE_PLAYBOOK");
             }
         }
         let status = cmd.status().await.context("running cargo build")?;
         if !status.success() {
-            // The pre-flight above refuses what it knows cannot work, so a
-            // failure here is usually an ordinary compile error. On a machine
-            // with no clang it may still be the C toolchain, and cc-rs's own
-            // wording names a program nobody should install, so the hint goes
-            // on the end where the user is already looking.
-            let hint = match toolchain::build_failure_hint(&self.compilers) {
-                Some(h) => format!("\n\n{h}"),
-                None => String::new(),
-            };
-            bail!(
-                "cargo build failed (exit {}){hint}",
-                status.code().unwrap_or(-1)
-            );
+            bail!("cargo build failed (exit {})", status.code().unwrap_or(-1));
         }
         Ok(())
     }

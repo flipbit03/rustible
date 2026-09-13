@@ -28,3 +28,6 @@ sha2 = "0.10"
 kdl = "6.7.1"
 toml = "1"
 tempfile.workspace = true
+# The C toolchain, driven as a library (M8). No default features: `universal2`
+# pulls `fat-macho` for a fat-binary mode Rustible never produces.
+cargo-zigbuild = { version = "0.23", default-features = false }
