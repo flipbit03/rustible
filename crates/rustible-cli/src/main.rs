@@ -19,6 +19,7 @@ mod toolchain;
 mod toolchain_cmd;
 mod transport;
 mod workspace;
+mod zig;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -107,6 +108,10 @@ enum ToolchainCmd {
     /// Check that this machine can build for the given targets, and show the
     /// compiler environment a build would use.
     Check(toolchain_cmd::CheckArgs),
+    /// Fetch the zig release Rustible builds with into its cache, ahead of
+    /// the first `playbook run`, and say where it is. Does nothing when a
+    /// zig is already on this machine: RUSTIBLE_ZIG, PATH, or the cache.
+    Install,
 }
 
 #[derive(Subcommand, Debug)]
@@ -168,8 +173,21 @@ fn dispatch_as_tool() -> Option<Result<()>> {
     })
 }
 
-#[tokio::main]
-async fn main() {
+/// The subcommands that build a playbook binary, and so need a zig before
+/// they start. Everything else — `init`, `playbook list`, `inventory show` —
+/// must not cause a 51 MB download.
+fn builds(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Run(_)
+        } | Cmd::Inventory {
+            cmd: InventoryCmd::Check { .. }
+        }
+    )
+}
+
+fn main() {
     if let Some(result) = dispatch_as_tool() {
         if let Err(e) = result {
             eprintln!("error: {e:#}");
@@ -185,7 +203,30 @@ async fn main() {
             std::process::exit(code as i32);
         }
     };
-    let code = match dispatch(cli).await {
+    // zig is provisioned here, before the runtime exists, and for one
+    // reason: cargo-zigbuild learns where zig is from the process
+    // environment, and setting that is only sound while this is the only
+    // thread. It is, until the runtime below is built.
+    if builds(&cli.cmd) {
+        match zig::provision(&|line| eprintln!("  {line}")) {
+            Ok(located) => {
+                if let Some(path) = located.export() {
+                    // SAFETY: single-threaded. `dispatch_as_tool` returned
+                    // `None`, the tokio runtime has not been created, and
+                    // nothing else spawns threads before it. `set_var`'s
+                    // hazard is a concurrent `getenv`, and there is no one
+                    // to make one.
+                    unsafe { std::env::set_var("CARGO_ZIGBUILD_ZIG_COMMAND", path) };
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(EXIT_ERROR as i32);
+            }
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("building the tokio runtime");
+    let code = match runtime.block_on(dispatch(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -256,6 +297,10 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             ToolchainCmd::Check(args) => {
                 reject_inventory(&inventory_override, "toolchain check")?;
                 toolchain_cmd::run(ws, args)
+            }
+            ToolchainCmd::Install => {
+                reject_inventory(&inventory_override, "toolchain install")?;
+                zig::install()
             }
         },
         // A failing zig child exits this process with the child's own code,
