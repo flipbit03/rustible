@@ -930,12 +930,10 @@ authorized_keys(name) => ERR: ... Pass the account directly with `for_account(ho
 
 ## Appendix A — reproducing it
 
-```sh
-# once, on the Linux controller
-ssh <mac> 'cd $(xcrun --show-sdk-path) && tar czf - usr/lib usr/include' \
-  | tar xzf - -C ~/.local/share/rustible/MacOSX.sdk
-export SDKROOT=~/.local/share/rustible/MacOSX.sdk
+As the tree stands after M8 — no SDK, nothing to copy; `rustible` fetches zig
+on the first build:
 
+```sh
 cargo install --path crates/rustible-cli
 
 cat > /tmp/hosts.mac.kdl <<'KDL'
@@ -949,9 +947,13 @@ rustible --workspace examples/workspace --inventory /tmp/hosts.mac.kdl \
          playbook run mac -v
 rustible --workspace examples/workspace --inventory /tmp/hosts.mac.kdl \
          playbook run macdeep
+rustible --workspace examples/workspace --inventory /tmp/hosts.mac.kdl \
+         playbook run macbrew
 ```
 
-On a mac, the same without `SDKROOT` and without the copy.
+The same commands work from a mac. (The spike as originally run needed an
+Apple SDK copied off a mac and named by `SDKROOT`; that recipe is gone with
+the code that read it, see the status note at the top.)
 
 ## Appendix B — what was installed
 
