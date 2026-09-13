@@ -86,33 +86,14 @@ On the machine you run Rustible *from* (the controller):
 cargo install rustible-cli
 ```
 
-That needs `rustup` present, and `curl`: on the first build `rustible`
-fetches the zig release it compiles with (about 50 MB, verified against a
-checksum in its source) into `~/.cache/rustible/zig/`, and never touches
-`PATH`, a shell rc, or a system directory. A zig already on the machine, or
-one named by `RUSTIBLE_ZIG`, is used instead and nothing is fetched.
-`rustible toolchain install` does the fetch ahead of time. Managed machines
-need nothing.
-
-**You also need a local C compiler — for cargo, not for `rustible`.** Two
-different programs build in a workspace, and they use two different
-toolchains:
-
-| who is building | toolchain | needs |
-|---|---|---|
-| `rustible playbook run` — the binaries shipped to your targets | zig, fetched by `rustible` | nothing you install |
-| cargo run directly — rust-analyzer, `cargo check`, `cargo test`, `cargo build` | your machine's C compiler | `cc`, `gcc` or `clang` on `PATH` |
-
-Both compile `ring`'s small amount of C. `rustible` does it through zig so
-that it can cross-compile for every target without a matrix of compilers;
-cargo on its own does it through whatever `cc` your machine has, like any
-Rust project with a C dependency. Every developer machine that has ever built
-C has one. If you want cargo to use `rustible`'s zig instead, start it from a
-shell that has the environment:
-
-```sh
-eval "$(rustible toolchain check --print-env)"
-```
+On your machine: rustup, a C compiler (`cc`, `gcc` or `clang` — cargo uses
+it for the workspace, as in any Rust project with a C dependency), and `curl`.
+zig is fetched automatically into `~/.cache/rustible/zig/` on the first build
+(about 50 MB, checksum-verified); a zig already on `PATH`, or one named by
+`RUSTIBLE_ZIG`, is used instead. `rustible toolchain install` fetches it ahead
+of time. To make a bare `cargo` or rust-analyzer use that zig too:
+`eval "$(rustible toolchain check --print-env)"`. Managed machines need
+nothing.
 
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.
@@ -648,14 +629,11 @@ match (&f.os, &f.distro) {
 }
 ```
 
-**Package managers are a set, not a value.** A Debian box with Homebrew has
-both `Pm::Apt` and `Pm::Brew`; a mac without Homebrew has none. Facts report
-what is *found*, by probing the binary, never what the distribution implies.
-
-**On a mac** the facts come from macOS's own sources: `Distro::Macos` with
-`distro_version` from `SystemVersion.plist` (`26.3`), `Init::Launchd`,
-`Pm::Brew` if Homebrew is installed, and `kernel`, `hostname`, `cpus` and
-`memory_mb` from one `sysctl` call, because there is no `/proc` there.
+**`package_managers` is a set**: every manager whose binary is found (a
+Debian box with Homebrew has both `Pm::Apt` and `Pm::Brew`; a mac without
+Homebrew has none). On a mac: `Distro::Macos`, `distro_version` from
+`SystemVersion.plist`, `Init::Launchd`, and `kernel`/`hostname`/`cpus`/
+`memory_mb` from `sysctl`.
 
 **There are no custom facts.** That list is all of them, and there is no
 `setup` module or local-facts directory. To answer anything else, ask the
@@ -1056,27 +1034,18 @@ so guard — with `has_pm`, since a host can have several:
 ensure!(f.has_pm(&Pm::Apt), "{} has {:?}", f.hostname, f.package_managers);
 ```
 
-**`brew` runs as the login user, never as root.** Homebrew refuses root
-outright, so `brew::Present` and `brew::Absent` refuse it too, by name — a
-playbook with `escalate = true` cannot use them directly. Run that playbook
-unescalated, or reach the owning user with `ctx.as_user(..)`. Like `apt`,
-the `brew` constructors take a list: `brew::Present::new(["nethack"])`. They
-gate on `Pm::Brew` being *found*, never on the OS, so Linuxbrew works too.
+**`brew` refuses root** (Homebrew does), so a playbook with `escalate = true`
+cannot use `brew::Present`/`Absent` directly: run it unescalated or use
+`ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
+It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
 
-**Every operation says where it runs, and refuses the rest by name.** On a
-mac, `/etc/passwd` and `/etc/group` exist but describe only system services
-(the accounts live in Open Directory), there is no `/proc`, and `apt`,
-`systemd`, `/etc/hostname` and `/etc/sysctl.d` mean nothing. So `user::*`,
-`group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and `systemd::*`
-refuse a mac with a message naming what macOS uses instead, rather than
-reporting `ok` about an account that exists or `changed` about a file nothing
-reads — both of which they did before this gate existed. `file::*`, `shell`,
-`http`, `archive` and `brew` run there. One op is split down the middle:
-`ssh::authorized_keys::Present::for_user_name("cadu")` refuses a mac because
-it looks the user up in `/etc/passwd`, while `for_account("/Users/cadu",
-501, 20)` is plain file work and runs. A platform Rustible has never heard of
-is refused by every op, so a wrong answer cannot come from a silent
-assumption.
+**Every operation declares where it runs and refuses the rest by name.** On a
+mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
+`systemd::*` refuse (there `/etc/passwd` lists only system accounts and there
+is no `/proc`); `file::*`, `shell`, `http`, `archive` and `brew` run.
+`ssh::authorized_keys::Present::for_user_name(..)` refuses a mac because it
+reads `/etc/passwd`; `for_account(home, uid, gid)` runs. A platform Rustible
+does not know is refused by every op.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:

@@ -73,12 +73,8 @@ Rustible runs **from** a controller and manages **targets**.
 | **Controller** — Linux | yes | yes |
 | **Controller** — macOS | yes (Intel) | yes (Apple silicon) |
 | **Target** — Linux, any libc | yes | yes |
-| **Target** — macOS (Apple silicon, Intel) | the file, shell, http, archive and `brew` ops; see the guide | the same |
+| **Target** — macOS | yes (basic support) | yes (basic support) |
 | **Target** — Windows, BSD | no | no |
-
-A Mac is a first-class controller, and since M8 a target too: any controller
-builds for any target, because the C toolchain is a zig that `rustible`
-fetches for itself.
 
 Targets need nothing installed. A Linux playbook arrives as one static musl
 binary; a macOS one as a Mach-O linked against nothing but `libSystem`.
@@ -89,15 +85,14 @@ binary; a macOS one as a Mach-O linked against nothing but `libSystem`.
 cargo install rustible-cli
 ```
 
-That gives you the `rustible` binary. It needs **rustup** on your machine —
-and `curl`, which it uses once to fetch the pinned zig release it compiles
-with into `~/.cache/rustible` — and nothing on the machines you manage.
+On your machine you need:
 
-Your **editor** and a bare `cargo check`/`cargo test` in a workspace are a
-different matter: they run cargo directly, and `ring` compiles a little C, so
-they want a local C compiler (`cc`, `gcc` or `clang`) like any Rust project
-with a C dependency. zig is what `rustible` uses for *its* builds — the
-cross-compiled binaries it ships — not a replacement for your machine's `cc`.
+- rustup
+- a C compiler (`cc`, `gcc` or `clang`)
+- `curl`
+
+zig is installed automatically, into `~/.cache/rustible`, if it is not already
+present. The machines you manage need nothing.
 
 To see what a machine can do before relying on it:
 
@@ -250,10 +245,8 @@ Two collections ship from this repository.
 | `http`, `archive` | `Download`, `Extracted` |
 | `shell` | `Command` |
 
-Every operation declares the platforms it runs on and refuses the rest by
-name. On a mac that means `file`, `shell`, `http`, `archive` and `brew` run,
-and `apt`, `systemd`, `user`, `group`, `hostname` and `sysctl` say why they
-do not, rather than misreading `/etc/passwd` and reporting a wrong answer.
+Every operation declares where it runs and refuses other platforms by name.
+On macOS, `file`, `shell`, `http`, `archive` and `brew` run; the rest refuse.
 
 **`rustible-github`** — a small collection showing what a third-party one
 looks like. It adds `github::UserKeys`, which fetches a GitHub user's public
