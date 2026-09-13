@@ -285,41 +285,50 @@ took 4.5 s).
 
 ### 5.3 Cross-compilation constraints (DECIDED for MVP)
 
-- **Linux only, `*-unknown-linux-musl` targets only**, for the MVP. Static musl
-  binaries run on any Linux regardless of libc version.
-- **Rustible needs no toolchain stock rustup cannot drive: no cross-gcc, no
-  zig, no docker. Clang on the operator's machine is required and is the only
-  addition (DECIDED 2026-09-07, AMENDED 2026-09-08).** `rustup target add
-  <triple>` plus a clang is the whole setup. Crates targeting musl link with
-  the bundled `rust-lld`, with `linker = "rust-lld"` and `-C
-  link-self-contained=yes` set per target in `.cargo/config.toml` (validated in
-  spike 1, `docs/03_SPIKE_CROSS_COMPILE.md`: 3.5 s link, no zig, no distro
-  toolchain), against the musl crt rustup ships, and playbook binaries are
-  fully static.
+- **Linux targets are `*-unknown-linux-musl` only.** Static musl binaries run
+  on any Linux regardless of libc version.
+- **Rustible's toolchain is rustup plus zig, and `curl` to fetch the zig
+  (DECIDED 2026-09-07, AMENDED 2026-09-08, AMENDED AGAIN 2026-09-13, M8).**
+  `rustup target add <triple>` is done for the operator, and so is zig: the
+  CLI fetches the pinned release into `~/.cache/rustible/zig/<version>/` on
+  first use, verified against a checksum in its own source, with the `curl`
+  the machine already has; a zig already present (`RUSTIBLE_ZIG`, or on
+  `PATH`) wins and nothing is fetched. zig compiles `ring`'s C and links every
+  target Rustible ships to, carrying its own libc for each — musl, Darwin,
+  FreeBSD — so there is no compiler to choose per target, no header set to
+  vendor, and no SDK to obtain from another machine. `cargo-zigbuild` is a
+  library dependency of `rustible-cli`, not a program the operator installs.
+  Playbook binaries for Linux are fully static musl; for macOS they are
+  Mach-O linked against `libSystem` alone, which every mac has by definition.
+  **Target hosts still need nothing**, as before. A crate that bundles a C
+  *library* (`openssl-sys`, `libgit2-sys`, `libsqlite3-sys`) remains
+  **unsupported**: the fix is the pure-Rust alternative (`rustls`, `gix`,
+  `rustix`).
 
-  The one C dependency is `ring`, the TLS crypto provider. Rustible carries
-  musl's libc headers for the targets that need them and sets the compiler
-  flags itself, so nothing beyond clang is ever installed by hand, and **target
-  hosts still need nothing**, as before. A crate that bundles a C *library*
-  (`openssl-sys`, `libgit2-sys`, `libsqlite3-sys`) remains **unsupported**: the
-  fix is the pure-Rust alternative (`rustls`, `gix`, `rustix`).
-
-  **What this replaced, and why.** The original rule forbade C outright, and
-  `cargo-zigbuild` was considered as an escape hatch and dropped. What that
-  rule was protecting was the toolchain, not the language, and the difference
-  showed up on real hardware: the only non-alpha pure-Rust TLS provider
-  (`rustls-graviola`) asserts instruction set extensions and aborts
-  mid-playbook below Intel Broadwell (2014), which broke a live host in the
-  dogfood fleet. `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` measured the
-  alternative: `ring` runs down to baseline x86-64, cross-compiles for
-  aarch64-musl with clang and no headers at all, produces *smaller* binaries,
-  and needs one package the target audience mostly has already. Ansible's
-  equivalent is the system OpenSSL on every target; ours is a compiler on one
-  machine.
+  **What this replaced, and why — twice.** The original rule forbade C
+  outright and named `cargo-zigbuild` as a rejected escape hatch. It was
+  narrowed on 2026-09-08 when the only non-alpha pure-Rust TLS provider
+  (`rustls-graviola`) aborted below Intel Broadwell on a live host and `ring`
+  measured better (`docs/plan/reports/C-TOOLCHAIN-SPIKE.md`); the lesson was
+  that the rule protected the toolchain, not the language, and the toolkit
+  became rustup plus clang. It was rewritten again on 2026-09-13 for the same
+  lesson a second time. Targeting macOS from Linux needed an Apple SDK copied
+  off a mac, which was unacceptable; measuring the alternative
+  (`docs/plan/reports/MACOS-TARGET-SPIKE.md`, `docs/plan/M8.md`) showed that
+  the SDK was a symptom and the condition was the compiler-selection *matrix*
+  clang required — different answers per target, host OS and compiler vendor,
+  a thousand lines of it plus vendored musl headers and a workaround for
+  Apple's patched `stddef.h`. zig deletes the matrix, and the rule that had
+  forbidden it was found to be forbidding the thing that reduces sprawl.
+  Ansible's equivalent is the system OpenSSL on every target; ours is one
+  toolchain fetched once onto one machine.
 - **Shipped binaries use the `dist` profile** (strip, fat LTO, `opt-level = "z"`):
   1.4 MB for the spike playbook on aarch64 versus 3.1 MB for plain release.
-- macOS and Windows targets are deferred. They have their own toolchain and SDK
-  requirements.
+- **macOS is a target** (Apple silicon and Intel) from any controller, for the
+  operations that make sense there; `docs/plan/reports/MACOS-TARGET-SPIKE.md`
+  is the measurement and section 6 is why the ops that read `/etc/passwd`
+  refuse it by name. Windows targets are deferred. FreeBSD and NetBSD build
+  today (zig carries their libc; CI proves FreeBSD) and wait for operations.
 
 Environment facts recorded 2026-09-05 on the primary dev box: rustc 1.97.1,
 targets installed: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, and

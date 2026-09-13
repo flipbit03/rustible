@@ -40,12 +40,27 @@ sends the next session hunting for work that is already done, or repeating it.
 
 ## The dependency rule
 
-**rustup plus `clang` is the entire set of dependencies for running Rustible,
-and that must never grow.** Not a preference, not a default to be revisited:
-it is the property the project exists to have. Target hosts need nothing at
-all, ever.
+**rustup plus zig plus `curl` is the entire set of dependencies for running
+Rustible, and that must never grow.** Not a preference, not a default to be
+revisited: it is the property the project exists to have. Target hosts need
+nothing at all, ever.
 
-The operator does not type `rustup target add` either — `Describe::build`
+zig *is* the C toolchain. `ring`, the TLS provider, compiles a little C, and
+zig compiles it for every target Rustible ships to — musl, Darwin, and
+whatever comes next — carrying its own libc for each, so there is no
+compiler to choose, no header set to vendor, and no SDK to obtain. The
+operator does not install it: `rustible` fetches the pinned release into
+`~/.cache/rustible/zig/<version>/` on first use, verified against a SHA-256
+in `crates/rustible-cli/src/zig.rs`, using the `curl` the machine already
+has. That download is the only reason a system tool is named at all, and the
+CLI links no TLS stack of its own so that `cargo install rustible-cli` needs
+no C compiler — it would be a strange thing to need in order to fetch the C
+compiler. A zig already on the machine (`RUSTIBLE_ZIG`, or on `PATH`) always
+wins and nothing is fetched. `cargo-zigbuild` is a library dependency of
+`rustible-cli`, not a program anyone installs. `rustible toolchain install`
+fetches deliberately, ahead of the first run.
+
+The operator does not type `rustup target add` either — `Cargo::build`
 calls `toolchain::ensure_targets_installed` first, because Rustible has
 already probed the hosts and knows which triples the run needs.
 
@@ -57,11 +72,12 @@ addition to what a user must install moves us back toward that, and hurts
 adoption more than any feature repays.
 
 So: a crate that bundles a C *library* (`openssl-sys`, `libgit2-sys`) is
-unsupported, and the fix is the pure-Rust alternative. No cross-gcc, no zig,
-no docker for builds. `ring` is the single C dependency, for TLS, and even
-there Rustible carries musl's headers itself so nothing else is installed by
-hand. If a change appears to require another tool, that is a design problem to
-solve, not a requirement to document.
+unsupported, and the fix is the pure-Rust alternative. No cross-gcc, no
+docker for builds, no SDK copied off another machine. If a change appears to
+require another tool, that is a design problem to solve, not a requirement to
+document. `docs/plan/M8.md` is how this rule came to name zig, and why the
+earlier rule that forbade it was measured and found to be protecting the
+wrong thing.
 
 ## Other rules
 
@@ -104,7 +120,7 @@ a public API, check that workspace too.
 ## How to work
 
 Every change goes through a branch and a pull request, even a one-line doc
-fix. CI runs eight jobs on each, and all eight must be green:
+fix. CI runs nine jobs on each, and all nine must be green:
 
 A job is named for the **mechanism** it runs the code with, then what it ran
 against, because the people reading a CI run do not have this file open:
@@ -115,7 +131,8 @@ against, because the people reading a CI run do not have this file open:
 | `Test: unit & fake` | tiers 1 and 2 |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Build: macOS controller` | the suite on macOS, and a cross-build for both Linux targets |
+| `Build: macOS controller` | the suite on macOS, a cross-build for both Linux targets, and a playbook run against the runner itself |
+| `Build: cross-compile (FreeBSD/x86_64)` | zig carries FreeBSD's libc, so the binary comes free; this keeps that claim true |
 | `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |
 | `Test: VM (Debian 12/x86_64)` | tier 4, on a KVM-accelerated guest |
 | `Test: VM (Debian 12/aarch64)` | tier 4, on an emulated guest |
@@ -495,35 +512,53 @@ Three things that will bite you:
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
 
-## TLS, and why clang
+## TLS, and why zig
 
 Rustible speaks TLS in two places: `http::Download` and the `rustible-github`
 collection. The provider is `ring`, reached through rustls, and it is the
-reason `clang` is in the dependency rule above.
+reason a C toolchain exists in the dependency rule at all.
 
-Ring compiles a small amount of C, and cargo's C helper will not use the
-host's compiler for a musl target unless it is named, so `rustible-cli` names
-it and supplies the compiler flags itself (`crates/rustible-cli/src/toolchain.rs`).
-For `x86_64` musl it also supplies musl's libc headers, which it carries
-vendored and unpacks into the workspace cache. For other musl targets ring
-needs no libc headers, except that Apple's clang patches its own `stddef.h` to
-delegate to the system header when the target is musl, so those get musl's
-headers offered as a last-resort include. None of this is visible to a user,
-and none of it may grow into a second thing to install.
+Every build goes through `cargo_zigbuild::Build` (`crates/rustible-cli/src/
+describe.rs`), which points `-C linker=` and `CC_<triple>` at wrapper scripts
+that exec `rustible zig cc …` — the hidden `rustible zig` subcommand and the
+`argv[0]` dispatch at the top of `main` are those wrappers' other half. Two
+things are not obvious and are both measured (`docs/plan/M8.md`): the
+host-native describe build passes `--target <host>` like every other, because
+without it cargo-zigbuild leaves the C compiler alone; and build scripts and
+proc-macros are host artifacts linked with the *host* linker, so
+`wire_host_linker` points that at zig too, or `serde`'s build script quietly
+needs a system `cc`.
 
-`rustible toolchain check` reports what a machine can build for, and
-`--print-env` prints the compiler environment a build is given. Use it rather
-than setting `CC_*` by hand.
+`rustible toolchain check` reports which zig a build would use and what it
+would hand cargo; `--print-env` prints that as `export` lines, and `eval`ing
+them turns a plain `cargo build --target <t>` into a Rustible build — which
+is how CI cross-builds where it has no host to ship to, and how to give
+rust-analyzer the zig `rustible` uses on a machine with no other C compiler.
+
+The one build that does not go through zig is the container-tier harness in
+`rustible-sdk::testing`, on purpose: every playbook links `rustible-sdk`, and
+`cargo-zigbuild` has no business in a playbook binary. That tier needs a C
+compiler on the developer's machine, like it needs docker; it is a developer
+requirement, not a user one.
 
 ## Platforms
 
-Rustible **runs from** Linux (x86_64, aarch64) and macOS on Apple silicon. It
-**manages** Linux hosts, x86_64 and aarch64, any libc.
+Rustible **runs from** Linux (x86_64, aarch64) and macOS (Apple silicon,
+Intel). It **manages** Linux hosts, x86_64 and aarch64, any libc, and macOS
+hosts, Apple silicon and Intel — with the operations that make sense there.
+Any controller builds for any target: the C toolchain is zig, which carries
+its own libc for each, so a Linux box produces a Mach-O and a mac produces a
+static musl binary with nothing installed for the purpose.
 
-macOS is a controller and never a target: the local probe refuses `Darwin
-arm64` by name, because the operations speak apt, systemd and `/etc/passwd`.
-A Linux controller cannot build macOS binaries at all, since linking Mach-O
-needs an Apple SDK that rustup does not ship.
+On a mac, `/etc/passwd` and `/etc/group` exist and describe nothing (the
+accounts live in Open Directory), there is no `/proc`, and `apt`, `systemd`
+and `/etc/hostname` mean nothing. So every operation declares where it runs:
+`user`, `group`, `hostname`, `sysctl`, `apt` and `systemd` refuse a mac by
+name, `ssh::authorized_keys` refuses only its `/etc/passwd` lookup, and the
+portable ops carry an explicit `Linux | Macos` match. `brew::{Present,
+Absent}` is the mac's package op. `docs/plan/reports/MACOS-TARGET-SPIKE.md`
+measured all of this against a real machine, including what the ungated ops
+did wrong before.
 
 Operations run on the target, including lookups (vision 5.1), so
 `github::UserKeys` needs network egress from the target rather than from the

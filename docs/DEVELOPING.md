@@ -1,7 +1,10 @@
 # Developing Rustible
 
-Most work here needs nothing but a Rust toolchain and `clang`. Two extra tiers
-exist for testing against real systems, and this file is how to turn them on.
+Most work here needs nothing but a Rust toolchain; `rustible` fetches the zig
+it builds with. The container tier is the exception — its harness compiles
+`ring` with the machine's own C compiler, on purpose — so `make integration`
+wants a `cc` beside docker. Two extra tiers exist for testing against real
+systems, and this file is how to turn them on.
 
 ```sh
 make            # fmt, clippy, test, rustdoc, and the example workspace

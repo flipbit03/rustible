@@ -73,13 +73,15 @@ Rustible runs **from** a controller and manages **targets**.
 | **Controller** — Linux | yes | yes |
 | **Controller** — macOS (Apple silicon) | — | yes |
 | **Target** — Linux, any libc | yes | yes |
-| **Target** — macOS, Windows, BSD | no | no |
+| **Target** — macOS (Apple silicon, Intel) | the file, shell, http, archive and `brew` ops; see the guide | the same |
+| **Target** — Windows, BSD | no | no |
 
-A Mac is a first-class controller: it cross-builds playbook binaries for both
-Linux targets with the clang that Xcode's command line tools already provide.
+A Mac is a first-class controller, and since M8 a target too: any controller
+builds for any target, because the C toolchain is a zig that `rustible`
+fetches for itself.
 
-Targets need nothing installed. The playbook arrives as one static musl
-binary.
+Targets need nothing installed. A Linux playbook arrives as one static musl
+binary; a macOS one as a Mach-O linked against nothing but `libSystem`.
 
 ## Install
 
@@ -87,13 +89,15 @@ binary.
 cargo install rustible-cli
 ```
 
-That gives you the `rustible` binary. It needs **rustup and clang** on your
-machine, and nothing on the machines you manage.
+That gives you the `rustible` binary. It needs **rustup** on your machine —
+and `curl`, which it uses once to fetch the pinned zig release it compiles
+with into `~/.cache/rustible` — and nothing on the machines you manage.
 
 To see what a machine can do before relying on it:
 
 ```sh
-rustible toolchain check      # what this machine can build for, and how
+rustible toolchain install    # fetch zig now rather than at the first run
+rustible toolchain check      # which zig a build uses, and what cargo is given
 ```
 
 ## Point your agent at this

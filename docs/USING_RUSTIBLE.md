@@ -86,7 +86,13 @@ On the machine you run Rustible *from* (the controller):
 cargo install rustible-cli
 ```
 
-That needs `rustup` and `clang` present. Managed machines need nothing.
+That needs `rustup` present, and `curl`: on the first build `rustible`
+fetches the zig release it compiles with (about 50 MB, verified against a
+checksum in its source) into `~/.cache/rustible/zig/`, and never touches
+`PATH`, a shell rc, or a system directory. A zig already on the machine, or
+one named by `RUSTIBLE_ZIG`, is used instead and nothing is fetched.
+`rustible toolchain install` does the fetch ahead of time. Managed machines
+need nothing.
 
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.
@@ -170,7 +176,8 @@ rustible playbook create playbooks/x.rs # scaffold one
 rustible playbook run <PLAYBOOK>        # build, ship, run
 rustible inventory show <HOST>          # one host, fully resolved
 rustible inventory check                # the inventory, and every playbook's vars
-rustible toolchain check                # what this machine can build for
+rustible toolchain install              # fetch zig now, not at the first run
+rustible toolchain check                # which zig a build uses, and what cargo is given
 ```
 
 `<PLAYBOOK>` is either a path (`playbooks/site.rs`) or the name (`site`).
@@ -1292,7 +1299,7 @@ the whole shape of the real run, conditionals included.
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
 | ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
 | `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |
-| ``no `clang` on PATH, and this playbook has to be built for …`` | install clang on the controller (§3) |
+| `curl is missing and is needed to download zig …` | install `curl`, or set `RUSTIBLE_ZIG` to a zig already on the machine (§3) |
 | a host is absent from the run | the playbook's `hosts` does not match it; check `rustible inventory show <host>` |
 
 Useful first moves:

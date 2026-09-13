@@ -11,13 +11,13 @@ Apple clang 17, passwordless `sudo`, Remote Login on. The controller was the
 x86_64 Linux dev box. Where a number is measured it says on what; where
 something is inferred it says so.
 
-**Status, 2026-09-12.** Sections 1-6 are the spike as it was run. **Section 10
-is what was then built on this branch**, after Cadu closed the scope in the
-same session: the Darwin target patch, `Os::Macos` / `Distro::Macos`, correct
-facts on a mac, a platform gate on every operation in `rustible-std`, and a
-`brew` op. Findings 5.1, 5.2 and 5.4 are fixed; 5.3 and 5.5 are not, and say
-so where they stand.
-
+**Status, 2026-09-13.** Sections 1-6 are the spike as it was run, and section
+2's SDK recipe is **superseded**: Cadu rejected copying an Apple SDK off a mac,
+the alternative was measured, and `docs/plan/M8.md` moved the whole build to
+zig, which needs no SDK and deleted the toolchain matrix that section 2 was
+working around. `darwin_env` and `SDKROOT` no longer exist in the tree. Section
+10 (the ops, facts, gates and `brew`) stands unchanged and is built.
+Findings 5.1, 5.2 and 5.4 are fixed; 5.3 and 5.5 are not, and say so.
 ---
 
 ## Verdict
