@@ -38,6 +38,12 @@ pub struct Cargo {
     pub manifest: PathBuf,
     pub target_dir: PathBuf,
     pub bin: String,
+    /// The triple this machine is, from `rustc -vV`. Every build names a
+    /// `--target`, including the host-native describe build, because that is
+    /// the only way cargo-zigbuild puts zig in front of the C compiler and
+    /// the linker; a build with no `--target` falls through to the system
+    /// `cc`, which Rustible no longer asks anyone to have (M8 step 2).
+    pub host: String,
 }
 
 #[derive(Deserialize)]
@@ -118,12 +124,18 @@ impl Cargo {
             manifest: manifest.to_path_buf(),
             target_dir: md.target_directory,
             bin,
+            host: host_triple()?,
         })
     }
 
-    /// The host-native debug binary (`--describe`, `--check-vars`).
+    /// The host-native debug binary (`--describe`, `--check-vars`). Under
+    /// `target/<host>/debug/` rather than `target/debug/`, because the
+    /// describe build passes `--target` like every other (see [`Cargo::host`]).
     pub fn debug_bin(&self) -> PathBuf {
-        self.target_dir.join("debug").join(&self.bin)
+        self.target_dir
+            .join(&self.host)
+            .join("debug")
+            .join(&self.bin)
     }
 
     /// The shipped binary for one triple.
@@ -150,18 +162,29 @@ impl Cargo {
         toolchain::ensure_targets_installed(triples)?;
 
         let mut b = cargo_zigbuild::Build::new(Some(self.manifest.clone()));
+        // The archiver too: cc-rs bundles ring's objects into a static
+        // library with `ar`, and without this cargo-zigbuild leaves that to
+        // whatever binutils the machine has — none, on a mac without the
+        // command line tools. zig ships one.
+        b.enable_zig_ar = true;
         if selected.is_some() {
             b.cargo.common.features = vec!["selected".into()];
         }
-        if !triples.is_empty() {
+        if triples.is_empty() {
+            // The host build, explicitly targeted: without `--target`,
+            // cargo-zigbuild leaves the C compiler and linker alone and the
+            // build quietly needs a system `cc` again.
+            b.cargo.common.target = vec![self.host.clone()];
+        } else {
             b.cargo.common.profile = Some("dist".into());
             b.cargo.common.target = triples.to_vec();
         }
         // This is where zig is located and the wrappers written; a machine
         // with no zig fails here, by name, before cargo runs.
-        let std_cmd = b
+        let mut std_cmd = b
             .build_command()
             .context("preparing the zig-backed cargo build")?;
+        self.wire_host_linker(&mut std_cmd)?;
         let mut cmd = tokio::process::Command::from(std_cmd);
         match selected {
             Some(name) => {
@@ -177,6 +200,61 @@ impl Cargo {
         }
         Ok(())
     }
+}
+
+impl Cargo {
+    /// Point the *host* linker at zig too, so build scripts and proc-macros
+    /// stop needing a system `cc`.
+    ///
+    /// Those are host artifacts, and cargo links them with the host's linker
+    /// regardless of `--target`. cargo-zigbuild only ever wires the target
+    /// triple, so on a cross build every build script still links with `cc`;
+    /// and when host == target it goes further and turns cargo's
+    /// `target-applies-to-host` off through a nightly-channel override — for
+    /// glibc-versioned host triples like `x86_64-unknown-linux-gnu.2.17`,
+    /// which Rustible never builds — so even there the host linker is `cc`.
+    /// Measured on M8 step 2: with no `cc` on `PATH`, `serde_core`'s build
+    /// script failed with "linker `cc` not found" while ring's C compiled
+    /// fine.
+    ///
+    /// The fix is the same for both cases: a zig wrapper for the host triple
+    /// in `CARGO_TARGET_<HOST>_LINKER`, which stable cargo applies to host
+    /// artifacts, and the override removed so that it can.
+    fn wire_host_linker(&self, cmd: &mut std::process::Command) -> Result<()> {
+        let config = cargo_config2::Config::load().context("loading cargo config for zig")?;
+        let host = cargo_zigbuild::zig::prepare_zig_linker(&self.host, &config)
+            .with_context(|| format!("preparing zig as the linker for host {}", self.host))?;
+        let env_host = self.host.replace('-', "_");
+        cmd.env(
+            format!("CARGO_TARGET_{}_LINKER", env_host.to_uppercase()),
+            &host.cc,
+        );
+        // A build script that compiles C for the host (rare; cc-rs builds
+        // for TARGET) gets zig as well.
+        cmd.env(format!("CC_{env_host}"), &host.cc);
+        cmd.env(format!("CXX_{env_host}"), &host.cxx);
+        for var in [
+            "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS",
+            "CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST",
+            "CARGO_TARGET_APPLIES_TO_HOST",
+        ] {
+            cmd.env_remove(var);
+        }
+        Ok(())
+    }
+}
+
+/// The triple `rustc` itself runs on, from `rustc -vV`'s `host:` line.
+fn host_triple() -> Result<String> {
+    let out = std::process::Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .context("running `rustc -vV` to learn the host triple")?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(|s| s.trim().to_string())
+        .context("no `host:` line in `rustc -vV`")
 }
 
 /// The describe cache key: the playbook source and `Cargo.lock` together

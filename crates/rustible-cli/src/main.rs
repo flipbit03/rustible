@@ -139,8 +139,44 @@ enum InventoryCmd {
     },
 }
 
+/// cargo-zigbuild does not write `ar`, `lib` or `install_name_tool` as
+/// wrapper scripts: it symlinks the *current executable* under those names
+/// and expects it to notice what it was called as. In cargo-zigbuild's own
+/// binary that is a check at the top of `main`; here it is this. Without it,
+/// `ar cq lib.a x.o` reaches clap as a `rustible` invocation whose program
+/// name happens to be `ar`, and `cq` is refused as an unknown subcommand —
+/// which is exactly how M8 step 2's first attempt failed.
+fn dispatch_as_tool() -> Option<Result<()>> {
+    let mut args = std::env::args();
+    let program = PathBuf::from(args.next()?);
+    let stem = program.file_stem()?.to_string_lossy().into_owned();
+    Some(match stem.as_str() {
+        "ar" => cargo_zigbuild::Zig::Ar {
+            args: args.collect(),
+        }
+        .execute(),
+        "lib" => cargo_zigbuild::Zig::Lib {
+            args: args.collect(),
+        }
+        .execute(),
+        s if s.ends_with("dlltool") => cargo_zigbuild::Zig::Dlltool {
+            args: args.collect(),
+        }
+        .execute(),
+        "install_name_tool" => cargo_zigbuild::macos::install_name_tool::execute(args),
+        _ => return None,
+    })
+}
+
 #[tokio::main]
 async fn main() {
+    if let Some(result) = dispatch_as_tool() {
+        if let Err(e) = result {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {

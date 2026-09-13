@@ -31,3 +31,6 @@ tempfile.workspace = true
 # The C toolchain, driven as a library (M8). No default features: `universal2`
 # pulls `fat-macho` for a fat-binary mode Rustible never produces.
 cargo-zigbuild = { version = "0.23", default-features = false }
+# Only to hand `cargo_zigbuild::zig::prepare_zig_linker` the cargo config it
+# reads `[target.*]` rustflags from; the same crate and version zigbuild uses.
+cargo-config2 = "0.1"
