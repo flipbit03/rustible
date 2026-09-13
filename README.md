@@ -94,12 +94,6 @@ On the machine you run `rustible` from (the controller) you need:
 zig is installed automatically, into `~/.cache/rustible`, if it is not already
 present. The machines you manage (the targets) need nothing.
 
-To see what a machine can do before relying on it:
-
-```sh
-rustible toolchain install    # fetch zig now rather than at the first run
-```
-
 ## Point your agent at this
 
 Rustible is new, so an AI agent has no prior knowledge of it. Give it this and
