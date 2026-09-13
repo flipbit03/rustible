@@ -559,6 +559,59 @@ mod tests {
         assert!(!f.has_pm(&Pm::Dnf));
     }
 
+    /// The macOS branch of `gather`, which only a mac can run: `os` is
+    /// compiled in, so on Linux this branch does not exist. The macOS CI job
+    /// runs `cargo test --workspace` on a real mac, and this is what it adds.
+    /// Every source is planted in the Fake — the plist, the brew binary,
+    /// launchd, and the one `sysctl` call — with the values measured on
+    /// macOS 26.3, so a regression in any of the four mappings is caught
+    /// without a machine to ssh to.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_reports_darwin_facts_from_darwin_sources() {
+        use crate::backend::Fake;
+        let fake = Fake::new()
+            .with_file(
+                SYSTEM_VERSION_PLIST,
+                "<plist><dict><key>ProductVersion</key><string>26.3</string></dict></plist>",
+            )
+            .with_file("/opt/homebrew/bin/brew", "")
+            .with_file("/sbin/launchd", "")
+            .with_cmd(
+                "/usr/sbin/sysctl",
+                None,
+                0,
+                "12\n51539607552\n25.3.0\nCADUMAC\n",
+            );
+        let f = Facts::gather(&fake);
+        assert_eq!(f.os, Os::Macos);
+        assert_eq!(f.distro, Distro::Macos);
+        assert_eq!(f.distro_version, "26.3");
+        assert!(f.has_pm(&Pm::Brew));
+        assert_eq!(f.init, Init::Launchd);
+        assert_eq!(f.cpus, 12);
+        assert_eq!(f.memory_mb, 49152);
+        assert_eq!(f.kernel, "25.3.0");
+        assert_eq!(f.hostname, "CADUMAC");
+    }
+
+    /// And a mac without Homebrew has no package manager at all: `Pm::Brew`
+    /// is found, never implied by `Os::Macos`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_without_homebrew_has_no_package_manager() {
+        use crate::backend::Fake;
+        let fake = Fake::new().with_file("/sbin/launchd", "").with_cmd(
+            "/usr/sbin/sysctl",
+            None,
+            0,
+            "8\n17179869184\n25.3.0\nx\n",
+        );
+        let f = Facts::gather(&fake);
+        assert!(f.package_managers.is_empty());
+        assert_eq!(f.init, Init::Launchd);
+    }
+
     /// No manager found is the empty set, which cannot be mistaken for one.
     #[test]
     fn no_known_manager_is_an_empty_set() {

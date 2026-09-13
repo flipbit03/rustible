@@ -71,7 +71,7 @@ Rustible runs **from** a controller and manages **targets**.
 | | x86_64 | aarch64 |
 |---|---|---|
 | **Controller** — Linux | yes | yes |
-| **Controller** — macOS (Apple silicon) | — | yes |
+| **Controller** — macOS | yes (Intel) | yes (Apple silicon) |
 | **Target** — Linux, any libc | yes | yes |
 | **Target** — macOS (Apple silicon, Intel) | the file, shell, http, archive and `brew` ops; see the guide | the same |
 | **Target** — Windows, BSD | no | no |
@@ -234,7 +234,8 @@ Two collections ship from this repository.
 
 | module | ops |
 |---|---|
-| `apt` | `Present`, `Absent`, `Latest` |
+| `apt` | `Present`, `Absent`, `Latest` — Debian and Ubuntu |
+| `brew` | `Present`, `Absent` — Homebrew, on a mac or Linuxbrew, as the login user |
 | `file` | `Copy`, `Directory`, `Symlink`, `Absent`, `Attrs`, `Line`, `Block` |
 | `user`, `group` | `Present`, `Absent`, `Membership` |
 | `ssh::authorized_keys` | `Present` (with `exclusive`), `Absent` |
@@ -242,6 +243,11 @@ Two collections ship from this repository.
 | `hostname`, `sysctl` | `Is`, `Present` |
 | `http`, `archive` | `Download`, `Extracted` |
 | `shell` | `Command` |
+
+Every operation declares the platforms it runs on and refuses the rest by
+name. On a mac that means `file`, `shell`, `http`, `archive` and `brew` run,
+and `apt`, `systemd`, `user`, `group`, `hostname` and `sysctl` say why they
+do not, rather than misreading `/etc/passwd` and reporting a wrong answer.
 
 **`rustible-github`** — a small collection showing what a third-party one
 looks like. It adds `github::UserKeys`, which fetches a GitHub user's public

@@ -803,6 +803,43 @@ mod tests {
     use super::*;
     use crate::file::testing::{expect_change, fake_sys};
 
+    /// `archive::Extracted` claims a mac — it is a pure-Rust extractor
+    /// writing through `sys`, and the macOS spike unpacked a tarball the
+    /// mac's own `tar` made — and refuses a platform nobody claimed.
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file("/tmp/hello.tar", TAR),
+        );
+        let base_sys = fake_sys(&fake);
+
+        let mut mac = base_sys.facts().clone();
+        mac.os = Os::Macos;
+        let sys = base_sys.clone().with_facts(mac);
+        let op = Extracted::from_path("/tmp/hello.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.file("/opt/hello/README.txt").unwrap().bytes,
+            b"hello from rustible\n"
+        );
+
+        let mut bsd = base_sys.facts().clone();
+        bsd.os = Os::Other("freebsd".into());
+        let sys = base_sys.with_facts(bsd);
+        let err = Extracted::from_path("/tmp/hello.tar")
+            .to("/opt")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("archive::Extracted has no implementation for freebsd"),
+            "{err}"
+        );
+    }
+
     // `fixtures/archive/hello.tar*`: one tree, four encodings, made with
     // GNU tar 1.35, gzip -9 -n, xz -9 and zstd -19:
     //   hello/            0775

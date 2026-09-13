@@ -494,3 +494,83 @@ fn load_or_exit(file: &Path) -> Inventory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("rustible").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The guard between a typo and a 51 MB download. Everything here is
+    /// what `make` once got wrong: a unit test ran the real binary with a
+    /// missing inventory and provisioning came before the refusal.
+    #[test]
+    fn only_builds_with_acceptable_flags_and_real_files_provision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = tmp.path().join("hosts.kdl");
+        std::fs::write(&inv, "host \"a\" connection=\"local\"\n").unwrap();
+        let inv = inv.to_str().unwrap();
+        let missing = tmp.path().join("nope.kdl");
+        let missing = missing.to_str().unwrap();
+
+        // Never for commands that do not build.
+        assert!(!needs_zig(&cli(&["playbook", "list"])));
+        assert!(!needs_zig(&cli(&["playbook", "create", "playbooks/x.rs"])));
+        assert!(!needs_zig(&cli(&["toolchain", "install"])));
+        assert!(!needs_zig(&cli(&["inventory", "show", "a", "--file", inv])));
+
+        // Builds, but the inventory it names is not there: `dispatch` will
+        // refuse it, so nothing is fetched first.
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "inventory",
+            "check"
+        ])));
+        assert!(!needs_zig(&cli(&["inventory", "check", "--file", missing])));
+
+        // Builds, but `--inventory` is refused for it.
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            inv,
+            "toolchain",
+            "check"
+        ])));
+
+        // The real thing.
+        assert!(needs_zig(&cli(&[
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(needs_zig(&cli(&["--inventory", inv, "inventory", "check"])));
+        assert!(needs_zig(&cli(&["inventory", "check", "--file", inv])));
+        assert!(needs_zig(&cli(&["toolchain", "check"])));
+    }
+
+    /// With no `--inventory`, `playbook run` needs a workspace to find the
+    /// inventory in; outside one, nothing is provisioned.
+    #[test]
+    fn no_workspace_means_no_provisioning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cli(&[
+            "--workspace",
+            tmp.path().to_str().unwrap(),
+            "playbook",
+            "run",
+            "x",
+        ]);
+        assert!(!needs_zig(&c));
+    }
+}

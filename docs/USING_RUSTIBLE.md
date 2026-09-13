@@ -103,8 +103,11 @@ Check a machine before relying on it:
 rustible toolchain check
 ```
 
-**Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon.
-**Targets:** Linux x86_64 and aarch64, any libc. Not macOS, Windows or BSD.
+**Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon or Intel.
+**Targets:** Linux x86_64 and aarch64, any libc; and macOS, Apple silicon or
+Intel, for the operations that make sense there — see §13. Any controller
+builds for any target. Not Windows or BSD (the BSD *binary* builds; no
+operation knows the platform yet).
 
 ## 4. The workspace
 
@@ -589,7 +592,7 @@ Gathered once per host, before the first step.
 
 ```rust
 let f = ctx.facts();
-if f.package_manager == Pm::Apt { ... }
+if f.has_pm(&Pm::Apt) { ... }
 if f.distro == Distro::Alpine { ... }
 ensure!(f.is_root, "this playbook needs root");
 ```
@@ -602,26 +605,37 @@ ensure!(f.is_root, "this playbook needs root");
 | `arch` | `Arch` |
 | `kernel` | `String` |
 | `hostname` | `String` |
-| `package_manager` | `Pm` |
+| `package_managers` | `BTreeSet<Pm>` — every one found; ask with `f.has_pm(&Pm::Apt)` |
 | `init` | `Init` |
 | `cpus` | `u32` |
 | `memory_mb` | `u64` |
 | `user` | `String` — the process's user |
 | `is_root` | `bool` |
 
-The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude, and
-each ends in an `Other(String)` carrying whatever Rustible read and did not
-recognise — a tuple variant, so it is `Distro::Other(_)` in a pattern. Match
+The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude. All
+but `Pm` end in an `Other(String)` carrying whatever Rustible read and did not
+recognise — a tuple variant, so it is `Distro::Other(_)` in a pattern; `Pm`
+has no `Other`, because "no manager Rustible knows" is the empty set. Match
 rather than comparing `distro_version` strings, and get the variant names from
 the source (see "Finding an operation" below):
 
 ```rust
-match &f.distro {
-    Distro::Debian | Distro::Ubuntu => { /* apt */ }
-    Distro::Alpine => { /* apk */ }
-    other => bail!("unsupported distribution: {other:?}"),
+match (&f.os, &f.distro) {
+    (Os::Linux, Distro::Debian | Distro::Ubuntu) => { /* apt */ }
+    (Os::Linux, Distro::Alpine) => { /* apk */ }
+    (Os::Macos, _) => { /* brew */ }
+    (os, distro) => bail!("unsupported platform: {} {distro:?}", os.name()),
 }
 ```
+
+**Package managers are a set, not a value.** A Debian box with Homebrew has
+both `Pm::Apt` and `Pm::Brew`; a mac without Homebrew has none. Facts report
+what is *found*, by probing the binary, never what the distribution implies.
+
+**On a mac** the facts come from macOS's own sources: `Distro::Macos` with
+`distro_version` from `SystemVersion.plist` (`26.3`), `Init::Launchd`,
+`Pm::Brew` if Homebrew is installed, and `kernel`, `hostname`, `cpus` and
+`memory_mb` from one `sysctl` call, because there is no `/proc` there.
 
 **There are no custom facts.** That list is all of them, and there is no
 `setup` module or local-facts directory. To answer anything else, ask the
@@ -864,9 +878,10 @@ file::Line::in_path("/etc/hosts").set("10.0.0.1 db")
 op to a variable and calling a method on it will not compile the way you
 expect.
 
-⚠️ **The apt operations take a list where most others take one name.**
-`apt::Present::new(["nginx"])` — with the brackets, even for a single package.
-`apt::Present::new("nginx")` does not compile. Every other constructor
+⚠️ **The apt and brew operations take a list where most others take one
+name.** `apt::Present::new(["nginx"])`, `brew::Present::new(["nethack"])` —
+with the brackets, even for a single package. `apt::Present::new("nginx")`
+does not compile. Every other constructor
 (`user::Present::new`, `systemd::Enabled::new`, `group::Present::new`,
 `hostname::Is::new`) takes a single name, which is exactly why the apt one
 catches people.
@@ -896,7 +911,7 @@ const CONF: &str = include_str!("../files/nginx.conf");
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let f = ctx.facts();
-    ensure!(f.package_manager == Pm::Apt, "{} is not apt-based", f.hostname);
+    ensure!(f.has_pm(&Pm::Apt), "{} is not apt-based", f.hostname);
 
     ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
 
@@ -1013,12 +1028,35 @@ earlier step. `.groups([..])` is the **supplementary** list, and `.append(bool)`
 says whether it adds to the current set or replaces it. Both require the groups
 to exist already.
 
-**`apt` is the only package manager with operations.** `Pm::Dnf`, `Pm::Apk`
-and the rest exist as *facts* with nothing behind them, so guard:
+**`apt` and `brew` are the only package managers with operations.**
+`Pm::Dnf`, `Pm::Apk` and the rest exist as *facts* with nothing behind them,
+so guard — with `has_pm`, since a host can have several:
 
 ```rust
-ensure!(f.package_manager == Pm::Apt, "{} uses {:?}", f.hostname, f.package_manager);
+ensure!(f.has_pm(&Pm::Apt), "{} has {:?}", f.hostname, f.package_managers);
 ```
+
+**`brew` runs as the login user, never as root.** Homebrew refuses root
+outright, so `brew::Present` and `brew::Absent` refuse it too, by name — a
+playbook with `escalate = true` cannot use them directly. Run that playbook
+unescalated, or reach the owning user with `ctx.as_user(..)`. Like `apt`,
+the `brew` constructors take a list: `brew::Present::new(["nethack"])`. They
+gate on `Pm::Brew` being *found*, never on the OS, so Linuxbrew works too.
+
+**Every operation says where it runs, and refuses the rest by name.** On a
+mac, `/etc/passwd` and `/etc/group` exist but describe only system services
+(the accounts live in Open Directory), there is no `/proc`, and `apt`,
+`systemd`, `/etc/hostname` and `/etc/sysctl.d` mean nothing. So `user::*`,
+`group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and `systemd::*`
+refuse a mac with a message naming what macOS uses instead, rather than
+reporting `ok` about an account that exists or `changed` about a file nothing
+reads — both of which they did before this gate existed. `file::*`, `shell`,
+`http`, `archive` and `brew` run there. One op is split down the middle:
+`ssh::authorized_keys::Present::for_user_name("cadu")` refuses a mac because
+it looks the user up in `/etc/passwd`, while `for_account("/Users/cadu",
+501, 20)` is plain file work and runs. A platform Rustible has never heard of
+is refused by every op, so a wrong answer cannot come from a silent
+assumption.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:

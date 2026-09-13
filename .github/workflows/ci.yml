@@ -157,12 +157,29 @@ jobs:
       # transport, which builds `aarch64-apple-darwin` through zig, ships the
       # binary to itself, and gathers Darwin facts. There is no macOS
       # container, so this is the only automated check of that path
-      # (docs/plan/reports/MACOS-TARGET-SPIKE.md).
-      - name: Run a playbook against this mac
+      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks, each run
+      # twice because the second run is the test: `hello` (facts), `mac`
+      # (escalation through the runner's sudo, files as root, TLS from the
+      # target), and `macbrew` (Homebrew, which the runner ships, as the
+      # login user because brew refuses root) — installed, then removed.
+      - name: Run playbooks against this mac
         run: |
           set -euo pipefail
           RUSTIBLE=$PWD/target/release/rustible
-          "$RUSTIBLE" --workspace examples/workspace playbook run hello -v
+          cat > /tmp/hosts.ci-mac.kdl <<'KDL'
+          defaults escalate="sudo"
+          group "mac" {
+              host "runner" connection="local"
+          }
+          host "local" connection="local"
+          KDL
+          run() { "$RUSTIBLE" --workspace examples/workspace --inventory /tmp/hosts.ci-mac.kdl playbook run "$@"; }
+          run hello -v
+          run mac -v
+          run mac | tee /dev/stderr | grep -q 'runner *4 *1 *0 *0 *0 *0'
+          run macbrew -v
+          run macbrew | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
+          run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *0 *1 *0 *0 *0 *0'
 
   # FreeBSD is not a target Rustible's operations know yet, but the binary
   # comes for free now — zig carries FreeBSD's libc — and this is what stops
