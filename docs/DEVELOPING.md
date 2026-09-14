@@ -162,7 +162,7 @@ make vm-up-x86
 make vm-up-arm
 make vm-status      # what is up, and the inventory that names it
 make vm-ssh         # a shell inside it (make vm-ssh M=arm to pick one)
-make vm-test        # run the playbook against whatever is up, twice
+make vm-test        # recreate the guests, then run the playbook twice
 make vm-halt        # stop, keep the disks
 make vm-destroy     # delete them
 make vm-orphans     # domains left behind by a deleted checkout
@@ -204,16 +204,28 @@ rustible --workspace examples/workspace \
          playbook run vagrant --check -v
 ```
 
-`make vm-test` runs the playbook twice and fails unless the second run reports
-nothing changed. That second run is the test. A first run that reports
-`changed` proves only that the operation did something; an operation that
-rewrites a correct file every time also reports `changed`.
+`make vm-test` **destroys and recreates the guests**, then runs the playbook
+twice and fails unless the first run changed something and the second changed
+nothing. That second run is the test. A first run that reports `changed`
+proves only that the operation did something; an operation that rewrites a
+correct file every time also reports `changed`.
 
-One difference from CI worth knowing: CI always starts from a freshly created
-machine, and your checkout does not. A local run against a guest that
-converged an hour ago exercises only the satisfied path and passes without
-proving anything. `make vm-destroy` first, or undo the change inside the guest,
-before you trust a local green.
+The recreate is there because the alternative is a false green. CI always
+starts from a freshly created machine; a checkout does not, and a local run
+against a guest that converged an hour ago reports `ok` twice and passes
+having exercised only the satisfied path — the one path that cannot be wrong.
+The first-run assertion is the belt to that braces: if the recreate somehow
+does not take, the run fails saying so rather than passing quietly.
+
+Which guests get recreated: the ones named in `HOSTS=`, or else whatever
+`vagrant status` reports as running, or else the autostart machine when
+nothing is up. So a Linux host that deliberately brought up the emulated `arm`
+guest keeps it, rather than having it swapped for `x86`.
+
+While iterating on an op, `make vm-test QUICK=1` skips the recreate and runs
+against the guests as they stand. It prints on stderr that what it ran is not
+the full test, and it drops the first-run assertion, since a converged guest
+is the expected case there. Drop `QUICK=1` before trusting a green.
 
 ## Troubleshooting
 
