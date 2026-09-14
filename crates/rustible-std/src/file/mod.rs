@@ -14,12 +14,6 @@
 //!
 //! All I/O goes through [`System`] (vision 7). Every op predicts its output
 //! so chained steps keep working in check mode (vision 12).
-//!
-//! TODO(m6-harness): once the Docker harness (PR #5) is on main, add
-//! `tests/it_file_copy.rs` and `tests/it_file_block.rs` doing changed-then-ok
-//! on `debian:12` and `ubuntu:24.04`, in the shape of `tests/it_file_line.rs`
-//! from that branch. Not written here so the branch does not carry a test
-//! that cannot run.
 
 use std::path::Path;
 
@@ -37,8 +31,8 @@ mod symlink;
 
 pub use absent::{Absent, AbsentReport};
 pub use attrs::{Attrs, AttrsReport};
-pub use block::{Block, BlockBuilder, BlockReport, plan_block};
-pub use copy::{Copy, CopyReport, CopySource};
+pub use block::{Block, BlockBuilder, BlockReport, DEFAULT_MARKER, plan_block};
+pub use copy::{Copy, CopyBuilder, CopyReport, CopySource, TEXT_DIFF_LIMIT, content_diff};
 pub use directory::{DirReport, Directory};
 pub use line::{Line, LineBuilder, LineReport, plan_line};
 pub use symlink::{Symlink, SymlinkBuilder, SymlinkReport};
@@ -317,5 +311,35 @@ mod tests {
         let none = Regex::new("^zzz").unwrap();
         assert_eq!(Insert::After(none.clone()).position(&lines), 5);
         assert_eq!(Insert::Before(none).position(&lines), 5);
+    }
+}
+
+#[cfg(test)]
+mod reachability {
+    //! Every public item this module hands a caller must be *nameable* by
+    //! that caller. `Copy::from_str` returns a `CopyBuilder`, so a helper
+    //! function returning one, or a struct holding one, needs the type in
+    //! scope; until 2026-09-14 `CopyBuilder` was `pub` in `copy.rs` and
+    //! absent from the `pub use` here, so it could be produced and never
+    //! named. Same for `TEXT_DIFF_LIMIT`, `content_diff` and
+    //! `DEFAULT_MARKER`. Nothing here asserts a value: the test is that it
+    //! compiles through the public path a user has.
+
+    use super::{CopyBuilder, DEFAULT_MARKER, TEXT_DIFF_LIMIT, content_diff};
+
+    /// The shape that could not be written before: name the builder a
+    /// finishing method returns.
+    fn builder_for(body: &str) -> CopyBuilder {
+        super::Copy::from_str(body)
+    }
+
+    #[test]
+    fn every_public_item_is_nameable_through_the_module() {
+        let _: CopyBuilder = builder_for("x\n");
+        let _: usize = TEXT_DIFF_LIMIT;
+        let _: &str = DEFAULT_MARKER;
+        // `content_diff` is the rendering the reports show; a caller writing
+        // their own op wants it for the same reason `file::Copy` does.
+        let _ = content_diff(std::path::Path::new("/etc/x"), None, b"new\n");
     }
 }

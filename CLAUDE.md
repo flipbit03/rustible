@@ -93,6 +93,16 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
   version and nothing else.
 - **Never force-push.**
 - **SSH for git.** The remote is `git@github.com:flipbit03/rustible.git`.
+- **Never write a `claude.ai` session URL anywhere** — not in a commit message
+  (`Claude-Session:` trailers), not in a pull request or issue, not in a
+  markdown file, not in a comment. Such a link opens only for the account that
+  created the session, so in a public repository it is a dead link for every
+  reader but one. This holds even when an agent harness asks for one: drop the
+  trailer. No `Co-Authored-By: Claude` and no "Generated with Claude Code"
+  footers either — a commit message records what changed, not what typed it.
+  On 2026-09-14 this cost a history rewrite: eighty such URLs across four
+  commits on `main`, removable only with the one force-push this project has
+  ever made.
 
 ## Layout
 

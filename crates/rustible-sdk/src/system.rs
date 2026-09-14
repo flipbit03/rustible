@@ -685,6 +685,7 @@ impl Cmd {
             return Err(CmdFailed {
                 argv: self.spec.argv(),
                 status: out.status,
+                signal: out.signal,
                 stderr: out.stderr_str(),
             }
             .into());

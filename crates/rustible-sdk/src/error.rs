@@ -187,15 +187,23 @@ impl StepFailed {
 /// stderr travels in the struct and is rendered once, at `-v`, from the
 /// `Failed` event rather than being repeated in every chain that quotes it.
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
-#[error("`{}` exited {status}", argv.join(" "))]
+#[error("`{}` {}", argv.join(" "), match signal {
+    Some(s) => format!("was killed by signal {s}"),
+    None => format!("exited {status}"),
+})]
 pub struct CmdFailed {
     /// Program first, then its arguments, exactly as spawned. The message
     /// joins them with spaces and does not quote, so an argument containing
     /// a space reads ambiguously there; the field itself is exact.
     pub argv: Vec<String>,
     /// The exit code, or `-1` when the process was killed by a signal and
-    /// so has no code of its own.
+    /// so has no code of its own. Read it with [`CmdFailed::signal`] beside
+    /// it: `-1` alone cannot be told apart from a command that exited `-1`.
     pub status: i32,
+    /// The signal that killed the process, when one did, otherwise `None`.
+    /// Defaulted on deserialize so an older peer's frame still parses.
+    #[serde(default)]
+    pub signal: Option<i32>,
     /// Everything the command wrote to stderr, decoded lossily as UTF-8 and
     /// not truncated. Absent from the `Display` message on purpose.
     pub stderr: String,
@@ -259,11 +267,36 @@ mod tests {
     }
 
     #[test]
+    fn a_signalled_command_names_the_signal_instead_of_an_ambiguous_minus_one() {
+        // `ExitStatus::code()` is `None` for a signalled process, so `status`
+        // falls back to -1 and on its own cannot be told apart from a command
+        // that genuinely exited -1. `signal` is what disambiguates, and the
+        // message has to say so: "exited -1" sends someone hunting for an
+        // exit code that was never produced.
+        let killed = CmdFailed {
+            argv: vec!["sleep".into(), "300".into()],
+            status: -1,
+            signal: Some(9),
+            stderr: String::new(),
+        };
+        assert_eq!(killed.to_string(), "`sleep 300` was killed by signal 9");
+
+        let exited = CmdFailed {
+            argv: vec!["sleep".into(), "300".into()],
+            status: -1,
+            signal: None,
+            stderr: String::new(),
+        };
+        assert_eq!(exited.to_string(), "`sleep 300` exited -1");
+    }
+
+    #[test]
     fn context_chains_outermost_first() {
         fn inner() -> Result<()> {
             Err(CmdFailed {
                 argv: vec!["apt-get".into(), "install".into()],
                 status: 100,
+                signal: None,
                 stderr: "E: nope".into(),
             }
             .into())

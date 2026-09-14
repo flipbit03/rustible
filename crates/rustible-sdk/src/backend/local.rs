@@ -161,6 +161,7 @@ impl Backend for Local {
         }
         Ok(Output {
             status: out.status.code().unwrap_or(-1),
+            signal: std::os::unix::process::ExitStatusExt::signal(&out.status),
             stdout: out.stdout,
             stderr: out.stderr,
         })

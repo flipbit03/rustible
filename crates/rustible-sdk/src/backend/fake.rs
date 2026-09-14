@@ -5,12 +5,22 @@ use std::sync::Mutex;
 
 use super::{Backend, CmdSpec, FileKind, Output, Stat};
 
+/// One path inside a [`Fake`], as [`Fake::file`] hands it back: the whole
+/// of what the fake knows about it. A test reaches for this when
+/// [`Fake::content`] is not enough — asserting the mode a `chmod` produced,
+/// or that an op wrote a symlink where a file was expected.
 #[derive(Debug, Clone)]
 pub struct FakeFile {
+    /// The file's contents. For a [`FileKind::Symlink`] this is the link
+    /// target as bytes, which is how the fake stores one.
     pub bytes: Vec<u8>,
+    /// Permission bits, low twelve only, as the ops compare them.
     pub mode: u32,
+    /// Owning user id.
     pub uid: u32,
+    /// Owning group id.
     pub gid: u32,
+    /// Whether this path is a regular file, a directory or a symlink.
     pub kind: FileKind,
 }
 
@@ -379,6 +389,10 @@ impl Backend for Fake {
         match hit {
             Some(c) => Ok(Output {
                 status: c.status,
+                // A canned response is a process that exited; the `Fake` has
+                // no way to express one that was signalled, and no op needs
+                // it to, so this is `None` rather than a builder knob.
+                signal: None,
                 stdout: c.stdout.clone().into_bytes(),
                 stderr: c.stderr.clone().into_bytes(),
             }),
