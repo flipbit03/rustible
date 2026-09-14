@@ -1,5 +1,6 @@
 //! The `rustible` command (vision doc section 3): `init`, `playbook
-//! run|list|create`, `inventory show|check`. Noun first, then verb. The
+//! run|list|create`, `inventory show|check`, `toolchain install`. Noun
+//! first, then verb. The
 //! orchestrator pipeline is `run.rs`; the inventory is the library half
 //! (`rustible_cli::inventory`).
 //!
@@ -16,9 +17,9 @@ mod init;
 mod render;
 mod run;
 mod toolchain;
-mod toolchain_cmd;
 mod transport;
 mod workspace;
+mod zig;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -90,13 +91,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ToolchainCmd,
     },
+    /// Hidden: the compiler and linker shim that cargo-zigbuild's wrapper
+    /// scripts exec. The wrappers name whatever `env::current_exe()` was when
+    /// they were written, and in Rustible that is this binary, so every C
+    /// compile and every link in a playbook build comes back through here as
+    /// `rustible zig cc …` (M8).
+    #[command(hide = true)]
+    Zig {
+        #[command(subcommand)]
+        cmd: cargo_zigbuild::Zig,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum ToolchainCmd {
-    /// Check that this machine can build for the given targets, and show the
-    /// compiler environment a build would use.
-    Check(toolchain_cmd::CheckArgs),
+    /// Fetch the zig release Rustible builds with into its cache, ahead of
+    /// the first `playbook run`, and say where it is. Does nothing when a
+    /// zig is already on this machine: RUSTIBLE_ZIG, PATH, or the cache.
+    Install,
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,8 +141,80 @@ enum InventoryCmd {
     },
 }
 
-#[tokio::main]
-async fn main() {
+/// cargo-zigbuild does not write `ar`, `lib` or `install_name_tool` as
+/// wrapper scripts: it symlinks the *current executable* under those names
+/// and expects it to notice what it was called as. In cargo-zigbuild's own
+/// binary that is a check at the top of `main`; here it is this. Without it,
+/// `ar cq lib.a x.o` reaches clap as a `rustible` invocation whose program
+/// name happens to be `ar`, and `cq` is refused as an unknown subcommand —
+/// which is exactly how M8 step 2's first attempt failed.
+fn dispatch_as_tool() -> Option<Result<()>> {
+    let mut args = std::env::args();
+    let program = PathBuf::from(args.next()?);
+    let stem = program.file_stem()?.to_string_lossy().into_owned();
+    Some(match stem.as_str() {
+        "ar" => cargo_zigbuild::Zig::Ar {
+            args: args.collect(),
+        }
+        .execute(),
+        "lib" => cargo_zigbuild::Zig::Lib {
+            args: args.collect(),
+        }
+        .execute(),
+        s if s.ends_with("dlltool") => cargo_zigbuild::Zig::Dlltool {
+            args: args.collect(),
+        }
+        .execute(),
+        "install_name_tool" => cargo_zigbuild::macos::install_name_tool::execute(args),
+        _ => return None,
+    })
+}
+
+/// Whether zig should be provisioned for this invocation, decided before the
+/// runtime starts and before anything expensive.
+///
+/// Only the subcommands that build need a zig: `playbook run` and `inventory
+/// check` (it builds every playbook to check their vars). `init`, `playbook list` and
+/// `inventory show` must never cause a 51 MB download. And neither must a
+/// typo: an invocation `dispatch` is about to refuse for a stray
+/// `--inventory`, or one that names a file that is not there, is answered
+/// with that refusal and nothing else. The checks here mirror the cheap
+/// early failures in `dispatch`; the real errors still come from there.
+///
+/// This is also what keeps the unit tests off the network: they run the
+/// real binary with a missing inventory and a misplaced flag, and neither
+/// gets as far as a fetch.
+fn needs_zig(cli: &Cli) -> bool {
+    // No workspace, no build: `playbook run` refuses and `inventory check`
+    // validates the file alone, so neither needs a zig.
+    let Ok(workspace) = Workspace::discover(cli.workspace.as_deref()) else {
+        return false;
+    };
+    let inventory_exists = |explicit: Option<&PathBuf>| -> bool {
+        match explicit {
+            Some(p) => p.is_file(),
+            None => workspace.inventory_path().is_file(),
+        }
+    };
+    match &cli.cmd {
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Run(_),
+        } => inventory_exists(cli.inventory.as_ref()),
+        Cmd::Inventory {
+            cmd: InventoryCmd::Check { file },
+        } => inventory_exists(file.as_ref().or(cli.inventory.as_ref())),
+        _ => false,
+    }
+}
+
+fn main() {
+    if let Some(result) = dispatch_as_tool() {
+        if let Err(e) = result {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -139,7 +223,30 @@ async fn main() {
             std::process::exit(code as i32);
         }
     };
-    let code = match dispatch(cli).await {
+    // zig is provisioned here, before the runtime exists, and for one
+    // reason: cargo-zigbuild learns where zig is from the process
+    // environment, and setting that is only sound while this is the only
+    // thread. It is, until the runtime below is built.
+    if needs_zig(&cli) {
+        match zig::provision(&|line| eprintln!("  {line}")) {
+            Ok(located) => {
+                if let Some(path) = located.export() {
+                    // SAFETY: single-threaded. `dispatch_as_tool` returned
+                    // `None`, the tokio runtime has not been created, and
+                    // nothing else spawns threads before it. `set_var`'s
+                    // hazard is a concurrent `getenv`, and there is no one
+                    // to make one.
+                    unsafe { std::env::set_var("CARGO_ZIGBUILD_ZIG_COMMAND", path) };
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(EXIT_ERROR as i32);
+            }
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("building the tokio runtime");
+    let code = match runtime.block_on(dispatch(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -207,11 +314,15 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         },
         Cmd::Inventory { cmd } => inventory(ws, inventory_override, cmd).await,
         Cmd::Toolchain { cmd } => match cmd {
-            ToolchainCmd::Check(args) => {
-                reject_inventory(&inventory_override, "toolchain check")?;
-                toolchain_cmd::run(ws, args)
+            ToolchainCmd::Install => {
+                reject_inventory(&inventory_override, "toolchain install")?;
+                zig::install()
             }
         },
+        // A failing zig child exits this process with the child's own code,
+        // so a failed link is a failed `rustible zig cc`, which is a failed
+        // cargo, which is a failed build. Nothing is swallowed on the way.
+        Cmd::Zig { cmd } => cmd.execute().map(|()| 0),
     }
 }
 
@@ -373,5 +484,115 @@ fn load_or_exit(file: &Path) -> Inventory {
             );
             std::process::exit(EXIT_ERROR as i32);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("rustible").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The guard between a typo and a 51 MB download. Everything here is
+    /// what `make` once got wrong: a unit test ran the real binary with a
+    /// missing inventory and provisioning came before the refusal.
+    #[test]
+    fn only_builds_with_acceptable_flags_and_real_files_provision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = tmp.path().join("hosts.kdl");
+        std::fs::write(&inv, "host \"a\" connection=\"local\"\n").unwrap();
+        let inv = inv.to_str().unwrap();
+        let missing = tmp.path().join("nope.kdl");
+        let missing = missing.to_str().unwrap();
+
+        // Never for commands that do not build.
+        assert!(!needs_zig(&cli(&["playbook", "list"])));
+        assert!(!needs_zig(&cli(&["playbook", "create", "playbooks/x.rs"])));
+        assert!(!needs_zig(&cli(&["toolchain", "install"])));
+        assert!(!needs_zig(&cli(&["inventory", "show", "a", "--file", inv])));
+
+        // Builds, but the inventory it names is not there: `dispatch` will
+        // refuse it, so nothing is fetched first.
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "inventory",
+            "check"
+        ])));
+        assert!(!needs_zig(&cli(&["inventory", "check", "--file", missing])));
+
+        // The inventory is there, but no workspace is: `playbook run`
+        // refuses and `inventory check` validates the file without building,
+        // so a fetch here would be 51 MB for nothing.
+        let ws = tmp.path().to_str().unwrap();
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
+
+        // The real thing.
+        std::fs::write(tmp.path().join("rustible.toml"), "").unwrap();
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "inventory",
+            "check"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
+    }
+
+    /// With no `--inventory`, `playbook run` needs a workspace to find the
+    /// inventory in; outside one, nothing is provisioned.
+    #[test]
+    fn no_workspace_means_no_provisioning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cli(&[
+            "--workspace",
+            tmp.path().to_str().unwrap(),
+            "playbook",
+            "run",
+            "x",
+        ]);
+        assert!(!needs_zig(&c));
     }
 }

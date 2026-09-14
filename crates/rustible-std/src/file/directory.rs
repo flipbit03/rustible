@@ -64,6 +64,13 @@ impl Op for Directory {
     type Output = DirReport;
 
     fn check(&self, sys: &System) -> Result<Plan<DirReport>> {
+        // Portable. file::Directory creates a directory through `sys` and sets mode and owner.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Directory has no implementation for {}", other.name()),
+        }
         let mut changes = vec![];
         let stat = sys.stat_follow(&self.path)?;
         let created = match &stat {
@@ -120,6 +127,40 @@ mod tests {
 
     use super::super::testing::{expect_change, fake_sys};
     use super::*;
+
+    /// The two platform claims every portable op makes, in one place: it
+    /// runs on a mac, and it refuses a platform nobody has claimed rather
+    /// than assuming. `Directory` is plain file work through `sys`, so the mac
+    /// half is the same test as on Linux with different facts.
+    fn on(os: Os) -> (std::sync::Arc<Fake>, System) {
+        let fake = std::sync::Arc::new(Fake::new().with_dir("/opt"));
+        let base = fake_sys(&fake);
+        let mut facts = base.facts().clone();
+        facts.os = os;
+        (fake.clone(), base.with_facts(facts))
+    }
+
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let (fake, sys) = on(Os::Macos);
+        let op = Directory::at("/opt/x");
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.file("/opt/x").unwrap().kind,
+            rustible_sdk::backend::FileKind::Dir
+        );
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+
+        let (_, sys) = on(Os::Other("freebsd".into()));
+        let err = Directory::at("/opt/x").check(&sys).unwrap_err().chain();
+        assert!(
+            err.contains("file::Directory has no implementation for freebsd"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn directory_is_created_with_mode_and_owner() {

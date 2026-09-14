@@ -220,6 +220,13 @@ impl Op for Command {
     type Output = CommandOutput;
 
     fn check(&self, sys: &System) -> Result<Plan<CommandOutput>> {
+        // Portable. shell::Command runs whatever argv it is given, so the platform is the caller's concern.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("shell::Command has no implementation for {}", other.name()),
+        }
         let satisfied = CommandOutput {
             status: 0,
             stdout: String::new(),
@@ -283,6 +290,38 @@ mod tests {
 
     fn fake_sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// `shell::Command` runs whatever argv it is given, so it is portable by
+    /// construction — but the claim is written down, and an unclaimed
+    /// platform is still refused.
+    #[test]
+    fn command_runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let fake = Arc::new(Fake::new().with_cmd("/usr/bin/sw_vers", None, 0, "macOS\n"));
+        let base = fake_sys(&fake);
+
+        let mut mac = base.facts().clone();
+        mac.os = Os::Macos;
+        mac.distro = Distro::Macos;
+        let sys = base.clone().with_facts(mac);
+        assert!(
+            Command::new("/usr/bin/sw_vers")
+                .check(&sys)
+                .unwrap()
+                .is_change()
+        );
+
+        let mut bsd = base.facts().clone();
+        bsd.os = Os::Other("freebsd".into());
+        let sys = base.with_facts(bsd);
+        let err = Command::new("/usr/bin/sw_vers")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("shell::Command has no implementation for freebsd"),
+            "{err}"
+        );
     }
 
     /// A `Ctx` over the fake plus the sink it reports to, so tests can

@@ -35,9 +35,9 @@ similar = "2"
 # is chosen here rather than by a feature default: it is `ring`, reached
 # through rustls's own `ring` feature and wired in one place,
 # `rustible-std::tls`, which `rustible-github` reuses. `ring` compiles a little
-# C, so the operator needs a clang on PATH to cross-build (vision 5.3); in
+# C, which is the reason zig is in the dependency rule (vision 5.3, M8); in
 # exchange it detects CPU features at runtime and runs down to baseline
-# x86-64. See `docs/plan/reports/C-TOOLCHAIN-SPIKE.md`.
+# x86-64. See `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` and `docs/plan/M8.md`.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 regex = "1"

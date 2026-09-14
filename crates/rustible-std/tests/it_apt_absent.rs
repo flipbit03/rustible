@@ -9,7 +9,7 @@ use rustible_std::apt;
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn absent_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
-    assert_eq!(ctx.facts().package_manager, Pm::Apt);
+    assert!(ctx.facts().has_pm(&Pm::Apt));
     // Nothing to remove yet: `ok`, with the name in `not_present`.
     let before = ctx.step("remove sl (not installed)", apt::Absent::new(["sl"]))?;
     assert!(!before.changed);

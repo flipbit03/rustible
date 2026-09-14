@@ -161,6 +161,13 @@ impl Op for Copy {
     type Output = CopyReport;
 
     fn check(&self, sys: &System) -> Result<Plan<CopyReport>> {
+        // Portable. file::Copy writes a file through `sys` and sets mode and owner; nothing in it is a Linux concept.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Copy has no implementation for {}", other.name()),
+        }
         let new = self.source_bytes(sys)?;
         let stat = sys.stat(&self.dest)?;
         let old = match &stat {
@@ -229,6 +236,47 @@ mod tests {
 
     use super::super::testing::{expect_change, fake_sys};
     use super::*;
+
+    /// The other half of the platform work: a portable op has to keep
+    /// working on a mac, and say so explicitly rather than by omission.
+    /// Measured against a real mac — this op wrote `/etc/rustible-spike/marker`
+    /// there as root.
+    #[test]
+    fn copy_runs_on_a_mac() {
+        let fake = Arc::new(Fake::new().with_dir("/etc"));
+        let base = fake_sys(&fake);
+        let mut facts = base.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        let sys = base.with_facts(facts);
+
+        let op = Copy::from_str("hello\n").to("/etc/x.conf");
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/etc/x.conf").unwrap(), "hello\n");
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// And a platform nobody has claimed is refused, not assumed.
+    #[test]
+    fn copy_refuses_an_unclaimed_platform() {
+        let fake = Arc::new(Fake::new().with_dir("/etc"));
+        let base = fake_sys(&fake);
+        let mut facts = base.facts().clone();
+        facts.os = Os::Other("freebsd".into());
+        let sys = base.with_facts(facts);
+        let err = Copy::from_str("x\n")
+            .to("/etc/x.conf")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("file::Copy has no implementation for freebsd"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn copy_is_satisfied_when_bytes_and_attrs_match() {

@@ -489,20 +489,23 @@ fn build_test_binary(spec: &Spec) -> std::result::Result<PathBuf, String> {
     // for `<arch>-linux-musl-gcc` and stops, even on a box with a perfectly
     // good gcc.
     //
-    // No sysroot is set, and none is needed. The target is always this
-    // machine's own architecture, so whatever libc headers the compiler
-    // defaults to are at least the right one, and ring reaches only `memcpy`,
-    // `memset`, `assert` and the types in `stdlib.h`. It is glibc declarations
-    // for musl-targeted code on a glibc box, which is the compromise
-    // `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` section 1.4 measured and called
-    // low-risk; the principled path, with vendored musl headers, is the
-    // `rustible` CLI's, because that is what ships a binary to a real host.
-    // Checked with clang as well as gcc: `CC=clang RUSTIBLE_INTEGRATION=1 cargo
-    // test -p rustible-std --test it_http_download` passes, because ring drops
-    // libc includes only for non-x86_64 musl and every real clang install
-    // brings libc headers with it.
+    // This is the one build in Rustible that does not go through zig, and
+    // deliberately: the harness lives in `rustible-sdk`, which every playbook
+    // links, and `cargo-zigbuild` has no business in a playbook binary. So
+    // the container tier is a *developer* requirement, like docker beside
+    // it — a C compiler on the machine running `make integration` — and not
+    // a user one; `rustible` itself asks the operator only for rustup, a C
+    // compiler for cargo's own use, and curl, and fetches zig itself (M8). No sysroot is set and none is
+    // needed: the target is always this machine's own architecture, so the
+    // compiler's default libc headers are at least the right one, and ring
+    // reaches only `memcpy`, `memset`, `assert` and the types in `stdlib.h`
+    // — the compromise `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` section 1.4
+    // measured and called low-risk.
     //
-    // Anything already in the environment wins.
+    // Anything already in the environment wins, which is also how to run
+    // this tier through zig: cc-rs splits `CC_*` on whitespace, so
+    // `CC_x86_64_unknown_linux_musl="$HOME/.cache/rustible/zig/<ver>/<dir>/zig cc
+    // -target x86_64-linux-musl"` works.
     let cc_var = format!("CC_{}", triple.replace('-', "_"));
     if std::env::var_os(&cc_var).is_none_or(|v| v.is_empty()) {
         cmd.env(&cc_var, host_c_compiler()?);

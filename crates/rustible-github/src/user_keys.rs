@@ -164,7 +164,19 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
 impl Op for UserKeys {
     type Output = Vec<PublicKey>;
 
-    fn check(&self, _sys: &System) -> Result<Plan<Vec<PublicKey>>> {
+    fn check(&self, sys: &System) -> Result<Plan<Vec<PublicKey>>> {
+        // Portable. github::UserKeys is an HTTPS GET parsed in Rust; nothing
+        // touches the host but the network, which is why `sys` is otherwise
+        // unused here. Declared anyway, as the worked example for a
+        // collection: the supported set is a claim the author makes, not
+        // something a reader infers from the absence of a check.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!(
+                "github::UserKeys has no implementation for {}",
+                other.name()
+            ),
+        }
         validate_login(&self.login)?;
         let url = self.url();
         let resp = self.fetcher().get(&url)?;
@@ -242,6 +254,41 @@ pub(crate) mod tests {
     }
 
     pub(crate) const URL_FOR_TESTS: &str = "https://github.com/flipbit03.keys";
+
+    /// The one op in an external collection, so the worked example of the
+    /// platform claim for collection authors: it runs on a mac (an HTTPS GET
+    /// touches nothing on the host) and refuses a platform nobody claimed,
+    /// and the refusal comes before the fetch — the canned fetcher records
+    /// every URL asked, and after the refusal it has been asked nothing.
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let canned = Canned::answering(URL_FOR_TESTS, Ok(Response::ok(body())));
+        let (base_sys, _) = sys();
+
+        let mut mac = base_sys.facts().clone();
+        mac.os = Os::Macos;
+        let sys_mac = base_sys.clone().with_facts(mac);
+        let op = UserKeys::of("flipbit03").fetch_with(canned.clone());
+        let Plan::Satisfied(keys) = op.check(&sys_mac).unwrap() else {
+            panic!("a lookup is always satisfied")
+        };
+        assert_eq!(keys.len(), 3);
+        assert_eq!(canned.asked().len(), 1);
+
+        let mut bsd = base_sys.facts().clone();
+        bsd.os = Os::Other("freebsd".into());
+        let sys_bsd = base_sys.with_facts(bsd);
+        let err = UserKeys::of("flipbit03")
+            .fetch_with(canned.clone())
+            .check(&sys_bsd)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("github::UserKeys has no implementation for freebsd"),
+            "{err}"
+        );
+        assert_eq!(canned.asked().len(), 1, "the refusal asked for nothing");
+    }
 
     fn finished(sink: &Collect) -> Vec<(String, Status)> {
         sink.events()

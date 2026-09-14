@@ -1,8 +1,9 @@
 # Rustible
 
 An independent replacement for Ansible. A playbook is an ordinary Rust file
-with typed operations and typed outputs. Running one compiles it into a static
-musl binary per target architecture, ships it over SSH, runs it *there*, and
+with typed operations and typed outputs. Running one compiles it into one
+self-contained binary per target — static musl on Linux, a Mach-O linked only
+against `libSystem` on macOS — ships it over SSH, runs it *there*, and
 streams `changed / ok / failed` back with dry run and diffs. The target needs
 nothing installed: no Python, no agent, no runtime.
 
@@ -40,12 +41,25 @@ sends the next session hunting for work that is already done, or repeating it.
 
 ## The dependency rule
 
-**rustup plus `clang` is the entire set of dependencies for running Rustible,
-and that must never grow.** Not a preference, not a default to be revisited:
-it is the property the project exists to have. Target hosts need nothing at
-all, ever.
+**rustup, a C compiler, and `curl` is the entire set of dependencies on the
+controller, and that must never grow.** Not a preference, not a default to be
+revisited: it is the property the project exists to have. Target hosts need
+nothing at all, ever. zig is not on that list because `rustible` fetches it
+itself; the C compiler is not `rustible`'s but cargo's, for a workspace under
+`cargo check`, `cargo test` or rust-analyzer, as in any Rust project with a C
+dependency.
 
-The operator does not type `rustup target add` either — `Describe::build`
+zig is the C toolchain: `ring` (TLS) compiles a little C, and zig compiles
+and links it for every target, carrying its own libc for each, so there is no
+compiler to choose, no headers to vendor and no SDK to obtain. `rustible`
+fetches the pinned release into `~/.cache/rustible/zig/<version>/` on first
+use with the machine's `curl`, verified against a SHA-256 in
+`crates/rustible-cli/src/zig.rs`; a zig on `PATH` or named by `RUSTIBLE_ZIG`
+wins. `cargo-zigbuild` is a library dependency, not a program anyone installs.
+The CLI links no TLS of its own, so `cargo install rustible-cli` needs no C
+compiler.
+
+The operator does not type `rustup target add` either — `Cargo::build`
 calls `toolchain::ensure_targets_installed` first, because Rustible has
 already probed the hosts and knows which triples the run needs.
 
@@ -57,18 +71,18 @@ addition to what a user must install moves us back toward that, and hurts
 adoption more than any feature repays.
 
 So: a crate that bundles a C *library* (`openssl-sys`, `libgit2-sys`) is
-unsupported, and the fix is the pure-Rust alternative. No cross-gcc, no zig,
-no docker for builds. `ring` is the single C dependency, for TLS, and even
-there Rustible carries musl's headers itself so nothing else is installed by
-hand. If a change appears to require another tool, that is a design problem to
-solve, not a requirement to document.
+unsupported, and the fix is the pure-Rust alternative. No cross-gcc, no
+docker for builds, no SDK copied off another machine. If a change appears to
+require another tool, that is a design problem to solve, not a requirement to
+document. `docs/plan/M8.md` is how this rule came to name zig.
 
 ## Other rules
 
 - **`escalate`, never `become`.** `become` is a reserved Rust keyword and the
   name is gone everywhere: the attribute, the inventory, the CLI, the code.
-- **Never publish to crates.io.** Releases are cut by tagging and publishing a
-  GitHub release, which fires `.github/workflows/release.yml`.
+- **Never run `cargo publish` by hand.** Releases are cut by tagging and
+  publishing a GitHub release, which fires `.github/workflows/release.yml`;
+  that workflow is the only thing that publishes to crates.io.
 - **The tree's version is `0.0.0` and stays there.** Nobody can publish that,
   so it means exactly "built from source, not released". `release.yml` rewrites
   it from the tag at publish time and fails if any occurrence is missed, so a
@@ -115,7 +129,7 @@ against, because the people reading a CI run do not have this file open:
 | `Test: unit & fake` | tiers 1 and 2 |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Build: macOS controller` | the suite on macOS, and a cross-build for both Linux targets |
+| `Test: macOS (controller and target)` | the suite on macOS, and three playbooks run against the runner itself as a target |
 | `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |
 | `Test: VM (Debian 12/x86_64)` | tier 4, on a KVM-accelerated guest |
 | `Test: VM (Debian 12/aarch64)` | tier 4, on an emulated guest |
@@ -167,7 +181,7 @@ The shape matters more than the code, and there is already a checklist for it:
 to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
-`crates/rustible-std/src/sysctl.rs`** — at ~630 lines it is short enough to
+`crates/rustible-std/src/sysctl.rs`** — at ~680 lines it is short enough to
 finish and has every part: pure planning functions over file
 text, a `check` that composes a `Diff`, an `apply`, and a test module split
 into `// ---- pure ----` and `// ---- Fake ----`.
@@ -270,8 +284,8 @@ Choosing the tier is the judgement; this is the mechanism.
 
 **Tiers 1 and 2 live in the op's own file**, in a `#[cfg(test)] mod tests` at
 the bottom. Every module in `rustible-std` that has tests does this — all
-nineteen of them, the twentieth being `ssh/mod.rs`, which only re-exports —
-and none has a separate unit-test file. Inside it, separate the two tiers with a banner
+twenty of them; `lib.rs` and `ssh/mod.rs` only re-export — and none has a
+separate unit-test file. Inside it, separate the two tiers with a banner
 comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and
 `// ---- Fake ----`, which is the pair to copy; older modules use their own
 wording.
@@ -414,7 +428,7 @@ Each of these has already produced a test that could not fail.
   changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
   the second answer by writing into the Fake between the two checks — the
   builders consume `self`, so this goes through the `Backend` trait, as
-  `sysctl.rs:630` does:
+  `sysctl.rs:674` does:
 
   ```rust
   rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"1\n")?;
@@ -495,36 +509,36 @@ Three things that will bite you:
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
 
-## TLS, and why clang
+## TLS, and why zig
 
-Rustible speaks TLS in two places: `http::Download` and the `rustible-github`
-collection. The provider is `ring`, reached through rustls, and it is the
-reason `clang` is in the dependency rule above.
+Rustible speaks TLS in `http::Download` and `rustible-github`; the provider is
+`ring`, which is why a C toolchain exists at all.
 
-Ring compiles a small amount of C, and cargo's C helper will not use the
-host's compiler for a musl target unless it is named, so `rustible-cli` names
-it and supplies the compiler flags itself (`crates/rustible-cli/src/toolchain.rs`).
-For `x86_64` musl it also supplies musl's libc headers, which it carries
-vendored and unpacks into the workspace cache. For other musl targets ring
-needs no libc headers, except that Apple's clang patches its own `stddef.h` to
-delegate to the system header when the target is musl, so those get musl's
-headers offered as a last-resort include. None of this is visible to a user,
-and none of it may grow into a second thing to install.
+Every build goes through `cargo_zigbuild::Build` (`describe.rs`), which points
+`-C linker=` and `CC_<triple>` at wrapper scripts that exec `rustible zig cc`;
+the hidden `rustible zig` subcommand and the `argv[0]` dispatch at the top of
+`main` are the other half. Two measured non-obvious things (`docs/plan/M8.md`):
+the describe build passes `--target <host>` like every other, or cargo-zigbuild
+leaves the C compiler alone; and build scripts link with the *host* linker, so
+`wire_host_linker` points that at zig too.
 
-`rustible toolchain check` reports what a machine can build for, and
-`--print-env` prints the compiler environment a build is given. Use it rather
-than setting `CC_*` by hand.
+The container-tier harness (`rustible-sdk::testing`) is the one build not on
+zig, on purpose — every playbook links the SDK. It uses the developer's C
+compiler, like it uses docker.
 
 ## Platforms
 
-Rustible **runs from** Linux (x86_64, aarch64) and macOS on Apple silicon. It
-**manages** Linux hosts, x86_64 and aarch64, any libc.
+Rustible **runs from** Linux and macOS, x86_64 and aarch64, and **manages**
+Linux (any libc) and macOS, both architectures. Any controller builds for any
+target.
 
-macOS is a controller and never a target: the local probe refuses `Darwin
-arm64` by name, because the operations speak apt, systemd and `/etc/passwd`.
-A Linux controller cannot build macOS binaries at all, since linking Mach-O
-needs an Apple SDK that rustup does not ship.
+Every operation declares where it runs and refuses the rest by name. On a mac
+`/etc/passwd` lists only system accounts and there is no `/proc`, so `user`,
+`group`, `hostname`, `sysctl`, `apt` and `systemd` refuse it;
+`ssh::authorized_keys` refuses only its `/etc/passwd` lookup; the portable ops
+carry an explicit `Linux | Macos` match; `brew` is the mac's package op.
+`docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement.
 
 Operations run on the target, including lookups (vision 5.1), so
-`github::UserKeys` needs network egress from the target rather than from the
+`rustible_github::UserKeys` needs network egress from the target rather than from the
 controller.

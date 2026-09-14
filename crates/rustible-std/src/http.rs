@@ -9,8 +9,8 @@
 //! `ring` detects CPU features at runtime and falls back to baseline code, so
 //! there is no instruction-set floor and no pre-flight: the binary this op
 //! ships in runs on any x86-64 or aarch64 target. It does compile a little C,
-//! which the operator's machine needs a `clang` for (vision 5.3); the target
-//! host still needs nothing at all.
+//! which zig does on the operator's machine (vision 5.3, M8); the target host
+//! still needs nothing at all.
 //!
 //! `check` never touches the network. It decides from the file on disk
 //! whether a download is due, so a dry run is fast and honest (vision 12).
@@ -481,6 +481,13 @@ impl Op for Download {
     type Output = DownloadReport;
 
     fn check(&self, sys: &System) -> Result<Plan<DownloadReport>> {
+        // Portable. http::Download is pure-Rust HTTP and TLS writing a file through `sys`; `ring` cross-compiles for Darwin.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("http::Download has no implementation for {}", other.name()),
+        }
         validate_url(&self.url).map_err(Error::msg)?;
         let checksum = self.parsed_checksum()?;
         let (stat, state) = self.content_state(sys, checksum.as_ref())?;
@@ -566,6 +573,45 @@ mod tests {
 
     use super::*;
     use crate::file::testing::{expect_change, fake_sys};
+
+    /// `http::Download` claims a mac and refuses a platform nobody claimed.
+    /// The mac half is a real download from the test server with Darwin
+    /// facts, because TLS from the target is exactly what the macOS spike
+    /// proved and what a wrong gate would silently lose; the refusal half
+    /// never opens a socket, since the gate comes first.
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let (base, hits) = serve(vec![("/hello.txt", 200, vec![], HELLO.to_vec())]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let base_sys = fake_sys(&fake);
+
+        let mut mac = base_sys.facts().clone();
+        mac.os = Os::Macos;
+        let sys = base_sys.clone().with_facts(mac);
+        let op = Download::get(format!("{base}/hello.txt")).to("/opt/hello.txt");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
+        let served = hits.load(Ordering::SeqCst);
+
+        let mut bsd = base_sys.facts().clone();
+        bsd.os = Os::Other("freebsd".into());
+        let sys = base_sys.with_facts(bsd);
+        let err = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/other.txt")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("http::Download has no implementation for freebsd"),
+            "{err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            served,
+            "the refusal made no request"
+        );
+    }
 
     const HELLO: &[u8] = b"hello from rustible\n";
     const HELLO_SHA256: &str = "86a9660ed95754054a62f1dbc68e53ab443dd67c84fa77362a699dbf8604da3d";

@@ -27,7 +27,7 @@ struct Vars {
 #[rustible::playbook(hosts = "vagrant", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     let f = ctx.facts();
-    ensure!(f.package_manager == Pm::Apt, "this playbook needs apt; {} uses {:?}", f.hostname, f.package_manager);
+    ensure!(f.has_pm(&Pm::Apt), "this playbook needs apt; {} has {:?}", f.hostname, f.package_managers);
     ensure!(f.is_root, "this playbook needs root, which means escalation worked");
     ctx.log(format!("{} is {:?} {} on {:?}, {} cpus", f.hostname, f.distro, f.distro_version, f.arch, f.cpus));
 

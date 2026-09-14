@@ -184,6 +184,13 @@ impl Op for Line {
     type Output = LineReport;
 
     fn check(&self, sys: &System) -> Result<Plan<LineReport>> {
+        // Portable. file::Line edits file text through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Line has no implementation for {}", other.name()),
+        }
         let text = super::read_text_or_empty(sys, &self.path, self.create)?;
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
@@ -241,6 +248,42 @@ mod tests {
 
     use super::super::testing::fake_sys;
     use super::*;
+
+    /// The two platform claims every portable op makes, in one place: it
+    /// runs on a mac, and it refuses a platform nobody has claimed rather
+    /// than assuming. `Line` is plain file work through `sys`, so the mac
+    /// half is the same test as on Linux with different facts.
+    fn on(os: Os) -> (std::sync::Arc<Fake>, System) {
+        let fake = std::sync::Arc::new(Fake::new().with_file("/etc/x", "a=1\n"));
+        let base = fake_sys(&fake);
+        let mut facts = base.facts().clone();
+        facts.os = os;
+        (fake.clone(), base.with_facts(facts))
+    }
+
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let (fake, sys) = on(Os::Macos);
+        let op = Line::in_path("/etc/x").matching("^b=").set("b=2");
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/etc/x").unwrap(), "a=1\nb=2\n");
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+
+        let (_, sys) = on(Os::Other("freebsd".into()));
+        let err = Line::in_path("/etc/x")
+            .matching("^b=")
+            .set("b=2")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("file::Line has no implementation for freebsd"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn plan_replaces_commented_line() {

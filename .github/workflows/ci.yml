@@ -101,20 +101,19 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: "Build: macOS controller"
+    name: "Test: macOS (controller and target)"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
-      # A mac is a supported *controller*: it builds the CLI natively and
-      # cross-builds playbook binaries for the Linux musl targets. It is never
-      # a target (vision 5.3, Linux musl only), which is why the local probe
-      # refuses it. Xcode's command line tools ship the clang that ring needs,
-      # so nothing is installed here.
+      # A mac is a supported controller and, since M8, a supported target.
+      # Nothing but Rust is installed here: the C toolchain is the zig that
+      # `rustible` fetches into its own cache on first use, and the cache
+      # step below is what keeps that from being a 50 MB download per run.
+      # The runner's own clang serves `cargo test` and the CLI build, as a
+      # developer's would.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
 
       - name: Cache cargo registry & build
         uses: actions/cache@v5
@@ -126,29 +125,43 @@ jobs:
           key: ci-macos-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-macos-cargo-
 
-      - run: clang --version
+      - name: Cache the zig rustible fetches
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rustible/zig
+          key: ci-macos-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - run: cargo test --workspace
 
-      # The property that matters: a mac produces a Linux playbook binary,
-      # with Apple clang and the musl headers the CLI carries. The compiler
-      # environment comes from `rustible toolchain check --print-env`, which
-      # is the same code `playbook run` uses; calling cargo directly here
-      # would set nothing and fail on `x86_64-linux-musl-gcc`, which is the
-      # error that whole module exists to prevent.
-      - name: Cross-build a playbook for both Linux targets
+      # And a mac as a *target*: the runner drives itself over the local
+      # transport, which builds `aarch64-apple-darwin` through zig, ships the
+      # binary to itself, and gathers Darwin facts. There is no macOS
+      # container, so this is the only automated check of that path
+      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks, each run
+      # twice because the second run is the test: `hello` (facts), `mac`
+      # (escalation through the runner's sudo, files as root, TLS from the
+      # target), and `macbrew` (Homebrew, which the runner ships, as the
+      # login user because brew refuses root) — installed, then removed.
+      - name: Run playbooks against this mac
         run: |
           set -euo pipefail
           cargo build --release -p rustible-cli
           RUSTIBLE=$PWD/target/release/rustible
-          "$RUSTIBLE" toolchain check
-          cd examples/workspace
-          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-            ( eval "$("$RUSTIBLE" toolchain check --target "$t" --print-env)"
-              RUSTIBLE_PLAYBOOK=hello \
-                cargo build --features selected --profile dist --target "$t" )
-            file "target/$t/dist/workspace"
-          done
+          cat > /tmp/hosts.ci-mac.kdl <<'KDL'
+          defaults escalate="sudo"
+          group "mac" {
+              host "runner" connection="local"
+          }
+          host "local" connection="local"
+          KDL
+          run() { "$RUSTIBLE" --workspace examples/workspace --inventory /tmp/hosts.ci-mac.kdl playbook run "$@"; }
+          run hello -v
+          run mac -v
+          run mac | tee /dev/stderr | grep -q 'runner *4 *1 *0 *0 *0 *0'
+          run macbrew -v
+          run macbrew | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
+          run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *0 *1 *0 *0 *0 *0'
+          run macbrew --var present=false | tee /dev/stderr | grep -q 'runner *1 *0 *0 *0 *0 *0'
 
   harness:
     name: "Test: Docker (Debian/Ubuntu/Alpine)"
@@ -223,8 +236,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The dependency rule, on a runner: a musl target plus clang. Nothing
-      # below installs a cross-gcc, a zig, or a docker image to build in.
+      # The dependency rule, on a runner: rustup, and the zig `rustible`
+      # fetches for itself with the runner's curl. No cross-gcc, no clang, no
+      # docker image to build in; `make vm-test` below is an ordinary
+      # `rustible playbook run`.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -239,6 +254,12 @@ jobs:
             target
           key: ci-machine-${{ matrix.machine }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-machine-${{ matrix.machine }}-cargo-
+
+      - name: Cache the zig rustible fetches
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/rustible/zig
+          key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - name: Install vagrant, libvirt and qemu
         run: |

@@ -6,7 +6,7 @@ use rustible::prelude::*;
 fn main(ctx: &mut Ctx) -> Result<()> {
     let f = ctx.facts();
     ctx.log(workspace::greeting(&f.hostname));
-    ctx.log(format!("{:?} {} on {:?}, {} cpus, {} MB, pm {:?}", f.distro, f.distro_version, f.arch, f.cpus, f.memory_mb, f.package_manager));
+    ctx.log(format!("{:?} {} on {:?}, {} cpus, {} MB, pm {:?}", f.distro, f.distro_version, f.arch, f.cpus, f.memory_mb, f.package_managers));
     if f.is_root {
         ctx.warn("running as root; hello does not need it");
     }

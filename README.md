@@ -33,35 +33,22 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
-Every operation returns a typed struct describing what it found or made, and
-those values feed the operations after it. `cfg` here is a `CopyReport`, and
-its `changed` is a `bool`, so a conditional reload is an ordinary `if` instead
-of a handler wired up by a `notify` string. `user::Present` returns an
-`Account` with `uid`, `gid` and `home` as real fields, so the step that wants
-a home directory is handed one rather than guessing it. All of it is checked
-at compile time: a misspelled field or a wrong type fails the build.
+Every operation returns a typed struct, and those values feed the steps after
+it: `cfg.changed` is a `bool`, so the reload is an `if`, not a handler. A
+misspelled field or a wrong type fails the build.
 
 ## Why
 
-Ansible expresses logic in YAML: conditionals are `when:` strings evaluated as
-Python, iteration is a `loop:` key, and values are Jinja templates rendered
-into whitespace-sensitive markup. None of it is type-checked, and mistakes
-surface at run time, on a host, partway through.
-
-Its execution model ships a Python module to the target for every task
-(AnsiballZ), so every machine you manage needs a compatible interpreter and
-whatever libraries the modules import.
-
-Rustible keeps the parts that work — desired state, idempotence, readable runs
-— and changes what does not.
+Rustible keeps the parts of Ansible that work — desired state, idempotence,
+readable runs — and changes what does not.
 
 | Ansible | Rustible |
 |---|---|
 | YAML tasks, Jinja templates | Rust functions, the compiler |
 | `when:` strings | `if` |
 | handlers and `notify` | `if step.changed { ... }` |
-| loops with `item` | just use `for` |
-| `register` + `set_fact` | the value the step returns |
+| loops with `item` | just use `for` :-) |
+| `register` + `set_fact` | just use the value the step returns |
 | Python on every target | one static binary, nothing preinstalled |
 
 ## Supported platforms
@@ -71,15 +58,13 @@ Rustible runs **from** a controller and manages **targets**.
 | | x86_64 | aarch64 |
 |---|---|---|
 | **Controller** — Linux | yes | yes |
-| **Controller** — macOS (Apple silicon) | — | yes |
+| **Controller** — macOS | yes (Intel) | yes (Apple silicon) |
 | **Target** — Linux, any libc | yes | yes |
-| **Target** — macOS, Windows, BSD | no | no |
+| **Target** — macOS | yes (basic support) | yes (basic support) |
+| **Target** — BSD | not yet (planned) | not yet (planned) |
+| **Target** — Windows | nope | no way |
 
-A Mac is a first-class controller: it cross-builds playbook binaries for both
-Linux targets with the clang that Xcode's command line tools already provide.
-
-Targets need nothing installed. The playbook arrives as one static musl
-binary.
+Targets need nothing installed. A playbook arrives on the target machine as one static binary, that's it.
 
 ## Install
 
@@ -87,19 +72,18 @@ binary.
 cargo install rustible-cli
 ```
 
-That gives you the `rustible` binary. It needs **rustup and clang** on your
-machine, and nothing on the machines you manage.
+On the machine you run `rustible` from (the controller) you need:
 
-To see what a machine can do before relying on it:
+- rustup (https://rustup.rs/)
+- a C compiler (`cc`, `gcc` or `clang`)
+- `curl`
 
-```sh
-rustible toolchain check      # what this machine can build for, and how
-```
+Rustible also uses zig (for playbook cross-compilation), but it is installed automatically if not already present.
+
 
 ## Point your agent at this
 
-Rustible is new, so an AI agent has no prior knowledge of it. Give it this and
-it can create a workspace, write playbooks, manage an inventory and run them:
+Rustible is new, so LLMs have no prior knowledge of it. Paste this into your coding agent's session for a quick bootstrap:
 
 ```
 Rustible is a Rust-based replacement for Ansible. Read
@@ -107,11 +91,6 @@ https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md
 to understand how to write playbooks and operate it, then help me with my
 infrastructure.
 ```
-
-[`docs/USING_RUSTIBLE.md`](docs/USING_RUSTIBLE.md) is written for a reader
-with no exposure to Rustible: the workspace layout, the CLI, the inventory,
-the playbook API, every operation, and the traps that catch people who expect
-Ansible.
 
 ## Five minutes
 
@@ -121,19 +100,14 @@ rustible init                                # Cargo.toml, build.rs, src/, hosts
 rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting this machine
 ```
 
-`rustible init` writes a Cargo package. `src/main.rs` and
-`build.rs` are generated shims you rarely open: the build script finds every
-file under `playbooks/` carrying the attribute and registers it, so adding a
-playbook is adding a file.
-
 Describe your machines in `hosts.kdl` ([KDL format](docs/HOSTS_KDL_REFERENCE.md)).
-`init` starts you with this machine:
+`rustible init` starts you with your local machine only:
 
 ```kdl
 host "local" connection="local"
 ```
 
-and a real fleet looks like:
+and here's a more fleshed out example of a `hosts.kdl` file:
 
 ```kdl
 defaults ssh_user="cadu" escalate="sudo"
@@ -142,7 +116,7 @@ group "web" {
     vars { nginx_workers 4 }
     host "web1" addr="10.0.1.11"
     host "web2" addr="10.0.1.12" {
-        // host beats group
+        // host variable override
         vars { nginx_workers 8 }
     }
 }
@@ -202,8 +176,7 @@ overrides the inventory.
 
 ## The model
 
-- **One verb.** `ctx.step(name, op)` runs everything. There is no separate
-  "task" and "command" API.
+- **One verb.** `ctx.step(name, op)` to run operations on a target machine.
 - **Ops are desired state, named for it.** `apt::Present`, `apt::Absent`,
   `systemd::Enabled`, `user::Present`. Things that are genuinely actions get
   verbs and always report changed: `systemd::Restart`, `shell::Command`.
@@ -219,10 +192,9 @@ overrides the inventory.
 
 ## Operations and collections
 
-An operation is one desired state: `apt::Present`, `systemd::Enabled`,
-`user::Absent`. A **collection** is a library of them — an ordinary Rust crate
-that depends on `rustible-sdk` and implements its `Op` trait. You add one with
-`cargo add`. There is no galaxy, no roles directory, no path search order.
+A Rustible Operation (Op) is one desired state: `apt::Present`, `systemd::Enabled`,
+`user::Absent`. A **Rustible collection** is a library of them — an ordinary Rust crate that depends on `rustible-sdk`. You add one with
+`cargo add`. Contrasting with Ansible, there is no "galaxy" - it's just crates.
 
 Two collections ship from this repository.
 
@@ -230,7 +202,8 @@ Two collections ship from this repository.
 
 | module | ops |
 |---|---|
-| `apt` | `Present`, `Absent`, `Latest` |
+| `apt` | `Present`, `Absent`, `Latest` — Debian and Ubuntu |
+| `brew` | `Present`, `Absent` — Homebrew, on a mac or Linuxbrew, as the login user |
 | `file` | `Copy`, `Directory`, `Symlink`, `Absent`, `Attrs`, `Line`, `Block` |
 | `user`, `group` | `Present`, `Absent`, `Membership` |
 | `ssh::authorized_keys` | `Present` (with `exclusive`), `Absent` |
@@ -239,8 +212,13 @@ Two collections ship from this repository.
 | `http`, `archive` | `Download`, `Extracted` |
 | `shell` | `Command` |
 
+Every operation declares where it runs and refuses other platforms by name.
+On macOS `file`, `shell`, `http`, `archive` and `brew` run, and
+`ssh::authorized_keys` runs when given the account rather than a name to look
+up; the rest refuse.
+
 **`rustible-github`** — a small collection showing what a third-party one
-looks like. It adds `github::UserKeys`, which fetches a GitHub user's public
+looks like. It adds `rustible_github::UserKeys`, which fetches a GitHub user's public
 keys, and `github_ssh_keys_to_user`, a helper that runs it and
 `ssh::authorized_keys::Present` as two visible steps:
 

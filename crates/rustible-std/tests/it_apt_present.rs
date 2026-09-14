@@ -9,7 +9,7 @@ use rustible_std::apt;
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn present_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
-    assert_eq!(ctx.facts().package_manager, Pm::Apt);
+    assert!(ctx.facts().has_pm(&Pm::Apt));
     // Stock images ship without package lists; `update_cache` runs
     // `apt-get update` in apply, so only the first step pays for it.
     let (first, second) = changed_then_ok(ctx, "install sl", || {

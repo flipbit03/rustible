@@ -1,7 +1,7 @@
 # Developing Rustible
 
-Most work here needs nothing but a Rust toolchain and `clang`. Two extra tiers
-exist for testing against real systems, and this file is how to turn them on.
+Most work here needs a Rust toolchain and a C compiler. Two extra tiers exist
+for testing against real systems, and this file is how to turn them on.
 
 ```sh
 make            # fmt, clippy, test, rustdoc, and the example workspace

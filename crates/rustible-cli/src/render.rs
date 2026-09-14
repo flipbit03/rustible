@@ -122,7 +122,7 @@ impl<W: Write> Renderer<W> {
                         f.distro,
                         f.distro_version,
                         f.arch,
-                        f.package_manager,
+                        f.package_managers,
                         f.cpus,
                         f.memory_mb,
                         f.user
@@ -265,8 +265,8 @@ impl<W: Write> Renderer<W> {
                 (_, Some(e)) => {
                     // One line, whatever the reason is. The full text was
                     // printed as the FAILED line above; a multi-line reason
-                    // here (a clang pre-flight refusal, a long connect error)
-                    // would break the table it sits in.
+                    // here (a toolchain refusal, a long connect error) would
+                    // break the table it sits in.
                     let _ = writeln!(out, "{host:<w$}  failed: {}", one_line(e, 96));
                 }
                 (Some(s), None) => {
@@ -383,13 +383,13 @@ mod one_line_tests {
     use super::one_line;
 
     /// The summary table is a table. A reason with newlines in it, which is
-    /// what a clang pre-flight refusal or a long connect error looks like,
-    /// must not turn one row into five.
+    /// what a toolchain refusal or a long connect error looks like, must not
+    /// turn one row into five.
     #[test]
     fn a_multi_line_reason_becomes_one_line() {
-        let reason = "no `clang` on PATH, and this playbook has to be built for \
-                      aarch64-unknown-linux-musl.\nInstall it and run this again:  \
-                      sudo apt install clang";
+        let reason = "curl is missing and is needed to download zig 0.15.2, and this playbook \
+                      has to be built for aarch64-unknown-linux-musl.\nInstall curl, or set \
+                      RUSTIBLE_ZIG to a zig already on this machine, and run this again";
         let got = one_line(reason, 96);
         assert!(!got.contains('\n'), "{got}");
         assert!(
@@ -397,7 +397,7 @@ mod one_line_tests {
             "{} chars: {got}",
             got.chars().count()
         );
-        assert!(got.starts_with("no `clang` on PATH"), "{got}");
+        assert!(got.starts_with("curl is missing"), "{got}");
         assert!(
             got.ends_with('…'),
             "elided, so the reader knows there is more: {got}"
@@ -587,17 +587,17 @@ arm      0        1             0        0       0         0
         );
     }
 
-    /// The table stays a table. A clang pre-flight refusal is two paragraphs
-    /// and a connect error can carry a chain; both arrive here through the
-    /// same orchestrator-level path, and both used to print in full inside one
+    /// The table stays a table. A toolchain refusal is two paragraphs and a
+    /// connect error can carry a chain; both arrive here through the same
+    /// orchestrator-level path, and both used to print in full inside one
     /// column. This pins the table, where `one_line_tests` pins the helper.
     /// The full text is still above, as the `FAILED:` line.
     #[test]
     fn a_multi_line_reason_does_not_break_the_summary_table() {
-        let reason = "no `clang` on PATH, and this playbook has to be built for \
-                      aarch64-unknown-linux-musl. Rustible's TLS provider (ring) compiles a \
-                      little C, and building for any architecture but this machine's own needs \
-                      clang.\nInstall it and run this again:  sudo apt install clang";
+        let reason = "curl is missing and is needed to download zig 0.15.2, and this playbook \
+                      has to be built for aarch64-unknown-linux-musl. Rustible's TLS provider \
+                      (ring) compiles a little C, and zig is what compiles it.\nInstall curl, \
+                      or set RUSTIBLE_ZIG to a zig already on this machine, and run this again";
         let out = render(0, |r| {
             r.failed("arm", reason);
             r.event("local", &Event::Finished(Summary::default()));
@@ -605,7 +605,7 @@ arm      0        1             0        0       0         0
             assert!(r.finish());
         });
         // The whole reason is above the table, newlines and all.
-        assert!(out.contains("Install it and run this again"), "{out}");
+        assert!(out.contains("and run this again"), "{out}");
         // The table itself is the header plus exactly one row per host.
         let table: Vec<&str> = out
             .lines()
@@ -614,10 +614,7 @@ arm      0        1             0        0       0         0
             .collect();
         assert_eq!(table.len(), 3, "header plus two hosts, got {table:#?}");
         let arm = table.iter().find(|l| l.starts_with("arm")).unwrap();
-        assert!(
-            arm.starts_with("arm    failed: no `clang` on PATH"),
-            "{arm}"
-        );
+        assert!(arm.starts_with("arm    failed: curl is missing"), "{arm}");
         assert!(arm.ends_with('…'), "elided: {arm}");
         assert!(!arm.contains("apt install"), "{arm}");
     }

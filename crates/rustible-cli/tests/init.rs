@@ -58,12 +58,7 @@ fn regenerates_the_example_workspace() {
     assert!(out.status.success(), "{}", stderr(&out));
 
     let example = example_workspace();
-    for rel in [
-        "Cargo.toml",
-        "build.rs",
-        "src/main.rs",
-        ".cargo/config.toml",
-    ] {
+    for rel in ["Cargo.toml", "build.rs", "src/main.rs"] {
         assert_eq!(
             read(&dir, rel),
             read(&example, rel),

@@ -79,6 +79,13 @@ impl Op for Symlink {
     type Output = SymlinkReport;
 
     fn check(&self, sys: &System) -> Result<Plan<SymlinkReport>> {
+        // Portable. file::Symlink creates a POSIX symlink through `sys`.
+        // The supported set is written out rather than left open, so a new
+        // platform is a decision made here and not an accident.
+        match sys.facts().os {
+            Os::Linux | Os::Macos => {}
+            ref other => bail!("file::Symlink has no implementation for {}", other.name()),
+        }
         let target = self.target.display().to_string();
         let mut changes = vec![];
         match sys.stat(&self.link)? {
@@ -153,6 +160,44 @@ mod tests {
 
     use super::super::testing::{expect_change, fake_sys};
     use super::*;
+
+    /// The two platform claims every portable op makes, in one place: it
+    /// runs on a mac, and it refuses a platform nobody has claimed rather
+    /// than assuming. `Symlink` is plain file work through `sys`, so the mac
+    /// half is the same test as on Linux with different facts.
+    fn on(os: Os) -> (std::sync::Arc<Fake>, System) {
+        let fake = std::sync::Arc::new(Fake::new().with_dir("/opt"));
+        let base = fake_sys(&fake);
+        let mut facts = base.facts().clone();
+        facts.os = os;
+        (fake.clone(), base.with_facts(facts))
+    }
+
+    #[test]
+    fn runs_on_a_mac_and_refuses_an_unclaimed_platform() {
+        let (fake, sys) = on(Os::Macos);
+        let op = Symlink::at("/opt/link").pointing_to("/opt/target");
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.file("/opt/link").unwrap().kind,
+            rustible_sdk::backend::FileKind::Symlink
+        );
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+
+        let (_, sys) = on(Os::Other("freebsd".into()));
+        let err = Symlink::at("/opt/link")
+            .pointing_to("/opt/target")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("file::Symlink has no implementation for freebsd"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn symlink_is_created_when_missing() {

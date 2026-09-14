@@ -22,8 +22,8 @@ use rustible_sdk::prelude::*;
 
 #[allow(unused_imports)]
 use crate::group::{
-    Group, Tools, group_by_gid, group_entry, groups_of, lookup_group, require_root, run_tool,
-    validate_field, validate_name,
+    Group, Tools, group_by_gid, group_entry, groups_of, lookup_group, require_passwd_db,
+    require_root, run_tool, validate_field, validate_name,
 };
 
 /// A user account as it stands on the machine. Output of [`Present`] and
@@ -968,6 +968,7 @@ impl Op for Present {
     type Output = Account;
 
     fn check(&self, sys: &System) -> Result<Plan<Account>> {
+        require_passwd_db(sys, "user::Present")?;
         require_root(sys, "user::Present")?;
         let Inspection {
             current,
@@ -1120,6 +1121,7 @@ impl Op for Absent {
     type Output = Removed;
 
     fn check(&self, sys: &System) -> Result<Plan<Removed>> {
+        require_passwd_db(sys, "user::Absent")?;
         require_root(sys, "user::Absent")?;
         validate_name("user", &self.name)?;
         let passwd = sys.read_to_string("/etc/passwd")?;
@@ -1210,6 +1212,7 @@ impl Op for Existing {
     type Output = Account;
 
     fn check(&self, sys: &System) -> Result<Plan<Account>> {
+        require_passwd_db(sys, "user::Existing")?;
         validate_name("user", &self.name)?;
         match read_account(sys, &self.name)? {
             Some(account) => Ok(Plan::Satisfied(account)),
@@ -1306,6 +1309,7 @@ impl Op for Membership {
     type Output = Member;
 
     fn check(&self, sys: &System) -> Result<Plan<Member>> {
+        require_passwd_db(sys, "user::Membership")?;
         require_root(sys, "user::Membership")?;
         validate_name("user", &self.user)?;
         validate_name("group", &self.group)?;
@@ -1596,8 +1600,60 @@ mod tests {
     fn alpine(sys: System) -> System {
         let mut facts = sys.facts().clone();
         facts.distro = Distro::Alpine;
-        facts.package_manager = Pm::Apk;
+        facts.package_managers = [Pm::Apk].into_iter().collect();
         sys.with_facts(facts)
+    }
+
+    /// A mac. `/etc/passwd` exists there and describes only system
+    /// services, so every op in this module has to refuse before reading it.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        sys.with_facts(facts)
+    }
+
+    /// Measured on macOS 26.3 before this gate existed: `user::Absent`
+    /// reported `ok` for the logged-in account and `user::Existing` reported
+    /// that it did not exist. Every one of the four refuses now, and the
+    /// message says where the accounts actually live.
+    #[test]
+    fn every_user_op_refuses_a_mac_naming_open_directory() {
+        let fake = Arc::new(base());
+        let s = macos(fake_sys(&fake));
+
+        let errs = [
+            Present::new("cadu").check(&s).unwrap_err().chain(),
+            Absent::new("cadu").check(&s).unwrap_err().chain(),
+            Existing::named("cadu").check(&s).unwrap_err().chain(),
+            Membership::of_name("cadu")
+                .in_group_named("staff")
+                .check(&s)
+                .unwrap_err()
+                .chain(),
+        ];
+        for (op, err) in ["Present", "Absent", "Existing", "Membership"]
+            .iter()
+            .zip(&errs)
+        {
+            assert!(err.contains(&format!("user::{op}")), "{op}: {err}");
+            assert!(err.contains("Open Directory"), "{op}: {err}");
+            assert!(err.contains("/etc/passwd"), "{op}: {err}");
+        }
+    }
+
+    /// A platform rustible has never heard of is refused too, and told which
+    /// assumption it failed rather than being handed a Darwin story.
+    #[test]
+    fn an_unknown_platform_is_refused_by_name() {
+        let fake = Arc::new(base());
+        let mut facts = fake_sys(&fake).facts().clone();
+        facts.os = Os::Other("freebsd".into());
+        let s = fake_sys(&fake).with_facts(facts);
+        let err = Present::new("cadu").check(&s).unwrap_err().chain();
+        assert!(err.contains("freebsd"), "{err}");
+        assert!(err.contains("only knows to be true on Linux"), "{err}");
     }
 
     fn not_root(sys: System) -> System {

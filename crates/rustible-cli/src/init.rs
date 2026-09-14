@@ -8,7 +8,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::toolchain::Compilers;
 use crate::workspace::normalize;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -26,7 +25,6 @@ const CARGO_TOML: &str = include_str!("../templates/Cargo.toml.tmpl");
 const BUILD_RS: &str = include_str!("../templates/build.rs.tmpl");
 const MAIN_RS: &str = include_str!("../templates/main.rs.tmpl");
 const LIB_RS: &str = include_str!("../templates/lib.rs.tmpl");
-const CARGO_CONFIG: &str = include_str!("../templates/cargo-config.toml");
 const HOSTS_KDL: &str = include_str!("../templates/hosts.kdl");
 const RUSTIBLE_TOML: &str = include_str!("../templates/rustible.toml");
 const GITIGNORE: &str = include_str!("../templates/gitignore");
@@ -35,12 +33,11 @@ const README_MD: &str = include_str!("../templates/README.md.tmpl");
 /// The paths [`generate`] writes, in write order. Kept equal to `generate`'s
 /// own paths by a test; [`conflicts`] needs them before a package name or a
 /// dependency style has been decided.
-const GENERATED_PATHS: [&str; 7] = [
+const GENERATED_PATHS: [&str; 6] = [
     "Cargo.toml",
     "build.rs",
     "src/main.rs",
     "src/lib.rs",
-    ".cargo/config.toml",
     "hosts.kdl",
     "rustible.toml",
 ];
@@ -184,8 +181,8 @@ pub fn run(args: InitArgs) -> Result<()> {
     for file in generate(&name, &deps) {
         let target = dir.join(file.path);
         // With --force, user-owned files (Cargo.toml, src/lib.rs, hosts.kdl,
-        // rustible.toml, .cargo/config.toml) are never overwritten; the shims
-        // are ours and always rewritten.
+        // rustible.toml) are never overwritten; the shims are ours and
+        // always rewritten.
         if args.force && target.exists() && !shim_paths.contains(&file.path) {
             eprintln!("    kept existing {}", file.path);
             continue;
@@ -195,14 +192,6 @@ pub fn run(args: InitArgs) -> Result<()> {
     ensure_gitignore(dir)?;
     ensure_gitkeep(dir)?;
     ensure_readme(dir, &name)?;
-
-    // A warning, not a failure: `init` compiles nothing, and a user who has
-    // just created a workspace would rather hear about a missing compiler now
-    // than at their first `playbook run` (vision 5.3, and
-    // `docs/plan/reports/C-TOOLCHAIN-SPIKE.md`).
-    if let Some(w) = Compilers::probe().init_warning() {
-        eprintln!("\n{w}");
-    }
 
     eprintln!(
         "\nWorkspace `{name}` is ready. Next:\n    cd {}\n    rustible playbook create playbooks/hello.rs\n    rustible playbook run playbooks/hello.rs",
@@ -233,10 +222,6 @@ pub fn generate(name: &str, deps: &Deps) -> Vec<Generated> {
         Generated {
             path: "src/lib.rs",
             contents: LIB_RS.replace("{{crate_ident}}", &crate_ident),
-        },
-        Generated {
-            path: ".cargo/config.toml",
-            contents: CARGO_CONFIG.to_string(),
         },
         Generated {
             path: "hosts.kdl",

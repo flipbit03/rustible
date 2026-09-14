@@ -44,8 +44,9 @@ in, and Rustible works out what differs and changes only that. Same job as
 Ansible, same ideas — desired state, idempotence, dry runs — with playbooks
 that are compiled code rather than YAML.
 
-A playbook is an ordinary Rust file. Running one compiles it to a static musl
-binary for the target's architecture, copies it over SSH, and runs it **on the
+A playbook is an ordinary Rust file. Running one compiles it to a single
+self-contained binary for the target's architecture — static musl on Linux, a
+Mach-O linked only against `libSystem` on macOS — copies it over SSH, and runs it **on the
 target**. The binary streams results back. Targets need nothing installed: no
 Python, no agent, no runtime.
 
@@ -86,19 +87,22 @@ On the machine you run Rustible *from* (the controller):
 cargo install rustible-cli
 ```
 
-That needs `rustup` and `clang` present. Managed machines need nothing.
+On the controller: rustup, a C compiler (`cc`, `gcc` or `clang` — cargo uses
+it for the workspace, as in any Rust project with a C dependency), and `curl`.
+zig (which cross-compiles playbooks for the target architectures) is fetched
+automatically into `~/.cache/rustible/zig/` on the first build (about 50 MB,
+checksum-verified); a zig already on `PATH`, or one named by
+`RUSTIBLE_ZIG`, is used instead. `rustible toolchain install` fetches it ahead
+of time. Managed machines need nothing.
 
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.
 
-Check a machine before relying on it:
-
-```sh
-rustible toolchain check
-```
-
-**Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon.
-**Targets:** Linux x86_64 and aarch64, any libc. Not macOS, Windows or BSD.
+**Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon or Intel.
+**Targets:** Linux x86_64 and aarch64, any libc; and macOS, Apple silicon or
+Intel, for the operations that make sense there — see §13. Any controller
+builds for any target. Not Windows or BSD (the BSD *binary* builds; no
+operation knows the platform yet).
 
 ## 4. The workspace
 
@@ -120,8 +124,6 @@ infra/
 ├── build.rs           # generated shim: finds playbooks/. Do not edit.
 ├── README.md          # yours: says what this is, and links this guide
 ├── .gitignore         # /target and /.rustible
-├── .cargo/
-│   └── config.toml    # musl cross-linking via rust-lld. Do not edit.
 ├── src/
 │   ├── main.rs        # generated shim. Do not edit.
 │   └── lib.rs         # yours: what more than one playbook needs
@@ -170,7 +172,7 @@ rustible playbook create playbooks/x.rs # scaffold one
 rustible playbook run <PLAYBOOK>        # build, ship, run
 rustible inventory show <HOST>          # one host, fully resolved
 rustible inventory check                # the inventory, and every playbook's vars
-rustible toolchain check                # what this machine can build for
+rustible toolchain install              # fetch zig now, not at the first run
 ```
 
 `<PLAYBOOK>` is either a path (`playbooks/site.rs`) or the name (`site`).
@@ -369,43 +371,18 @@ name — `playbooks/web/nginx.rs` is the playbook `web/nginx`, which is what
 
 ### Where the code goes: the playbook, or `src/lib.rs`
 
-**A playbook is the readable record of what happens to a machine.** Someone
-opening it — a colleague at 2am, you in six months, an agent asked to change
-one thing — should be able to read down the page and see the run. Keeping that
-true is the one rule here. Everything below follows from it.
+**A playbook is the readable record of what happens to a machine**: open it
+and read down the page. So steps go in the playbook by default, and
+**`src/lib.rs` is earned by a second playbook, and by nothing else.** Moving
+code there before a second caller exists buys nothing and costs the reader a
+file. A second playbook permits the move, it does not compel it: share the
+incidental parts (`ssh_dir`, `caddy_vhost`) and let each play keep the steps
+that are its story.
 
-So **steps go in the playbook by default**, and `src/lib.rs` is earned, not
-assumed. A helper there is a good thing when it is pulling its weight; it is a
-cost when it is only moving code out of sight.
-
-**`lib.rs` is earned by a second playbook, and by nothing else.** That is the
-whole trigger. It is the only thing `lib.rs` can do that a function in the
-playbook file cannot, and moving code there before a second playbook exists
-buys nothing and costs the reader a file.
-
-A second playbook *permits* the move; it does not compel it. The rule above
-still outranks it: if lifting a shared sequence would leave the playbooks that
-used it saying nothing, leave it where it is and accept the repetition. Three
-plays that each install an account, its `~/.ssh`, its GitHub keys and a deploy
-key have a genuinely common shape — and hoisting the whole of it turns all
-three into two statements apiece. Share the parts that are incidental to the
-story (`ssh_dir`, `caddy_vhost`), and let each play keep the steps that *are*
-its story.
-
-Everything else that makes you want a function is served by a function **in
-the playbook file**, which is the next heading. Repeating a group of steps
-three times inside one play is a good reason for a function — and a bad reason
-to move it to `lib.rs`, because nothing else can call it yet. Wanting a name
-for a policy (`harden_ssh`) is the same: the name is worth having wherever the
-function lives, and it lives next to its only caller until there is a second
-one.
-
-Then the check that catches the common mistake: **called once, takes nothing
-but `ctx`, and its name just restates its own body — inline it.**
-`setup_nginx()` holding install-then-config-then-enable, inside a playbook
-whose whole purpose is nginx, is that. `harden_ssh()` is not.
-
-Both of these read well, and both are fine:
+The check for the common mistake: **called once, takes nothing but `ctx`, and
+its name restates its body — inline it.** `setup_nginx()` inside a playbook
+whose whole purpose is nginx is that; `harden_ssh()` called from four
+playbooks is not.
 
 ```rust
 // Everything inline. The default, and never wrong.
@@ -416,72 +393,30 @@ ctx.step("nginx enabled", systemd::Enabled::new("nginx").now(true))?;
 // Helpers, with the playbook still saying what happens.
 ctx.step("base packages", apt::Present::new(["curl", "ufw"]))?;
 harden_ssh(ctx)?;                       // in lib.rs: four playbooks call it
-deploy_app(ctx, "v1.2.3")?;             // in lib.rs: two do
 ctx.step("firewall enabled", systemd::Enabled::new("ufw").now(true))?;
 ```
 
-This one does not, because `setup_web_server` is in `src/lib.rs` and this
-playbook is its only caller:
+⚠️ The failure to avoid, one extraction at a time:
 
 ```rust
 use infra::setup_web_server;
 
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
-    setup_web_server(ctx)               // ⚠️ what does this do? another file knows
+    setup_web_server(ctx)               // what does this do? another file knows
 }
 ```
 
-The same three words written as a `fn` lower down *this* file would be fine —
-see below. It is the trip to `lib.rs`, for one caller, that costs the reader.
+**A plain `fn` further down the playbook file is not an extraction.** Use one
+to name the phases of a long play, or for a group repeated within it; the
+file still reads top to bottom. A long playbook that is merely long gets
+`ctx.section(..)` (§8). Bulk private to one playbook — a template, a parser —
+goes in a sibling file declared with `mod helpers;` (§7).
 
-⚠️ **The failure to avoid is a playbook that no longer tells you anything.**
-It happens a step at a time: each extraction looks tidy, and at the end the
-playbook is two lines and the machine's actual behaviour lives somewhere else.
-If the playbook has become shorter than the list of things it does, extract
-less. If a playbook is *long* rather than unreadable, group it with
-`ctx.section(..)` (§8), which keeps the steps on the page.
-
-**Converting an Ansible repository?** Ansible already draws this line, and you
-can follow it mechanically:
-
-| Ansible | where it goes |
-|---|---|
-| a `roles/` entry used by several playbooks | a `lib.rs` function — this is the reuse it was for |
-| `include_tasks: subtasks/10_foo.yaml`, used once | **inline it into the playbook** |
-
-`include_tasks` is how a YAML file gets split when it grows, not a reuse
-mechanism. A Rust file does not have YAML's length problem, so those subtasks
-become ordinary statements in the playbook, in the order they ran. Turning
-each one into a `lib.rs` function reproduces the file-splitting without the
-reason for it, and costs you the readable playbook.
-
-**A plain `fn` further down the playbook file is not an extraction, and it is
-where most helpers belong.** The unit that has to stay readable is the *file*,
-not `main`. Use one when a play reads better as named phases, and use one when
-a play does the same thing several times — three sites, three mounts, three
-accounts — with no other playbook needing it. Either way you still open one
-file and read down it:
-
-```rust
-fn main(ctx: &mut Ctx) -> Result<()> {
-    base_packages(ctx)?;                // each of these is a `fn` in
-    cadu_account(ctx)?;                 // this same file, below
-    qemu(ctx)?;
-    Ok(())
-}
-```
-
-That is the same *shape* as the antipattern above and none of its cost,
-because nothing moved out of sight. The damage comes from the jump to another
-file, not from the existence of a function. If you find yourself wanting that
-structure, prefer this over `lib.rs` until a second playbook actually needs
-the code.
-
-One more place, for bulk rather than for steps: **a sibling file declared
-inside the playbook**, `mod helpers;` (§7 above). That is for material that
-belongs to one playbook and nothing else — a long config template, a parser.
-It keeps that out of the way without pretending it is shared.
+**Converting an Ansible repository?** A `roles/` entry used by several
+playbooks is a `lib.rs` function; an `include_tasks:` file used once is
+inlined into the playbook, in the order it ran. `include_tasks` split YAML
+because YAML got long; a Rust file does not have that problem.
 
 | where | what belongs there |
 |---|---|
@@ -582,7 +517,7 @@ Gathered once per host, before the first step.
 
 ```rust
 let f = ctx.facts();
-if f.package_manager == Pm::Apt { ... }
+if f.has_pm(&Pm::Apt) { ... }
 if f.distro == Distro::Alpine { ... }
 ensure!(f.is_root, "this playbook needs root");
 ```
@@ -595,26 +530,34 @@ ensure!(f.is_root, "this playbook needs root");
 | `arch` | `Arch` |
 | `kernel` | `String` |
 | `hostname` | `String` |
-| `package_manager` | `Pm` |
+| `package_managers` | `BTreeSet<Pm>` — every one found; ask with `f.has_pm(&Pm::Apt)` |
 | `init` | `Init` |
 | `cpus` | `u32` |
 | `memory_mb` | `u64` |
 | `user` | `String` — the process's user |
 | `is_root` | `bool` |
 
-The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude, and
-each ends in an `Other(String)` carrying whatever Rustible read and did not
-recognise — a tuple variant, so it is `Distro::Other(_)` in a pattern. Match
+The enums are `Os`, `Distro`, `Arch`, `Pm`, `Init`, all in the prelude. All
+but `Pm` end in an `Other(String)` carrying whatever Rustible read and did not
+recognise — a tuple variant, so it is `Distro::Other(_)` in a pattern; `Pm`
+has no `Other`, because "no manager Rustible knows" is the empty set. Match
 rather than comparing `distro_version` strings, and get the variant names from
 the source (see "Finding an operation" below):
 
 ```rust
-match &f.distro {
-    Distro::Debian | Distro::Ubuntu => { /* apt */ }
-    Distro::Alpine => { /* apk */ }
-    other => bail!("unsupported distribution: {other:?}"),
+match (&f.os, &f.distro) {
+    (Os::Linux, Distro::Debian | Distro::Ubuntu) => { /* apt */ }
+    (Os::Linux, Distro::Alpine) => { /* apk */ }
+    (Os::Macos, _) => { /* brew */ }
+    (os, distro) => bail!("unsupported platform: {} {distro:?}", os.name()),
 }
 ```
+
+**`package_managers` is a set**: every manager whose binary is found (a
+Debian box with Homebrew has both `Pm::Apt` and `Pm::Brew`; a mac without
+Homebrew has none). On a mac: `Distro::Macos`, `distro_version` from
+`SystemVersion.plist`, `Init::Launchd`, and `kernel`/`hostname`/`cpus`/
+`memory_mb` from `sysctl`.
 
 **There are no custom facts.** That list is all of them, and there is no
 `setup` module or local-facts directory. To answer anything else, ask the
@@ -777,7 +720,7 @@ cargo doc -p rustible-std --no-deps --open
 **3. [docs.rs/rustible-std](https://docs.rs/rustible-std/latest/rustible_std/)**,
 the same thing on the web.
 
-The modules carrying operations are `apt`, `archive`, `file`, `group`,
+The modules carrying operations are `apt`, `archive`, `brew`, `file`, `group`,
 `hostname`, `http`, `shell`, `ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
 you cannot get that way — which shape to reach for, and what bites — is the
 rest of this section.
@@ -823,7 +766,7 @@ content — return a builder that finishes by naming the second:
 | `file::Symlink` | `at(link)` | `.pointing_to(target)` |
 | `file::Line` | `in_path(file)` | `.set(line)` |
 | `file::Block` | `in_path(file)` | `.set(block)` |
-| `ssh::authorized_keys::*` | `for_user(&acct)` / `for_user_name(n)` | `.keys([..])` |
+| `ssh::authorized_keys::*` | `for_user(&acct)` / `for_user_name(n)` / `for_account(home, uid, gid)` / `in_file(path)` | `.keys([..])` |
 | `user::Membership` | `of(&acct)` / `of_name(n)` | `.in_group(&g)` / `.in_group_named(n)` |
 
 ⚠️ **The constructor is not always `new`.** `file::Directory`, `file::Absent`
@@ -857,9 +800,10 @@ file::Line::in_path("/etc/hosts").set("10.0.0.1 db")
 op to a variable and calling a method on it will not compile the way you
 expect.
 
-⚠️ **The apt operations take a list where most others take one name.**
-`apt::Present::new(["nginx"])` — with the brackets, even for a single package.
-`apt::Present::new("nginx")` does not compile. Every other constructor
+⚠️ **The apt and brew operations take a list where most others take one
+name.** `apt::Present::new(["nginx"])`, `brew::Present::new(["nethack"])` —
+with the brackets, even for a single package. `apt::Present::new("nginx")`
+does not compile. Every other constructor
 (`user::Present::new`, `systemd::Enabled::new`, `group::Present::new`,
 `hostname::Is::new`) takes a single name, which is exactly why the apt one
 catches people.
@@ -889,7 +833,7 @@ const CONF: &str = include_str!("../files/nginx.conf");
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let f = ctx.facts();
-    ensure!(f.package_manager == Pm::Apt, "{} is not apt-based", f.hostname);
+    ensure!(f.has_pm(&Pm::Apt), "{} is not apt-based", f.hostname);
 
     ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
 
@@ -1006,12 +950,26 @@ earlier step. `.groups([..])` is the **supplementary** list, and `.append(bool)`
 says whether it adds to the current set or replaces it. Both require the groups
 to exist already.
 
-**`apt` is the only package manager with operations.** `Pm::Dnf`, `Pm::Apk`
-and the rest exist as *facts* with nothing behind them, so guard:
+**`apt` and `brew` are the only package managers with operations.**
+`Pm::Dnf`, `Pm::Apk` and the rest exist as *facts* with nothing behind them,
+so guard — with `has_pm`, since a host can have several:
 
 ```rust
-ensure!(f.package_manager == Pm::Apt, "{} uses {:?}", f.hostname, f.package_manager);
+ensure!(f.has_pm(&Pm::Apt), "{} has {:?}", f.hostname, f.package_managers);
 ```
+
+**`brew` refuses root** (Homebrew does), so a playbook with `escalate = true`
+cannot use `brew::Present`/`Absent` directly: run it unescalated or use
+`ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
+It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
+
+**Every operation declares where it runs and refuses the rest by name.** On a
+mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
+`systemd::*` refuse (there `/etc/passwd` lists only system accounts and there
+is no `/proc`); `file::*`, `shell`, `http`, `archive` and `brew` run.
+`ssh::authorized_keys::Present::for_user_name(..)` refuses a mac because it
+reads `/etc/passwd`; `for_account(home, uid, gid)` runs. A platform Rustible
+does not know is refused by every op.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:
@@ -1292,7 +1250,7 @@ the whole shape of the real run, conditionals included.
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
 | ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
 | `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |
-| ``no `clang` on PATH, and this playbook has to be built for …`` | install clang on the controller (§3) |
+| `curl is missing and is needed to download zig …` | install `curl`, or set `RUSTIBLE_ZIG` to a zig already on the machine (§3) |
 | a host is absent from the run | the playbook's `hosts` does not match it; check `rustible inventory show <host>` |
 
 Useful first moves:

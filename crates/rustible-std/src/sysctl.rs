@@ -193,6 +193,23 @@ impl Op for Present {
     type Output = SysctlReport;
 
     fn check(&self, sys: &System) -> Result<Plan<SysctlReport>> {
+        // Until this gate existed, a mac only escaped by accident: the
+        // refusal was "/etc/sysctl.d does not exist", so creating that
+        // directory was enough to make `Present` write a file macOS never
+        // reads and report `changed`. Measured on macOS 26.3.
+        match sys.facts().os {
+            Os::Linux => {}
+            Os::Macos => bail!(
+                "sysctl::Present persists to /etc/sysctl.d and applies through /proc/sys, and \
+                 macOS has neither: it reads /etc/sysctl.conf at boot and applies values with \
+                 `sysctl -w`. Writing the Linux paths here produces a file nothing reads"
+            ),
+            ref other => bail!(
+                "sysctl::Present uses /etc/sysctl.d and /proc/sys, which rustible only \
+                 expects on Linux; this host is {}",
+                other.name()
+            ),
+        }
         if let Err(why) = validate_key(&self.key) {
             bail!("sysctl::Present: {why}");
         }
@@ -291,6 +308,33 @@ mod tests {
 
     fn sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// Facts for a mac: the platform each op in this file has to refuse.
+    fn macos(sys: System) -> System {
+        let mut facts = sys.facts().clone();
+        facts.os = Os::Macos;
+        facts.distro = Distro::Macos;
+        facts.package_managers = [Pm::Brew].into_iter().collect();
+        facts.init = Init::Launchd;
+        sys.with_facts(facts)
+    }
+
+    /// The old refusal was an accident of `/etc/sysctl.d` being absent:
+    /// creating that directory on a mac was enough to make `Present` write a
+    /// file nothing reads and report `changed`. Measured on macOS 26.3.
+    /// The gate must hold even when the directory is there.
+    #[test]
+    fn refuses_a_mac_even_with_the_linux_directory_present() {
+        let fake = Arc::new(Fake::new().with_dir("/etc/sysctl.d"));
+        let s = macos(sys(&fake));
+        let err = Present::new("kern.maxfiles", "49152")
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("sysctl::Present"), "{err}");
+        assert!(err.contains("/etc/sysctl.conf"), "{err}");
+        assert!(fake.content("/etc/sysctl.d/99-rustible.conf").is_none());
     }
 
     /// A box with `/etc/sysctl.d`, the drop-in holding `text` (or absent), and
