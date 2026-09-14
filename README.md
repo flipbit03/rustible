@@ -47,8 +47,8 @@ readable runs — and changes what does not.
 | YAML tasks, Jinja templates | Rust functions, the compiler |
 | `when:` strings | `if` |
 | handlers and `notify` | `if step.changed { ... }` |
-| loops with `item` | just use `for` |
-| `register` + `set_fact` | the value the step returns |
+| loops with `item` | just use `for` :-) |
+| `register` + `set_fact` | just use the value the step returns |
 | Python on every target | one static binary, nothing preinstalled |
 
 ## Supported platforms
@@ -61,10 +61,10 @@ Rustible runs **from** a controller and manages **targets**.
 | **Controller** — macOS | yes (Intel) | yes (Apple silicon) |
 | **Target** — Linux, any libc | yes | yes |
 | **Target** — macOS | yes (basic support) | yes (basic support) |
-| **Target** — Windows, BSD | no | no |
+| **Target** — BSD | not yet (planned) | not yet (planned) |
+| **Target** — Windows | nope | no way |
 
-Targets need nothing installed. A Linux playbook arrives as one static musl
-binary; a macOS one as a Mach-O linked against nothing but `libSystem`.
+Targets need nothing installed. A playbook arrives on the target machine as one static binary, that's it.
 
 ## Install
 
@@ -74,18 +74,16 @@ cargo install rustible-cli
 
 On the machine you run `rustible` from (the controller) you need:
 
-- rustup
+- rustup (https://rustup.rs/)
 - a C compiler (`cc`, `gcc` or `clang`)
 - `curl`
 
-zig (which cross-compiles playbooks for the target architectures) is installed
-automatically into `~/.cache/rustible` if it is not already present. The
-machines you manage (the targets) need nothing.
+Rustible also uses zig (for playbook cross-compilation), but it is installed automatically if not already present.
+
 
 ## Point your agent at this
 
-Rustible is new, so an AI agent has no prior knowledge of it. Give it this and
-it can create a workspace, write playbooks, manage an inventory and run them:
+Rustible is new, so LLMs have no prior knowledge of it. Paste this into your coding agent's session for a quick bootstrap:
 
 ```
 Rustible is a Rust-based replacement for Ansible. Read
@@ -93,11 +91,6 @@ https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md
 to understand how to write playbooks and operate it, then help me with my
 infrastructure.
 ```
-
-[`docs/USING_RUSTIBLE.md`](docs/USING_RUSTIBLE.md) is written for a reader
-with no exposure to Rustible: the workspace layout, the CLI, the inventory,
-the playbook API, every operation, and the traps that catch people who expect
-Ansible.
 
 ## Five minutes
 
@@ -108,13 +101,13 @@ rustible playbook create playbooks/hello.rs  # a scaffolded playbook targeting t
 ```
 
 Describe your machines in `hosts.kdl` ([KDL format](docs/HOSTS_KDL_REFERENCE.md)).
-`init` starts you with this machine:
+`rustible init` starts you with your local machine only:
 
 ```kdl
 host "local" connection="local"
 ```
 
-and a real fleet looks like:
+and here's a more fleshed out example of a `hosts.kdl` file:
 
 ```kdl
 defaults ssh_user="cadu" escalate="sudo"
@@ -123,7 +116,7 @@ group "web" {
     vars { nginx_workers 4 }
     host "web1" addr="10.0.1.11"
     host "web2" addr="10.0.1.12" {
-        // host beats group
+        // host variable override
         vars { nginx_workers 8 }
     }
 }
@@ -183,8 +176,7 @@ overrides the inventory.
 
 ## The model
 
-- **One verb.** `ctx.step(name, op)` runs everything. There is no separate
-  "task" and "command" API.
+- **One verb.** `ctx.step(name, op)` to run operations on a target machine.
 - **Ops are desired state, named for it.** `apt::Present`, `apt::Absent`,
   `systemd::Enabled`, `user::Present`. Things that are genuinely actions get
   verbs and always report changed: `systemd::Restart`, `shell::Command`.
@@ -200,10 +192,9 @@ overrides the inventory.
 
 ## Operations and collections
 
-An operation is one desired state: `apt::Present`, `systemd::Enabled`,
-`user::Absent`. A **collection** is a library of them — an ordinary Rust crate
-that depends on `rustible-sdk` and implements its `Op` trait. You add one with
-`cargo add`. There is no galaxy, no roles directory, no path search order.
+A Rustible Operation (Op) is one desired state: `apt::Present`, `systemd::Enabled`,
+`user::Absent`. A **Rustible collection** is a library of them — an ordinary Rust crate that depends on `rustible-sdk`. You add one with
+`cargo add`. Contrasting with Ansible, there is no "galaxy" - it's just crates.
 
 Two collections ship from this repository.
 
