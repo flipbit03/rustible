@@ -91,6 +91,15 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
 - **Release names are exactly `vX.Y.Z`.** No description, no suffix, no
   "v0.1.0 — the streaming release". The tag and the release title are the
   version and nothing else.
+- **This repository is communal: it names no personal machine.** Not the
+  employer's, not your own, and not under a pseudonym — a renamed host still
+  points at hardware nobody else can reach. A tracked inventory names hosts
+  that cannot resolve (RFC 5737 / RFC 1918 documentation addresses), and the
+  suite enforces it: `example_workspace_inventory_loads` fails if a host in
+  `examples/workspace/hosts.kdl` gains a routable address. Test fixtures are
+  the easy ones to forget, and the ones that matter most — they ship to
+  crates.io. Real machines belong in an untracked file passed with
+  `--inventory`, the way `dev/vagrant/hosts.vagrant.kdl` works.
 - **Never force-push.**
 - **SSH for git.** The remote is `git@github.com:flipbit03/rustible.git`.
 - **Never write a `claude.ai` session URL anywhere** — not in a commit message

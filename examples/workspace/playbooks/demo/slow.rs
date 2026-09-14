@@ -9,7 +9,7 @@
 use rustible::prelude::*;
 use rustible_std::shell;
 
-#[rustible::playbook(hosts = "lab")]
+#[rustible::playbook(hosts = "vagrant")]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let f = ctx.local_file("hosts.kdl")?;
     ctx.log(format!("streamed hosts.kdl to {}", f.display()));

@@ -20,7 +20,7 @@ build scripts\" or any cargo command in a terminal.";
 #[derive(Args, Debug)]
 pub struct CreateArgs {
     /// File to create, normally under `playbooks/`, e.g.
-    /// `playbooks/cadu/ssh_enable_root_user.rs`. Missing directories are
+    /// `playbooks/demo/ssh_enable_root_user.rs`. Missing directories are
     /// created; `.rs` is added when absent.
     pub path: PathBuf,
 }
@@ -140,8 +140,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::write(root.join("rustible.toml"), "").unwrap();
-        let (name, warn) = playbook_name(&root.join("playbooks/cadu/x.rs")).unwrap();
-        assert_eq!(name, "cadu/x");
+        let (name, warn) = playbook_name(&root.join("playbooks/demo/x.rs")).unwrap();
+        assert_eq!(name, "demo/x");
         assert!(warn.is_none());
 
         let (name, warn) = playbook_name(&root.join("src/x.rs")).unwrap();

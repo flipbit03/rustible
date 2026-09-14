@@ -359,7 +359,7 @@ one under `qemu-aarch64-static`.
 ### 3. A real playbook, both architectures, through the CLI
 
 A generated workspace, an inventory of `local` and `arm`
-(`cadu@cadu-cogram-vm-arm`), and a playbook that downloads a file over HTTPS.
+(the aarch64 ARM VM), and a playbook that downloads a file over HTTPS.
 With clang on `PATH`:
 
 ```

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// One playbook file found under `playbooks/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// Path under `playbooks/` without the extension, `/`-separated: `cadu/mc`.
+    /// Path under `playbooks/` without the extension, `/`-separated: `demo/mc`.
     pub name: String,
     /// Absolute path of the file.
     pub path: PathBuf,
@@ -445,20 +445,20 @@ mod tests {
     #[test]
     fn render_emits_path_modules_and_registry() {
         let d = Discovered {
-            name: "cadu/mc".into(),
-            path: "/abs/playbooks/cadu/mc.rs".into(),
+            name: "demo/mc".into(),
+            path: "/abs/playbooks/demo/mc.rs".into(),
         };
         let code = render(&[d]);
-        let ident = module_ident("cadu/mc");
+        let ident = module_ident("demo/mc");
         assert!(
             code.contains(&format!(
-                "#[path = \"/abs/playbooks/cadu/mc.rs\"]\npub mod {ident};"
+                "#[path = \"/abs/playbooks/demo/mc.rs\"]\npub mod {ident};"
             )),
             "{code}"
         );
         assert!(
             code.contains(&format!(
-                "Named {{ name: \"cadu/mc\", playbook: &{ident}::__RUSTIBLE_PLAYBOOK }}"
+                "Named {{ name: \"demo/mc\", playbook: &{ident}::__RUSTIBLE_PLAYBOOK }}"
             )),
             "{code}"
         );

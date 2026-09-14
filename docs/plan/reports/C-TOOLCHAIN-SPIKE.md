@@ -3,8 +3,7 @@
 Spike, 2026-09-08. Follow-up to `TLS-OPTIONS.md`, prompted by `github::UserKeys`
 failing on `outpost.flipbit03.com` because graviola aborts on a CPU without `adx`.
 
-Everything below was measured on `cadu-cogram-vm-x86` (Ubuntu 24.04, x86_64,
-16 cores) by compiling and running. Where I inferred rather than demonstrated, it
+Everything below was measured on an x86_64 Ubuntu 24.04 host (16 cores) by compiling and running. Where I inferred rather than demonstrated, it
 says so in the line.
 
 ---
@@ -87,7 +86,7 @@ rustc resolves the name itself.
 ### Is clang on the mac?
 
 **Not established.** `cadu@cadumac.local` timed out on port 22, and no `cadumac`
-appears in `tailscale status` (the sibling `cadu-cogram-vm-arm` is listed but
+appears in `tailscale status` (the sibling aarch64 host is listed but
 offline, last seen 7 minutes before the check). Inferred: macOS Command Line
 Tools ship clang and the macOS SDK, so the aarch64 case would work there
 unchanged. The x86_64 case would need the vendored musl headers, because a mac's

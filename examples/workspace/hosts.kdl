@@ -50,19 +50,20 @@ group "monitored" {
     vars { nginx_workers 2 }
 }
 
-// The machines the unattended build runs against: this VM and the ARM VM.
-// `playbooks/cadu/mc.rs` targets this group and needs `package`.
-group "lab" {
-    vars { package "mc" }
-    host "local" connection="local"
-    host "arm" addr="cadu-cogram-vm-arm" ssh_user="cadu"
-}
-
-// `playbooks/vagrant.rs` targets a group named "vagrant", which is not here:
+// Every host above is fictional, and that is deliberate: this file is read by
+// everyone who clones the repository, so it names nobody's machines. The one
+// host that does anything is `laptop`, which is this machine by way of
+// `connection="local"`.
+//
+// The playbooks that need a real target -- `vagrant.rs` and everything under
+// `playbooks/demo/` -- target a group named "vagrant", which is not here.
 // `dev/vagrant/Vagrantfile` writes it to `dev/vagrant/hosts.vagrant.kdl` on
-// `vagrant up`, naming the key path and address of that developer's machines.
-// That file is a complete inventory and is used instead of this one:
+// `vagrant up`, naming the key path and address of the guests on the machine
+// it ran on. That file is a complete inventory and is used instead of this
+// one:
 //
-//     make vm-test
+//     make vm-up && make vm-test
 //
-// which is `rustible --inventory dev/vagrant/hosts.vagrant.kdl ...`.
+// which is `rustible --inventory dev/vagrant/hosts.vagrant.kdl ...`. To run
+// the demo playbooks against hardware of your own, write an inventory like it
+// and pass `--inventory`; do not add the addresses here.

@@ -41,7 +41,7 @@ use crate::workspace::Workspace;
 
 #[derive(clap::Args, Debug)]
 pub struct RunArgs {
-    /// Playbook file (`playbooks/cadu/mc.rs`) or name (`cadu/mc`).
+    /// Playbook file (`playbooks/demo/mc.rs`) or name (`demo/mc`).
     pub playbook: String,
     /// Dry run: report what would change, change nothing.
     #[arg(long)]
@@ -978,7 +978,7 @@ vars { fruit "banana" }
 group "lab" {
     vars { package "mc" }
     host "local" connection="local"
-    host "arm" addr="cadu-cogram-vm-arm" port=2222 escalate="doas" escalate_user="admin"
+    host "arm" addr="10.0.3.11" port=2222 escalate="doas" escalate_user="admin"
 }
 host "solo" addr="10.0.0.9"
 "#;
@@ -989,7 +989,7 @@ host "solo" addr="10.0.0.9"
 
     #[test]
     fn escalation_argv() {
-        let bin = "/home/cadu/.cache/rustible/bin/cadu_mc-abc";
+        let bin = "/home/cadu/.cache/rustible/bin/demo_mc-abc";
         assert_eq!(
             exec_argv(bin, false, Escalate::Sudo, "root"),
             [bin, "--remote"]
@@ -1041,8 +1041,8 @@ host "solo" addr="10.0.0.9"
     #[test]
     fn remote_path_is_absolute_and_flat() {
         assert_eq!(
-            remote_path("/home/cadu", "cadu/mc", "abc"),
-            "/home/cadu/.cache/rustible/bin/cadu_mc-abc"
+            remote_path("/home/cadu", "demo/mc", "abc"),
+            "/home/cadu/.cache/rustible/bin/demo_mc-abc"
         );
         assert_eq!(
             remote_path("/root/", "hello", "1"),
@@ -1085,7 +1085,7 @@ host "solo" addr="10.0.0.9"
         assert_eq!(
             arm,
             SshTarget {
-                addr: "cadu-cogram-vm-arm".into(),
+                addr: "10.0.3.11".into(),
                 user: Some("cadu".into()),
                 port: Some(2222),
                 args: vec![],

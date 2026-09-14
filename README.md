@@ -166,7 +166,7 @@ struct Vars {
     update_cache: bool,
 }
 
-#[rustible::playbook(hosts = "lab", vars = Vars, escalate = true)]
+#[rustible::playbook(hosts = "vagrant", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { /* ... */ }
 ```
 

@@ -13,7 +13,7 @@ struct Vars {
     secret: String,
 }
 
-#[rustible::playbook(hosts = "lab", vars = Vars)]
+#[rustible::playbook(hosts = "vagrant", vars = Vars)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     let path = ctx.local_file(&vars.file)?;
     let sum = ctx.sys().cmd("sha256sum").arg(path.to_string_lossy()).run()?;

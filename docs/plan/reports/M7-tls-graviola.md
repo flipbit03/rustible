@@ -132,7 +132,7 @@ Both were run against `https://github.com/flipbit03.keys` for a genuine TLS 1.3
 handshake, not just built:
 
 - the x86_64 binary on this VM: `status 200 keys 4`
-- the aarch64 binary on `cadu@cadu-cogram-vm-arm`: `status 200 keys 4`
+- the aarch64 binary on the ARM VM: `status 200 keys 4`
 
 The ARM run was not asked for and is worth having: it is the only end-to-end
 exercise of the aarch64 detection path, on a machine whose `Features` line

@@ -5,7 +5,7 @@
 use rustible::prelude::*;
 use rustible_std::file;
 
-#[rustible::playbook(hosts = "lab")]
+#[rustible::playbook(hosts = "vagrant")]
 fn main(ctx: &mut Ctx) -> Result<()> {
     let f = ctx.facts();
     ensure!(!f.is_root, "run this playbook unescalated; it escalates per step");

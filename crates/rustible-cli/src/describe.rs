@@ -447,8 +447,8 @@ mod tests {
 
     #[test]
     fn cache_path_shape() {
-        let p = cache_path(Path::new("/ws/.rustible"), "cadu/mc", "abc");
-        assert_eq!(p, PathBuf::from("/ws/.rustible/describe/cadu/mc-abc.json"));
+        let p = cache_path(Path::new("/ws/.rustible"), "demo/mc", "abc");
+        assert_eq!(p, PathBuf::from("/ws/.rustible/describe/demo/mc-abc.json"));
     }
 
     #[test]
@@ -456,7 +456,7 @@ mod tests {
         let doc: DescribeDoc = serde_json::from_str(
             r#"{"protocol": 2, "playbooks": [
                 {"name": "hello", "hosts": "local", "escalate": false, "vars_schema": null},
-                {"name": "cadu/mc", "hosts": "lab", "escalate": true,
+                {"name": "demo/mc", "hosts": "lab", "escalate": true,
                  "vars_schema": {"type": "object", "properties": {"package": {"type": "string"}}, "required": ["package"]}}
             ]}"#,
         )

@@ -623,16 +623,13 @@ arm      0        1             0        0       0         0
     #[test]
     fn orchestrator_failures_and_missing_summaries_fail_the_run() {
         let out = render(0, |r| {
-            r.failed("arm", "ssh to cadu-cogram-vm-arm: Connection timed out");
+            r.failed("arm", "ssh to 10.0.3.11: Connection timed out");
             r.event("local", &Event::Finished(Summary::default()));
             r.exited("local", 0);
             assert!(r.finish());
         });
-        assert!(out.contains("[arm  ]  FAILED: ssh to cadu-cogram-vm-arm: Connection timed out\n"));
-        assert!(
-            out.contains("arm    failed: ssh to cadu-cogram-vm-arm"),
-            "{out}"
-        );
+        assert!(out.contains("[arm  ]  FAILED: ssh to 10.0.3.11: Connection timed out\n"));
+        assert!(out.contains("arm    failed: ssh to 10.0.3.11"), "{out}");
 
         let out = render(0, |r| {
             r.exited("local", 101);

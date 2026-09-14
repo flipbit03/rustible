@@ -813,14 +813,27 @@ fn example_workspace_inventory_loads() {
         "/../../examples/workspace/hosts.kdl"
     ))
     .unwrap();
-    assert_eq!(inv.select("lab").unwrap().len(), 2);
-    let arm = inv.resolve("arm").unwrap();
-    assert_eq!(arm.params.addr.as_deref(), Some("cadu-cogram-vm-arm"));
-    assert_eq!(arm.params.ssh_user, "cadu");
-    let local = inv.resolve("local").unwrap();
-    assert_eq!(local.params.connection, Connection::Local);
-    assert_eq!(local.groups, ["lab"]);
+    // The one host that resolves to real hardware is `laptop`, and it resolves
+    // to *this* machine. Everything else in that file is fictional on purpose:
+    // it is read by everyone who clones the repository, so it names nobody's
+    // machines, and the playbooks that need a real target take one from
+    // `--inventory` instead.
+    let laptop = inv.resolve("laptop").unwrap();
+    assert_eq!(laptop.params.connection, Connection::Local);
     assert!(inv.resolve("web2").is_ok());
+    assert_eq!(inv.select("web").unwrap().len(), 2);
+
+    // No group in the example inventory may carry an address that could route
+    // anywhere. Documentation ranges only (RFC 5737 and RFC 1918), which is
+    // what stops a personal machine being reintroduced by a later edit.
+    for name in ["web1", "web2", "db1", "db2"] {
+        let h = inv.resolve(name).unwrap();
+        let addr = h.params.addr.as_deref().unwrap_or_default();
+        assert!(
+            addr.starts_with("10.0."),
+            "{name} has addr `{addr}`: the example inventory names no real host"
+        );
+    }
 }
 
 #[test]

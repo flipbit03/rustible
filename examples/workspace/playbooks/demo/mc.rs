@@ -6,18 +6,20 @@ use std::time::Duration;
 use rustible::prelude::*;
 use rustible_std::apt;
 
-mod helpers; // sibling file: playbooks/cadu/helpers.rs (vision doc section 9)
+mod helpers; // sibling file: playbooks/demo/helpers.rs (vision doc section 9)
 
 #[rustible::vars]
 struct Vars {
-    /// The apt package to ensure.
+    /// The apt package to ensure. Defaulted, so the playbook runs against the
+    /// Vagrant guests without the inventory having to carry a var for it.
+    #[default = "mc"]
     package: String,
     /// Run `apt-get update` first (always, not by list age) when installing.
     #[default = false]
     update_cache: bool,
 }
 
-#[rustible::playbook(hosts = "lab", vars = Vars, escalate = true)]
+#[rustible::playbook(hosts = "vagrant", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     let f = ctx.facts();
     ensure!(f.has_pm(&Pm::Apt), "this playbook needs apt; {} has {:?}", f.hostname, f.package_managers);

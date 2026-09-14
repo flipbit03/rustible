@@ -27,7 +27,7 @@ command, 345 ms warm.
   through the `openssh` crate (system `ssh`, ControlMaster).
 
 ```
-cargo run -p rustible -- --bin mc --host local --host cadu@cadu-cogram-vm-arm --escalate [--check] [-v]
+cargo run -p rustible -- --bin mc --host local --host user@arm-host --escalate [--check] [-v]
 ```
 
 ## The pipeline as run

@@ -1,4 +1,4 @@
-//! Helper module for `cadu/mc.rs`. Not a playbook: no `#[rustible::playbook]`.
+//! Helper module for `demo/mc.rs`. Not a playbook: no `#[rustible::playbook]`.
 
 use rustible::sdk::Applied;
 use rustible_std::apt::InstallReport;

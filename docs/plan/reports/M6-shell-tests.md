@@ -351,7 +351,7 @@ hangs.
 ## Not verified
 
 - **ARM.** Everything above ran on the x86 VM only. The images are
-  multi-arch, so the tests should run on `cadu-cogram-vm-arm` unchanged, but
+  multi-arch, so the tests should run on an aarch64 host unchanged, but
   nobody has run them there.
 - **`shell::Command` over SSH.** The stdin-from-a-thread fix is in
   `Local::spawn`. The remote transport has its own path, and no container test

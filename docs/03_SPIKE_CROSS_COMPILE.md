@@ -8,7 +8,7 @@ with the stock rustup toolchain. No zig, no distro cross-compiler, no Docker.
 ## Setup
 
 - Host: x86_64 Ubuntu 24.04, rustc 1.97.1.
-- Target: `cadu-cogram-vm-arm` (Ubuntu 24.04, aarch64, glibc 2.39), reached
+- Target: an aarch64 Ubuntu 24.04 host (glibc 2.39), reached
   over Tailscale with passwordless SSH as `cadu`.
 - The spike playbook from spike 3 (`crates/spike-playbook`), unchanged.
 
