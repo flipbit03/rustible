@@ -32,7 +32,7 @@ Sizes: 1261 lines across five modules, of which roughly half is tests.
 
 ## Verification
 
-Everything in `docs/plan/logs/M6-github-done.txt`, run twice: once on the
+Everything in the done-when transcript (removed), run twice: once on the
 branch as committed, then again after `git merge main`. All commands exit 0.
 
 | Command | Result |

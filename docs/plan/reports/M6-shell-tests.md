@@ -249,7 +249,7 @@ All four gates and the whole container suite, twice: on the merge of `main`
 that brought the M3 CLI and the M7 CI workflows, and again on the second merge
 that brought the `rustible-github` collection. That second merge conflicted in
 `DECISIONS.md`, where both sides had appended a block; both blocks are kept.
-Output in `docs/plan/logs/M6-shell-tests-done.txt`.
+Output in the done-when transcript (removed).
 
 | gate | result |
 |---|---|

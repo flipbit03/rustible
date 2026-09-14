@@ -195,7 +195,7 @@ untouched.
 
 ## Verification
 
-`docs/plan/logs/M7-amendments-done.txt`. Every command exited 0.
+the done-when transcript (removed). Every command exited 0.
 
 | command | result |
 |---|---|

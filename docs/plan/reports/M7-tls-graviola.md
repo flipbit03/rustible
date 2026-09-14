@@ -236,7 +236,7 @@ tight. Worth revisiting if a third collection appears.
 
 ## Verification
 
-Everything below is in `docs/plan/logs/M7-tls-graviola-done.txt`, run twice:
+Everything below is in the done-when transcript (removed), run twice:
 once on the merged tree and once again after the review fix. All green both
 times.
 

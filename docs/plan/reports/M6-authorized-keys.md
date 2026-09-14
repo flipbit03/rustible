@@ -4,7 +4,7 @@
 (resumed once after a rate-limit interruption). **Brief:** the
 `ssh::authorized_keys` row of `docs/plan/M6.md` plus the wave-one template in
 `docs/06_BUILD_PLAN.md` section 4.
-**Done-when log:** `docs/plan/logs/M6-authorized-keys-done.txt`.
+**Done-when log:** removed on 2026-09-14 with the rest of `docs/plan/logs/`; those were raw terminal transcripts of one developer's machines, and this report is the part that was meant to outlive them. See `docs/plan/DECISIONS.md`.
 
 ## What was built
 
@@ -65,7 +65,7 @@ ctx.log(format!("+{} -{} keys in {}", r.added.len(), r.removed.len(), r.path.dis
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
   warnings`, `cargo test --workspace`: clean.
 - `cargo test -p rustible-std ssh`: 33 tests, output in
-  `docs/plan/logs/M6-authorized-keys-done.txt`. Pure tests: plain key,
+  the done-when transcript (removed). Pure tests: plain key,
   no comment and extra spaces, options field with quoted spaces and escapes,
   cert and `sk-` types, non-keys, identity ignoring comment and options;
   `plan_present` on an empty file, satisfied, matching by identity with a

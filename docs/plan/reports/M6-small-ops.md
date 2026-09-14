@@ -4,7 +4,7 @@
 **Brief:** the `apt`, `hostname` and `sysctl` rows of `docs/plan/M6.md` plus
 the wave-one template in `docs/06_BUILD_PLAN.md` section 4; governing vision
 sections 6.2, 6.3, 6.7, 6.8, 7, 8, 12, 13.
-**Done-when log:** `docs/plan/logs/M6-small-ops-done.txt`.
+**Done-when log:** removed on 2026-09-14 with the rest of `docs/plan/logs/`; those were raw terminal transcripts of one developer's machines, and this report is the part that was meant to outlive them. See `docs/plan/DECISIONS.md`.
 **Tests:** 67 in the three modules (63 new; the four pre-existing
 `apt::Present` tests stay, one adjusted to assert that no `stat` or
 `apt-get update` runs without `update_cache`).

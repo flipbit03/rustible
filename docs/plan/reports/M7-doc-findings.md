@@ -202,7 +202,7 @@ is the reword experiment.
 
 ## Verification
 
-Full output in `docs/plan/logs/M7-doc-findings-done.txt`. All commands exit 0.
+Full output in the done-when transcript (removed). All commands exit 0.
 
 | Command | Result |
 |---|---|

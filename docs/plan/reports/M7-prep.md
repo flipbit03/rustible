@@ -55,7 +55,7 @@ of `rustible playbook run` invocations that only M3 makes real.
 
 ## Verified
 
-Log: `docs/plan/logs/M7-prep-done.txt`.
+Log: the done-when transcript (removed).
 
 - All seven publishable crates package cleanly (`cargo package --no-verify
   --allow-dirty`), which is as close to a publish as the hard limits allow;

@@ -3,7 +3,7 @@
 **Branch:** `m6-user-group`. **Run:** unattended run 1, 2026-09-08 (subagent).
 **Brief:** the `user` and `group` rows of `docs/plan/M6.md` plus the wave-one
 template in `docs/06_BUILD_PLAN.md` section 4 and the lead's op brief.
-**Done-when log:** `docs/plan/logs/M6-user-group-done.txt`.
+**Done-when log:** removed on 2026-09-14 with the rest of `docs/plan/logs/`; those were raw terminal transcripts of one developer's machines, and this report is the part that was meant to outlive them. See `docs/plan/DECISIONS.md`.
 
 ## What was built
 

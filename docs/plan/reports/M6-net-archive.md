@@ -10,7 +10,7 @@ C), 6.2, 6.3, 6.4, 6.7 (one op, one job), 6.9, 7 (System), 8 (testing), 12
 `crates/rustible-std/tests/it_archive_extracted.rs` (new),
 `crates/rustible-std/fixtures/archive/hello.tar{,.gz,.xz,.zst}` (new),
 `Cargo.toml`, `crates/rustible-std/Cargo.toml`, `Cargo.lock`,
-`docs/plan/DECISIONS.md`, `docs/plan/logs/M6-net-archive-done.txt`.
+`docs/plan/DECISIONS.md`, the done-when transcript (removed).
 No SDK changes.
 
 ## What was built
@@ -119,7 +119,7 @@ gate was re-run after each merge:
    conflict, both sides kept.
 
 The table is the last run, at merge commit `1e3d624`. Full output is in
-`docs/plan/logs/M6-net-archive-done.txt`, which has seven UTC-stamped
+the done-when transcript (removed), which has seven UTC-stamped
 sections: the pre-merge run at `01623e5`, one after each of the five merges,
 and one after the review fixes.
 

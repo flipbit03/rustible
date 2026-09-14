@@ -569,7 +569,7 @@ pure Rust is still true of the binary it produces.
 
 ## Verification
 
-All in `docs/plan/logs/M7-tls-ring-done.txt`.
+All in the done-when transcript (removed).
 
 | command | result |
 |---|---|

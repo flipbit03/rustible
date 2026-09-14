@@ -3,7 +3,7 @@
 **Branch:** `m6-systemd`. **Governing sections:** vision 6.2, 6.3, 6.4, 6.7,
 6.8 (systemd translation), 6.9, 7, 8, 12, 13. **Files:**
 `crates/rustible-std/src/systemd.rs` (new), `crates/rustible-std/src/lib.rs`
-(one `pub mod` line), `docs/plan/DECISIONS.md`, `docs/plan/logs/M6-systemd-done.txt`, `crates/rustible-std/tests/it_systemd.rs` (new).
+(one `pub mod` line), `docs/plan/DECISIONS.md`, the done-when transcript (removed), `crates/rustible-std/tests/it_systemd.rs` (new).
 No new dependencies, no SDK changes.
 
 ## What was built, per op
@@ -111,7 +111,7 @@ Recorded in `docs/plan/DECISIONS.md` under `[M6-sd]`:
   warnings`, `cargo test --workspace`: clean (one doctest fixed on the way:
   a doctest fn cannot be called `main`).
 - `cargo test -p rustible-std systemd`: 40 tests, saved in
-  `docs/plan/logs/M6-systemd-done.txt`. Seven pure-parsing tests (every
+  the done-when transcript (removed). Seven pure-parsing tests (every
   documented `is-enabled` / `is-active` word, `disabled` with exit 1,
   `inactive`/`failed` with exit 3, `inactive` with exit 4, empty stdout with
   and without an exit code, unknown words), the rest `Fake`-backend: per op
