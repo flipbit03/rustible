@@ -445,6 +445,15 @@ impl Inventory {
                     }
                     put(k, v, Source::Group(g.clone()), &mut vars, &mut sources);
                 }
+                // All seven names, `addr` included, though `addr` can never
+                // produce a conflict here: it is refused on a group at parse
+                // time (`parse.rs`'s `"addr"` arm, asserted by
+                // `tests::errors_are_collected_not_first_only`), so `is_set`
+                // cannot be true for it on a group's params. The loop stays
+                // general
+                // rather than special-casing the name, so that a later
+                // decision to allow `addr` on a group gets conflict
+                // detection for free instead of silently losing it.
                 for name in HostParams::NAMES {
                     let is_set = param_is_set(name);
                     if !is_set(&grp.params) {

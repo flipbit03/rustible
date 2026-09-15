@@ -553,6 +553,7 @@ arm      0        1             0        0       0         0
                     "nginx".into(),
                 ],
                 status: 100,
+                signal: None,
                 stderr: "E: Unable to locate package nginx\n".into(),
             }),
         };

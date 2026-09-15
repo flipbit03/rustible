@@ -13,7 +13,7 @@ mod local;
 pub use elevated::{
     Elevated, HelperOp, HelperRequest, HelperResponse, Spawner, helper_argv, serve_helper,
 };
-pub use fake::Fake;
+pub use fake::{Fake, FakeFile};
 pub use local::Local;
 
 /// What one path looks like on the target: the part of `stat(2)` the ops
@@ -104,8 +104,14 @@ impl CmdSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     /// The exit code, or `-1` when the child was killed by a signal and had
-    /// none.
+    /// none — in which case [`Output::signal`] names it, so `-1` here is
+    /// never ambiguous with a command that genuinely exited `-1`.
     pub status: i32,
+    /// The signal that killed the child, when one did. `None` for a process
+    /// that exited on its own, whatever its code. Defaulted on deserialize,
+    /// so a frame from an older peer that does not carry it still parses.
+    #[serde(default)]
+    pub signal: Option<i32>,
     /// Everything the command wrote to stdout, captured whole rather than
     /// streamed.
     #[serde(with = "crate::protocol::b64")]
