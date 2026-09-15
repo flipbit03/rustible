@@ -1,0 +1,35 @@
+[package]
+name = "rustible-std"
+description = "Rustible standard operations"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+rustible-sdk.workspace = true
+regex.workspace = true
+serde.workspace = true
+# http::Download, and the `tls` module both it and `rustible-github` use.
+# The direct `rustls` entry stays: `tls` names `rustls::crypto::CryptoProvider`
+# and reaches the `ring` provider through rustls's own `ring` feature, so there
+# is no separate `ring` entry to keep in step with rustls's.
+ureq.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+# archive::Extracted
+tar.workspace = true
+flate2.workspace = true
+lzma-rust2.workspace = true
+ruzstd.workspace = true
+
+[dev-dependencies]
+# For `#[rustible::integration_test]` in tests/. Path-only on purpose: cargo
+# strips a path-only dev-dependency at publish, so there is no
+# rustible -> rustible-std -> rustible cycle on crates.io (same as
+# rustible-macros).
+rustible = { path = "../rustible" }

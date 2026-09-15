@@ -1,0 +1,12 @@
+# The repository's own cross-linking, for the container-tier musl test
+# binaries: pure-Rust crates link with the bundled rust-lld and the
+# self-contained musl crt that rustup ships. Playbook builds do not read this;
+# they go through zig (`crates/rustible-cli/src/zig.rs`).
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "link-self-contained=yes"]

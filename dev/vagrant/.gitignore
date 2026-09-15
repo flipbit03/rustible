@@ -1,0 +1,4 @@
+# Vagrant's own per-machine state, and the inventory the Vagrantfile
+# generates from it: both name absolute paths on one developer's disk.
+.vagrant/
+hosts.vagrant.kdl

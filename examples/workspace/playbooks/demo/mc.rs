@@ -1,0 +1,38 @@
+//! On an apt-based host, ensure a package (Midnight Commander by default) is
+//! installed. Needs root, so the attribute says `escalate = true`.
+
+use std::time::Duration;
+
+use rustible::prelude::*;
+use rustible_std::apt;
+
+mod helpers; // sibling file: playbooks/demo/helpers.rs (vision doc section 9)
+
+#[rustible::vars]
+struct Vars {
+    /// The apt package to ensure. Defaulted, so the playbook runs against the
+    /// Vagrant guests without the inventory having to carry a var for it.
+    #[default = "mc"]
+    package: String,
+    /// Run `apt-get update` first (always, not by list age) when installing.
+    #[default = false]
+    update_cache: bool,
+}
+
+#[rustible::playbook(hosts = "vagrant", vars = Vars, escalate = true)]
+fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
+    let f = ctx.facts();
+    ensure!(f.has_pm(&Pm::Apt), "this playbook needs apt; {} has {:?}", f.hostname, f.package_managers);
+    ensure!(f.is_root, "this playbook needs root (escalate)");
+
+    let name = format!("{} present", vars.package);
+    let mut present = apt::Present::new([vars.package.as_str()]);
+    if vars.update_cache {
+        // `update_cache` takes the age at which the apt lists count as stale;
+        // ZERO means "always refresh before installing".
+        present = present.update_cache(Duration::ZERO);
+    }
+    let pkg = ctx.step(name, present)?;
+    ctx.log(helpers::describe(&pkg));
+    Ok(())
+}

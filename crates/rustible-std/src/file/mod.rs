@@ -1,0 +1,345 @@
+//! File operations: the Rustible side of Ansible's `copy`, `file`,
+//! `lineinfile` and `blockinfile` modules. One type per desired state
+//! (vision 6.3):
+//!
+//! | Ansible | Rustible |
+//! |---|---|
+//! | `copy` (with `src` or `content`) | [`struct@Copy`] |
+//! | `file: state=directory` | [`Directory`] |
+//! | `file: state=link` | [`Symlink`] |
+//! | `file: state=absent` | [`Absent`] |
+//! | `file: state=file` (attributes only) | [`Attrs`] |
+//! | `lineinfile: state=present` | [`Line`] |
+//! | `blockinfile` | [`Block`] |
+//!
+//! All I/O goes through [`System`] (vision 7). Every op predicts its output
+//! so chained steps keep working in check mode (vision 12).
+
+use std::path::Path;
+
+use regex::Regex;
+use rustible_sdk::backend::Stat;
+use rustible_sdk::prelude::*;
+
+mod absent;
+mod attrs;
+mod block;
+mod copy;
+mod directory;
+mod line;
+mod symlink;
+
+pub use absent::{Absent, AbsentReport};
+pub use attrs::{Attrs, AttrsReport};
+pub use block::{Block, BlockBuilder, BlockReport, DEFAULT_MARKER, plan_block};
+pub use copy::{Copy, CopyBuilder, CopyReport, CopySource, TEXT_DIFF_LIMIT, content_diff};
+pub use directory::{DirReport, Directory};
+pub use line::{Line, LineBuilder, LineReport, plan_line};
+pub use symlink::{Symlink, SymlinkBuilder, SymlinkReport};
+
+/// Where to put a line (or block) that is not present yet. Only consulted
+/// when nothing matched: a line or a marked block that is already in the
+/// file is edited where it stands and never moved. Both [`Line`] and
+/// [`Block`] default to `Append`.
+#[derive(Debug, Clone)]
+pub enum Insert {
+    /// After the last line of the file, which is where Ansible puts a line
+    /// given neither `insertafter` nor `insertbefore`.
+    Append,
+    /// Before the first line of the file. Ansible's `insertbefore: BOF`.
+    Prepend,
+    /// After the *last* line the regex matches, as Ansible's `insertafter`.
+    /// A regex that matches nothing appends.
+    After(Regex),
+    /// Before the *first* line the regex matches, as Ansible's
+    /// `insertbefore`. A regex that matches nothing appends; it does not
+    /// prepend.
+    Before(Regex),
+}
+
+impl Insert {
+    /// Index at which to insert into `lines` when the thing is absent.
+    /// `After` takes the last match (Ansible's `insertafter`), `Before` the
+    /// first (`insertbefore`); no match falls back to the end of the file.
+    pub(crate) fn position(&self, lines: &[String]) -> usize {
+        match self {
+            Insert::Append => lines.len(),
+            Insert::Prepend => 0,
+            Insert::After(re) => lines
+                .iter()
+                .rposition(|l| re.is_match(l))
+                .map(|i| i + 1)
+                .unwrap_or(lines.len()),
+            Insert::Before(re) => lines
+                .iter()
+                .position(|l| re.is_match(l))
+                .unwrap_or(lines.len()),
+        }
+    }
+}
+
+/// Numeric owner, as `chown uid:gid`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    /// Numeric user id. Names are never resolved here, so a playbook that
+    /// wants `www-data` reads the uid off a [`user::Account`](crate::user::Account) first.
+    pub uid: u32,
+    /// Numeric group id, the half after the colon in `chown uid:gid`. It is
+    /// independent of the user: nothing forces it to be that user's primary
+    /// group.
+    pub gid: u32,
+}
+
+impl Owner {
+    fn label(&self) -> String {
+        format!("{}:{}", self.uid, self.gid)
+    }
+
+    fn of(s: &Stat) -> Owner {
+        Owner {
+            uid: s.uid,
+            gid: s.gid,
+        }
+    }
+}
+
+/// Pure planning of the attribute part shared by every op that takes
+/// `.mode()` and `.owner()`: which of the wanted attributes differ from
+/// `current` (`None` when the path does not exist yet, rendered as `-`).
+/// Mode comparison ignores the file type bits (`& 0o7777`).
+pub fn plan_attrs(
+    current: Option<&Stat>,
+    mode: Option<u32>,
+    owner: Option<Owner>,
+) -> Vec<AttrChange> {
+    let mut changes = vec![];
+    if let Some(want) = mode {
+        let want = want & 0o7777;
+        match current {
+            Some(s) if s.mode & 0o7777 == want => {}
+            Some(s) => changes.push(AttrChange {
+                name: "mode".into(),
+                from: format!("{:04o}", s.mode & 0o7777),
+                to: format!("{want:04o}"),
+            }),
+            None => changes.push(AttrChange {
+                name: "mode".into(),
+                from: "-".into(),
+                to: format!("{want:04o}"),
+            }),
+        }
+    }
+    if let Some(want) = owner {
+        match current {
+            Some(s) if Owner::of(s) == want => {}
+            Some(s) => changes.push(AttrChange {
+                name: "owner".into(),
+                from: Owner::of(s).label(),
+                to: want.label(),
+            }),
+            None => changes.push(AttrChange {
+                name: "owner".into(),
+                from: "-".into(),
+                to: want.label(),
+            }),
+        }
+    }
+    changes
+}
+
+/// Apply the attributes an op was given. Unconditional: `chmod`/`chown`
+/// are idempotent and `check` already decided a change is due.
+///
+/// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on anything
+/// that is not a directory, so the owner is set *first* and the mode after
+/// it. The other order silently drops the setuid bit of a
+/// `.mode(0o4755).owner(..)` op and still reports success.
+pub(crate) fn apply_attrs(
+    sys: &System,
+    path: &Path,
+    mode: Option<u32>,
+    owner: Option<Owner>,
+) -> Result<()> {
+    if let Some(o) = owner {
+        sys.set_owner(path, o.uid, o.gid)?;
+    }
+    if let Some(mode) = mode {
+        sys.set_mode(path, mode & 0o7777)?;
+    }
+    Ok(())
+}
+
+/// The line terminator a text uses, so a rewrite keeps CRLF files CRLF.
+pub(crate) fn eol_of(text: &str) -> &'static str {
+    if text.contains("\r\n") { "\r\n" } else { "\n" }
+}
+
+/// Read a text file for editing. Refuses a symlink: an atomic rewrite would
+/// replace the link with a regular file and leave its target stale, which is
+/// never what an edit meant. Missing is empty text when `create`, else an
+/// error naming the `.create(true)` option.
+pub(crate) fn read_text_or_empty(sys: &System, path: &Path, create: bool) -> Result<String> {
+    use rustible_sdk::backend::FileKind;
+    match sys.stat(path)? {
+        Some(s) if s.kind == FileKind::Symlink => bail!(
+            "{} is a symlink; edit its target instead (an atomic rewrite would replace the link)",
+            path.display()
+        ),
+        Some(s) if s.kind == FileKind::Dir => bail!("{} is a directory", path.display()),
+        Some(_) => sys.read_to_string(path),
+        None if create => Ok(String::new()),
+        None => bail!(
+            "{} does not exist (use .create(true) to create it)",
+            path.display()
+        ),
+    }
+}
+
+/// Back up (when asked, and the file exists) then write atomically. Returns
+/// the backup path.
+pub(crate) fn write_with_backup(
+    sys: &System,
+    path: &Path,
+    backup: bool,
+    bytes: &[u8],
+) -> Result<Option<std::path::PathBuf>> {
+    let backup_path = if backup && sys.exists(path)? {
+        Some(sys.backup(path)?)
+    } else {
+        None
+    };
+    sys.write_atomic(path, bytes)?;
+    Ok(backup_path)
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Arc;
+
+    use rustible_sdk::backend::Fake;
+    use rustible_sdk::event::Collect;
+    use rustible_sdk::prelude::*;
+
+    pub fn fake_sys(fake: &Arc<Fake>) -> System {
+        System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// Run `check`, insist on a change, return it.
+    pub fn expect_change<O: Op>(op: &O, sys: &System) -> Change<O::Output> {
+        match op.check(sys).unwrap() {
+            Plan::Change(c) => c,
+            Plan::Satisfied(_) => panic!("expected a change, op was satisfied"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustible_sdk::backend::FileKind;
+
+    use super::*;
+
+    fn stat(mode: u32, uid: u32, gid: u32) -> Stat {
+        Stat {
+            mode,
+            uid,
+            gid,
+            size: 0,
+            kind: FileKind::File,
+        }
+    }
+
+    #[test]
+    fn plan_attrs_nothing_wanted_or_all_equal_is_empty() {
+        let s = stat(0o644, 1000, 1000);
+        assert!(plan_attrs(Some(&s), None, None).is_empty());
+        assert!(plan_attrs(None, None, None).is_empty());
+        assert!(
+            plan_attrs(
+                Some(&s),
+                Some(0o644),
+                Some(Owner {
+                    uid: 1000,
+                    gid: 1000
+                })
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn plan_attrs_reports_mode_and_owner_changes() {
+        let s = stat(0o644, 0, 0);
+        let ch = plan_attrs(Some(&s), Some(0o600), Some(Owner { uid: 33, gid: 33 }));
+        let rendered: Vec<String> = ch
+            .iter()
+            .map(|c| format!("{}:{}->{}", c.name, c.from, c.to))
+            .collect();
+        assert_eq!(rendered, vec!["mode:0644->0600", "owner:0:0->33:33"]);
+    }
+
+    #[test]
+    fn plan_attrs_ignores_file_type_bits() {
+        // A stat that (wrongly) carries S_IFREG must still compare equal.
+        let s = stat(0o100644, 0, 0);
+        assert!(plan_attrs(Some(&s), Some(0o644), None).is_empty());
+        assert!(plan_attrs(Some(&s), Some(0o100644), None).is_empty());
+        let ch = plan_attrs(Some(&s), Some(0o100600), None);
+        assert_eq!(ch[0].from, "0644");
+        assert_eq!(ch[0].to, "0600");
+    }
+
+    #[test]
+    fn plan_attrs_on_missing_path_renders_dash() {
+        let ch = plan_attrs(None, Some(0o750), Some(Owner { uid: 1, gid: 2 }));
+        assert_eq!(ch.len(), 2);
+        assert_eq!((ch[0].from.as_str(), ch[0].to.as_str()), ("-", "0750"));
+        assert_eq!((ch[1].from.as_str(), ch[1].to.as_str()), ("-", "1:2"));
+    }
+
+    #[test]
+    fn insert_positions() {
+        let lines: Vec<String> = ["a", "Port 1", "b", "Port 2", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let re = Regex::new("^Port").unwrap();
+        assert_eq!(Insert::Append.position(&lines), 5);
+        assert_eq!(Insert::Prepend.position(&lines), 0);
+        assert_eq!(Insert::After(re.clone()).position(&lines), 4);
+        assert_eq!(Insert::Before(re).position(&lines), 1);
+        let none = Regex::new("^zzz").unwrap();
+        assert_eq!(Insert::After(none.clone()).position(&lines), 5);
+        assert_eq!(Insert::Before(none).position(&lines), 5);
+    }
+}
+
+#[cfg(test)]
+mod reachability {
+    //! Every public item this module hands a caller must be *nameable* by
+    //! that caller. `Copy::from_str` returns a `CopyBuilder`, so a helper
+    //! function returning one, or a struct holding one, needs the type in
+    //! scope; until 2026-09-14 `CopyBuilder` was `pub` in `copy.rs` and
+    //! absent from the `pub use` here, so it could be produced and never
+    //! named. Same for `TEXT_DIFF_LIMIT`, `content_diff` and
+    //! `DEFAULT_MARKER`. Nothing here asserts a value: the test is that it
+    //! compiles through the public path a user has.
+
+    use super::{CopyBuilder, DEFAULT_MARKER, TEXT_DIFF_LIMIT, content_diff};
+
+    /// The shape that could not be written before: name the builder a
+    /// finishing method returns.
+    fn builder_for(body: &str) -> CopyBuilder {
+        super::Copy::from_str(body)
+    }
+
+    #[test]
+    fn every_public_item_is_nameable_through_the_module() {
+        let _: CopyBuilder = builder_for("x\n");
+        let _: usize = TEXT_DIFF_LIMIT;
+        let _: &str = DEFAULT_MARKER;
+        // `content_diff` is the rendering the reports show; a caller writing
+        // their own op wants it for the same reason `file::Copy` does.
+        let _ = content_diff(std::path::Path::new("/etc/x"), None, b"new\n");
+    }
+}

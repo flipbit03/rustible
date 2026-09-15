@@ -1,0 +1,598 @@
+//! The `rustible` command (vision doc section 3): `init`, `playbook
+//! run|list|create`, `inventory show|check`, `toolchain install`. Noun
+//! first, then verb. The
+//! orchestrator pipeline is `run.rs`; the inventory is the library half
+//! (`rustible_cli::inventory`).
+//!
+//! Exit codes: 0 ok; 1 the inventory, the vars, or a build is wrong; 2 a
+//! host failed; 3 the command line was wrong.
+
+// See the note in this crate's lib.rs: the CLI runs on the operator's own
+// machine, so vision 7.2's `sys` rule does not apply to it.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+mod create;
+mod describe;
+mod init;
+mod render;
+mod run;
+mod toolchain;
+mod transport;
+mod workspace;
+mod zig;
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use rustible_cli::inventory::{Inventory, format_vars_report, render_show};
+use rustible_sdk::runtime::HostVars;
+
+use describe::Cargo;
+use workspace::Workspace;
+
+const EXIT_ERROR: u8 = 1;
+const EXIT_USAGE: u8 = 3;
+
+/// The command line was wrong: exit 3 rather than 1.
+#[derive(Debug)]
+pub struct Usage(pub String);
+
+impl fmt::Display for Usage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Usage {}
+
+pub fn usage(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Usage(msg.into()))
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "rustible",
+    about = "Configuration management as real code",
+    version
+)]
+struct Cli {
+    /// Workspace root (the directory holding rustible.toml). Default: walk
+    /// up from the current directory.
+    #[arg(long, global = true, value_name = "DIR")]
+    workspace: Option<PathBuf>,
+    /// Inventory file, overriding the workspace's `inventory` setting. For
+    /// running against machines that are not in the committed inventory, such
+    /// as the Vagrant guests `dev/vagrant` brings up. A relative path is
+    /// relative to the current directory, not to `--workspace`.
+    #[arg(long, global = true, value_name = "FILE")]
+    inventory: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Create a Rustible workspace in a directory.
+    Init(init::InitArgs),
+    /// Run, list, or scaffold playbooks.
+    Playbook {
+        #[command(subcommand)]
+        cmd: PlaybookCmd,
+    },
+    /// Inspect and validate the inventory.
+    Inventory {
+        #[command(subcommand)]
+        cmd: InventoryCmd,
+    },
+    /// What this machine can build playbook binaries for.
+    Toolchain {
+        #[command(subcommand)]
+        cmd: ToolchainCmd,
+    },
+    /// Hidden: the compiler and linker shim that cargo-zigbuild's wrapper
+    /// scripts exec. The wrappers name whatever `env::current_exe()` was when
+    /// they were written, and in Rustible that is this binary, so every C
+    /// compile and every link in a playbook build comes back through here as
+    /// `rustible zig cc …` (M8).
+    #[command(hide = true)]
+    Zig {
+        #[command(subcommand)]
+        cmd: cargo_zigbuild::Zig,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolchainCmd {
+    /// Fetch the zig release Rustible builds with into its cache, ahead of
+    /// the first `playbook run`, and say where it is. Does nothing when a
+    /// zig is already on this machine: RUSTIBLE_ZIG, PATH, or the cache.
+    Install,
+}
+
+#[derive(Subcommand, Debug)]
+enum PlaybookCmd {
+    /// Build a playbook for its hosts, ship it, run it, and render the
+    /// result.
+    Run(run::RunArgs),
+    /// The playbooks under `playbooks/`, by name.
+    List,
+    /// Scaffold a playbook file.
+    Create(create::CreateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum InventoryCmd {
+    /// Resolved parameters and vars of one host, with the source of each.
+    Show {
+        /// Host name as written in the inventory.
+        host: String,
+        /// Inventory file (default: the workspace's).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Load the inventory, then check every playbook's vars against every
+    /// host it targets. Exit 1 on any error.
+    Check {
+        /// Inventory file (default: the workspace's).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+}
+
+/// cargo-zigbuild does not write `ar`, `lib` or `install_name_tool` as
+/// wrapper scripts: it symlinks the *current executable* under those names
+/// and expects it to notice what it was called as. In cargo-zigbuild's own
+/// binary that is a check at the top of `main`; here it is this. Without it,
+/// `ar cq lib.a x.o` reaches clap as a `rustible` invocation whose program
+/// name happens to be `ar`, and `cq` is refused as an unknown subcommand —
+/// which is exactly how M8 step 2's first attempt failed.
+fn dispatch_as_tool() -> Option<Result<()>> {
+    let mut args = std::env::args();
+    let program = PathBuf::from(args.next()?);
+    let stem = program.file_stem()?.to_string_lossy().into_owned();
+    Some(match stem.as_str() {
+        "ar" => cargo_zigbuild::Zig::Ar {
+            args: args.collect(),
+        }
+        .execute(),
+        "lib" => cargo_zigbuild::Zig::Lib {
+            args: args.collect(),
+        }
+        .execute(),
+        s if s.ends_with("dlltool") => cargo_zigbuild::Zig::Dlltool {
+            args: args.collect(),
+        }
+        .execute(),
+        "install_name_tool" => cargo_zigbuild::macos::install_name_tool::execute(args),
+        _ => return None,
+    })
+}
+
+/// Whether zig should be provisioned for this invocation, decided before the
+/// runtime starts and before anything expensive.
+///
+/// Only the subcommands that build need a zig: `playbook run` and `inventory
+/// check` (it builds every playbook to check their vars). `init`, `playbook list` and
+/// `inventory show` must never cause a 51 MB download. And neither must a
+/// typo: an invocation `dispatch` is about to refuse for a stray
+/// `--inventory`, or one that names a file that is not there, is answered
+/// with that refusal and nothing else. The checks here mirror the cheap
+/// early failures in `dispatch`; the real errors still come from there.
+///
+/// This is also what keeps the unit tests off the network: they run the
+/// real binary with a missing inventory and a misplaced flag, and neither
+/// gets as far as a fetch.
+fn needs_zig(cli: &Cli) -> bool {
+    // No workspace, no build: `playbook run` refuses and `inventory check`
+    // validates the file alone, so neither needs a zig.
+    let Ok(workspace) = Workspace::discover(cli.workspace.as_deref()) else {
+        return false;
+    };
+    let inventory_exists = |explicit: Option<&PathBuf>| -> bool {
+        match explicit {
+            Some(p) => p.is_file(),
+            None => workspace.inventory_path().is_file(),
+        }
+    };
+    match &cli.cmd {
+        Cmd::Playbook {
+            cmd: PlaybookCmd::Run(_),
+        } => inventory_exists(cli.inventory.as_ref()),
+        Cmd::Inventory {
+            cmd: InventoryCmd::Check { file },
+        } => inventory_exists(file.as_ref().or(cli.inventory.as_ref())),
+        _ => false,
+    }
+}
+
+fn main() {
+    if let Some(result) = dispatch_as_tool() {
+        if let Err(e) = result {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let code = if e.use_stderr() { EXIT_USAGE } else { 0 };
+            let _ = e.print();
+            std::process::exit(code as i32);
+        }
+    };
+    // zig is provisioned here, before the runtime exists, and for one
+    // reason: cargo-zigbuild learns where zig is from the process
+    // environment, and setting that is only sound while this is the only
+    // thread. It is, until the runtime below is built.
+    if needs_zig(&cli) {
+        match zig::provision(&|line| eprintln!("  {line}")) {
+            Ok(located) => {
+                if let Some(path) = located.export() {
+                    // SAFETY: single-threaded. `dispatch_as_tool` returned
+                    // `None`, the tokio runtime has not been created, and
+                    // nothing else spawns threads before it. `set_var`'s
+                    // hazard is a concurrent `getenv`, and there is no one
+                    // to make one.
+                    unsafe { std::env::set_var("CARGO_ZIGBUILD_ZIG_COMMAND", path) };
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(EXIT_ERROR as i32);
+            }
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("building the tokio runtime");
+    let code = match runtime.block_on(dispatch(cli)) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            if e.downcast_ref::<Usage>().is_some() {
+                EXIT_USAGE
+            } else {
+                EXIT_ERROR
+            }
+        }
+    };
+    std::process::exit(code as i32);
+}
+
+/// `--inventory` is global so it can be written on either side of the
+/// subcommand, which means clap offers it to subcommands that do not read an
+/// inventory at all. Refusing there is better than accepting and ignoring: a
+/// flag that silently does nothing is how a run against the wrong machines
+/// gets reported as a success.
+fn reject_inventory(inventory: &Option<PathBuf>, cmd: &str) -> Result<()> {
+    match inventory {
+        Some(_) => Err(usage(format!(
+            "--inventory does not apply to `{cmd}`; it names the inventory a \
+             run resolves hosts from, and `{cmd}` resolves none"
+        ))),
+        None => Ok(()),
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<u8> {
+    let ws = cli.workspace.as_deref();
+    let inventory_override = cli.inventory.clone();
+    match cli.cmd {
+        Cmd::Init(args) => {
+            if ws.is_some() {
+                return Err(usage(
+                    "--workspace does not apply to `init`; give the directory as its argument",
+                ));
+            }
+            reject_inventory(&inventory_override, "init")?;
+            init::run(args).map(|()| 0)
+        }
+        Cmd::Playbook { cmd } => match cmd {
+            PlaybookCmd::Run(args) => {
+                let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
+                let file = inventory_override.unwrap_or_else(|| ws.inventory_path());
+                let inv = load_or_exit(&file);
+                run::run(&ws, &inv, args).await
+            }
+            PlaybookCmd::List => {
+                reject_inventory(&inventory_override, "playbook list")?;
+                let ws = Workspace::discover(ws).map_err(|e| usage(format!("{e:#}")))?;
+                list(&ws)
+            }
+            PlaybookCmd::Create(mut args) => {
+                reject_inventory(&inventory_override, "playbook create")?;
+                // A relative path belongs to the workspace the user named,
+                // not to the current directory.
+                if let Some(root) = ws
+                    && args.path.is_relative()
+                {
+                    args.path = root.join(&args.path);
+                }
+                create::run(args).map(|()| 0)
+            }
+        },
+        Cmd::Inventory { cmd } => inventory(ws, inventory_override, cmd).await,
+        Cmd::Toolchain { cmd } => match cmd {
+            ToolchainCmd::Install => {
+                reject_inventory(&inventory_override, "toolchain install")?;
+                zig::install()
+            }
+        },
+        // A failing zig child exits this process with the child's own code,
+        // so a failed link is a failed `rustible zig cc`, which is a failed
+        // cargo, which is a failed build. Nothing is swallowed on the way.
+        Cmd::Zig { cmd } => cmd.execute().map(|()| 0),
+    }
+}
+
+/// `playbook list`: the same scan the build script runs (vision 9).
+fn list(ws: &Workspace) -> Result<u8> {
+    let dir = ws.playbooks_dir();
+    if !dir.is_dir() {
+        eprintln!("no playbooks/ directory in {}", ws.root.display());
+        return Ok(0);
+    }
+    let found = rustible_build::scan(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if found.is_empty() {
+        eprintln!(
+            "no playbooks under {} (create one with `rustible playbook create playbooks/<name>.rs`)",
+            dir.display()
+        );
+        return Ok(0);
+    }
+    let width = found.iter().map(|d| d.name.len()).max().unwrap_or(0);
+    for d in &found {
+        println!("{:<width$}  {}", d.name, ws.playbook_file(&d.name));
+    }
+    Ok(0)
+}
+
+/// `inventory show` and `inventory check`. Load errors go to stderr one
+/// per line as `file:line:col: error: message`; any error exits 1.
+async fn inventory(
+    ws: Option<&Path>,
+    inventory_override: Option<PathBuf>,
+    cmd: InventoryCmd,
+) -> Result<u8> {
+    let (file, ws) = match &cmd {
+        InventoryCmd::Show { file, .. } | InventoryCmd::Check { file } => {
+            // `--file` is this subcommand's own spelling of the global
+            // `--inventory`; either names the file, and the workspace's
+            // setting answers when neither does.
+            let named = file.clone().or(inventory_override);
+            match (named, Workspace::discover(ws)) {
+                (Some(f), ws) => (f, ws.ok()),
+                (None, Ok(ws)) => (ws.inventory_path(), Some(ws)),
+                (None, Err(e)) => return Err(usage(format!("{e:#} (or pass --file)"))),
+            }
+        }
+    };
+    match cmd {
+        InventoryCmd::Show { host, .. } => {
+            let inv = load_or_exit(&file);
+            match inv.resolve(&host) {
+                Ok(resolved) => print!("{}", render_show(&resolved)),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return Ok(EXIT_ERROR);
+                }
+            }
+            Ok(0)
+        }
+        InventoryCmd::Check { .. } => {
+            let inv = load_or_exit(&file);
+            let shown = match &ws {
+                Some(ws) if file == ws.inventory_path() => {
+                    ws.config.inventory.display().to_string()
+                }
+                _ => file.display().to_string(),
+            };
+            println!(
+                "{shown}: ok ({} hosts, {} groups)",
+                inv.hosts.len(),
+                inv.groups.len()
+            );
+            match ws {
+                Some(ws) => check_playbooks(&ws, &inv, &shown).await,
+                None => {
+                    eprintln!("not inside a rustible workspace: playbooks not checked");
+                    Ok(0)
+                }
+            }
+        }
+    }
+}
+
+/// Vars of every playbook against every host it targets (vision 3, 10.3),
+/// through one host-native build of the whole workspace and its
+/// `--check-vars` mode.
+async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result<u8> {
+    let cargo = Cargo::load(ws).await?;
+    cargo
+        .build(None, &[])
+        .await
+        .context("building the workspace")?;
+    let bin = cargo.debug_bin();
+    let playbooks = describe::describe_bin(&bin).await?;
+    // `shown` is the file the user pointed at (`--file staging.kdl`), which
+    // is not always the workspace default the config names.
+    let inventory_file = shown.to_string();
+    let mut errors = 0usize;
+    for d in &playbooks {
+        let src = ws.playbook_file(&d.name);
+        let hosts = match inv.select(&d.hosts) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("{src}: targets `{}`: {e}", d.hosts);
+                errors += 1;
+                continue;
+            }
+        };
+        let mut resolved = vec![];
+        for h in &hosts {
+            resolved.push(inv.resolve(&h.name).map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+        if d.vars_schema.is_null() {
+            println!("{src}: ok ({}, no vars)", count(hosts.len(), "host"));
+            continue;
+        }
+        let input: Vec<HostVars> = resolved
+            .iter()
+            .map(|r| HostVars {
+                host: r.host.clone(),
+                vars: rustible_cli::inventory::bag_to_json(&r.vars),
+            })
+            .collect();
+        let (results, warnings) =
+            run::split_checks(describe::check_vars(&bin, &d.name, &input).await?);
+        for (host, message) in warnings {
+            eprintln!("warning: {src} on host `{host}`: {message}");
+        }
+        let is_group = inv.groups.contains_key(&d.hosts);
+        match format_vars_report(&d.hosts, is_group, &src, &inventory_file, &results) {
+            Some(report) => {
+                eprint!("{report}");
+                errors += 1;
+            }
+            None => println!("{src}: ok ({})", count(hosts.len(), "host")),
+        }
+    }
+    if errors > 0 {
+        eprintln!("{shown}: {} with vars errors", count(errors, "playbook"));
+        return Ok(EXIT_ERROR);
+    }
+    Ok(0)
+}
+
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+fn load_or_exit(file: &Path) -> Inventory {
+    match Inventory::load(file) {
+        Ok(inv) => inv,
+        Err(errs) => {
+            for e in errs.iter() {
+                eprintln!("{e}");
+            }
+            let n = errs.len();
+            eprintln!(
+                "{}: {n} error{}",
+                file.display(),
+                if n == 1 { "" } else { "s" }
+            );
+            std::process::exit(EXIT_ERROR as i32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("rustible").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The guard between a typo and a 51 MB download. Everything here is
+    /// what `make` once got wrong: a unit test ran the real binary with a
+    /// missing inventory and provisioning came before the refusal.
+    #[test]
+    fn only_builds_with_acceptable_flags_and_real_files_provision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inv = tmp.path().join("hosts.kdl");
+        std::fs::write(&inv, "host \"a\" connection=\"local\"\n").unwrap();
+        let inv = inv.to_str().unwrap();
+        let missing = tmp.path().join("nope.kdl");
+        let missing = missing.to_str().unwrap();
+
+        // Never for commands that do not build.
+        assert!(!needs_zig(&cli(&["playbook", "list"])));
+        assert!(!needs_zig(&cli(&["playbook", "create", "playbooks/x.rs"])));
+        assert!(!needs_zig(&cli(&["toolchain", "install"])));
+        assert!(!needs_zig(&cli(&["inventory", "show", "a", "--file", inv])));
+
+        // Builds, but the inventory it names is not there: `dispatch` will
+        // refuse it, so nothing is fetched first.
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(!needs_zig(&cli(&[
+            "--inventory",
+            missing,
+            "inventory",
+            "check"
+        ])));
+        assert!(!needs_zig(&cli(&["inventory", "check", "--file", missing])));
+
+        // The inventory is there, but no workspace is: `playbook run`
+        // refuses and `inventory check` validates the file without building,
+        // so a fetch here would be 51 MB for nothing.
+        let ws = tmp.path().to_str().unwrap();
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(!needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
+
+        // The real thing.
+        std::fs::write(tmp.path().join("rustible.toml"), "").unwrap();
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "playbook",
+            "run",
+            "x"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "--inventory",
+            inv,
+            "inventory",
+            "check"
+        ])));
+        assert!(needs_zig(&cli(&[
+            "--workspace",
+            ws,
+            "inventory",
+            "check",
+            "--file",
+            inv
+        ])));
+    }
+
+    /// With no `--inventory`, `playbook run` needs a workspace to find the
+    /// inventory in; outside one, nothing is provisioned.
+    #[test]
+    fn no_workspace_means_no_provisioning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cli(&[
+            "--workspace",
+            tmp.path().to_str().unwrap(),
+            "playbook",
+            "run",
+            "x",
+        ]);
+        assert!(!needs_zig(&c));
+    }
+}

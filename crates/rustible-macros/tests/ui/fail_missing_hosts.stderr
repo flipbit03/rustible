@@ -1,0 +1,7 @@
+error: `#[rustible::playbook]` needs `hosts = "<host or group>"`
+ --> tests/ui/fail_missing_hosts.rs:6:5
+  |
+6 |     #[rustible::playbook(escalate = true)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `rustible::playbook` (in Nightly builds, run with -Z macro-backtrace for more info)

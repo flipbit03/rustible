@@ -1,0 +1,23 @@
+[package]
+name = "rustible-macros"
+description = "Proc macros for Rustible playbooks (#[rustible::playbook], #[rustible::vars]). Use through the `rustible` crate."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+trybuild = "1"
+rustible = { path = "../rustible" }

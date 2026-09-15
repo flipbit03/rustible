@@ -1,0 +1,5 @@
+error: expected `fn name(ctx: &mut Ctx) -> Result<()>`
+ --> tests/ui/fail_integration_test_signature.rs:2:1
+  |
+2 | fn something() -> rustible::sdk::Result<()> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

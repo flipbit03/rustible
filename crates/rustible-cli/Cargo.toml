@@ -1,0 +1,45 @@
+[package]
+name = "rustible-cli"
+description = "The rustible command: orchestrates Rustible playbooks over SSH. Configuration management as real code."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "rustible"
+path = "src/main.rs"
+
+[dependencies]
+rustible-sdk.workspace = true
+rustible-build.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+openssh = { version = "0.11", features = ["native-mux"] }
+sha2 = "0.10"
+kdl = "6.7.1"
+toml = "1"
+tempfile.workspace = true
+# The C toolchain, driven as a library (M8). No default features: `universal2`
+# pulls `fat-macho` for a fat-binary mode Rustible never produces.
+cargo-zigbuild = { version = "0.23", default-features = false }
+# Only to hand `cargo_zigbuild::zig::prepare_zig_linker` the cargo config it
+# reads `[target.*]` rustflags from; the same crate and version zigbuild uses.
+cargo-config2 = "0.1"
+# Unpacking the zig release Rustible fetches: pure Rust, the same pair
+# `rustible-std::archive` already reads `.tar.xz` with.
+tar.workspace = true
+lzma-rust2.workspace = true
+
+[dev-dependencies]
+# The xz *encoder*, only so a test can build a release-shaped tarball in
+# memory instead of downloading one. Dev-only: the CLI itself never writes xz.
+lzma-rust2 = { workspace = true, features = ["encoder"] }

@@ -1,0 +1,29 @@
+[package]
+name = "rustible-github"
+description = "Rustible collection for GitHub: fetch a user's SSH keys and other GitHub-backed operations."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+# A collection depends on the SDK and, when it composes with standard ops, on
+# rustible-std. Never on rustible-cli (vision 9).
+[dependencies]
+rustible-sdk.workspace = true
+rustible-std.workspace = true
+# HTTPS for the `.keys` endpoint. The crypto provider is not chosen here: see
+# the note below.
+ureq.workspace = true
+# No crypto entry of its own: the provider comes from `rustible_std::tls`,
+# which this crate already depends on, so the two agree by construction.
+# Nothing here names a `rustls::` path either.
+
+[dev-dependencies]
+# Only so the module-header doctest can show a real `#[rustible::playbook]`.
+# Path-only on purpose: cargo strips a path-only dev-dependency at publish, the
+# same reason rustible-std and rustible-macros carry it this way.
+rustible = { path = "../rustible" }

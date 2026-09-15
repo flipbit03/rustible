@@ -1,0 +1,18 @@
+[package]
+name = "rustible-build"
+description = "Build-script helper for Rustible workspaces: discovers playbook files marked #[rustible::playbook]. Called from the generated build.rs."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[dev-dependencies]
+tempfile.workspace = true

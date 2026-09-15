@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustible",
+    "crates/rustible-cli",
+    "crates/rustible-sdk",
+    "crates/rustible-macros",
+    "crates/rustible-build",
+    "crates/rustible-std",
+    "crates/rustible-github",
+]
+exclude = ["examples/workspace"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/flipbit03/rustible"
+homepage = "https://github.com/flipbit03/rustible"
+authors = ["Carlos Eduardo <cadu@cadu.dev>"]
+rust-version = "1.95"
+
+[workspace.dependencies]
+rustible = { path = "crates/rustible", version = "0.0.0" }
+rustible-sdk = { path = "crates/rustible-sdk", version = "0.0.0" }
+rustible-macros = { path = "crates/rustible-macros", version = "0.0.0" }
+rustible-build = { path = "crates/rustible-build", version = "0.0.0" }
+rustible-std = { path = "crates/rustible-std", version = "0.0.0" }
+rustible-github = { path = "crates/rustible-github", version = "0.0.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+similar = "2"
+# Network. `ureq` without its default `rustls` feature so the crypto provider
+# is chosen here rather than by a feature default: it is `ring`, reached
+# through rustls's own `ring` feature and wired in one place,
+# `rustible-std::tls`, which `rustible-github` reuses. `ring` compiles a little
+# C, which is the reason zig is in the dependency rule (vision 5.3, M8); in
+# exchange it detects CPU features at runtime and runs down to baseline
+# x86-64. See `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` and `docs/plan/M8.md`.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+regex = "1"
+tempfile = "3"
+rustix = { version = "1", features = ["process"] }
+# Archives, all pure Rust (vision 5.3), for `rustible-std::archive`.
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "xz"] }
+ruzstd = "0.9"
+zeroize = "1"
+base64 = "0.22"
+
+# Profile for binaries shipped to targets: small over fast-to-build.
+[profile.dist]
+inherits = "release"
+strip = true
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "unwind"
