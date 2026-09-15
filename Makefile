@@ -66,8 +66,10 @@ vm-up-x86:
 vm-up-arm:
 	cd $(VAGRANT_DIR) && $(VAGRANT) up arm
 
-# Runs against whichever machines are up, twice, and fails if the second run
-# changes anything. Pass HOSTS=vagrant-arm to limit it.
+# Destroys and recreates the guests, then runs the playbook twice: the first
+# run must change something (otherwise the test is vacuous) and the second must
+# change nothing. Pass HOSTS=vagrant-arm to limit it, QUICK=1 to skip the
+# recreate while iterating.
 vm-test: example
 	$(CARGO) build --release -p rustible-cli
 	$(VAGRANT_DIR)/vm-test.sh $(HOSTS)

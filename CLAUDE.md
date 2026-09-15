@@ -511,10 +511,12 @@ Three things that will bite you:
   state tying a libvirt domain to Vagrant lives in `dev/vagrant/.vagrant/`;
   remove that first and the domain keeps running with nothing able to stop it.
   `make vm-orphans` finds them and prints the `virsh` commands.
-- **CI always starts from a destroyed machine; your laptop does not.** A
-  local `make vm-test` may be running against a guest that converged an hour
-  ago, which only exercises the satisfied path. `make vm-destroy` first, or
-  undo the change inside the guest, before trusting a local green.
+- **`make vm-test` destroys and recreates the guests before it runs**, because
+  a guest that converged an hour ago makes both runs report `ok` and passes
+  the suite having exercised only the satisfied path. It also asserts the
+  *first* run changed something, so a recreate that did not take fails loudly
+  instead of passing vacuously. `make vm-test QUICK=1` skips the recreate for
+  iteration and says on stderr that what it ran is not the full test.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.
