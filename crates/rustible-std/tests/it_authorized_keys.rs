@@ -341,3 +341,52 @@ fn a_dry_run_of_a_first_provision_does_not_fail(ctx: &mut Ctx) -> Result<()> {
     assert!(err.contains("home directory"), "{err}");
     Ok(())
 }
+
+/// The `in_file` form had no coverage at this tier, and it is the form whose
+/// contract is "owns the file it was handed and nothing around it". Against a
+/// real filesystem that means three things the `Fake` cannot show: a file it
+/// creates really is 0600, a file that already exists keeps the mode and
+/// owner it had, and a missing parent is refused rather than created.
+#[rustible::integration_test(images = ["debian:12"])]
+fn in_file_owns_the_file_and_nothing_around_it(ctx: &mut Ctx) -> Result<()> {
+    ctx.sys().mkdir_all("/etc/ssh/keys")?;
+
+    // A file it creates: 0600, and root-owned because nothing named an account.
+    let (first, _) = changed_then_ok(ctx, "in_file creates", || {
+        authorized_keys::Present::in_file("/etc/ssh/keys/svc").keys([K1])
+    })?;
+    assert_eq!(first.created_dir, None, "in_file creates no directory");
+    let st = ctx.sys().stat("/etc/ssh/keys/svc")?.expect("file exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o600, 0, 0));
+
+    // One that already exists keeps its attributes: this form manages the
+    // contents and nothing else, which is what separates it from the user
+    // forms.
+    ctx.sys().set_mode("/etc/ssh/keys/svc", 0o644)?;
+    ctx.step(
+        "in_file adds to an existing file",
+        authorized_keys::Present::in_file("/etc/ssh/keys/svc").keys([K1, K2]),
+    )?;
+    assert_eq!(
+        ctx.sys().stat("/etc/ssh/keys/svc")?.expect("file").mode,
+        0o644,
+        "the mode it had, not the one the op would have chosen"
+    );
+    assert_eq!(
+        ctx.sys().read_to_string("/etc/ssh/keys/svc")?,
+        format!("{K1}\n{K2}\n")
+    );
+
+    // A missing parent is refused, and not created on the way out.
+    let err = ctx
+        .step(
+            "in_file with no parent",
+            authorized_keys::Present::in_file("/etc/ssh/absent/svc").keys([K1]),
+        )
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("/etc/ssh/absent does not exist"), "{err}");
+    assert!(err.contains("having no account to own it"), "{err}");
+    assert!(!ctx.sys().exists("/etc/ssh/absent")?);
+    Ok(())
+}

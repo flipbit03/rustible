@@ -1407,6 +1407,39 @@ mod tests {
         let text = format!("# c\r\n{K1}\r\n");
         let planned = plan_present(&text, &[key(K2)], false);
         assert_eq!(planned.text.unwrap(), format!("# c\r\n{K1}\r\n{K2}\r\n"));
+
+        // `eol_of` is shared, so removal has to keep them too: a rewrite that
+        // normalised to LF would rewrite every line of a CRLF file and show
+        // up as a diff of the whole thing.
+        let text = format!("# c\r\n{K1}\r\n{K2}\r\n");
+        let planned = plan_absent(&text, &[key(K1)]);
+        assert_eq!(planned.text.unwrap(), format!("# c\r\n{K2}\r\n"));
+    }
+
+    /// `Absent` under `--check`: it plans the removal and the attribute
+    /// repair, and writes nothing. The three other check-mode tests are all
+    /// `Present`.
+    #[test]
+    fn absent_in_check_mode_plans_and_writes_nothing() {
+        let fake = fake_with_wrong_attributes();
+        let sys = fake_sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = Absent::for_user_name("cadu")
+            .keys([K1])
+            .check(&sys)
+            .unwrap()
+        else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff.short(),
+            "mode=0700 owner=1000:1001 +0 -1 lines mode=0600 owner=1000:1001"
+        );
+        assert_eq!(
+            fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
+            format!("{K1}\n{K2}\n"),
+            "check mode changed the file"
+        );
+        assert_eq!(fake.file("/home/cadu/.ssh").unwrap().mode, 0o755);
     }
 
     #[test]
