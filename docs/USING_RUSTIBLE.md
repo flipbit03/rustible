@@ -908,49 +908,29 @@ operation you wanted — `user`, `group` and `authorized_keys` all do.
 into a directory that does not exist fails at `apply`, after earlier steps have
 already changed the machine. Create the directory first.
 
-**The one op that does create a directory is `ssh::authorized_keys`**, and
-only in its user forms (`for_user`, `for_user_name`, `for_account`). It owns
-`~/.ssh` as well as the file inside it: it creates the directory when missing
-and holds it at 0700 and the file at 0600, owned by the account, on **every**
-run — the modes `sshd(8)` recommends and the ones Ansible sets. A wrong mode
-or owner is repaired, and the repair is reported as its own block in the diff.
-So there is no `file::Directory` step above, and you do not want one.
+**The one op that creates a directory is `ssh::authorized_keys`**, in its user
+forms (`for_user`, `for_user_name`, `for_account`). It owns `~/.ssh` as well as
+the file in it: creates the directory when missing, and holds it at 0700 and
+the file at 0600 owned by the account, repairing them when wrong. So there is
+no `file::Directory` step above, and you do not want one.
 
-⚠️ The reason the repair is not cosmetic: `StrictModes` is on by default, and
-sshd's own manual says that if `authorized_keys`, `~/.ssh` or the home
-directory *"are writable by other users ... sshd will not allow it to be
-used"*. It says nothing and logs nothing the caller sees. So a step that
-installs keys into a group-writable `~/.ssh` and leaves the mode alone reports
-a clean `changed` over an account that still cannot log in. (sshd is narrower
-than the recommendation in two ways worth knowing: it accepts a directory
-owned by *root* as well as by the user, and it accepts a 0644
-`authorized_keys`, since neither is writable by others. 0700/0600 are what its
-manual recommends and what Ansible writes, so they are what this op holds.)
-
-ℹ️ This is Ansible's `manage_dir` (default true), with three differences.
-(1) `ansible.posix.authorized_key` reaches its directory-and-ownership pass
-only on a run that is already rewriting the file, so on a host whose keys are
-already correct it never looks at the mode; `Present` checks every run,
-because "the keys are already right" is exactly when a group-writable
-`~/.ssh` is invisible. (2) `Absent` keeps Ansible's rule rather than
-`Present`'s — see below. (3) Ansible's `path` + `manage_dir: true` will chmod
-0700 and chown an arbitrary directory, which its own docs warn about;
-`in_file` refuses instead.
+⚠️ It checks those permissions on **every** run, so the step can report
+`changed` having moved no key — it fixed a mode. Not a bug: sshd silently
+ignores keys in a `~/.ssh` writable by anyone but its owner, so a step that
+installed keys and left the mode alone would report success over an account
+that still cannot log in.
 
 What it still refuses:
 
 | in the way | what happens |
 |---|---|
-| the **home directory** is missing | refused, naming `user::Present::new(..).create_home(true)` — creating a home here would leave it root-owned, which is an account that cannot log in |
-| `~/.ssh` is a regular file | refused: this op does not remove what is in the way |
+| the **home directory** is missing | refused, naming `user::Present::new(..).create_home(true)` |
+| `~/.ssh` is a regular file | refused: it does not remove what is in the way |
 | `~/.ssh` is a symlink pointing at nothing | refused, saying so |
-| `in_file(path)` with a missing parent | refused: no account is named, so nothing says who a created directory should belong to |
+| `in_file(path)` with a missing parent | refused: no account is named, so nothing says who would own it |
 
-`authorized_keys::Absent` follows Ansible exactly: on a run that removes a
-key it brings `~/.ssh` and the file to the same state, and on one that finds
-nothing to remove it reports `ok` and touches nothing. It never creates the
-directory, and never needs to — `.ssh` is missing only when the file is, and
-then there is no key to remove.
+`authorized_keys::Absent` repairs the same way on a run that removes a key, and
+touches nothing on a run that finds nothing to remove.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1271,11 +1251,9 @@ the real run converges and there is nothing to fix; if not, ensure it with
 file::Directory::at(..)
 ```
 
-The **user** forms are not affected: they create `~/.ssh` themselves, so
-there is no earlier step for a dry run to have to trust. A missing *home*
-directory is tolerated under `--check` for the same reason — a dry run of a
-first provision would otherwise fail on a playbook that converges in one real
-pass — and refused in a run that can act.
+The **user** forms are not affected: they create `~/.ssh` themselves. A
+missing *home* directory is tolerated under `--check` and refused in a run
+that can act, so a dry run of a first provision passes.
 
 `user::Membership` naming a group an earlier `group::Present` would create is
 *not* affected either — it consults the registry and passes.

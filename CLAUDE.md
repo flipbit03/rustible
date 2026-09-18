@@ -100,6 +100,17 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
   the easy ones to forget, and the ones that matter most — they ship to
   crates.io. Real machines belong in an untracked file passed with
   `--inventory`, the way `dev/vagrant/hosts.vagrant.kdl` works.
+- **`docs/USING_RUSTIBLE.md` is an operating manual, not a changelog.** It is
+  what an external adopter's agent reads to learn Rustible, which is in no
+  model's training, and it is already long: every paragraph added spends the
+  reader's attention and the agent's context. So it carries only what changes
+  what somebody *writes* or how they read a failure — the shape of a call, a
+  refusal they will hit, a trap that will cost them an afternoon. It does not
+  carry why a behaviour was chosen, what it used to be, how it compares to
+  Ansible, or which release changed it. Reasons and history go in
+  `docs/plan/DECISIONS.md`; the behaviour itself is in the source, which is
+  where a model checks it. When an op changes, the edit here is usually
+  smaller than the change was — often a line, sometimes nothing.
 - **Never force-push.**
 - **SSH for git.** The remote is `git@github.com:flipbit03/rustible.git`.
 - **Never write a `claude.ai` session URL anywhere** — not in a commit message
