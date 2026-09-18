@@ -499,11 +499,13 @@ struct SshDir {
 /// Plan `~/.ssh` in the user forms: create it when it is absent, and hold it
 /// at 0700 owned by the account when it is not.
 ///
-/// This is the one place the op reaches past its own file, and it is
-/// deliberate (vision 6.7 amendment): `~/.ssh` exists to hold
-/// `authorized_keys` and nothing else, the op already knows its mode and its
-/// owner without being told, and both the creation and the repair are lines
-/// in the diff, so the report stays honest. `ansible.posix.authorized_key`'s
+/// This is the one place the op reaches past its own file, and it is the
+/// exception vision 6.7 names: a file belonging to a single account, so the
+/// directory holding it belongs to that account alone and is not a shared
+/// resource, and the op was handed the account, so nothing about the owner
+/// or the mode is a guess. The two limits 6.7 puts on it are kept here —
+/// the creation and the repair are lines in the diff, and the home
+/// directory itself is never created. `ansible.posix.authorized_key`'s
 /// `manage_dir` defaults to true and does the same work, though it reaches it
 /// only on a run that is already rewriting the file; [`Present`] goes
 /// further, and says why.

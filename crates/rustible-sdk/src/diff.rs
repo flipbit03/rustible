@@ -47,9 +47,9 @@ pub enum Diff {
     /// stays complete.
     ///
     /// Not a way to bundle unrelated work: two things that can be wanted
-    /// independently are two steps. (That test comes from the granularity
-    /// amendment proposed for vision 6.7, not from 6.7 as it stands today,
-    /// which only says an op must not create a prerequisite silently.)
+    /// independently are two steps. Vision 6.7 is the rule that keeps them
+    /// apart — an op changes one kind of resource, and its one exception is
+    /// narrow and named.
     Many(Vec<Diff>),
 }
 

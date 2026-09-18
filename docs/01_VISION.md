@@ -456,7 +456,7 @@ coordination feature, not a backend concern.
 //! playbooks/cadu/ensure_rustible_user.rs
 use rustible::prelude::*;
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{file, user};
+use rustible_std::user;
 
 #[rustible::playbook(hosts = "local", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
@@ -472,11 +472,7 @@ fn main(ctx: &mut Ctx) -> Result<()> {
     )?;
 
     // Chaining: the next op consumes the previous op's typed result.
-    ctx.step(
-        "Ensure ~/.ssh exists",
-        file::Directory::at(account.home.join(".ssh")).owner(&account).mode(0o700),
-    )?;
-
+    // `~/.ssh` is not a step: `authorized_keys` creates it (6.7).
     let authorized = ctx.step(
         "Install authorized keys",
         authorized_keys::Present::for_user(&account).keys(keys).exclusive(true),
@@ -496,10 +492,9 @@ Rendered by the orchestrator from the event stream:
 PLAYBOOK ensure_rustible_user   hosts: local   (x86_64-unknown-linux-musl, cached)
 
 [local]  Ensure rustible user exists ........ changed   uid=1002
-[local]  Ensure ~/.ssh exists ............... ok
 [local]  Install authorized keys ............ changed   +2 keys
 
-local    ok=3  changed=2  skipped=0  failed=0     1.2s
+local    ok=2  changed=2  skipped=0  failed=0     1.2s
 ```
 
 - The `#[rustible::playbook(...)]` attribute carries metadata: target hosts (a host
@@ -720,6 +715,19 @@ state-as-parameter shape 6.3 rejects; corrected 2026-09-07 during vetting.
 with a clear message rather than creating it silently.** `user::Membership` does
 not create the group; `group::Present` does. This keeps the report honest about
 what changed. The stdlib will make this call hundreds of times; this is the rule.
+
+**One exception, and it is about home directories only.** An op that manages a
+file belonging to a single account may create the account's own directory that
+holds it — `~/.ssh` for `ssh::authorized_keys`, and nothing outside a home
+directory. That directory is not a shared resource: it belongs to that account
+alone, and an op that was given the account already has its uid, gid and home
+in hand, so there is nothing to guess about who should own it or what mode it
+takes. Two limits keep this from becoming the general case. The op still
+reports the creation in its own diff, so the report stays honest about what
+changed; and it still refuses to create the **home directory** itself, which
+belongs to `user::Present::create_home`. Outside a home directory nothing
+changes: a shared directory such as `/etc/sysctl.d`, or a download
+destination, is a prerequisite and is refused.
 
 ### 6.8 Translations of real Ansible modules
 
@@ -1741,7 +1749,7 @@ The verdict column says whether deciding late has a cost.
 | 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
 | 3 | ~~Playbook-to-bin mapping~~ | decided 2026-09-07 | Build-script discovery of files marked `#[rustible::playbook]`, one playbook per shipped binary via `RUSTIBLE_PLAYBOOK` (section 9). |
 | 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
-| 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`; more variants for package sets, permissions, services | M6 | Additive; ops construct variants, nobody matches exhaustively. |
+| 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`, `Many`; more variants for package sets, permissions, services | M6 | Additive; ops construct variants, nobody matches exhaustively. |
 | 6 | **Output rendering**: per-host buffering vs live interleaving, verbosity levels, machine-readable mode | M3, then iterate | Orchestrator UX, not API. |
 | 7 | **Target-side cache cleanup** for `~/.cache/rustible/bin/` | whenever | Trivial. |
 | 8 | **`doas` specifics** for `escalate="doas"` | M5 | Same shape as sudo. |
