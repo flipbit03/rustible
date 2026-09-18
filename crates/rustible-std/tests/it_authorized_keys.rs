@@ -113,10 +113,15 @@ fn authorized_keys_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The attribute half, against a real `chmod`/`chown`. sshd's `StrictModes`
-/// refuses keys out of a group-writable `.ssh` or a file the account does not
-/// own, so an op that installed keys and left those alone would report a
-/// clean `changed` over an account that still cannot log in.
+/// The attribute half, against a real `chmod`/`chown`.
+///
+/// The `.ssh` is planted 0775 deliberately: that is group-writable, which is
+/// the state `sshd(8)` actually refuses to read keys out of under
+/// `StrictModes` (its manual: writable by other users means "sshd will not
+/// allow it to be used"). So this is the case where installing keys and
+/// leaving the mode alone reports a clean `changed` over an account that
+/// still cannot log in.
+///
 /// Ansible repairs these only on a run that is already rewriting the file;
 /// here the keys are already correct, so this is the case its `do_write` gate
 /// misses and the reason `Present` checks on every run.

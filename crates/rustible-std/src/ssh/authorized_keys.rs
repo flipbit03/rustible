@@ -22,13 +22,27 @@ use rustible_sdk::prelude::*;
 
 use crate::file::{Owner, apply_attrs, plan_attrs};
 
-/// The mode `~/.ssh` must have. Not a preference: sshd's `StrictModes` — on
-/// by default — refuses to read keys out of a directory that anyone but the
-/// owner can write to, so a wrong mode here is an account that cannot log in
-/// while the run reports success.
+/// The mode `~/.ssh` is held at: what `sshd(8)` recommends, and what
+/// `ansible.posix.authorized_key` sets.
+///
+/// The half that is not a preference is the *write* bits. sshd's
+/// `StrictModes` is on by default, and its own manual says that if
+/// `authorized_keys`, `~/.ssh` or the home directory "are writable by other
+/// users ... sshd will not allow it to be used": the keys are then ignored
+/// silently, so a group-writable `.ssh` is an account that cannot log in
+/// while the run reports success. Ownership counts too — sshd accepts the
+/// user or root and refuses a third party.
+///
+/// 0700 rather than 0755 is the recommendation rather than the rule, and is
+/// what this op sets because it is also what Ansible sets.
 const SSH_DIR_MODE: u32 = 0o700;
 
-/// The mode `authorized_keys` must have, for the same reason.
+/// The mode `authorized_keys` is held at: `sshd(8)`'s recommended
+/// "read/write for the user, and not accessible by others", and Ansible's
+/// value. sshd itself only refuses a file writable by others — 0644 passes
+/// its check — so unlike the directory this is hygiene rather than a login
+/// failure: a world-readable `authorized_keys` tells every account on the
+/// box which keys open this one.
 const KEYS_FILE_MODE: u32 = 0o600;
 
 /// One line of an `authorized_keys` file, as sshd reads it:
@@ -718,12 +732,16 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 /// directly (from `user::Present` or `user::Existing`) with no lookup.
 ///
 /// **The user forms own `~/.ssh` as well as the file in it.** Both are
-/// created when missing, and both are held at the mode sshd insists on —
-/// 0700 for the directory, 0600 for the file — owned by the account, on
-/// every run. A directory or file left group-writable or owned by root is
-/// repaired and the repair is reported, because sshd's `StrictModes`
-/// silently refuses keys it finds that way: without this the step reports
-/// success over an account that still cannot log in.
+/// created when missing, and both are held at 0700 and 0600 respectively,
+/// owned by the account, on every run — the modes `sshd(8)` recommends and
+/// the ones Ansible sets.
+///
+/// Repairing them matters because of what sshd does when they are wrong:
+/// `StrictModes` is on by default, and a `~/.ssh` writable by anyone but its
+/// owner makes sshd ignore the keys **silently**. Install keys into one of
+/// those and the step reports a clean `changed` over an account that still
+/// cannot log in. So the attributes are checked every run and the repair is
+/// reported as its own block in the diff.
 ///
 /// That last part goes **further than Ansible**, deliberately.
 /// `ansible.posix.authorized_key` does the same work — `manage_dir` defaults
@@ -897,16 +915,39 @@ impl Op for Present {
         };
         let resolved = self.target.resolve(sys)?;
 
-        // The directory first: the file goes inside it. `check` refused a
-        // missing home, so `mkdir_all` here can only create this one
-        // component.
+        // The directory first: the file goes inside it.
         if let Some(dir) = &report.created_dir {
+            // `check` refuses a missing home, and only a dry run — which
+            // never reaches `apply` (`Ctx::step` returns at the check-mode
+            // arm) — is allowed past that. Verify rather than trust: the only
+            // tool available is `mkdir_all`, which would invent the home
+            // directory root-owned and 0755, and that is the one outcome
+            // this op promises never to produce. One `stat` is a cheap price
+            // for making the promise structural.
+            let home = dir.parent().unwrap_or(dir.as_path());
+            if sys.stat_follow(home)?.is_none() {
+                bail!(
+                    "home directory {} disappeared between check and apply; refusing to \
+                     create {} because doing so would create the home too, root-owned",
+                    home.display(),
+                    dir.display()
+                );
+            }
             sys.mkdir_all(dir)?;
         }
         if let Some(dir) = &resolved.ssh_dir {
             let (mode, owner) =
                 planned_attrs(&change.diff, dir, SSH_DIR_MODE, resolved.file_owner());
-            apply_attrs(sys, dir, mode, owner)?;
+            // Naming the account here because the bare failure is an errno
+            // against a path: `chown` needs root, so an unescalated run
+            // against a directory somebody else owns fails with `EPERM` and
+            // nothing saying which account it was trying to hand it to.
+            apply_attrs(sys, dir, mode, owner).with_context(|| {
+                format!(
+                    "giving {} the mode and owner the account's keys need",
+                    dir.display()
+                )
+            })?;
         }
 
         // Absent when only the attributes were wrong: the keys in the file
@@ -920,7 +961,12 @@ impl Op for Present {
             KEYS_FILE_MODE,
             resolved.file_owner(),
         );
-        apply_attrs(sys, &resolved.path, mode, owner)?;
+        apply_attrs(sys, &resolved.path, mode, owner).with_context(|| {
+            format!(
+                "giving {} the mode and owner the account's keys need",
+                resolved.path.display()
+            )
+        })?;
         Ok(report)
     }
 }
@@ -1496,10 +1542,12 @@ mod tests {
         assert!(r.added.is_empty());
     }
 
-    /// sshd's `StrictModes` silently refuses keys out of a group-writable
-    /// `.ssh` or a file the account does not own, so leaving these alone
-    /// would mean reporting a clean `changed` over an account that still
-    /// cannot log in.
+    /// The planted `.ssh` is 0755 root-owned. sshd would actually *accept*
+    /// that one — it refuses only a directory writable by others, and root
+    /// ownership is allowed — which is the point: the op holds both at the
+    /// recommended modes rather than at the minimum sshd tolerates, the way
+    /// Ansible does. `wrong_modes_and_ownership_are_repaired` at tier 3 uses
+    /// 0775, which sshd does refuse.
     ///
     /// A key *is* being added here, so Ansible would repair too;
     /// `a_wrong_mode_alone_is_a_change_with_no_text_diff` is the case its
@@ -1538,6 +1586,13 @@ mod tests {
 
     /// The attributes are a change in their own right: the keys can be
     /// exactly as asked for while the file is still readable by everyone.
+    ///
+    /// The rendered diff is asserted whole because of what is *missing* from
+    /// it. The file is already owned by the account, so no `owner` line is
+    /// planned — and `apply` sets only what the diff names, so no `chown`
+    /// happens. That is what keeps an unescalated run working: `chown` needs
+    /// root, and a run managing its own keys must not be asked to give away
+    /// a file it already owns just because the mode was wrong.
     #[test]
     fn a_wrong_mode_alone_is_a_change_with_no_text_diff() {
         let fake = fake_with_user_and_ssh_dir();
@@ -1640,6 +1695,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("/nope does not exist"), "{err}");
+        // The *reason*, not just the fact: `in_file` names no account, so
+        // there is no owner for a directory it might create. Asserting only
+        // on "does not exist" would pass on the message the user forms used
+        // to give, which now create the directory instead.
+        assert!(err.contains("having no account to own it"), "{err}");
+        assert!(
+            err.contains("for_user/for_account"),
+            "names the forms that do create it: {err}"
+        );
+        assert!(fake.file("/nope").is_none());
+    }
+
+    /// `exclusive` and the directory work are independent, and a first
+    /// provision with `.exclusive(true)` is a real shape — it is what
+    /// `rustible_github`'s exclusive mode does on a fresh account.
+    #[test]
+    fn exclusive_on_a_fresh_account_creates_the_directory_and_writes_only_ours() {
+        let fake = fake_with_user(); // no /home/cadu/.ssh
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu")
+            .exclusive(true)
+            .keys([K1, K2]);
+
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.file("/home/cadu/.ssh").unwrap().mode,
+            0o700,
+            "exclusive does not skip the directory work"
+        );
+        assert_eq!(
+            fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
+            format!("{K1}\n{K2}\n")
+        );
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// `apply` will not create a home directory even when handed a plan that
+    /// says to create `.ssh` inside a home that is not there.
+    ///
+    /// `Ctx::step` cannot produce that pairing — it returns at the check-mode
+    /// arm without calling `apply` — so this reaches past it and calls the
+    /// two halves directly, which is the only way to exercise the guard. The
+    /// outcome it prevents is the one `[M6] 2026-09-08` refused and this op's
+    /// own message promises: a root-owned home, an account that cannot log
+    /// in, and a repair nobody asked for.
+    #[test]
+    fn apply_refuses_to_create_a_home_even_when_the_plan_says_to() {
+        let fake = Arc::new(Fake::new().with_file("/etc/passwd", PASSWD));
+        let op = Present::for_user_name("cadu").keys([K1]);
+
+        // A dry check tolerates the missing home and plans the directory.
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = op.check(&dry).unwrap() else {
+            panic!("check mode tolerates a missing home")
+        };
+        assert_eq!(
+            c.predicted.as_ref().unwrap().created_dir,
+            Some(PathBuf::from("/home/cadu/.ssh"))
+        );
+
+        // Handing that plan to a real `apply` must not make the home.
+        let err = op.apply(&fake_sys(&fake), c).unwrap_err().chain();
+        assert!(err.contains("home directory /home/cadu"), "{err}");
+        assert!(fake.file("/home/cadu").is_none(), "no root-owned home");
+        assert!(fake.file("/home/cadu/.ssh").is_none());
     }
 
     #[test]

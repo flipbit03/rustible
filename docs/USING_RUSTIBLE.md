@@ -910,13 +910,21 @@ already changed the machine. Create the directory first.
 **The one op that does create a directory is `ssh::authorized_keys`**, and
 only in its user forms (`for_user`, `for_user_name`, `for_account`). It owns
 `~/.ssh` as well as the file inside it: it creates the directory when missing
-and holds both at the mode sshd insists on — 0700 for the directory, 0600 for
-the file — owned by the account, on **every** run. A `.ssh` left
-group-writable or owned by root is repaired, and the repair is reported as its
-own block in the diff, because sshd's `StrictModes` silently refuses keys it
-finds that way: without it the step reports success over an account that still
-cannot log in. So there is no `file::Directory` step above, and you do not
-want one.
+and holds it at 0700 and the file at 0600, owned by the account, on **every**
+run — the modes `sshd(8)` recommends and the ones Ansible sets. A wrong mode
+or owner is repaired, and the repair is reported as its own block in the diff.
+So there is no `file::Directory` step above, and you do not want one.
+
+⚠️ The reason the repair is not cosmetic: `StrictModes` is on by default, and
+sshd's own manual says that if `authorized_keys`, `~/.ssh` or the home
+directory *"are writable by other users ... sshd will not allow it to be
+used"*. It says nothing and logs nothing the caller sees. So a step that
+installs keys into a group-writable `~/.ssh` and leaves the mode alone reports
+a clean `changed` over an account that still cannot log in. (sshd is narrower
+than the recommendation in two ways worth knowing: it accepts a directory
+owned by *root* as well as by the user, and it accepts a 0644
+`authorized_keys`, since neither is writable by others. 0700/0600 are what its
+manual recommends and what Ansible writes, so they are what this op holds.)
 
 ℹ️ This is Ansible's `manage_dir` (default true) with one difference.
 `ansible.posix.authorized_key` reaches its directory-and-ownership pass only
