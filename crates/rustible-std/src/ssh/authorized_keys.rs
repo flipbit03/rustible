@@ -489,10 +489,10 @@ struct SshDir {
 /// deliberate (vision 6.7 amendment): `~/.ssh` exists to hold
 /// `authorized_keys` and nothing else, the op already knows its mode and its
 /// owner without being told, and both the creation and the repair are lines
-/// in the diff, so the report stays honest. `ansible.posix.authorized_key`
-/// draws the line in the same place — its `manage_dir` defaults to true and
-/// its `chmod`/`chown` sit *outside* the "did it exist" branch, so it
-/// repairs every run too.
+/// in the diff, so the report stays honest. `ansible.posix.authorized_key`'s
+/// `manage_dir` defaults to true and does the same work, though it reaches it
+/// only on a run that is already rewriting the file; [`Present`] goes
+/// further, and says why.
 ///
 /// Two refusals survive, both "something unexpected is in the way": `.ssh`
 /// is not a directory, or it is a symlink pointing at nothing.
@@ -636,6 +636,44 @@ fn planned_attrs(
     (None, None)
 }
 
+/// Collapse the parts of a change into one diff. A single part stays the
+/// shape it always was, so the common case — keys appended to a file that is
+/// already correct — renders as the plain file diff a reader is used to.
+fn one_or_many(mut parts: Vec<Diff>) -> Option<Diff> {
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(Diff::Many(parts)),
+    }
+}
+
+/// The attribute changes for an existing `~/.ssh`, and none when the op owns
+/// no directory. Unlike [`plan_ssh_dir`] this never plans a creation: its
+/// caller has already found the file, so the directory holding it is there.
+fn plan_existing_dir_attrs(sys: &System, resolved: &Resolved) -> Result<Vec<AttrChange>> {
+    let Some(dir) = &resolved.ssh_dir else {
+        return Ok(vec![]);
+    };
+    Ok(match sys.stat_follow(dir)? {
+        Some(s) if s.kind == FileKind::Dir => {
+            plan_attrs(Some(&s), Some(SSH_DIR_MODE), resolved.file_owner())
+        }
+        _ => vec![],
+    })
+}
+
+/// Apply the attribute parts `check` planned for the directory and the file.
+/// Shared by [`Present`] and [`Absent`], which differ in *when* they plan
+/// them, not in how they are applied.
+fn apply_planned_attrs(sys: &System, resolved: &Resolved, diff: &Diff) -> Result<()> {
+    if let Some(dir) = &resolved.ssh_dir {
+        let (mode, owner) = planned_attrs(diff, dir, SSH_DIR_MODE, resolved.file_owner());
+        apply_attrs(sys, dir, mode, owner)?;
+    }
+    let (mode, owner) = planned_attrs(diff, &resolved.path, KEYS_FILE_MODE, resolved.file_owner());
+    apply_attrs(sys, &resolved.path, mode, owner)
+}
+
 /// The new file text in a plan, or `None` when only attributes were wrong
 /// and the contents are already what they should be.
 fn planned_text(diff: &Diff) -> Option<&str> {
@@ -686,9 +724,19 @@ fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
 /// repaired and the repair is reported, because sshd's `StrictModes`
 /// silently refuses keys it finds that way: without this the step reports
 /// success over an account that still cannot log in.
-/// `ansible.posix.authorized_key` behaves the same (`manage_dir`, default
-/// true). The home directory itself is *not* created: that belongs to
-/// `user::Present::create_home` and creating it here would leave it
+///
+/// That last part goes **further than Ansible**, deliberately.
+/// `ansible.posix.authorized_key` does the same work — `manage_dir` defaults
+/// to true — but gates it on `do_write` (`authorized_key.py:672-673`), so on
+/// a host whose keys are already correct it never looks at the mode and
+/// leaves a 0755 root-owned `.ssh` in place. The keys being right is exactly
+/// the case where a wrong mode is invisible and fatal, so this op checks it
+/// on every run and reports the repair as its own block in the diff.
+/// [`Absent`] keeps Ansible's gate, because a revocation is not a claim
+/// about the account's keys as a whole.
+///
+/// The home directory itself is *not* created: that belongs to
+/// `user::Present::create_home`, and creating it here would leave it
 /// root-owned.
 ///
 /// The `in_file` form writes an explicit path, handles no ownership, and
@@ -836,17 +884,10 @@ impl Op for Present {
                 changes: file_attrs,
             });
         }
-        if parts.is_empty() {
+        let Some(diff) = one_or_many(parts) else {
             return Ok(Plan::Satisfied(report));
-        }
-        report.created_dir = dir.create;
-        // One part stays the shape it always was, so the common case — keys
-        // appended to a file that is already correct — renders as the plain
-        // file diff a reader is used to.
-        let diff = match parts.len() {
-            1 => parts.pop().expect("one part"),
-            _ => Diff::Many(parts),
         };
+        report.created_dir = dir.create;
         Ok(Plan::change_predicting(diff, report))
     }
 
@@ -898,13 +939,18 @@ impl Op for Present {
 /// # Ok(()) }
 /// ```
 ///
-/// A missing file is already satisfied. Nothing is created and no
-/// attributes are changed — including `~/.ssh`, which [`Present`] creates
-/// and repairs. The asymmetry is deliberate: revoking a key is not a claim
-/// about who should own the account's directory, and an op named `Absent`
-/// that reported `changed` for a mode it fixed while removing no key would
-/// be answering a question nobody asked. Use [`Present`], `file::Directory`
-/// or `file::Attrs` for that.
+/// A missing file, or one that does not carry the key, is already satisfied:
+/// nothing is written, nothing is created, and no attribute is touched.
+///
+/// **On a run that does remove a key**, the account's `~/.ssh` and the file
+/// are brought to the mode sshd requires and to the account's ownership,
+/// exactly as [`Present`] does. This is `ansible.posix.authorized_key`'s own
+/// rule, which gates the whole directory-and-ownership pass on `do_write`
+/// (`authorized_key.py:672-673`): a revocation that rewrites the file takes
+/// that pass with it, and one that finds nothing to revoke does not.
+///
+/// `Absent` never *creates* `~/.ssh`. It cannot need to: the directory is
+/// missing only when the file is, and then there is no key to remove.
 #[derive(Debug, Clone)]
 pub struct Absent {
     target: Target,
@@ -971,30 +1017,68 @@ impl Op for Absent {
     fn check(&self, sys: &System) -> Result<Plan<KeysReport>> {
         let keys = parse_keys(&self.keys)?;
         let resolved = self.target.resolve(sys)?;
-        // No `plan_ssh_dir`: a missing file is satisfied, so there is
-        // nothing this op could need the directory for.
-        let before = read_existing(sys, &resolved.path)?.map(|(text, _)| text);
+        let existing = read_existing(sys, &resolved.path)?;
+        let (before, before_stat) = match existing {
+            Some((text, stat)) => (Some(text), Some(stat)),
+            None => (None, None),
+        };
         let planned = plan_absent(before.as_deref().unwrap_or(""), &keys);
         let (text, report) = planned.into_report(resolved.path.clone());
-        match text {
-            None => Ok(Plan::Satisfied(report)),
-            Some(after) => Ok(Plan::change_predicting(
-                Diff::text(&resolved.path, before.unwrap_or_default(), after),
-                report,
-            )),
+
+        // Ansible's `do_write` gate. No key to remove means no write, and a
+        // run that writes nothing takes no directory or ownership pass with
+        // it — so a revocation that finds nothing to revoke is `ok` and
+        // leaves even a wrong mode alone. `Present` is the op that asserts
+        // what the account's keys should be, and the op to reach for when
+        // the attributes are what need fixing.
+        let Some(after) = text else {
+            return Ok(Plan::Satisfied(report));
+        };
+
+        // It is rewriting the file, so the pass comes along. `before_stat`
+        // is `Some` here: `plan_absent` only removes what it read.
+        let dir_changes = plan_existing_dir_attrs(sys, &resolved)?;
+        let file_changes = match (resolved.file_owner(), &before_stat) {
+            (Some(o), Some(stat)) => plan_attrs(Some(stat), Some(KEYS_FILE_MODE), Some(o)),
+            _ => vec![],
+        };
+
+        let mut parts = Vec::new();
+        if !dir_changes.is_empty()
+            && let Some(dir) = &resolved.ssh_dir
+        {
+            parts.push(Diff::Attrs {
+                subject: dir.display().to_string(),
+                changes: dir_changes,
+            });
         }
+        parts.push(Diff::text(
+            &resolved.path,
+            before.unwrap_or_default(),
+            after,
+        ));
+        if !file_changes.is_empty() {
+            parts.push(Diff::Attrs {
+                subject: resolved.path.display().to_string(),
+                changes: file_changes,
+            });
+        }
+        let diff = one_or_many(parts).expect("the text part is always there");
+        Ok(Plan::change_predicting(diff, report))
     }
 
     fn apply(&self, sys: &System, change: Change<KeysReport>) -> Result<KeysReport> {
-        let Diff::Text { after, .. } = &change.diff else {
-            bail!("authorized_keys::Absent::apply received a non-text diff");
+        let Some(after) = planned_text(&change.diff) else {
+            bail!("authorized_keys::Absent::apply received a change with no file text");
         };
         let Some(report) = change.predicted else {
             bail!("authorized_keys::Absent::apply received a change without its prediction");
         };
         let resolved = self.target.resolve(sys)?;
-        // The file exists (check found keys in it), so this never creates.
+        // The file exists (check found keys in it), so this never creates,
+        // and its mode and owner are already what they should be.
         sys.write_atomic(&resolved.path, after.as_bytes())?;
+        apply_planned_attrs(sys, &resolved, &change.diff)?;
         Ok(report)
     }
 }
@@ -1415,9 +1499,11 @@ mod tests {
     /// sshd's `StrictModes` silently refuses keys out of a group-writable
     /// `.ssh` or a file the account does not own, so leaving these alone
     /// would mean reporting a clean `changed` over an account that still
-    /// cannot log in. `ansible.posix.authorized_key` repairs both on every
-    /// run (its `chmod`/`chown` sit outside the "did it exist" branch) and
-    /// so does this.
+    /// cannot log in.
+    ///
+    /// A key *is* being added here, so Ansible would repair too;
+    /// `a_wrong_mode_alone_is_a_change_with_no_text_diff` is the case its
+    /// `do_write` gate misses and this op does not.
     #[test]
     fn an_existing_file_and_dir_are_repaired_to_what_sshd_needs() {
         let fake = Arc::new(
@@ -1821,16 +1907,17 @@ mod tests {
 
     #[test]
     fn absent_removes_exactly_one_of_three() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/etc/passwd", PASSWD)
-                .with_dir("/home/cadu")
-                .with_dir("/home/cadu/.ssh")
-                .with_file(
-                    "/home/cadu/.ssh/authorized_keys",
-                    format!("# keys\n{K1}\n{K2}\n{K3}\n"),
-                ),
-        );
+        // Attributes already right, so the diff is about keys and nothing
+        // else; `absent_repairs_attributes_on_a_run_that_removes_a_key`
+        // covers the case where they are not.
+        let fake = fake_with_user_and_ssh_dir();
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new("/home/cadu/.ssh/authorized_keys"),
+            format!("# keys\n{K1}\n{K2}\n{K3}\n").as_bytes(),
+        )
+        .unwrap();
+        set_attrs(&fake, "/home/cadu/.ssh/authorized_keys", 0o600, 1000, 1001);
         let sys = fake_sys(&fake);
         let op = Absent::for_user_name("cadu").keys([K2]);
         let Plan::Change(c) = op.check(&sys).unwrap() else {
@@ -1847,15 +1934,10 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
-    /// `Absent` is a revocation, not a claim about who should own the
-    /// account's directory: it creates no `.ssh` and repairs no mode, where
-    /// `Present` does both. Ansible has one module for both states and
-    /// manages attributes whenever it writes; this split follows the op
-    /// names instead, so a step called `Absent` never reports `changed` for
-    /// a mode it fixed while removing no key.
-    #[test]
-    fn absent_leaves_the_directory_and_the_mode_alone() {
-        let fake = Arc::new(
+    /// A `.ssh` and a key file left wrong by a careless hand, carrying two
+    /// keys.
+    fn fake_with_wrong_attributes() -> Arc<Fake> {
+        Arc::new(
             Fake::new()
                 .with_file("/etc/passwd", PASSWD)
                 .with_dir("/home/cadu")
@@ -1865,23 +1947,71 @@ mod tests {
                     format!("{K1}\n{K2}\n"),
                     0o644,
                 ),
-        );
+        )
+    }
+
+    /// Ansible gates the whole directory-and-ownership pass on `do_write`
+    /// (`authorized_key.py:672-673`), so a `state: absent` that removes a key
+    /// takes it along. This is that half.
+    #[test]
+    fn absent_repairs_attributes_on_a_run_that_removes_a_key() {
+        let fake = fake_with_wrong_attributes();
         let sys = fake_sys(&fake);
         let op = Absent::for_user_name("cadu").keys([K1]);
+
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert!(matches!(c.diff, Diff::Text { .. }), "no attribute parts");
+        assert_eq!(
+            c.diff.short(),
+            "mode=0700 owner=1000:1001 +0 -1 lines mode=0600 owner=1000:1001"
+        );
         op.apply(&sys, c).unwrap();
+
         assert_eq!(
             fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
             format!("{K2}\n")
         );
+        let file = fake.file("/home/cadu/.ssh/authorized_keys").unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
+        let dir = fake.file("/home/cadu/.ssh").unwrap();
+        assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 1000, 1001));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// And the other half, which is what keeps `Absent` honest: with no key
+    /// to remove there is no write, so Ansible's `do_write` stays false and
+    /// nothing is touched. A revocation that finds nothing to revoke must not
+    /// report `changed` for a mode it decided to fix.
+    #[test]
+    fn absent_with_nothing_to_remove_repairs_nothing() {
+        let fake = fake_with_wrong_attributes();
+        let sys = fake_sys(&fake);
+        let op = Absent::for_user_name("cadu").keys([K3]); // not in the file
+
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        assert_eq!(fake.file("/home/cadu/.ssh").unwrap().mode, 0o755);
         assert_eq!(
             fake.file("/home/cadu/.ssh/authorized_keys").unwrap().mode,
             0o644
         );
-        assert_eq!(fake.file("/home/cadu/.ssh").unwrap().mode, 0o755);
+    }
+
+    /// `Absent` never creates the directory, and never needs to: `.ssh` is
+    /// missing only when the file is, and then there is no key to remove.
+    #[test]
+    fn absent_never_creates_the_directory() {
+        let fake = fake_with_user(); // no /home/cadu/.ssh
+        let sys = fake_sys(&fake);
+        let Plan::Satisfied(r) = Absent::for_user_name("cadu")
+            .keys([K1])
+            .check(&sys)
+            .unwrap()
+        else {
+            panic!("nothing to remove")
+        };
+        assert_eq!(r.created_dir, None);
+        assert!(fake.file("/home/cadu/.ssh").is_none());
     }
 
     #[test]

@@ -915,9 +915,15 @@ the file — owned by the account, on **every** run. A `.ssh` left
 group-writable or owned by root is repaired, and the repair is reported as its
 own block in the diff, because sshd's `StrictModes` silently refuses keys it
 finds that way: without it the step reports success over an account that still
-cannot log in. `ansible.posix.authorized_key` behaves the same
-(`manage_dir`, default true). So there is no `file::Directory` step above,
-and you do not want one.
+cannot log in. So there is no `file::Directory` step above, and you do not
+want one.
+
+ℹ️ This is Ansible's `manage_dir` (default true) with one difference.
+`ansible.posix.authorized_key` reaches its directory-and-ownership pass only
+on a run that is already rewriting the file, so on a host whose keys are
+already correct it never looks at the mode. `Present` checks every run,
+because "the keys are already right" is exactly when a wrong mode is
+invisible and fatal.
 
 What it still refuses:
 
@@ -928,8 +934,11 @@ What it still refuses:
 | `~/.ssh` is a symlink pointing at nothing | refused, saying so |
 | `in_file(path)` with a missing parent | refused: no account is named, so nothing says who a created directory should belong to |
 
-`authorized_keys::Absent` creates and repairs nothing: revoking a key is not
-a claim about who should own the directory.
+`authorized_keys::Absent` follows Ansible exactly: on a run that removes a
+key it brings `~/.ssh` and the file to the same state, and on one that finds
+nothing to remove it reports `ok` and touches nothing. It never creates the
+directory, and never needs to — `.ssh` is missing only when the file is, and
+then there is no key to remove.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already

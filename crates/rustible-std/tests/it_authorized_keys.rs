@@ -73,13 +73,36 @@ fn authorized_keys_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         format!("{K1}\n{K2}\n")
     );
 
-    // Absent: one key goes, the other stays.
+    // Absent: one key goes, the other stays. Ansible gates its
+    // directory-and-ownership pass on `do_write`, so a revocation that writes
+    // takes it along — break both first and watch the removal fix them.
+    ctx.sys().set_mode(&ssh_dir, 0o755)?;
+    ctx.sys().set_mode(&keys_file, 0o644)?;
     let (first, second) = changed_then_ok(ctx, "revoke a key", || {
         authorized_keys::Absent::for_user(&account).keys([K1])
     })?;
     assert_eq!(first.removed.len(), 1);
     assert_eq!(second.not_present.len(), 1);
     assert_eq!(ctx.sys().read_to_string(&keys_file)?, format!("{K2}\n"));
+    let st = ctx.sys().stat(&ssh_dir)?.expect("dir exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o700, account.uid, account.gid));
+    let st = ctx.sys().stat(&keys_file)?.expect("file exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o600, account.uid, account.gid));
+
+    // But a revocation with nothing to revoke writes nothing, so it takes no
+    // pass with it: Ansible's `do_write` stays false and so does ours.
+    ctx.sys().set_mode(&keys_file, 0o644)?;
+    let r = ctx.step(
+        "revoke a key that is already gone",
+        authorized_keys::Absent::for_user(&account).keys([K1]),
+    )?;
+    assert!(!r.changed);
+    assert_eq!(
+        ctx.sys().stat(&keys_file)?.expect("file exists").mode,
+        0o644,
+        "a revocation that removes nothing must not repair anything"
+    );
+    ctx.sys().set_mode(&keys_file, 0o600)?;
 
     // Same file by name, as a playbook without the account in scope does it.
     let r = ctx.step(
@@ -94,7 +117,9 @@ fn authorized_keys_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 /// refuses keys out of a group-writable `.ssh` or a file the account does not
 /// own, so an op that installed keys and left those alone would report a
 /// clean `changed` over an account that still cannot log in.
-/// `ansible.posix.authorized_key` repairs both on every run; so does this.
+/// Ansible repairs these only on a run that is already rewriting the file;
+/// here the keys are already correct, so this is the case its `do_write` gate
+/// misses and the reason `Present` checks on every run.
 #[rustible::integration_test(images = ["debian:12"])]
 fn wrong_modes_and_ownership_are_repaired(ctx: &mut Ctx) -> Result<()> {
     let account = ctx.step(
