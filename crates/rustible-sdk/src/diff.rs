@@ -46,8 +46,10 @@ pub enum Diff {
     /// directory that holds it reports both, so the account of what changed
     /// stays complete.
     ///
-    /// Not a way to bundle unrelated work. Two things that can be wanted
-    /// independently are two steps, and vision 6.7 is the test.
+    /// Not a way to bundle unrelated work: two things that can be wanted
+    /// independently are two steps. (That test comes from the granularity
+    /// amendment proposed for vision 6.7, not from 6.7 as it stands today,
+    /// which only says an op must not create a prerequisite silently.)
     Many(Vec<Diff>),
 }
 

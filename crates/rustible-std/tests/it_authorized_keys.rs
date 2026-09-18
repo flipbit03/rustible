@@ -4,12 +4,14 @@
 //! real filesystem. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys`.
 //!
-//! This tier is the only one that can prove the directory work. The `Fake`'s
-//! `write` does not need a parent to exist, so at tier 2 a `check` that
-//! planned the directory and an `apply` that forgot to create it look
-//! identical; here the write fails. Real `mkdir`, `chmod` and `chown`, and a
-//! real `/etc/passwd`, are also what says whether the attribute repair does
-//! on a machine what it does against the fake.
+//! What this tier adds over the `Fake`, having checked rather than assumed:
+//! a missing `mkdir_all` *is* caught at tier 2 (the fake's `set_mode` errors
+//! on an absent path), so that is not the reason. The reasons are real
+//! `chmod`/`chown` semantics on a real inode, a real `/etc/passwd` that
+//! `useradd` wrote, the fact that `useradd -m` does not make `~/.ssh` — which
+//! is the premise the whole change rests on and which only a real `useradd`
+//! can establish — and symlink resolution through a directory component,
+//! which `Fake::resolve` does not model.
 
 use std::sync::Arc;
 
@@ -26,8 +28,10 @@ const STRANGER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else";
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn authorized_keys_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
-    // The vision 6.1 playbook, which is now two steps rather than three:
-    // `~/.ssh` is the keys step's own business (issue #40).
+    // The vision 6.1 playbook, minus its `file::Directory` step: `~/.ssh` is
+    // the keys step's own business now (issue #40). Vision 6.1 itself still
+    // shows three steps and is unamended — the amendment is proposed, not
+    // applied, because CLAUDE.md reserves that edit for the author.
     let account = ctx.step("user", user::Present::new("rustible-ak").shell("/bin/bash"))?;
     assert!(account.changed);
     let ssh_dir = account.home.join(".ssh");
@@ -184,7 +188,13 @@ fn refusals_that_need_a_human(ctx: &mut Ctx) -> Result<()> {
         )
         .unwrap_err()
         .chain();
-    assert!(err.contains("home directory"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "home directory {} does not exist",
+            homeless.home.display()
+        )),
+        "must be the missing-home refusal, not the not-absolute one: {err}"
+    );
     assert!(err.contains("create_home(true)"), "names the fix: {err}");
     assert!(
         !ctx.sys().exists(&homeless.home)?,
@@ -222,7 +232,51 @@ fn refusals_that_need_a_human(ctx: &mut Ctx) -> Result<()> {
         )
         .unwrap_err()
         .chain();
-    assert!(err.contains("exists and is not a directory"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "{} exists and is not a directory",
+            ssh_path.display()
+        )),
+        "must name the .ssh path, not some other parent: {err}"
+    );
+    Ok(())
+}
+
+/// Symlink resolution through a directory component, which the `Fake` does
+/// not model: `Fake::resolve` follows only a path's final component, so tier
+/// 2 cannot say where the file actually lands when `~/.ssh` is a link. Here a
+/// real kernel answers.
+#[rustible::integration_test(images = ["debian:12"])]
+fn symlinked_ssh_dir_is_followed_to_the_real_directory(ctx: &mut Ctx) -> Result<()> {
+    let account = ctx.step("user", user::Present::new("rustible-ak7"))?;
+    let ssh_dir = account.home.join(".ssh");
+    ctx.sys().mkdir_all("/srv/keys/rustible-ak7")?;
+    ctx.sys().set_mode("/srv/keys/rustible-ak7", 0o755)?;
+    ctx.sys().symlink("/srv/keys/rustible-ak7", &ssh_dir)?;
+
+    let (first, _) = changed_then_ok(ctx, "keys behind a link", || {
+        authorized_keys::Present::for_user(&account).keys([K1])
+    })?;
+    assert_eq!(first.created_dir, None, "the link resolves to a directory");
+
+    // The file is in the real directory, and the mode landed on the target
+    // rather than on the link.
+    let real = ctx.sys().stat("/srv/keys/rustible-ak7")?.expect("target");
+    assert_eq!(
+        (real.mode, real.uid, real.gid),
+        (0o700, account.uid, account.gid)
+    );
+    assert_eq!(
+        ctx.sys()
+            .read_to_string("/srv/keys/rustible-ak7/authorized_keys")?,
+        format!("{K1}\n")
+    );
+    let link = ctx.sys().stat(&ssh_dir)?.expect("link");
+    assert_eq!(
+        link.kind,
+        rustible::sdk::backend::FileKind::Symlink,
+        "the link itself was not replaced"
+    );
     Ok(())
 }
 
@@ -267,6 +321,11 @@ fn a_dry_run_of_a_first_provision_does_not_fail(ctx: &mut Ctx) -> Result<()> {
     let short = planned.diff.as_ref().unwrap().short();
     assert!(short.contains("exists=yes"), "{short}");
     assert!(short.contains("mode=0700"), "{short}");
+    assert!(
+        short.contains(&format!("owner={}:{}", account.uid, account.gid)),
+        "a dry run that silently dropped the ownership line would still log in \
+         nowhere: {short}"
+    );
 
     // Nothing was touched: check mode is a dry run, not a rehearsal.
     assert!(!ctx.sys().exists(&account.home)?);

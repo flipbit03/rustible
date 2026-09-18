@@ -889,8 +889,9 @@ Only the **first** match is rewritten, so a file that already has two such
 lines keeps the second. And ⚠️ an invalid regex **panics**; it is not an error
 you can catch.
 
-**Prerequisites are refused, never created.** Nothing creates a group, a home
-directory's parent, or a destination directory as a side effect. Sequence them:
+**Prerequisites are refused, never created**, with one exception noted below.
+Nothing creates a group, a home directory, or a destination directory as a
+side effect. Sequence them:
 
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
@@ -926,12 +927,15 @@ owned by *root* as well as by the user, and it accepts a 0644
 `authorized_keys`, since neither is writable by others. 0700/0600 are what its
 manual recommends and what Ansible writes, so they are what this op holds.)
 
-ℹ️ This is Ansible's `manage_dir` (default true) with one difference.
-`ansible.posix.authorized_key` reaches its directory-and-ownership pass only
-on a run that is already rewriting the file, so on a host whose keys are
-already correct it never looks at the mode. `Present` checks every run,
-because "the keys are already right" is exactly when a wrong mode is
-invisible and fatal.
+ℹ️ This is Ansible's `manage_dir` (default true), with three differences.
+(1) `ansible.posix.authorized_key` reaches its directory-and-ownership pass
+only on a run that is already rewriting the file, so on a host whose keys are
+already correct it never looks at the mode; `Present` checks every run,
+because "the keys are already right" is exactly when a group-writable
+`~/.ssh` is invisible. (2) `Absent` keeps Ansible's rule rather than
+`Present`'s — see below. (3) Ansible's `path` + `manage_dir: true` will chmod
+0700 and chown an arbitrary directory, which its own docs warn about;
+`in_file` refuses instead.
 
 What it still refuses:
 
