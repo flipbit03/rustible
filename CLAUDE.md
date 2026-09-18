@@ -144,6 +144,27 @@ a public API, check that workspace too.
 
 ## How to work
 
+**Routine work you do; core changes you propose first.** Adding an operation
+that follows the established pattern, a test, a refusal, a message, a doc fix
+— that is the job, and you get on with it. But a change to the *core* is a
+proposal, not a task: state the problem, the options you rejected and why, the
+one you recommend, and its blast radius in files and call sites. Then stop and
+wait for an answer. The author stays in the loop on the shape of the thing,
+not just its outcome, and gets to disagree while disagreeing is still cheap.
+
+Core means: the `rustible-sdk` public surface (`Op`, `Plan`, `Diff`, `System`,
+`Backend`, `Ctx`, the event and protocol types), the wire format, the `Fake`'s
+semantics, the run pipeline, the build and toolchain path, a new dependency,
+the MSRV, or the shape of CI. If you are unsure whether something counts, it
+counts.
+
+The failure this prevents is real and has happened: an SDK change bundled into
+a feature branch gets approved as part of the feature, because the go-ahead
+was for the feature. A `Diff` variant, a trait method, a new field on a
+protocol frame — each is a decision about what Rustible *is*, and each is
+harder to reverse than the operation that motivated it. Raising it separately
+costs one message. Not raising it costs an architecture nobody chose.
+
 Every change goes through a branch and a pull request, even a one-line doc
 fix. CI runs eight jobs on each, and all eight must be green:
 
