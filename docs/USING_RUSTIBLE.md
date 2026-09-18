@@ -897,8 +897,6 @@ ctx.step("docker group", group::Present::new("docker"))?;
 let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
 // `app` is only readable when the op could predict it, so guard for --check
 if app.is_available() {
-    ctx.step("ssh dir", file::Directory::at(app.home.join(".ssh"))
-        .owner(app.uid, app.gid).mode(0o700))?;
     ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
 }
 ```
@@ -909,10 +907,29 @@ operation you wanted — `user`, `group` and `authorized_keys` all do.
 into a directory that does not exist fails at `apply`, after earlier steps have
 already changed the machine. Create the directory first.
 
-⚠️ Sequencing them correctly still does not make the pair above pass
-`--check` on a machine where `.ssh` is missing — `authorized_keys` stats the
-directory rather than consulting what the previous step promised. A real run
-converges; see §15.
+**The one op that does create a directory is `ssh::authorized_keys`**, and
+only in its user forms (`for_user`, `for_user_name`, `for_account`). It owns
+`~/.ssh` as well as the file inside it: it creates the directory when missing
+and holds both at the mode sshd insists on — 0700 for the directory, 0600 for
+the file — owned by the account, on **every** run. A `.ssh` left
+group-writable or owned by root is repaired, and the repair is reported as its
+own block in the diff, because sshd's `StrictModes` silently refuses keys it
+finds that way: without it the step reports success over an account that still
+cannot log in. `ansible.posix.authorized_key` behaves the same
+(`manage_dir`, default true). So there is no `file::Directory` step above,
+and you do not want one.
+
+What it still refuses:
+
+| in the way | what happens |
+|---|---|
+| the **home directory** is missing | refused, naming `user::Present::new(..).create_home(true)` — creating a home here would leave it root-owned, which is an account that cannot log in |
+| `~/.ssh` is a regular file | refused: this op does not remove what is in the way |
+| `~/.ssh` is a symlink pointing at nothing | refused, saying so |
+| `in_file(path)` with a missing parent | refused: no account is named, so nothing says who a created directory should belong to |
+
+`authorized_keys::Absent` creates and repairs nothing: revoking a key is not
+a claim about who should own the directory.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1219,21 +1236,28 @@ satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
 changed, so they pass a dry run against a unit that does not exist yet. That
 is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
 
-`ssh::authorized_keys` is the other one you will meet. It stats the `.ssh`
-directory itself, so a `file::Directory` one line above that *would* create it
-does not count — and the refusal says so rather than telling you to add the
-step you already wrote:
+`ssh::authorized_keys::Present::in_file(path)` is the other one you will
+meet. It stats the parent directory itself, so a `file::Directory` one line
+above that *would* create it does not count — and the refusal says so rather
+than telling you to add the step you already wrote:
 
 ```
-FAILED at `keys`: /home/app/.ssh does not exist; ssh::authorized_keys does not
-create it (vision 6.7). Under --check a directory an earlier step would create
-is still reported missing, because this op stats the real filesystem. If a step
-in this run creates it, the real run converges and there is nothing to fix; if
-not, ensure it with file::Directory::at(..).mode(0o700).owner(..)
+FAILED at `keys`: /etc/ssh/keys does not exist; the in_file form of
+ssh::authorized_keys does not create it, having no account to own it. Under
+--check a directory an earlier step would create is still reported missing,
+because this op stats the real filesystem. If a step in this run creates it,
+the real run converges and there is nothing to fix; if not, ensure it with
+file::Directory::at(..)
 ```
+
+The **user** forms are not affected: they create `~/.ssh` themselves, so
+there is no earlier step for a dry run to have to trust. A missing *home*
+directory is tolerated under `--check` for the same reason — a dry run of a
+first provision would otherwise fail on a playbook that converges in one real
+pass — and refused in a run that can act.
 
 `user::Membership` naming a group an earlier `group::Present` would create is
-*not* affected — it consults the registry and passes.
+*not* affected either — it consults the registry and passes.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,

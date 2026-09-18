@@ -304,18 +304,24 @@ impl Backend for Fake {
         Ok(())
     }
 
+    // `chmod` and `chown` follow symlinks, which `System::set_mode` and
+    // `System::set_owner` both document. Operating on the link entry itself
+    // instead would let an op pass its tests here and change the wrong
+    // inode on a real machine.
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
         let mut files = self.files.lock().unwrap();
+        let real = Self::resolve(&files, p);
         files
-            .get_mut(p)
+            .get_mut(&real)
             .map(|f| f.mode = mode)
             .ok_or_else(|| not_found(p))
     }
 
     fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
         let mut files = self.files.lock().unwrap();
+        let real = Self::resolve(&files, p);
         files
-            .get_mut(p)
+            .get_mut(&real)
             .map(|f| {
                 f.uid = uid;
                 f.gid = gid;
@@ -407,6 +413,35 @@ impl Backend for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `chmod` and `chown` follow symlinks, and `System::set_mode` and
+    /// `System::set_owner` both say so. The fake operated on the link entry
+    /// itself until `ssh::authorized_keys` learned to repair a symlinked
+    /// `~/.ssh`: its test passed here while a real machine would have kept
+    /// the wrong mode on the directory that actually holds the keys.
+    #[test]
+    fn set_mode_and_set_owner_follow_symlinks_as_chmod_does() {
+        let fake = Fake::new()
+            .with_dir("/srv/keys")
+            .with_symlink("/home/a/.ssh", "/srv/keys");
+        fake.set_mode(Path::new("/home/a/.ssh"), 0o700).unwrap();
+        fake.set_owner(Path::new("/home/a/.ssh"), 1000, 1001)
+            .unwrap();
+
+        let target = fake.file("/srv/keys").unwrap();
+        assert_eq!((target.mode, target.uid, target.gid), (0o700, 1000, 1001));
+        // The link itself is untouched, and is still a link.
+        assert_eq!(fake.file("/home/a/.ssh").unwrap().kind, FileKind::Symlink);
+    }
+
+    /// A dangling link has nothing to chmod, and says so rather than
+    /// inventing the target.
+    #[test]
+    fn set_mode_through_a_dangling_symlink_is_not_found() {
+        let fake = Fake::new().with_symlink("/home/a/.ssh", "/gone");
+        assert!(fake.set_mode(Path::new("/home/a/.ssh"), 0o700).is_err());
+        assert!(fake.file("/gone").is_none());
+    }
 
     #[test]
     fn symlink_read_link_and_stat_kind() {

@@ -475,8 +475,10 @@ struct Inspection {
 ///         .groups(["docker", "adm"])
 ///         .create_home(true),
 /// )?;
-/// ctx.step("Ensure ~/.ssh exists",
-///     file::Directory::at(account.home.join(".ssh")).mode(0o700))?;
+/// ctx.step("Ensure the app directory",
+///     file::Directory::at("/srv/app")
+///         .owner(account.uid, account.gid)
+///         .mode(0o750))?;
 /// # Ok(()) }
 /// ```
 ///
