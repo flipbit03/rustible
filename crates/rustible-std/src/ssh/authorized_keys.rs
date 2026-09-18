@@ -659,17 +659,6 @@ fn planned_attrs(
     (None, None)
 }
 
-/// Collapse the parts of a change into one diff. A single part stays the
-/// shape it always was, so the common case — keys appended to a file that is
-/// already correct — renders as the plain file diff a reader is used to.
-fn one_or_many(mut parts: Vec<Diff>) -> Option<Diff> {
-    match parts.len() {
-        0 => None,
-        1 => parts.pop(),
-        _ => Some(Diff::Many(parts)),
-    }
-}
-
 /// The attribute changes for an existing `~/.ssh`, and none when the op owns
 /// no directory. Unlike [`plan_ssh_dir`] this never plans a creation: its
 /// caller has already found the file, so the directory holding it is there.
@@ -965,7 +954,7 @@ impl Op for Present {
                 changes: file_attrs,
             });
         }
-        let Some(diff) = one_or_many(parts) else {
+        let Some(diff) = Diff::many(parts) else {
             return Ok(Plan::Satisfied(report));
         };
         report.created_dir = dir.create;
@@ -1160,7 +1149,7 @@ impl Op for Absent {
                 changes: file_changes,
             });
         }
-        let diff = one_or_many(parts).expect("the text part is always there");
+        let diff = Diff::many(parts).expect("the text part is always there");
         Ok(Plan::change_predicting(diff, report))
     }
 

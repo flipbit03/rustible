@@ -50,6 +50,12 @@ pub enum Diff {
     /// independently are two steps. Vision 6.7 is the rule that keeps them
     /// apart — an op changes one kind of resource, and its one exception is
     /// narrow and named.
+    ///
+    /// Build it with [`Diff::many`] rather than by hand. The variant is
+    /// recursive because `Vec<Diff>` is the only shape that composes without
+    /// duplicating every other variant into a second enum — but a `Many`
+    /// inside a `Many`, a `Many` of one, and a `Many` of none all mean
+    /// nothing, and the constructor is what makes them unreachable.
     Many(Vec<Diff>),
 }
 
@@ -88,6 +94,31 @@ impl Diff {
     /// is binary or too large to diff.
     pub fn summary(s: impl Into<String>) -> Self {
         Diff::Summary(s.into())
+    }
+
+    /// Compose parts into one diff, in the order they happen.
+    ///
+    /// Returns the part itself when there is one, so the common case keeps
+    /// the shape it always had and an op that composes conditionally does
+    /// not have to special-case it; `None` when there are none, because a
+    /// change with nothing in it is not a change and the caller should be
+    /// returning [`Plan::Satisfied`] instead. Nested [`Diff::Many`] is
+    /// flattened.
+    ///
+    /// [`Plan::Satisfied`]: crate::op::Plan::Satisfied
+    pub fn many(parts: impl IntoIterator<Item = Diff>) -> Option<Diff> {
+        let mut flat = Vec::new();
+        for part in parts {
+            match part {
+                Diff::Many(inner) => flat.extend(inner),
+                one => flat.push(one),
+            }
+        }
+        match flat.len() {
+            0 => None,
+            1 => flat.pop(),
+            _ => Some(Diff::Many(flat)),
+        }
     }
 
     /// Human-readable rendering. Unified diff for text.
@@ -213,5 +244,29 @@ mod tests {
     fn short_skips_parts_with_nothing_to_say() {
         let d = Diff::Many(vec![Diff::summary(""), attrs("/tmp/x", "mode", "0600")]);
         assert_eq!(d.short(), "mode=0600");
+    }
+
+    /// The constructor is what keeps the recursive variant from carrying
+    /// shapes that mean nothing: no `Many` of none, no `Many` of one, no
+    /// nesting. The variant is recursive because `Vec<Diff>` is the only
+    /// composition that does not duplicate every other variant into a second
+    /// enum; this is the price of that, and it is paid in one place.
+    #[test]
+    fn many_collapses_the_shapes_that_would_mean_nothing() {
+        assert!(Diff::many([]).is_none());
+
+        let one = Diff::many([attrs("/tmp/x", "mode", "0600")]).unwrap();
+        assert!(matches!(one, Diff::Attrs { .. }), "one part stays itself");
+
+        let nested = Diff::many([
+            Diff::Many(vec![attrs("/a", "mode", "1"), attrs("/b", "mode", "2")]),
+            attrs("/c", "mode", "3"),
+        ])
+        .unwrap();
+        let Diff::Many(parts) = &nested else {
+            panic!("expected many")
+        };
+        assert_eq!(parts.len(), 3, "flattened, not nested");
+        assert!(parts.iter().all(|p| matches!(p, Diff::Attrs { .. })));
     }
 }
