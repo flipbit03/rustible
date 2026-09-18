@@ -100,6 +100,17 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
   the easy ones to forget, and the ones that matter most — they ship to
   crates.io. Real machines belong in an untracked file passed with
   `--inventory`, the way `dev/vagrant/hosts.vagrant.kdl` works.
+- **`docs/USING_RUSTIBLE.md` is an operating manual, not a changelog.** It is
+  what an external adopter's agent reads to learn Rustible, which is in no
+  model's training, and it is already long: every paragraph added spends the
+  reader's attention and the agent's context. So it carries only what changes
+  what somebody *writes* or how they read a failure — the shape of a call, a
+  refusal they will hit, a trap that will cost them an afternoon. It does not
+  carry why a behaviour was chosen, what it used to be, how it compares to
+  Ansible, or which release changed it. Reasons and history go in
+  `docs/plan/DECISIONS.md`; the behaviour itself is in the source, which is
+  where a model checks it. When an op changes, the edit here is usually
+  smaller than the change was — often a line, sometimes nothing.
 - **Never force-push.**
 - **SSH for git.** The remote is `git@github.com:flipbit03/rustible.git`.
 - **Never write a `claude.ai` session URL anywhere** — not in a commit message
@@ -132,6 +143,27 @@ break it silently. CI builds it as its own job for that reason. If you change
 a public API, check that workspace too.
 
 ## How to work
+
+**Routine work you do; core changes you propose first.** Adding an operation
+that follows the established pattern, a test, a refusal, a message, a doc fix
+— that is the job, and you get on with it. But a change to the *core* is a
+proposal, not a task: state the problem, the options you rejected and why, the
+one you recommend, and its blast radius in files and call sites. Then stop and
+wait for an answer. The author stays in the loop on the shape of the thing,
+not just its outcome, and gets to disagree while disagreeing is still cheap.
+
+Core means: the `rustible-sdk` public surface (`Op`, `Plan`, `Diff`, `System`,
+`Backend`, `Ctx`, the event and protocol types), the wire format, the `Fake`'s
+semantics, the run pipeline, the build and toolchain path, a new dependency,
+the MSRV, or the shape of CI. If you are unsure whether something counts, it
+counts.
+
+The failure this prevents is real and has happened: an SDK change bundled into
+a feature branch gets approved as part of the feature, because the go-ahead
+was for the feature. A `Diff` variant, a trait method, a new field on a
+protocol frame — each is a decision about what Rustible *is*, and each is
+harder to reverse than the operation that motivated it. Raising it separately
+costs one message. Not raising it costs an architecture nobody chose.
 
 Every change goes through a branch and a pull request, even a one-line doc
 fix. CI runs eight jobs on each, and all eight must be green:

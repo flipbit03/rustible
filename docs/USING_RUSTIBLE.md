@@ -897,8 +897,6 @@ ctx.step("docker group", group::Present::new("docker"))?;
 let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
 // `app` is only readable when the op could predict it, so guard for --check
 if app.is_available() {
-    ctx.step("ssh dir", file::Directory::at(app.home.join(".ssh"))
-        .owner(app.uid, app.gid).mode(0o700))?;
     ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
 }
 ```
@@ -908,11 +906,6 @@ operation you wanted — `user`, `group` and `authorized_keys` all do.
 ⚠️ `file::Copy` is the exception: it looks only at the destination, so a copy
 into a directory that does not exist fails at `apply`, after earlier steps have
 already changed the machine. Create the directory first.
-
-⚠️ Sequencing them correctly still does not make the pair above pass
-`--check` on a machine where `.ssh` is missing — `authorized_keys` stats the
-directory rather than consulting what the previous step promised. A real run
-converges; see §15.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1218,19 +1211,6 @@ satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
 `systemd::Reload` — never inspect anything, because they always report
 changed, so they pass a dry run against a unit that does not exist yet. That
 is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
-
-`ssh::authorized_keys` is the other one you will meet. It stats the `.ssh`
-directory itself, so a `file::Directory` one line above that *would* create it
-does not count — and the refusal says so rather than telling you to add the
-step you already wrote:
-
-```
-FAILED at `keys`: /home/app/.ssh does not exist; ssh::authorized_keys does not
-create it (vision 6.7). Under --check a directory an earlier step would create
-is still reported missing, because this op stats the real filesystem. If a step
-in this run creates it, the real run converges and there is nothing to fix; if
-not, ensure it with file::Directory::at(..).mode(0o700).owner(..)
-```
 
 `user::Membership` naming a group an earlier `group::Present` would create is
 *not* affected — it consults the registry and passes.

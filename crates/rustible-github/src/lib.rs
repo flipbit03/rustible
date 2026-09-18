@@ -42,15 +42,13 @@
 //! ```no_run
 //! use rustible::prelude::*;
 //! use rustible_github as github;
-//! use rustible_std::{file, user};
+//! use rustible_std::user;
 //!
 //! #[rustible::playbook(hosts = "all", escalate = true)]
 //! fn main(ctx: &mut Ctx) -> Result<()> {
-//!     let account = ctx.step("Ensure cadu exists", user::Present::new("cadu").create_home(true))?;
-//!     ctx.step("Ensure ~/.ssh",
-//!         file::Directory::at(account.home.join(".ssh"))
-//!             .owner(account.uid, account.gid)
-//!             .mode(0o700))?;
+//!     // `create_home(true)` is the part that matters: the install step
+//!     // below makes `~/.ssh` itself, but never the home above it.
+//!     ctx.step("Ensure cadu exists", user::Present::new("cadu").create_home(true))?;
 //!
 //!     // Two steps in the run output: the fetch (always `ok`) and the install.
 //!     let installed = github::github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;

@@ -22,8 +22,11 @@ use crate::user_keys::UserKeys;
 /// GitHub keys of <gh_login>` (a lookup, always `ok`) and `Install GitHub
 /// keys of <gh_login> for <sys_user>` (`changed` when a key was appended).
 /// The second step is `ssh::authorized_keys::Present::for_user_name`, so its
-/// rules apply: `sys_user` must exist in `/etc/passwd` and `~/.ssh` must
-/// already exist (vision 6.7). Returns the install step's report.
+/// rules apply: `sys_user` must exist in `/etc/passwd`, and `~/.ssh` is
+/// created (0700, owned by the account) if it is not there — the home
+/// directory above it is not, so create the account with
+/// `user::Present::new(..).create_home(true)` first. Returns the install
+/// step's report.
 ///
 /// **Additive**: keys already in the file that GitHub does not list are
 /// left alone. This is the default because it can never lock anyone out;
@@ -182,11 +185,29 @@ mod tests {
     const PASSWD: &str = "root:x:0:0:root:/root:/bin/bash\ncadu:x:1000:1000::/home/cadu:/bin/zsh\n";
     const AK: &str = "/home/cadu/.ssh/authorized_keys";
 
+    /// `with_dir` plants 0755 root-owned, which `ssh::authorized_keys` now
+    /// repairs, so a `.ssh` that is already right keeps these tests about
+    /// what they are about.
     fn fake_fs() -> Fake {
+        let fake = Fake::new()
+            .with_file("/etc/passwd", PASSWD)
+            .with_dir("/home/cadu")
+            .with_dir("/home/cadu/.ssh");
+        use rustible_sdk::backend::Backend;
+        let p = std::path::Path::new("/home/cadu/.ssh");
+        Backend::set_mode(&fake, p, 0o700).unwrap();
+        Backend::set_owner(&fake, p, 1000, 1000).unwrap();
+        fake
+    }
+
+    /// A freshly created account, with a home and nothing in it. The helper
+    /// inherits `ssh::authorized_keys`' directory handling, so this is the
+    /// shape a first provision actually has (issue #40) and it must not need
+    /// a `file::Directory` step in front of it.
+    fn fake_fs_without_ssh_dir() -> Fake {
         Fake::new()
             .with_file("/etc/passwd", PASSWD)
             .with_dir("/home/cadu")
-            .with_dir("/home/cadu/.ssh")
     }
 
     fn mk_ctx(fake: &Arc<Fake>, sink: &Arc<Collect>) -> Ctx {
@@ -265,6 +286,37 @@ mod tests {
         GithubSshKeysToUser::new("flipbit03", "cadu")
             .fetch_with(fetch)
             .run(ctx)
+    }
+
+    /// A first provision: the account exists, its home exists, and nothing
+    /// else does. The helper delegates to `ssh::authorized_keys::Present`,
+    /// so it inherits the directory work and needs no `file::Directory`
+    /// step in front of it (issue #40).
+    #[test]
+    fn installs_into_an_account_that_has_no_ssh_dir_yet() {
+        let canned = Canned::answering(URL, Ok(Response::ok(body())));
+        let fake = Arc::new(fake_fs_without_ssh_dir());
+        let sink = Arc::new(Collect::default());
+        let mut ctx = mk_ctx(&fake, &sink);
+
+        let r = keys_to_user_via(&mut ctx, canned.clone()).unwrap();
+        assert!(r.changed);
+        assert_eq!(r.added.len(), 3);
+        assert_eq!(
+            r.created_dir.as_deref(),
+            Some(std::path::Path::new("/home/cadu/.ssh"))
+        );
+        let dir = fake
+            .file("/home/cadu/.ssh")
+            .expect("the directory was created");
+        assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 1000, 1000));
+        let file = fake.file(AK).expect("the file was written inside it");
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1000));
+
+        // Two steps, not three, and the second run changes nothing.
+        assert_eq!(finished(&sink).len(), 2);
+        let mut ctx = mk_ctx(&fake, &Arc::new(Collect::default()));
+        assert!(!keys_to_user_via(&mut ctx, canned).unwrap().changed);
     }
 
     #[test]
@@ -365,6 +417,35 @@ mod tests {
             w[0].contains("flipbit03") && w[0].contains("no public keys"),
             "{w:?}"
         );
+    }
+
+    /// The same no-keys path, but with the account's `~/.ssh` left
+    /// group-writable — the state sshd refuses to read keys out of. The
+    /// install step has nothing to install and still reports `changed`,
+    /// because it fixed the directory.
+    ///
+    /// This is the production route to `Present::keys([])`: an earlier cut of
+    /// that op returned `Satisfied` here without looking at the directory,
+    /// and a review found it through this helper.
+    #[test]
+    fn a_broken_ssh_dir_is_repaired_even_when_github_has_no_keys() {
+        let canned = Canned::answering(URL, Ok(Response::ok("")));
+        let fake = Arc::new(fake_fs());
+        {
+            use rustible_sdk::backend::Backend;
+            let p = std::path::Path::new("/home/cadu/.ssh");
+            Backend::set_mode(&*fake, p, 0o775).unwrap();
+            Backend::set_owner(&*fake, p, 0, 0).unwrap();
+        }
+        let sink = Arc::new(Collect::default());
+        let mut ctx = mk_ctx(&fake, &sink);
+
+        let r = keys_to_user_via(&mut ctx, canned).unwrap();
+        assert!(r.changed, "the directory was fixed");
+        assert!(r.added.is_empty(), "no key was installed");
+        let dir = fake.file("/home/cadu/.ssh").unwrap();
+        assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 1000, 1000));
+        assert!(fake.file(AK).is_none(), "and no file was invented");
     }
 
     #[test]
