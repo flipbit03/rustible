@@ -889,9 +889,8 @@ Only the **first** match is rewritten, so a file that already has two such
 lines keeps the second. And ⚠️ an invalid regex **panics**; it is not an error
 you can catch.
 
-**Prerequisites are refused, never created**, with one exception noted below.
-Nothing creates a group, a home directory, or a destination directory as a
-side effect. Sequence them:
+**Prerequisites are refused, never created.** Nothing creates a group, a home
+directory's parent, or a destination directory as a side effect. Sequence them:
 
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
@@ -907,30 +906,6 @@ operation you wanted — `user`, `group` and `authorized_keys` all do.
 ⚠️ `file::Copy` is the exception: it looks only at the destination, so a copy
 into a directory that does not exist fails at `apply`, after earlier steps have
 already changed the machine. Create the directory first.
-
-**The one op that creates a directory is `ssh::authorized_keys`**, in its user
-forms (`for_user`, `for_user_name`, `for_account`). It owns `~/.ssh` as well as
-the file in it: creates the directory when missing, and holds it at 0700 and
-the file at 0600 owned by the account, repairing them when wrong. So there is
-no `file::Directory` step above, and you do not want one.
-
-⚠️ It checks those permissions on **every** run, so the step can report
-`changed` having moved no key — it fixed a mode. Not a bug: sshd silently
-ignores keys in a `~/.ssh` writable by anyone but its owner, so a step that
-installed keys and left the mode alone would report success over an account
-that still cannot log in.
-
-What it still refuses:
-
-| in the way | what happens |
-|---|---|
-| the **home directory** is missing | refused, naming `user::Present::new(..).create_home(true)` |
-| `~/.ssh` is a regular file | refused: it does not remove what is in the way |
-| `~/.ssh` is a symlink pointing at nothing | refused, saying so |
-| `in_file(path)` with a missing parent | refused: no account is named, so nothing says who would own it |
-
-`authorized_keys::Absent` repairs the same way on a run that removes a key, and
-touches nothing on a run that finds nothing to remove.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1237,26 +1212,8 @@ satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
 changed, so they pass a dry run against a unit that does not exist yet. That
 is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
 
-`ssh::authorized_keys::Present::in_file(path)` is the other one you will
-meet. It stats the parent directory itself, so a `file::Directory` one line
-above that *would* create it does not count — and the refusal says so rather
-than telling you to add the step you already wrote:
-
-```
-FAILED at `keys`: /etc/ssh/keys does not exist; the in_file form of
-ssh::authorized_keys does not create it, having no account to own it. Under
---check a directory an earlier step would create is still reported missing,
-because this op stats the real filesystem. If a step in this run creates it,
-the real run converges and there is nothing to fix; if not, ensure it with
-file::Directory::at(..)
-```
-
-The **user** forms are not affected: they create `~/.ssh` themselves. A
-missing *home* directory is tolerated under `--check` and refused in a run
-that can act, so a dry run of a first provision passes.
-
 `user::Membership` naming a group an earlier `group::Present` would create is
-*not* affected either — it consults the registry and passes.
+*not* affected — it consults the registry and passes.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,
