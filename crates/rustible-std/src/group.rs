@@ -231,11 +231,9 @@ struct Inspection {
 /// which fails clearly). `system(true)` allocates from the system range on
 /// creation and is ignored for an existing group, as in Ansible.
 ///
-/// Prediction (vision 12): the output is predicted when the gid is known,
-/// that is when `gid` is given or the group already exists. Creating without
-/// a gid returns a change without a prediction, so a check-mode run that
-/// chains from this step stops there with a clear message rather than
-/// carrying a made-up gid.
+/// Check mode (vision 12): a step that would change has no output, so a
+/// dry run that chains from this step — `.gid(&grp)` on the next one —
+/// stops there with a clear message rather than carrying a made-up gid.
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,
@@ -341,31 +339,13 @@ impl Op for Present {
                 current.expect("no changes means it exists"),
             ));
         }
-        if current.is_none() {
-            // Check mode: let a later `user::Present`/`user::Membership` in
-            // this run accept the group this step would create (vision 6.7
-            // still holds: nothing is created here).
-            sys.note_would_create("group", &self.name, self.gid);
-        }
-        let diff = Diff::Attrs {
+        Ok(Plan::change(Diff::Attrs {
             subject: format!("group {}", self.name),
             changes,
-        };
-        let gid = self.gid.or(current.as_ref().map(|g| g.gid));
-        Ok(match gid {
-            Some(gid) => Plan::change_predicting(
-                diff,
-                Group {
-                    name: self.name.clone(),
-                    gid,
-                    members: current.map(|g| g.members).unwrap_or_default(),
-                },
-            ),
-            None => Plan::change(diff),
-        })
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<Group>) -> Result<Group> {
+    fn apply(&self, sys: &System, change: Change) -> Result<Group> {
         // `check` produced the diff; execute it (vision 6.2). An `exists`
         // change means create, anything else is the gid change.
         let Diff::Attrs { changes, .. } = &change.diff else {
@@ -480,30 +460,28 @@ impl Op for Absent {
                 owner.name
             );
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: format!("group {}", self.name),
-                changes: vec![AttrChange {
-                    name: "exists".into(),
-                    from: "yes".into(),
-                    to: "no".into(),
-                }],
-            },
-            Removed {
-                name: self.name.clone(),
-                gid: Some(group.gid),
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: format!("group {}", self.name),
+            changes: vec![AttrChange {
+                name: "exists".into(),
+                from: "yes".into(),
+                to: "no".into(),
+            }],
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<Removed>) -> Result<Removed> {
+    fn apply(&self, sys: &System, _: Change) -> Result<Removed> {
+        // The output names the gid that went: read it before groupdel takes it.
+        let text = sys.read_to_string("/etc/group")?;
+        let gid = lookup_group(&text, &self.name)?.map(|g| g.gid);
         let tools = Tools::of(sys);
         match tools {
             Tools::Shadow => run_tool(sys.cmd("groupdel").arg(&self.name), tools, "groupdel")?,
             Tools::BusyBox => run_tool(sys.cmd("delgroup").arg(&self.name), tools, "delgroup")?,
         }
-        change.predicted.ok_or_else(|| {
-            Error::msg("group::Absent::apply received a change without its prediction")
+        Ok(Removed {
+            name: self.name.clone(),
+            gid,
         })
     }
 }
@@ -652,14 +630,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(c.diff.short(), "exists=yes gid=1500");
-        assert_eq!(
-            c.predicted,
-            Some(Group {
-                name: "rustible".into(),
-                gid: 1500,
-                members: vec![]
-            })
-        );
         assert!(fake.commands().is_empty(), "check runs nothing");
 
         // The fake cannot run groupadd; stand in for its effect on the file.
@@ -678,13 +648,13 @@ mod tests {
     }
 
     #[test]
-    fn present_without_gid_does_not_predict() {
+    fn present_without_gid_plans_only_the_creation() {
         let fake = Arc::new(base());
         let Plan::Change(c) = Present::new("rustible").check(&fake_sys(&fake)).unwrap() else {
             panic!("expected change")
         };
+        // The gid is groupadd's to pick, so the diff does not name one.
         assert_eq!(c.diff.short(), "exists=yes");
-        assert!(c.predicted.is_none(), "gid is unknown until groupadd runs");
     }
 
     #[test]
@@ -696,7 +666,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(c.diff.short(), "gid=2000");
-        assert_eq!(c.predicted.as_ref().unwrap().members, vec!["cadu"]);
         fake.write(
             Path::new("/etc/group"),
             GROUP.replace("docker:x:998:", "docker:x:2000:").as_bytes(),
@@ -845,46 +814,24 @@ mod tests {
     }
 
     #[test]
-    fn a_planned_creation_is_noted_for_later_steps_in_check_mode_only() {
-        let fake = Arc::new(base());
-        let sys = fake_sys(&fake).with_check_mode(true);
-        assert!(!sys.would_create("group", "rustible"));
-        assert!(Present::new("rustible").check(&sys).unwrap().is_change());
-        assert!(sys.would_create("group", "rustible"));
-        assert!(sys.would_create_id("group", 5000).is_none());
-        assert!(
-            Present::new("fixed")
-                .gid(5000)
-                .check(&sys)
-                .unwrap()
-                .is_change()
-        );
-        assert_eq!(sys.would_create_id("group", 5000).unwrap().name, "fixed");
-        // An existing group is not "planned".
-        assert!(matches!(
-            Present::new("docker").check(&sys).unwrap(),
-            Plan::Satisfied(_)
-        ));
-        assert!(!sys.would_create("group", "docker"));
-        // Outside check mode the note is inert: a real run never accepts a
-        // group that is not on the machine.
-        let real = fake_sys(&fake);
-        assert!(Present::new("rustible").check(&real).unwrap().is_change());
-        assert!(!real.would_create("group", "rustible"));
-    }
-
-    #[test]
-    fn check_mode_through_ctx_runs_nothing_and_predicts() {
+    fn check_mode_through_ctx_runs_nothing_and_has_no_output() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        // A would-change step has no output in check mode, gid given or not
+        // (vision 12): the group only exists once `apply` has run.
         let r = ctx
             .step("group", Present::new("rustible").gid(1500))
             .unwrap();
-        assert!(r.changed && r.predicted && r.is_available());
-        assert_eq!(r.gid, 1500);
+        assert!(r.changed && !r.is_available());
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
         let r = ctx.step("group", Present::new("nogid")).unwrap();
         assert!(r.changed && !r.is_available());
+        // A satisfied step keeps its output.
+        let r = ctx.step("group", Present::new("docker")).unwrap();
+        assert!(!r.changed && r.is_available());
+        assert_eq!(r.gid, 998);
         assert!(fake.commands().is_empty());
         assert_eq!(fake.content("/etc/group").unwrap(), GROUP);
     }

@@ -260,13 +260,20 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 - **`check` does all the thinking** and produces the diff. **`apply` executes
   that diff**, rather than inspecting the system again. That is what lets the
   `Fake` tests plant a tool's effect and check the result.
-- **Predict an output only when every field is honestly knowable.** A new user
-  needs an explicit primary group; an apt install needs a candidate version.
-  Otherwise return `Plan::change` with no prediction, and check mode reports
-  the output as unavailable rather than handing out a plausible lie.
-- **Refuse, do not invent.** An operation that manages a user does not create
-  the group it references, and `authorized_keys` does not create `~/.ssh`'s
-  parent. Fail naming the operation the author wanted.
+- **A step that would change has no output in check mode.** `Change` carries
+  the diff and nothing else; there is no prediction to fill in, and `apply`
+  reads for itself whatever its output needs that the diff does not carry (a
+  gid to report, a digest). A later step that reads a would-change step's
+  output under `--check` fails with a clear message (vision 12).
+- **Refuse, do not invent — in a real run.** An operation that manages a user
+  does not create the group it references, and `authorized_keys` does not
+  create the home. Fail naming the operation the author wanted. Under
+  `--check`, a prerequisite another step in the run could create (a group, an
+  account, a parent directory, a unit) is *not* refused: report `would
+  change` with it named in the diff. Gate that on `sys.check_mode()`, so a
+  real run's `check` still refuses; a dry run's plan never reaches `apply`. A
+  refusal about the machine itself — not root, wrong platform, a masked unit
+  — holds in both modes.
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
 - Everything the operation does to the machine goes through `sys`, including
@@ -464,11 +471,13 @@ that the step is in that playbook and the second run reports `ok`.
 
 Each of these has already produced a test that could not fail.
 
-- **`Applied.predicted` is only ever true in check mode.** Asserting on a
-  prediction inside a tier-3 body is vacuous, because harness bodies run with
-  check mode off. A review found exactly this in a merged Alpine test. To test
-  a prediction, build a second dry `Ctx` over the same machine — see
-  `crates/rustible-std/tests/it_user_busybox.rs`.
+- **Check-mode behaviour only shows under check mode.** Asserting that a
+  step's output is unavailable, or that a missing prerequisite is tolerated,
+  inside a tier-3 body is vacuous, because harness bodies run with check mode
+  off. A review found exactly this in a merged Alpine test (it asserted on a
+  prediction, back when there were predictions). To test a dry run, build a
+  second dry `Ctx` over the same machine — see
+  `crates/rustible-std/tests/it_user_group.rs`.
 - **The `Fake` models files well and commands badly.** `spawn` returns the
   *first* canned entry matching the program, and `with_cmd` consumes `self`,
   so there is no way to make a command answer differently on a second call. An

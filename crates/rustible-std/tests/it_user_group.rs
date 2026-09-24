@@ -1,7 +1,10 @@
 //! Docker integration test for `user` and `group` (vision 8, tier 3): the
 //! real `groupadd`/`useradd`/`usermod`/`userdel` as root, with `/etc/passwd`
 //! and `/etc/group` checked afterwards, plus a check-mode dry run of the
-//! vision 6.6 shape (group step, then user step) over the real machine.
+//! fresh-host shape (group, then the user, keys and membership that depend
+//! on it) over the real machine, which is the proof of vision 12's rule
+//! that a dry run does not refuse a prerequisite an earlier step would
+//! create.
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group`.
 
 use std::path::Path;
@@ -11,6 +14,7 @@ use rustible::prelude::*;
 use rustible::sdk::event::Collect;
 use rustible::sdk::testing::changed_then_ok;
 use rustible::sdk::{HostInfo, System};
+use rustible_std::ssh::authorized_keys;
 use rustible_std::{group, user};
 
 // Distinct names: `useradd` on Debian creates a private group named after
@@ -18,6 +22,7 @@ use rustible_std::{group, user};
 const GRP: &str = "rustible-grp";
 const GRP2: &str = "rustible-grp2";
 const USR: &str = "rustible-usr";
+const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONE rustible@test";
 
 fn line_of(text: &str, name: &str) -> Option<String> {
     text.lines()
@@ -66,6 +71,17 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert_eq!(
         line_of(&etc_group, GRP).as_deref(),
         Some(format!("{GRP}:x:{}:{USR}", grp.gid).as_str())
+    );
+
+    // Keys for the account it just made: the real half of the fresh-host
+    // shape the dry run below walks through.
+    let (keys, _) = changed_then_ok(ctx, "keys", || {
+        authorized_keys::Present::for_user(&account).keys([KEY])
+    })?;
+    assert_eq!(keys.added.len(), 1);
+    assert_eq!(
+        keys.created_dir.as_deref(),
+        Some(account.home.join(".ssh").as_path())
     );
 
     // Modify an existing account: shell and comment through usermod.
@@ -132,54 +148,77 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(err.contains("does not exist"), "{err}");
     assert!(line_of(&ctx.sys().read_to_string("/etc/passwd")?, "rustible-nope").is_none());
 
-    // Check mode over the real machine (vision 6.6 shape): the group step
-    // reports "would create" and the user, membership and gid steps that
-    // depend on it continue instead of aborting the dry run.
+    // Check mode over the real machine, the fresh-host shape (vision 6.6):
+    // group, then the user, keys and membership that depend on it. Every
+    // step reports `would change` and none has an output, because a
+    // prerequisite another step could create is verified only when the run
+    // is about to act (vision 12). Nothing here exists on the machine.
     let mut dry = Ctx::new(
         System::local(true, Arc::new(Collect::default())),
         HostInfo::local(),
     );
     let planned = dry.step("dry group", group::Present::new("rustible-dry"))?;
-    assert!(
-        planned.changed && !planned.is_available(),
-        "no gid to predict"
-    );
+    assert!(planned.changed && !planned.is_available());
     let dry_user = dry.step(
-        "dry user in planned group",
+        "dry user in a group not there yet",
         user::Present::new("rustible-dry-usr").groups(["rustible-dry"]),
     )?;
     assert!(dry_user.changed && !dry_user.is_available());
+    let dry_keys = dry.step(
+        "dry keys for a user not there yet",
+        authorized_keys::Present::for_user_name("rustible-dry-usr").keys([KEY]),
+    )?;
+    assert!(dry_keys.changed && !dry_keys.is_available());
     let member = dry.step(
-        "dry membership in planned group",
+        "dry membership in a group not there yet",
         user::Membership::of(&account).in_group_named("rustible-dry"),
     )?;
-    assert!(member.changed && member.is_available());
+    assert!(member.changed && !member.is_available());
     let planned_gid = dry.step(
         "dry group with gid",
         group::Present::new("rustible-dry2").gid(4343),
     )?;
-    assert!(planned_gid.changed && planned_gid.predicted);
+    assert!(planned_gid.changed && !planned_gid.is_available());
     let dry_user2 = dry.step(
-        "dry user with planned primary group",
+        "dry user with a primary group not there yet",
         user::Present::new("rustible-dry-usr2")
             .uid(4343)
-            .gid(&*planned_gid)
+            .gid("rustible-dry2")
             .shell("/bin/sh"),
     )?;
-    assert!(dry_user2.predicted);
-    assert_eq!(dry_user2.gid, 4343);
+    assert!(dry_user2.changed && !dry_user2.is_available());
+    let short = dry_user2.diff.as_ref().unwrap().short();
+    assert!(
+        short.contains("group=rustible-dry2"),
+        "the diff names the group it could not resolve: {short}"
+    );
     // The same steps fail outside check mode, and nothing was created.
     let err = ctx
         .step(
-            "real user in planned-only group",
+            "real user in a missing group",
             user::Present::new("rustible-dry-usr").groups(["rustible-dry"]),
         )
         .unwrap_err()
         .chain();
     assert!(err.contains("does not exist"), "{err}");
+    let err = ctx
+        .step(
+            "real keys for a missing user",
+            authorized_keys::Present::for_user_name("rustible-dry-usr").keys([KEY]),
+        )
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("does not exist in /etc/passwd"), "{err}");
     let etc_group = ctx.sys().read_to_string("/etc/group")?;
     assert!(line_of(&etc_group, "rustible-dry").is_none());
     assert!(line_of(&etc_group, "rustible-dry2").is_none());
+    assert!(
+        line_of(
+            &ctx.sys().read_to_string("/etc/passwd")?,
+            "rustible-dry-usr"
+        )
+        .is_none()
+    );
 
     // Absent: the user with its home, then the groups.
     let (removed, _) = changed_then_ok(ctx, "user absent", || {

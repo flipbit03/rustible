@@ -55,8 +55,7 @@ pub struct DirReport {
     pub path: PathBuf,
     /// True only when this step made the directory. A step that found the
     /// directory already there and merely fixed its mode or owner reports
-    /// `false` while still counting as `changed`. `check` predicts it, so a
-    /// check-mode run sees the value the real run would produce.
+    /// `false` while still counting as `changed`.
     pub created: bool,
 }
 
@@ -73,20 +72,17 @@ impl Op for Directory {
         }
         let mut changes = vec![];
         let stat = sys.stat_follow(&self.path)?;
-        let created = match &stat {
-            None => {
-                changes.push(AttrChange {
-                    name: "exists".into(),
-                    from: "no".into(),
-                    to: "yes".into(),
-                });
-                true
-            }
+        match &stat {
+            None => changes.push(AttrChange {
+                name: "exists".into(),
+                from: "no".into(),
+                to: "yes".into(),
+            }),
             Some(s) if s.kind != FileKind::Dir => {
                 bail!("{} exists and is not a directory", self.path.display())
             }
-            Some(_) => false,
-        };
+            Some(_) => {}
+        }
         changes.extend(plan_attrs(stat.as_ref(), self.mode, self.owner));
         if changes.is_empty() {
             return Ok(Plan::Satisfied(DirReport {
@@ -94,20 +90,16 @@ impl Op for Directory {
                 created: false,
             }));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.path.display().to_string(),
-                changes,
-            },
-            DirReport {
-                path: self.path.clone(),
-                created,
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.path.display().to_string(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<DirReport>) -> Result<DirReport> {
-        let created = change.predicted.map(|p| p.created).unwrap_or(false);
+    fn apply(&self, sys: &System, change: Change) -> Result<DirReport> {
+        // The diff says whether the directory is to be created or only
+        // reshaped; `apply` executes it rather than looking again.
+        let created = super::diff_has(&change.diff, "exists");
         if created {
             sys.mkdir_all(&self.path)?;
         }
@@ -169,9 +161,11 @@ mod tests {
         let op = Directory::at("/srv/app").mode(0o750).owner(33, 33);
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff.short(), "exists=yes mode=0750 owner=33:33");
-        assert!(c.predicted.as_ref().unwrap().created);
         let r = op.apply(&sys, c).unwrap();
-        assert!(r.created);
+        assert!(
+            r.created,
+            "the diff's `exists` change is what apply executes"
+        );
         let f = fake.file("/srv/app").unwrap();
         assert_eq!(
             (f.kind, f.mode, f.uid, f.gid),
@@ -187,9 +181,8 @@ mod tests {
         let op = Directory::at("/srv/app").owner(1000, 1000);
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff.short(), "owner=1000:1000");
-        assert!(!c.predicted.as_ref().unwrap().created);
         let r = op.apply(&sys, c).unwrap();
-        assert!(!r.created);
+        assert!(!r.created, "no `exists` change in the diff, so no mkdir");
         let f = fake.file("/srv/app").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 1000, 1000));
     }

@@ -202,10 +202,9 @@ impl Ctx {
     /// not by itself end the playbook; the `?` in the playbook body does.
     ///
     /// The returned [`Applied`] derefs to the op's output and *panics* on
-    /// deref when there is none, which happens for a step that would change
-    /// in check mode unless the op predicted its output. Reach for
-    /// [`Applied::is_available`] or [`Applied::output`] to handle that
-    /// instead of panicking.
+    /// deref when there is none, which is every step that would change in
+    /// check mode (vision doc 12). Reach for [`Applied::is_available`] or
+    /// [`Applied::output`] to handle that instead of panicking.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
@@ -251,7 +250,7 @@ impl Ctx {
             Ok(Plan::Satisfied(out)) => {
                 finish(Status::Ok, None, None);
                 self.bump(|s| s.ok += 1);
-                Applied::new(name, Some(out), false, false, None, t0.elapsed())
+                Applied::new(name, Some(out), false, None, t0.elapsed())
             }
             Ok(Plan::Change(change)) if self.sys.check_mode() => {
                 let note = if op.always_changes() {
@@ -261,15 +260,9 @@ impl Ctx {
                 };
                 finish(Status::WouldChange, Some(change.diff.clone()), note);
                 self.bump(|s| s.would_change += 1);
-                let predicted = change.predicted.is_some();
-                Applied::new(
-                    name,
-                    change.predicted,
-                    true,
-                    predicted,
-                    Some(change.diff),
-                    t0.elapsed(),
-                )
+                // No apply, so no output: the step would change and the
+                // value only exists once it has (vision doc 12).
+                Applied::new(name, None, true, Some(change.diff), t0.elapsed())
             }
             Ok(Plan::Change(change)) => {
                 let diff = change.diff.clone();
@@ -297,7 +290,7 @@ impl Ctx {
                             Some("ran, unchanged".into()),
                         );
                         self.bump(|s| s.ok += 1);
-                        Applied::new(name, Some(out), false, false, Some(diff), t0.elapsed())
+                        Applied::new(name, Some(out), false, Some(diff), t0.elapsed())
                     }
                     Ok(out) => {
                         let note = if op.always_changes() {
@@ -307,7 +300,7 @@ impl Ctx {
                         };
                         finish(Status::Changed, Some(diff.clone()), note);
                         self.bump(|s| s.changed += 1);
-                        Applied::new(name, Some(out), true, false, Some(diff), t0.elapsed())
+                        Applied::new(name, Some(out), true, Some(diff), t0.elapsed())
                     }
                 }
             }
@@ -592,7 +585,7 @@ mod tests {
             }
             Ok(Plan::change(crate::Diff::summary("do it")))
         }
-        fn apply(&self, _: &System, _: crate::Change<()>) -> Result<()> {
+        fn apply(&self, _: &System, _: crate::Change) -> Result<()> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

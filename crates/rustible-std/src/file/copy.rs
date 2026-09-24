@@ -54,8 +54,7 @@ pub struct CopyBuilder {
     source: CopySource,
 }
 
-/// Output of [`struct@Copy`]. `check` predicts all of it except
-/// `backup_path`, which cannot exist before `apply` has taken the copy.
+/// Output of [`struct@Copy`], as `apply` left the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyReport {
     /// Whether the bytes were (or would be) rewritten, as opposed to an
@@ -198,20 +197,15 @@ impl Op for Copy {
                 changes: attrs,
             }
         };
-        Ok(Plan::change_predicting(diff, report))
+        Ok(Plan::change(diff))
     }
 
-    fn apply(&self, sys: &System, change: Change<CopyReport>) -> Result<CopyReport> {
-        // Branch on the plan, not on the diff's presentation: recompute the
-        // comparison when no prediction is at hand.
+    fn apply(&self, sys: &System, change: Change) -> Result<CopyReport> {
         let bytes = self.source_bytes(sys)?;
-        let rewrite = match &change.predicted {
-            Some(p) => p.content_changed,
-            None => match sys.stat(&self.dest)? {
-                Some(s) if s.kind == FileKind::File => sys.read(&self.dest)? != bytes,
-                _ => true,
-            },
-        };
+        // Execute the diff: attributes-only means the content already
+        // matched; any other shape (a text diff, a byte-count summary) is a
+        // rewrite.
+        let rewrite = !matches!(change.diff, Diff::Attrs { .. });
         let backup_path = if rewrite {
             super::write_with_backup(sys, &self.dest, self.backup, &bytes)?
         } else {
@@ -301,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_text_change_has_unified_diff_and_predicts() {
+    fn copy_text_change_has_unified_diff() {
         let fake = Arc::new(Fake::new().with_file("/etc/x.conf", "a=1\nb=2\n"));
         let sys = fake_sys(&fake);
         let op = Copy::from_bytes(b"a=1\nb=3\n").to("/etc/x.conf");
@@ -312,9 +306,9 @@ mod tests {
             "{}",
             c.diff.render()
         );
-        assert_eq!(c.predicted.as_ref().unwrap().bytes, 8);
 
         let r = op.apply(&sys, c).unwrap();
+        assert!(r.content_changed, "a text diff means a rewrite");
         assert_eq!(r.bytes, 8);
         assert_eq!(r.backup_path, None);
         assert_eq!(fake.content("/etc/x.conf").unwrap(), "a=1\nb=3\n");
@@ -401,11 +395,6 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Copy::from_str("new\n").to("/etc/x").backup(true);
         let c = expect_change(&op, &sys);
-        assert_eq!(
-            c.predicted.as_ref().unwrap().backup_path,
-            None,
-            "path unknown until apply"
-        );
         let r = op.apply(&sys, c).unwrap();
         let bp = r.backup_path.expect("backup path");
         assert!(
@@ -457,15 +446,15 @@ mod tests {
     }
 
     #[test]
-    fn copy_in_check_mode_predicts_and_writes_nothing() {
+    fn copy_in_check_mode_reports_would_change_and_writes_nothing() {
         let fake = Arc::new(Fake::new().with_file("/f", "a\n"));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let r = ctx
             .step("copy", Copy::from_str("bb\n").to("/f").mode(0o600))
             .unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!(r.bytes, 3);
+        assert!(r.changed && !r.is_available(), "no apply, so no output");
+        assert_eq!(r.diff.as_ref().unwrap().short(), "+1 -1 lines");
         let f = fake.file("/f").unwrap();
         assert_eq!((f.mode, f.bytes.as_slice()), (0o644, b"a\n".as_slice()));
     }

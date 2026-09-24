@@ -171,13 +171,17 @@ impl Present {
             let parent = self.file.parent().unwrap_or(Path::new("/"));
             match sys.stat_follow(parent)? {
                 Some(s) if s.kind == rustible_sdk::backend::FileKind::Dir => {}
+                // Under --check an earlier file::Directory may create it
+                // (vision 12); stock debian:12 ships without /etc/sysctl.d.
+                None if sys.check_mode() => {}
                 _ => bail!(
                     "{} does not exist; sysctl::Present creates the file but not its directory (use file::Directory)",
                     parent.display()
                 ),
             }
         }
-        crate::file::read_text_or_empty(sys, &self.file, true)
+        // `create` is true, so a missing file reads as empty text.
+        Ok(crate::file::read_text_or_empty(sys, &self.file, true)?.unwrap_or_default())
     }
 
     fn read_live(&self, sys: &System) -> Result<Option<String>> {
@@ -264,33 +268,32 @@ impl Op for Present {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: format!("sysctl {}", self.key),
-                changes,
-            },
-            report,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: format!("sysctl {}", self.key),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<SysctlReport>) -> Result<SysctlReport> {
-        let Some(report) = change.predicted else {
-            bail!("sysctl::Present::apply received a change without its prediction");
-        };
+    fn apply(&self, sys: &System, change: Change) -> Result<SysctlReport> {
         // The diff carries no text, so re-plan against the file as it is now.
         let text = self.read_file(sys)?;
         if let Some(new_text) = plan_sysctl_line(&text, &self.key, &self.value) {
             sys.write_atomic(&self.file, new_text.as_bytes())?;
         }
-        if self.apply_now
-            && let Some(current) = &report.previous_live
-            && normalize(current) != normalize(&self.value)
-        {
+        // The output wants the value the kernel had, so read it before the
+        // write; whether that write is due is what the diff says.
+        let previous_live = self.read_live(sys)?;
+        if crate::file::diff_has(&change.diff, "live") {
             sys.cmd("sysctl")
                 .args(["-w", &format!("{}={}", self.key, self.value)])
                 .run()?;
         }
-        Ok(report)
+        Ok(SysctlReport {
+            key: self.key.clone(),
+            value: self.value.clone(),
+            previous_live,
+            file: self.file.clone(),
+        })
     }
 }
 
@@ -566,9 +569,10 @@ mod tests {
         let Plan::Change(c) = op.check(&sys(&fake)).unwrap() else {
             panic!("persist-only must plan the file")
         };
-        assert_eq!(c.predicted.as_ref().unwrap().previous_live, None);
-        op.apply(&sys(&fake), c).unwrap();
+        let r = op.apply(&sys(&fake), c).unwrap();
+        assert_eq!(r.previous_live, None, "no such key, so nothing was live");
         assert_eq!(fake.content(DEFAULT_FILE).unwrap(), "net.nope = 1\n");
+        assert!(fake.argvs().is_empty(), "persist-only never runs sysctl -w");
     }
 
     #[test]
@@ -595,6 +599,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("/etc/sysctl.d does not exist"), "{err}");
+    }
+
+    /// Under --check the directory may be one an earlier `file::Directory`
+    /// would create (vision 12): the step reports the file it would write
+    /// instead of refusing, and writes nothing.
+    #[test]
+    fn missing_directory_is_tolerated_under_check() {
+        let fake = Arc::new(Fake::new().with_file(PROC, "0\n"));
+        let s = sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = Present::new(KEY, "1").check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff.render(),
+            "sysctl net.ipv4.ip_forward:\n  /etc/sysctl.d/99-rustible.conf: absent -> 1\n  live: 0 -> 1\n"
+        );
+        assert!(fake.file(DEFAULT_FILE).is_none());
+        assert!(fake.argvs().is_empty());
     }
 
     #[test]
@@ -631,32 +653,46 @@ mod tests {
         assert!(err.contains("needs root") && err.contains("cadu"), "{err}");
     }
 
+    /// `apply` executes the diff `check` produced (vision 6.2): the live write
+    /// happens when the diff carries a `live` change and not otherwise, even
+    /// though the kernel value differs here.
     #[test]
-    fn apply_without_prediction_is_refused() {
+    fn apply_runs_sysctl_w_only_when_the_diff_says_so() {
         let fake = Arc::new(box_with(None, Some("0")));
-        let err = Present::new(KEY, "1")
+        let s = sys(&fake);
+        let r = Present::new(KEY, "1")
             .apply(
-                &sys(&fake),
+                &s,
                 Change {
-                    diff: Diff::summary("x"),
-                    predicted: None,
+                    diff: Diff::Attrs {
+                        subject: format!("sysctl {KEY}"),
+                        changes: vec![AttrChange {
+                            name: DEFAULT_FILE.into(),
+                            from: "absent".into(),
+                            to: "1".into(),
+                        }],
+                    },
                 },
             )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("without its prediction"), "{err}");
-        assert!(fake.file(DEFAULT_FILE).is_none());
+            .unwrap();
+        assert_eq!(
+            fake.content(DEFAULT_FILE).unwrap(),
+            "net.ipv4.ip_forward = 1\n"
+        );
+        assert!(fake.argvs().is_empty(), "no live change in the diff");
+        assert_eq!(r.previous_live.as_deref(), Some("0"), "read, not carried");
     }
 
     #[test]
-    fn check_mode_predicts_writes_nothing_and_runs_nothing() {
+    fn check_mode_reports_would_change_writes_nothing_and_runs_nothing() {
         let fake = Arc::new(box_with(None, Some("0")));
         let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
         let r = ctx.step("fwd", Present::new(KEY, "1")).unwrap();
-        assert!(r.changed && r.predicted && r.is_available());
-        assert_eq!(r.previous_live.as_deref(), Some("0"));
-        assert_eq!(r.key, KEY);
+        // A would-change step has no output in check mode (vision 12).
+        assert!(r.changed && !r.is_available());
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
         assert!(
             fake.file(DEFAULT_FILE).is_none(),
             "check mode must not write"

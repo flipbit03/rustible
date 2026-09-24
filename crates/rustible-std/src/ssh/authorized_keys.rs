@@ -392,6 +392,30 @@ fn ensure_absolute_home(home: &Path) -> Result<()> {
 }
 
 impl Target {
+    /// Under `--check`, the plan for a user that is not in `/etc/passwd`
+    /// yet: an earlier `user::Present` in the run may create it, and a dry
+    /// run verifies such a prerequisite only when it is about to act
+    /// (vision 12). `None` when the account is there, or outside check
+    /// mode, where [`Target::resolve`] refuses as before. Only [`Present`]
+    /// asks: revoking keys from an account that does not exist is a refusal
+    /// in both modes, since no step in the run can make it meaningful.
+    fn deferred_under_check(&self, sys: &System, keys: usize) -> Result<Option<Diff>> {
+        let Target::User(name) = self else {
+            return Ok(None);
+        };
+        if !sys.check_mode() || sys.facts().os != Os::Linux {
+            return Ok(None);
+        }
+        let passwd = sys.read_to_string("/etc/passwd")?;
+        if crate::user::lookup_user(&passwd, name)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Diff::summary(format!(
+            "user `{name}` does not exist yet; ssh::authorized_keys would manage \
+             ~{name}/.ssh/authorized_keys ({keys} key(s)) once an earlier step creates it"
+        ))))
+    }
+
     fn resolve(&self, sys: &System) -> Result<Resolved> {
         match self {
             Target::File(path) => Ok(Resolved {
@@ -565,20 +589,13 @@ fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<SshDir> {
             dir.display()
         );
     }
-    // Under --check nothing has run, so a home an earlier step would create
-    // is still missing and refusing here would fail a dry run of a playbook
-    // that converges in one real pass — the wart this op used to have one
-    // level down. A dry run writes nothing, and `Ctx::step` returns at its
-    // check-mode arm without ever calling `apply` (`ctx.rs:256`, the only
-    // `apply` call site in the workspace), so a plan made under this
-    // tolerance cannot reach the creation — and `Present::apply` verifies
-    // the home anyway rather than resting on that. Ansible's check mode does
-    // not look at the directory at all, for the same reason.
-
-    // A run that can act always takes the refusal above, because it runs
-    // `check` with `check_mode` off. Note the guarantee is about *which
-    // branch a real run takes*, not about re-checking: `Ctx::step` runs
-    // `check` once and applies the plan it produced.
+    // Under --check nothing has run, so a home an earlier `user::Present`
+    // would create is still missing; a dry run verifies a prerequisite
+    // another step could supply only when it is about to act (vision doc
+    // 6.7, 12), and Ansible's check mode does not look at the directory at
+    // all. A run that can act always takes the refusal above, because it
+    // runs `check` with check mode off, and `Present::apply` verifies the
+    // home once more rather than resting on that.
     let mut changes = vec![AttrChange {
         name: "exists".into(),
         from: "no".into(),
@@ -596,12 +613,10 @@ fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<SshDir> {
 /// and no honest mode to give one. A missing parent is a refusal, as it was
 /// for every form before the user forms learned to manage `~/.ssh`.
 ///
-/// The refusal is worded differently under `--check`. Nothing registers a
-/// planned directory the way `group::Present` registers a planned group, so
-/// this `stat_follow` sees the machine as it is and reports a directory an
-/// earlier step would create as missing. Telling the author to "ensure it
-/// first with `file::Directory`" is then advice they have already taken, and
-/// sends them looking for a bug in a playbook that is correct.
+/// Under `--check` a missing parent is not refused: an earlier step in the
+/// run may create it, and a dry run verifies prerequisites another step
+/// could supply only when it is about to act (vision doc 6.7, 12). The real
+/// run takes the refusal below, because it runs `check` with check mode off.
 fn check_given_parent(sys: &System, path: &Path) -> Result<()> {
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
         return Ok(());
@@ -609,14 +624,7 @@ fn check_given_parent(sys: &System, path: &Path) -> Result<()> {
     match sys.stat_follow(parent)? {
         Some(s) if s.kind == FileKind::Dir => Ok(()),
         Some(_) => bail!("{} exists and is not a directory", parent.display()),
-        None if sys.check_mode() => bail!(
-            "{} does not exist; the in_file form of ssh::authorized_keys does not create \
-             it, having no account to own it. Under --check a directory an earlier step \
-             would create is still reported missing, because this op stats the real \
-             filesystem. If a step in this run creates it, the real run converges and \
-             there is nothing to fix; if not, ensure it with file::Directory::at(..)",
-            parent.display()
-        ),
+        None if sys.check_mode() => Ok(()),
         None => bail!(
             "{} does not exist; the in_file form of ssh::authorized_keys does not create \
              it, having no account to own it. Ensure it first with \
@@ -679,18 +687,42 @@ fn plan_existing_dir_attrs(sys: &System, resolved: &Resolved) -> Result<Vec<Attr
 /// path in the plan is about a file the machine no longer has: `mkdir_all`
 /// would make the old `~/.ssh`, the write would go to a directory `check`
 /// never inspected, and the attribute parts would match no subject and be
-/// skipped in silence. One comparison turns all of that into a refusal.
-fn ensure_same_target(resolved: &Resolved, report: &KeysReport) -> Result<()> {
-    if resolved.path != report.path {
+/// skipped in silence. One comparison of the paths the diff names against
+/// the ones resolved now turns all of that into a refusal.
+fn ensure_same_target(resolved: &Resolved, diff: &Diff) -> Result<()> {
+    let ours = |p: &str| {
+        p == resolved.path.display().to_string()
+            || resolved
+                .ssh_dir
+                .as_ref()
+                .is_some_and(|d| p == d.display().to_string())
+    };
+    let planned = diff.parts().iter().find_map(|part| match part {
+        Diff::Text { path, .. } if !ours(&path.display().to_string()) => {
+            Some(path.display().to_string())
+        }
+        Diff::Attrs { subject, .. } if !ours(subject) => Some(subject.clone()),
+        _ => None,
+    });
+    if let Some(planned) = planned {
         bail!(
-            "the account moved between check and apply: this step planned {} and now \
+            "the account moved between check and apply: this step planned {planned} and now \
              resolves to {}. Nothing was written. Re-run, and if it keeps happening \
              something else is editing /etc/passwd while the playbook runs",
-            report.path.display(),
             resolved.path.display()
         );
     }
     Ok(())
+}
+
+/// Whether the diff plans to create `subject`: its attribute part carries an
+/// `exists` change. `apply` creates exactly what `check` said it would.
+fn planned_creation(diff: &Diff, subject: &Path) -> bool {
+    let subject = subject.display().to_string();
+    diff.parts().iter().any(|part| {
+        matches!(part, Diff::Attrs { subject: s, changes }
+            if *s == subject && changes.iter().any(|c| c.name == "exists"))
+    })
 }
 
 /// Apply the attribute parts `check` planned for the directory and the file.
@@ -881,6 +913,9 @@ impl Op for Present {
 
     fn check(&self, sys: &System) -> Result<Plan<KeysReport>> {
         let keys = parse_keys(&self.keys)?;
+        if let Some(diff) = self.target.deferred_under_check(sys, keys.len())? {
+            return Ok(Plan::change(diff));
+        }
         let resolved = self.target.resolve(sys)?;
         let dir = plan_ssh_dir(sys, &resolved)?;
         let existing = read_existing(sys, &resolved.path)?;
@@ -889,7 +924,7 @@ impl Op for Present {
             None => (None, None),
         };
         let planned = plan_present(before.as_deref().unwrap_or(""), &keys, self.exclusive);
-        let (text, mut report) = planned.into_report(resolved.path.clone());
+        let (text, report) = planned.into_report(resolved.path.clone());
 
         // `~/.ssh` is created to hold a file, never for its own sake: with
         // no key to write and no file to protect, a missing directory stays
@@ -957,19 +992,26 @@ impl Op for Present {
         let Some(diff) = Diff::many(parts) else {
             return Ok(Plan::Satisfied(report));
         };
-        report.created_dir = dir.create;
-        Ok(Plan::change_predicting(diff, report))
+        Ok(Plan::change(diff))
     }
 
-    fn apply(&self, sys: &System, change: Change<KeysReport>) -> Result<KeysReport> {
-        let Some(report) = change.predicted else {
-            bail!("authorized_keys::Present::apply received a change without its prediction");
-        };
+    fn apply(&self, sys: &System, change: Change) -> Result<KeysReport> {
         let resolved = self.target.resolve(sys)?;
-        ensure_same_target(&resolved, &report)?;
+        ensure_same_target(&resolved, &change.diff)?;
+        // The output is what the pure plan says about the file as it stands,
+        // read before the write the way `check` read it.
+        let keys = parse_keys(&self.keys)?;
+        let before = read_existing(sys, &resolved.path)?.map(|(text, _)| text);
+        let (_, mut report) = plan_present(before.as_deref().unwrap_or(""), &keys, self.exclusive)
+            .into_report(resolved.path.clone());
 
-        // The directory first: the file goes inside it.
-        if let Some(dir) = &report.created_dir {
+        // The directory first: the file goes inside it. Whether it is to be
+        // created is what the diff says.
+        if let Some(dir) = resolved
+            .ssh_dir
+            .as_ref()
+            .filter(|d| planned_creation(&change.diff, d))
+        {
             // `check` refuses a missing home, and only a dry run — which
             // never reaches `apply` (`Ctx::step` returns at the check-mode
             // arm) — is allowed past that. Verify rather than trust: the only
@@ -987,6 +1029,7 @@ impl Op for Present {
                 );
             }
             sys.mkdir_all(dir)?;
+            report.created_dir = Some(dir.clone());
         }
         if let Some(dir) = &resolved.ssh_dir {
             let (mode, owner) =
@@ -1150,18 +1193,21 @@ impl Op for Absent {
             });
         }
         let diff = Diff::many(parts).expect("the text part is always there");
-        Ok(Plan::change_predicting(diff, report))
+        Ok(Plan::change(diff))
     }
 
-    fn apply(&self, sys: &System, change: Change<KeysReport>) -> Result<KeysReport> {
+    fn apply(&self, sys: &System, change: Change) -> Result<KeysReport> {
         let Some(after) = planned_text(&change.diff) else {
             bail!("authorized_keys::Absent::apply received a change with no file text");
         };
-        let Some(report) = change.predicted else {
-            bail!("authorized_keys::Absent::apply received a change without its prediction");
-        };
         let resolved = self.target.resolve(sys)?;
-        ensure_same_target(&resolved, &report)?;
+        ensure_same_target(&resolved, &change.diff)?;
+        // The output is what the pure plan says about the file as it stands,
+        // read before the write the way `check` read it.
+        let keys = parse_keys(&self.keys)?;
+        let before = read_existing(sys, &resolved.path)?.map(|(text, _)| text);
+        let (_, report) =
+            plan_absent(before.as_deref().unwrap_or(""), &keys).into_report(resolved.path.clone());
         // Attributes first, and the directory's before the file's, the same
         // order `Present` uses: `write_atomic` makes its temporary file
         // inside the directory, so a `~/.ssh` this identity cannot write to
@@ -1596,19 +1642,19 @@ mod tests {
             "+2 -0 lines mode=0600 owner=1000:1001",
             "a created file's mode and owner are planned, not left to apply"
         );
-        let predicted = change.predicted.clone().unwrap();
-        assert_eq!(
-            predicted.path,
-            PathBuf::from("/home/cadu/.ssh/authorized_keys")
-        );
-        assert_eq!(predicted.added, vec![key(K1), key(K2)]);
         assert!(
             fake.file("/home/cadu/.ssh/authorized_keys").is_none(),
             "check must not create"
         );
 
         let report = op.apply(&sys, change).unwrap();
-        assert_eq!(report, predicted);
+        assert_eq!(
+            report.path,
+            PathBuf::from("/home/cadu/.ssh/authorized_keys")
+        );
+        assert_eq!(report.added, vec![key(K1), key(K2)]);
+        assert!(report.already_present.is_empty() && report.removed.is_empty());
+        assert_eq!(report.created_dir, None, "the directory was already there");
         assert_eq!(
             fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
             format!("{K1}\n{K2}\n")
@@ -1738,8 +1784,10 @@ mod tests {
         assert!(!r.changed);
     }
 
+    /// Under `--check` a would-change step has no output (vision 12): the
+    /// diff is there to read, the report is not, and nothing is written.
     #[test]
-    fn check_mode_predicts_and_writes_nothing() {
+    fn check_mode_reports_would_change_with_no_output_and_writes_nothing() {
         let fake = fake_with_user_and_ssh_dir();
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_check_mode(true);
@@ -1747,8 +1795,13 @@ mod tests {
         let r = ctx
             .step("keys", Present::for_user_name("cadu").keys([K1]))
             .unwrap();
-        assert!(r.changed && r.predicted && r.is_available());
-        assert_eq!(r.added, vec![key(K1)]);
+        assert!(r.changed && !r.is_available());
+        assert_eq!(
+            r.diff.as_ref().unwrap().short(),
+            "+1 -0 lines mode=0600 owner=1000:1001"
+        );
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
         assert!(fake.file("/home/cadu/.ssh/authorized_keys").is_none());
     }
 
@@ -1835,9 +1888,10 @@ mod tests {
         let Plan::Change(c) = op.check(&dry).unwrap() else {
             panic!("check mode tolerates a missing home")
         };
-        assert_eq!(
-            c.predicted.as_ref().unwrap().created_dir,
-            Some(PathBuf::from("/home/cadu/.ssh"))
+        assert!(
+            planned_creation(&c.diff, Path::new("/home/cadu/.ssh")),
+            "{}",
+            c.diff.render()
         );
 
         // Handing that plan to a real `apply` must not make the home.
@@ -1863,6 +1917,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("user `ghost` does not exist"), "{err}");
+    }
+
+    /// Under `--check` the account an earlier `user::Present` would create is
+    /// not there yet, and a dry run verifies such a prerequisite only when it
+    /// is about to act (vision 12): `Present` reports the file it would
+    /// manage, `Absent` still refuses, since no step can make revoking keys
+    /// from a missing account meaningful. The real run keeps both refusals.
+    #[test]
+    fn under_check_a_missing_user_is_tolerated_by_present_and_still_refused_by_absent() {
+        let fake = fake_with_user();
+        let dry = fake_sys(&fake).with_check_mode(true);
+
+        let Plan::Change(c) = Present::for_user_name("app")
+            .keys([K1, K2])
+            .check(&dry)
+            .unwrap()
+        else {
+            panic!("a dry run of a first provision must not fail")
+        };
+        assert_eq!(
+            c.diff.render(),
+            "user `app` does not exist yet; ssh::authorized_keys would manage \
+             ~app/.ssh/authorized_keys (2 key(s)) once an earlier step creates it"
+        );
+        assert!(fake.file("/home/app").is_none(), "nothing was created");
+
+        let err = Absent::for_user_name("app")
+            .keys([K1])
+            .check(&dry)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("user `app` does not exist in /etc/passwd"),
+            "{err}"
+        );
+
+        let err = Present::for_user_name("app")
+            .keys([K1])
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "user `app` does not exist in /etc/passwd; ssh::authorized_keys does not \
+                 create users, use user::Present first"
+            ),
+            "{err}"
+        );
     }
 
     /// The headline of issue #40: the step that used to refuse now does the
@@ -1894,11 +1996,6 @@ mod tests {
         assert_eq!(
             c.diff.short(),
             "exists=yes mode=0700 owner=1000:1001 +1 -0 lines mode=0600 owner=1000:1001"
-        );
-        let predicted = c.predicted.clone().unwrap();
-        assert_eq!(
-            predicted.created_dir,
-            Some(PathBuf::from("/home/cadu/.ssh"))
         );
         assert!(
             fake.file("/home/cadu/.ssh").is_none(),
@@ -1976,9 +2073,10 @@ mod tests {
         else {
             panic!("a dry run of a first provision must not fail")
         };
-        assert_eq!(
-            c.predicted.unwrap().created_dir,
-            Some(PathBuf::from("/home/cadu/.ssh"))
+        assert!(
+            planned_creation(&c.diff, Path::new("/home/cadu/.ssh")),
+            "{}",
+            c.diff.render()
         );
         assert!(fake.file("/home/cadu").is_none());
     }
@@ -2023,8 +2121,9 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.predicted.as_ref().unwrap().created_dir, None);
-        op.apply(&sys, c).unwrap();
+        assert!(!planned_creation(&c.diff, Path::new("/home/cadu/.ssh")));
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.created_dir, None, "the directory was already there");
         let target = fake.file("/srv/keys/cadu").unwrap();
         assert_eq!((target.mode, target.uid, target.gid), (0o700, 1000, 1001));
         assert_eq!(
@@ -2100,33 +2199,29 @@ mod tests {
         assert!(err.contains("remove what is in the way"), "{err}");
     }
 
-    /// The `in_file` form kept the old contract and the old check-mode
-    /// wording with it: it has no account, so no uid for a directory it
-    /// might create. A `file::Directory` one step earlier reports `would
-    /// change` but creates nothing and no registry records it, so this op
-    /// still sees the parent as missing; telling the author to add the step
-    /// they already wrote sends them hunting for a bug in a correct
-    /// playbook.
+    /// The `in_file` form has no account, so no uid for a directory it might
+    /// create: a missing parent is a refusal in a real run. Under `--check`
+    /// it is not (vision 12): a `file::Directory` one step earlier reports
+    /// `would change` and creates nothing, so this op sees the parent as
+    /// missing and reports the file it would write, rather than telling the
+    /// author to add a step they already wrote.
     #[test]
-    fn under_check_the_in_file_missing_parent_refusal_does_not_blame_the_author() {
+    fn under_check_the_in_file_missing_parent_is_tolerated_and_a_real_run_refuses() {
         let fake = Arc::new(Fake::new());
-        let sys = fake_sys(&fake).with_check_mode(true);
-        let err = Present::in_file("/etc/ssh/keys/root")
-            .keys([K1])
-            .check(&sys)
-            .unwrap_err()
-            .to_string();
+        let op = Present::in_file("/etc/ssh/keys/root").keys([K1]);
 
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = op.check(&dry).unwrap() else {
+            panic!("a dry run must not fail on a parent an earlier step creates")
+        };
+        assert_eq!(c.diff.short(), "+1 -0 lines mode=0600");
+        assert!(fake.file("/etc/ssh/keys").is_none(), "nothing was created");
+
+        let err = op.check(&fake_sys(&fake)).unwrap_err().chain();
         assert!(err.contains("/etc/ssh/keys does not exist"), "{err}");
-        assert!(err.contains("--check"), "names the dry run: {err}");
         assert!(
-            err.contains("the real run converges"),
-            "says the playbook may be fine: {err}"
-        );
-        // The real-run imperative must not be the advice offered here.
-        assert!(
-            !err.contains("Ensure it first with"),
-            "must not give advice the author has already taken: {err}"
+            err.contains("Ensure it first with file::Directory::at(..)"),
+            "names the fix: {err}"
         );
     }
 
@@ -2142,7 +2237,7 @@ mod tests {
         let r = ctx
             .step("keys", Present::for_user_name("cadu").keys([K1]))
             .unwrap();
-        assert!(r.changed && !r.predicted);
+        assert!(r.changed && r.is_available());
         assert_eq!(r.added, vec![key(K1)]);
         assert_eq!(
             fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
@@ -2276,8 +2371,8 @@ mod tests {
             "/home/cadu/.ssh:\n  mode: 0755 -> 0700\n  owner: 0:0 -> 1000:1001\n",
             "the directory alone: no file was written and none exists"
         );
-        assert_eq!(c.predicted.as_ref().unwrap().created_dir, None);
-        op.apply(&sys, c).unwrap();
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.created_dir, None, "repaired, not created");
         let dir = fake.file("/home/cadu/.ssh").unwrap();
         assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 1000, 1001));
         assert!(

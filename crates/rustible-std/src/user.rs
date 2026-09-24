@@ -10,11 +10,11 @@
 //! except Alpine, whose BusyBox `adduser`/`deluser`/`addgroup`/`delgroup`
 //! take different flags and cannot modify an existing account's attributes.
 //! Nothing here creates a group (vision 6.7): a `.groups([..])` or `.gid(..)`
-//! naming a missing group fails at `check`; use `group::Present` first. In
-//! check mode a group that an earlier `group::Present` step in the same run
-//! would create is accepted (`System::would_create`), so a dry run of a
-//! playbook that creates the group and then the user gets as far as the
-//! real run would.
+//! naming a missing group fails at `check`; use `group::Present` first. Under
+//! `--check` it does not fail: an earlier `group::Present` in the run may
+//! create the group, and a dry run verifies such a prerequisite only when it
+//! is about to act (vision 12), so the step reports `would change` with the
+//! group named in its diff and the real run refuses if it is really missing.
 
 use std::path::PathBuf;
 
@@ -145,9 +145,8 @@ pub enum GroupId {
     /// when no group carries it.
     Id(u32),
     /// A group name, from `.gid("docker")`. Resolved against `/etc/group` at
-    /// `check`. In check mode a group an earlier `group::Present` step would
-    /// create is accepted, but unless that step named a gid there is no gid
-    /// to predict the account with.
+    /// `check`; under `--check` a name not there yet is carried into the diff
+    /// as `group=<name>`, since an earlier step may create it (vision 12).
     Name(String),
 }
 
@@ -452,8 +451,6 @@ fn useradd_defaults(sys: &System, tools: Tools) -> Result<UseraddDefaults> {
 struct Inspection {
     /// The account as it is, if it exists.
     current: Option<PasswdEntry>,
-    /// Its supplementary groups, sorted.
-    current_groups: Vec<String>,
     /// Primary group, when asked for.
     primary: Option<Primary>,
     /// Attribute changes on an existing account.
@@ -492,18 +489,11 @@ struct Inspection {
 /// uid, gid, home, shell or comment of an existing account fails clearly;
 /// group membership still works through `addgroup`/`delgroup`.
 ///
-/// Prediction (vision 12): the output is predicted whenever it is honest.
-/// For an existing account everything is known. For a new account the uid
-/// must be given (the tool allocates it otherwise), the primary gid must be
-/// given (`gid`), and on BusyBox the shell must be given too (`adduser`
-/// takes it from the invoking environment, which this op cannot see);
-/// otherwise the step returns a change without a prediction and a
-/// check-mode run that chains from it stops there with a clear message.
-///
-/// Check mode and groups: a group named in `groups` or `gid` that an
-/// earlier `group::Present` step in the same run would create is accepted
-/// (`System::would_create`), so the dry run continues past the user step
-/// exactly where the real run would. Outside check mode the group must exist.
+/// Check mode (vision 12): a step that would change has no output, so a
+/// dry run that chains from this step stops at the first read with a clear
+/// message. A group named in `groups` or `gid` that is not on the machine
+/// yet is not refused there — an earlier `group::Present` in the run may
+/// create it — and appears in the diff by name; the real run refuses it.
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,
@@ -540,9 +530,7 @@ impl Present {
 
     /// Numeric uid. Unset by default, which lets the tool allocate one.
     /// Enforced on an existing account too, and that only rewrites
-    /// `/etc/passwd`: files owned by the old uid are not chowned. Giving it
-    /// is also one of the conditions for predicting a new account's
-    /// [`Account`] in check mode.
+    /// `/etc/passwd`: files owned by the old uid are not chowned.
     pub fn uid(mut self, uid: u32) -> Self {
         self.uid = Some(uid);
         self
@@ -608,8 +596,11 @@ impl Present {
         self
     }
 
-    /// The primary group, which must exist (vision 6.7) or, in check mode,
-    /// be one an earlier step in this run would create.
+    /// The primary group, which must exist (vision 6.7). Under `--check` a
+    /// missing one is named in the diff and not refused: an earlier
+    /// `group::Present` in the run may create it, and a dry run verifies a
+    /// prerequisite another step could supply only when it is about to act
+    /// (vision 12). The real run runs `check` with check mode off and refuses.
     fn resolve_primary(&self, sys: &System, group_text: &str) -> Result<Option<Primary>> {
         Ok(match &self.gid {
             None => None,
@@ -618,58 +609,41 @@ impl Present {
                     name: g.name,
                     gid: Some(g.gid),
                 }),
-                None => match sys.would_create_id("group", *gid) {
-                    Some(planned) => Some(Primary {
-                        name: planned.name,
-                        gid: Some(*gid),
-                    }),
-                    None => bail!(
-                        "no group has gid {gid}; user::Present does not create groups, use \
-                         group::Present first"
-                    ),
-                },
+                None if sys.check_mode() => Some(Primary {
+                    name: gid.to_string(),
+                    gid: Some(*gid),
+                }),
+                None => bail!(
+                    "no group has gid {gid}; user::Present does not create groups, use \
+                     group::Present first"
+                ),
             },
             Some(GroupId::Name(name)) => match lookup_group(group_text, name)? {
                 Some(g) => Some(Primary {
                     name: g.name,
                     gid: Some(g.gid),
                 }),
-                // A group an earlier step in this dry run would create. Take
-                // the gid it planned when it has one, so `.gid("web")` and
-                // `.gid(&*web)` predict alike; without one the diff names the
-                // group and prediction is blocked (vision 12).
-                None => match sys.would_create_id_by_name("group", name) {
-                    Some(planned) => Some(Primary {
-                        name: name.clone(),
-                        gid: planned.id,
-                    }),
-                    None => bail!(
-                        "group `{name}` does not exist; user::Present does not create groups, \
-                         use group::Present first"
-                    ),
-                },
+                None if sys.check_mode() => Some(Primary {
+                    name: name.clone(),
+                    gid: None,
+                }),
+                None => bail!(
+                    "group `{name}` does not exist; user::Present does not create groups, \
+                     use group::Present first"
+                ),
             },
         })
     }
 
     /// The primary group for a new account when `gid` was not given: the
-    /// group named after the user, if one exists (or, in check mode, is
-    /// planned), because `useradd`/`adduser` would otherwise fail trying to
-    /// create the private group. `None` lets the tool create it.
-    fn same_named_group(&self, sys: &System, group_text: &str) -> Result<Option<Primary>> {
-        Ok(match lookup_group(group_text, &self.name)? {
-            Some(g) => Some(Primary {
-                name: g.name,
-                gid: Some(g.gid),
-            }),
-            None => match sys.would_create_id_by_name("group", &self.name) {
-                Some(planned) => Some(Primary {
-                    name: self.name.clone(),
-                    gid: planned.id,
-                }),
-                None => None,
-            },
-        })
+    /// group named after the user, if one exists, because `useradd`/`adduser`
+    /// would otherwise fail trying to create the private group. `None` lets
+    /// the tool create it.
+    fn same_named_group(&self, group_text: &str) -> Result<Option<Primary>> {
+        Ok(lookup_group(group_text, &self.name)?.map(|g| Primary {
+            name: g.name,
+            gid: Some(g.gid),
+        }))
     }
 
     fn inspect(&self, sys: &System) -> Result<Inspection> {
@@ -697,8 +671,10 @@ impl Present {
         let passwd = sys.read_to_string("/etc/passwd")?;
         let group_text = sys.read_to_string("/etc/group")?;
 
+        // A missing supplementary group is refused, except under --check,
+        // where an earlier step may create it (vision 12).
         for g in self.groups.iter().flatten() {
-            if lookup_group(&group_text, g)?.is_none() && !sys.would_create("group", g) {
+            if lookup_group(&group_text, g)?.is_none() && !sys.check_mode() {
                 bail!(
                     "group `{g}` does not exist; user::Present does not create groups, use \
                      group::Present first"
@@ -708,7 +684,7 @@ impl Present {
         let current = lookup_user(&passwd, &self.name)?;
         let mut primary = self.resolve_primary(sys, &group_text)?;
         if primary.is_none() && current.is_none() {
-            primary = self.same_named_group(sys, &group_text)?;
+            primary = self.same_named_group(&group_text)?;
         }
         if let Some(uid) = self.uid
             && let Some(taken) = passwd_by_uid(&passwd, uid)
@@ -753,15 +729,13 @@ impl Present {
         }
         Ok(Inspection {
             current,
-            current_groups,
             primary,
             delta,
             group_text,
         })
     }
 
-    /// The plan for a missing account: the diff and, when honest, the
-    /// predicted account.
+    /// The plan for a missing account: the diff, field by field.
     fn plan_create(&self, sys: &System, primary: Option<Primary>) -> Result<Plan<Account>> {
         let tools = Tools::of(sys);
         let mut changes = vec![AttrChange {
@@ -784,7 +758,7 @@ impl Present {
         }
         match &primary {
             Some(Primary { gid: Some(gid), .. }) => change("gid", gid.to_string()),
-            // Planned by an earlier step in this dry run; the gid is not known.
+            // Under --check, a group an earlier step may create: named, gid unknown.
             Some(Primary { name, gid: None }) => change("group", name.clone()),
             None => {}
         }
@@ -799,7 +773,7 @@ impl Present {
         }
         // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
         // user's passwd entry, which this op cannot see through `sys`: only
-        // an explicit shell is predicted (and shown) there.
+        // an explicit shell is shown there.
         let shell = match &self.shell {
             Some(s) => Some(s.clone()),
             None if tools == Tools::BusyBox => None,
@@ -815,39 +789,15 @@ impl Present {
         if !groups.is_empty() {
             change("groups", groups.join(","));
         }
-        let diff = Diff::Attrs {
+        Ok(Plan::change(Diff::Attrs {
             subject: format!("user {}", self.name),
             changes,
-        };
-
-        let Some(uid) = self.uid else {
-            return Ok(Plan::change(diff));
-        };
-        // The private group's gid is allocated by useradd from login.defs
-        // ranges (GID_MIN/GID_MAX, SYS_GID_*, USERGROUPS_ENAB), which this op
-        // does not model; guessing gid == uid would be a lie in a dry run
-        // (vision 12). Predict only an explicit primary group whose gid is
-        // known (a planned group without a gid is not).
-        let gid = primary.and_then(|p| p.gid);
-        Ok(match (gid, shell) {
-            (Some(gid), Some(shell)) => Plan::change_predicting(
-                diff,
-                Account {
-                    name: self.name.clone(),
-                    uid,
-                    gid,
-                    home,
-                    shell,
-                    groups,
-                },
-            ),
-            _ => Plan::change(diff),
-        })
+        }))
     }
 
     fn create(&self, sys: &System, tools: Tools, primary: Option<Primary>) -> Result<()> {
-        // `apply` resolved the primary group against the real `/etc/group`,
-        // so the gid is known; a planned-only group cannot reach here.
+        // A real run's `check` refused a group it could not find, so the gid
+        // is known here; the check-mode tolerance never reaches `apply`.
         let primary = match primary {
             Some(Primary {
                 name,
@@ -974,7 +924,6 @@ impl Op for Present {
         require_root(sys, "user::Present")?;
         let Inspection {
             current,
-            current_groups,
             primary,
             delta,
             group_text,
@@ -982,9 +931,9 @@ impl Op for Present {
         let Some(entry) = current else {
             return self.plan_create(sys, primary);
         };
-        // Check mode, existing account, primary group planned by an earlier
-        // step and its gid unknown: the group change is real but cannot be
-        // compared or predicted.
+        // Check mode, existing account, a primary group not on the machine
+        // yet (an earlier step may create it): the group change is real but
+        // its gid cannot be compared.
         if let Some(Primary { name, gid: None }) = &primary {
             let mut changes = delta.changes.clone();
             changes.push(AttrChange {
@@ -1000,28 +949,13 @@ impl Op for Present {
         if delta.is_empty() {
             return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
         }
-        let groups = match &self.groups {
-            None => current_groups,
-            Some(_) if self.append => sorted([current_groups, delta.add_groups.clone()].concat()),
-            Some(g) => sorted(g.clone()),
-        };
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: format!("user {}", self.name),
-                changes: delta.changes.clone(),
-            },
-            Account {
-                name: self.name.clone(),
-                uid: delta.uid.unwrap_or(entry.uid),
-                gid: delta.gid.unwrap_or(entry.gid),
-                home: delta.home.clone().unwrap_or(entry.home),
-                shell: delta.shell.clone().unwrap_or(entry.shell),
-                groups,
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: format!("user {}", self.name),
+            changes: delta.changes.clone(),
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<Account>) -> Result<Account> {
+    fn apply(&self, sys: &System, change: Change) -> Result<Account> {
         let Diff::Attrs { changes, .. } = &change.diff else {
             bail!("user::Present::apply received a diff it did not produce");
         };
@@ -1030,7 +964,7 @@ impl Op for Present {
             let group_text = sys.read_to_string("/etc/group")?;
             let mut primary = self.resolve_primary(sys, &group_text)?;
             if primary.is_none() {
-                primary = self.same_named_group(sys, &group_text)?;
+                primary = self.same_named_group(&group_text)?;
             }
             self.create(sys, tools, primary)?;
         } else {
@@ -1145,19 +1079,21 @@ impl Op for Absent {
                 to: "removed".into(),
             });
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: format!("user {}", self.name),
-                changes,
-            },
-            Removed {
-                name: self.name.clone(),
-                home: self.remove_home.then_some(entry.home),
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: format!("user {}", self.name),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<Removed>) -> Result<Removed> {
+    fn apply(&self, sys: &System, _: Change) -> Result<Removed> {
+        // The output names the home that went with the account: read it
+        // before userdel takes the entry.
+        let home = if self.remove_home {
+            let passwd = sys.read_to_string("/etc/passwd")?;
+            lookup_user(&passwd, &self.name)?.map(|e| e.home)
+        } else {
+            None
+        };
         let tools = Tools::of(sys);
         match tools {
             Tools::Shadow => {
@@ -1175,8 +1111,9 @@ impl Op for Absent {
                 run_tool(cmd.arg(&self.name), tools, "deluser")?;
             }
         }
-        change.predicted.ok_or_else(|| {
-            Error::msg("user::Absent::apply received a change without its prediction")
+        Ok(Removed {
+            name: self.name.clone(),
+            home,
         })
     }
 }
@@ -1226,7 +1163,7 @@ impl Op for Existing {
         }
     }
 
-    fn apply(&self, _: &System, _: Change<Account>) -> Result<Account> {
+    fn apply(&self, _: &System, _: Change) -> Result<Account> {
         bail!("user::Existing never changes anything; apply must not be called")
     }
 }
@@ -1315,19 +1252,23 @@ impl Op for Membership {
         require_root(sys, "user::Membership")?;
         validate_name("user", &self.user)?;
         validate_name("group", &self.group)?;
+        // Both the user and the group are refused when missing, except under
+        // --check, where an earlier step may create either (vision 12): the
+        // step then reports the membership it would add.
         let passwd = sys.read_to_string("/etc/passwd")?;
-        let Some(entry) = lookup_user(&passwd, &self.user)? else {
-            bail!(
+        let entry = match lookup_user(&passwd, &self.user)? {
+            Some(e) => Some(e),
+            None if sys.check_mode() => None,
+            None => bail!(
                 "user `{}` does not exist; user::Membership does not create users, use \
                  user::Present first",
                 self.user
-            );
+            ),
         };
         let group_text = sys.read_to_string("/etc/group")?;
         let group = match lookup_group(&group_text, &self.group)? {
             Some(g) => Some(g),
-            // Planned by an earlier step in this dry run: not a member yet.
-            None if sys.would_create("group", &self.group) => None,
+            None if sys.check_mode() => None,
             None => bail!(
                 "group `{}` does not exist; user::Membership does not create groups, use \
                  group::Present first",
@@ -1338,27 +1279,24 @@ impl Op for Membership {
             user: self.user.clone(),
             group: self.group.clone(),
         };
-        if let Some(group) = &group
+        if let (Some(entry), Some(group)) = (&entry, &group)
             && (group.members.contains(&self.user) || group.gid == entry.gid)
         {
             return Ok(Plan::Satisfied(member));
         }
         let before = groups_of(&group_text, &self.user);
         let after = sorted([before.clone(), vec![self.group.clone()]].concat());
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: format!("user {}", self.user),
-                changes: vec![AttrChange {
-                    name: "groups".into(),
-                    from: before.join(","),
-                    to: after.join(","),
-                }],
-            },
-            member,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: format!("user {}", self.user),
+            changes: vec![AttrChange {
+                name: "groups".into(),
+                from: before.join(","),
+                to: after.join(","),
+            }],
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<Member>) -> Result<Member> {
+    fn apply(&self, sys: &System, _: Change) -> Result<Member> {
         let tools = Tools::of(sys);
         match tools {
             Tools::Shadow => run_tool(
@@ -1372,8 +1310,9 @@ impl Op for Membership {
                 "addgroup",
             )?,
         }
-        change.predicted.ok_or_else(|| {
-            Error::msg("user::Membership::apply received a change without its prediction")
+        Ok(Member {
+            user: self.user.clone(),
+            group: self.group.clone(),
         })
     }
 }
@@ -1676,7 +1615,7 @@ mod tests {
         fake.write(Path::new(path), text.as_bytes()).unwrap();
     }
 
-    fn change<T>(plan: Plan<T>) -> Change<T> {
+    fn change<T>(plan: Plan<T>) -> Change {
         match plan {
             Plan::Change(c) => c,
             Plan::Satisfied(_) => panic!("expected a change"),
@@ -1696,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn present_creates_with_useradd_predicts_and_rereads() {
+    fn present_creates_with_useradd_and_rereads() {
         let fake = Arc::new(base().with_cmd("useradd", None, 0, ""));
         let sys = fake_sys(&fake);
         let op = Present::new("rustible")
@@ -1710,18 +1649,6 @@ mod tests {
             c.diff.short(),
             "exists=yes uid=1002 gid=4 home=/home/rustible shell=/bin/bash comment=Rustible \
              groups=docker,sudo"
-        );
-        let predicted = c.predicted.clone().unwrap();
-        assert_eq!(
-            predicted,
-            Account {
-                name: "rustible".into(),
-                uid: 1002,
-                gid: 4,
-                home: "/home/rustible".into(),
-                shell: "/bin/bash".into(),
-                groups: vec!["docker".into(), "sudo".into()],
-            }
         );
         assert!(fake.commands().is_empty(), "check runs nothing");
 
@@ -1739,7 +1666,18 @@ mod tests {
                 .replace("sudo:x:27:cadu", "sudo:x:27:cadu,rustible"),
         );
         let account = op.apply(&sys, c).unwrap();
-        assert_eq!(account, predicted, "the prediction was honest");
+        assert_eq!(
+            account,
+            Account {
+                name: "rustible".into(),
+                uid: 1002,
+                gid: 4,
+                home: "/home/rustible".into(),
+                shell: "/bin/bash".into(),
+                groups: vec!["docker".into(), "sudo".into()],
+            },
+            "apply reports the account as the files now have it"
+        );
         assert_eq!(
             fake.argvs(),
             vec![vec![
@@ -1762,30 +1700,32 @@ mod tests {
     }
 
     #[test]
-    fn present_create_without_uid_does_not_predict() {
+    fn present_create_without_uid_plans_from_the_defaults() {
         let fake = Arc::new(base());
         let c = change(Present::new("rustible").check(&fake_sys(&fake)).unwrap());
+        // No uid and no gid in the diff: useradd allocates both, and the op
+        // does not guess what it will pick.
         assert_eq!(
             c.diff.short(),
             "exists=yes home=/home/rustible shell=/bin/sh"
         );
-        assert!(c.predicted.is_none(), "uid is unknown until useradd runs");
     }
 
     #[test]
-    fn present_create_predicts_only_with_an_explicit_primary_group() {
+    fn present_create_takes_a_same_named_group_as_primary() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake);
         // The private group's gid comes from login.defs ranges the op does
-        // not model, so a uid alone is not enough for an honest prediction.
+        // not model, so a uid alone puts no gid in the diff.
         let c = change(Present::new("rustible").uid(1500).check(&sys).unwrap());
-        assert!(c.predicted.is_none());
-        let c = change(Present::new("rustible").uid(4).check(&sys).unwrap());
-        assert!(c.predicted.is_none());
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes uid=1500 home=/home/rustible shell=/bin/sh"
+        );
         // A group named after the new user becomes its primary group (the
         // tool would refuse to create the private group), so the gid is known.
         let c = change(Present::new("docker").uid(1500).check(&sys).unwrap());
-        assert_eq!(c.predicted.unwrap().gid, 998);
+        assert!(c.diff.short().contains("gid=998"), "{}", c.diff.short());
         // With an explicit primary group the gid is known.
         let c = change(
             Present::new("rustible")
@@ -1794,7 +1734,7 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert_eq!(c.predicted.unwrap().gid, 4);
+        assert!(c.diff.short().contains("gid=4 "), "{}", c.diff.short());
     }
 
     #[test]
@@ -1849,10 +1789,6 @@ mod tests {
         let op = Present::new("cadu").shell("/bin/bash").groups(["docker"]);
         let c = change(op.check(&sys).unwrap());
         assert_eq!(c.diff.short(), "shell=/bin/bash groups=adm,docker,sudo");
-        let predicted = c.predicted.clone().unwrap();
-        assert_eq!(predicted.shell, Path::new("/bin/bash"));
-        assert_eq!(predicted.groups, vec!["adm", "docker", "sudo"]);
-        assert_eq!(predicted.uid, 1000);
 
         write(
             &fake,
@@ -1865,7 +1801,9 @@ mod tests {
             &GROUP.replace("docker:x:998:", "docker:x:998:cadu"),
         );
         let a = op.apply(&sys, c).unwrap();
-        assert_eq!(a, predicted);
+        assert_eq!(a.shell, Path::new("/bin/bash"));
+        assert_eq!(a.groups, vec!["adm", "docker", "sudo"]);
+        assert_eq!(a.uid, 1000);
         assert_eq!(
             fake.argvs(),
             vec![vec!["usermod", "-s", "/bin/bash", "-aG", "docker", "cadu"]]
@@ -1879,7 +1817,6 @@ mod tests {
         let op = Present::new("cadu").groups(["docker"]).append(false);
         let c = change(op.check(&sys).unwrap());
         assert_eq!(c.diff.short(), "groups=docker");
-        assert_eq!(c.predicted.as_ref().unwrap().groups, vec!["docker"]);
         write(
             &fake,
             "/etc/group",
@@ -1982,8 +1919,11 @@ mod tests {
             .groups(["sudo", "adm"])
             .create_home(false);
         let c = change(op.check(&sys).unwrap());
-        let predicted = c.predicted.clone().unwrap();
-        assert_eq!((predicted.uid, predicted.gid), (1002, 998));
+        assert!(
+            c.diff.short().contains("uid=1002 gid=998"),
+            "{}",
+            c.diff.short()
+        );
         write(
             &fake,
             "/etc/passwd",
@@ -1997,7 +1937,8 @@ mod tests {
                 .replace("sudo:x:27:cadu", "sudo:x:27:cadu,rustible"),
         );
         let a = op.apply(&sys, c).unwrap();
-        assert_eq!(a, predicted);
+        assert_eq!((a.uid, a.gid), (1002, 998));
+        assert_eq!(a.groups, vec!["adm", "sudo"]);
         assert_eq!(
             fake.argvs(),
             vec![
@@ -2024,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn present_on_alpine_system_user_without_shell_does_not_predict() {
+    fn present_on_alpine_system_user_shows_only_an_explicit_shell() {
         let fake = Arc::new(base());
         let sys = alpine(fake_sys(&fake));
         let c = change(
@@ -2034,7 +1975,7 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert!(c.predicted.is_none());
+        assert!(!c.diff.short().contains("shell="), "{}", c.diff.short());
         let c = change(
             Present::new("svc")
                 .uid(100)
@@ -2044,13 +1985,18 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert_eq!(c.predicted.unwrap().shell, Path::new("/sbin/nologin"));
+        assert!(
+            c.diff.short().contains("shell=/sbin/nologin"),
+            "{}",
+            c.diff.short()
+        );
     }
 
     #[test]
-    fn present_on_busybox_does_not_predict_or_show_a_shell_it_did_not_ask_for() {
+    fn present_on_busybox_shows_no_shell_it_did_not_ask_for() {
         // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
-        // user's passwd entry (`/bin/ash` for root on Alpine), not `/bin/sh`.
+        // user's passwd entry (`/bin/ash` for root on Alpine), not `/bin/sh`,
+        // and the op cannot see that through `sys`: the diff names no shell.
         let fake = Arc::new(base());
         let sys = alpine(fake_sys(&fake));
         let c = change(
@@ -2060,12 +2006,11 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert!(c.predicted.is_none(), "uid and gid known, shell not");
         assert_eq!(
             c.diff.short(),
             "exists=yes uid=1002 gid=998 home=/home/rustible"
         );
-        // With an explicit shell the prediction is honest again.
+        // An explicit shell is shown.
         let c = change(
             Present::new("rustible")
                 .uid(1002)
@@ -2074,7 +2019,11 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/ash"));
+        assert!(
+            c.diff.short().ends_with("shell=/bin/ash"),
+            "{}",
+            c.diff.short()
+        );
         // shadow-utils read the default from /etc/default/useradd.
         let c = change(
             Present::new("rustible")
@@ -2083,7 +2032,11 @@ mod tests {
                 .check(&fake_sys(&fake))
                 .unwrap(),
         );
-        assert_eq!(c.predicted.unwrap().shell, Path::new("/bin/sh"));
+        assert!(
+            c.diff.short().ends_with("shell=/bin/sh"),
+            "{}",
+            c.diff.short()
+        );
     }
 
     #[test]
@@ -2103,7 +2056,6 @@ mod tests {
             c.diff.short(),
             "exists=yes uid=4000 gid=4000 home=/home/svc shell=/bin/sh"
         );
-        assert_eq!(c.predicted.as_ref().unwrap().gid, 4000, "gid is known");
         write(
             &fake,
             "/etc/passwd",
@@ -2148,178 +2100,197 @@ mod tests {
                 .check(&fake_sys(&fake))
                 .unwrap(),
         );
-        assert_eq!(c.predicted.unwrap().gid, 998);
+        assert!(c.diff.short().contains("gid=998"), "{}", c.diff.short());
+    }
 
-        // In check mode the same-named group may itself be planned.
+    // ---- check mode: a prerequisite another step could create (vision 12) ----
+
+    /// Vision 12: under `--check` an earlier `group::Present` in the run may
+    /// create the primary group, so the step reports the account it would
+    /// create and names the group it cannot number. A real run refuses,
+    /// with the same message as before.
+    #[test]
+    fn check_mode_defers_a_missing_primary_group_by_name() {
         let fake = Arc::new(base());
-        let sys = fake_sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
-        ctx.step("group", crate::group::Present::new("svc"))
-            .unwrap();
-        let u = ctx.step("user", Present::new("svc").uid(4000)).unwrap();
-        assert!(u.changed && !u.is_available());
-        assert!(u.diff.as_ref().unwrap().short().contains("group=svc"));
-        let mut ctx = Ctx::new(
-            fake_sys(&fake).with_check_mode(true),
-            rustible_sdk::HostInfo::local(),
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = change(Present::new("app").gid("app").check(&dry).unwrap());
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes group=app home=/home/app shell=/bin/sh"
         );
-        ctx.step("group", crate::group::Present::new("svc").gid(4000))
-            .unwrap();
-        let u = ctx
-            .step("user", Present::new("svc").uid(4000).shell("/bin/sh"))
-            .unwrap();
-        assert!(u.predicted);
-        assert_eq!(u.gid, 4000);
+        assert!(fake.commands().is_empty(), "check mode runs nothing");
+
+        let err = Present::new("app")
+            .gid("app")
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "group `app` does not exist; user::Present does not create groups, use \
+                 group::Present first"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
-    fn check_mode_accepts_a_group_an_earlier_step_would_create() {
-        // Vision 6.6: `group::Present` then `user::Present ... .groups([..])`
-        // in one dry run. Without the note the user step aborts the run
-        // while the real run succeeds.
+    fn check_mode_defers_a_missing_primary_group_by_id() {
+        let fake = Arc::new(base());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = change(Present::new("app").gid(3000).check(&dry).unwrap());
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes gid=3000 home=/home/app shell=/bin/sh"
+        );
+
+        let err = Present::new("app")
+            .gid(3000)
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "no group has gid 3000; user::Present does not create groups, use \
+                 group::Present first"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn check_mode_defers_a_missing_supplementary_group() {
+        let fake = Arc::new(base());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        // A new account.
+        let c = change(
+            Present::new("app")
+                .groups(["app", "adm"])
+                .check(&dry)
+                .unwrap(),
+        );
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes home=/home/app shell=/bin/sh groups=adm,app"
+        );
+        // An existing one joining it.
+        let c = change(Present::new("cadu").groups(["app"]).check(&dry).unwrap());
+        assert_eq!(c.diff.short(), "groups=adm,app,sudo");
+        assert!(fake.commands().is_empty(), "check mode runs nothing");
+
+        let err = Present::new("app")
+            .groups(["app"])
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "group `app` does not exist; user::Present does not create groups, use \
+                 group::Present first"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn check_mode_defers_an_existing_accounts_primary_group_it_cannot_number() {
+        let fake = Arc::new(base());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = change(Present::new("cadu").gid("app").check(&dry).unwrap());
+        assert_eq!(c.diff.short(), "group=app");
+        let err = Present::new("cadu")
+            .gid("app")
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `app` does not exist"), "{err}");
+    }
+
+    #[test]
+    fn membership_defers_a_missing_group_or_user_in_check_mode_only() {
+        let fake = Arc::new(base());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = change(
+            Membership::of_name("cadu")
+                .in_group_named("app")
+                .check(&dry)
+                .unwrap(),
+        );
+        assert_eq!(c.diff.short(), "groups=adm,app,sudo");
+        let c = change(
+            Membership::of_name("ghost")
+                .in_group_named("docker")
+                .check(&dry)
+                .unwrap(),
+        );
+        assert_eq!(c.diff.short(), "groups=docker");
+        assert!(fake.commands().is_empty(), "check mode runs nothing");
+
+        let real = fake_sys(&fake);
+        let err = Membership::of_name("cadu")
+            .in_group_named("app")
+            .check(&real)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "group `app` does not exist; user::Membership does not create groups, use \
+                 group::Present first"
+            ),
+            "{err}"
+        );
+        let err = Membership::of_name("ghost")
+            .in_group_named("docker")
+            .check(&real)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "user `ghost` does not exist; user::Membership does not create users, use \
+                 user::Present first"
+            ),
+            "{err}"
+        );
+    }
+
+    /// The dry run of a first provision, through `Ctx`: group, user in it,
+    /// membership. Every step reports `would change`, none has an output,
+    /// nothing runs (vision 12).
+    #[test]
+    fn check_mode_through_ctx_walks_a_first_provision_with_no_outputs() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
 
-        let planned = ctx
-            .step("group", crate::group::Present::new("rustible"))
+        let g = ctx
+            .step("group", crate::group::Present::new("app"))
             .unwrap();
-        assert!(planned.changed && !planned.is_available());
-
-        // New user, planned supplementary group: would change, no prediction
-        // (no uid), diff lists the group.
+        assert!(g.changed && !g.is_available());
         let u = ctx
-            .step("user", Present::new("svc").groups(["rustible", "adm"]))
+            .step("user", Present::new("app").gid("app").groups(["app"]))
             .unwrap();
         assert!(u.changed && !u.is_available());
-        let short = u.diff.as_ref().unwrap().short();
-        assert!(short.contains("groups=adm,rustible"), "{short}");
-
-        // New user, planned primary group by name: the gid is unknown, so the
-        // diff names the group and nothing is predicted even with a uid.
-        let u = ctx
-            .step(
-                "user primary",
-                Present::new("svc").uid(1002).gid("rustible"),
-            )
-            .unwrap();
-        assert!(u.changed && !u.is_available());
-        let short = u.diff.as_ref().unwrap().short();
-        assert!(short.contains("group=rustible"), "{short}");
-
-        // Existing user, planned primary group: a change, not predicted.
-        let u = ctx
-            .step("cadu primary", Present::new("cadu").gid("rustible"))
-            .unwrap();
-        assert!(u.changed && !u.is_available());
-        assert_eq!(u.diff.as_ref().unwrap().short(), "group=rustible");
-
-        // Existing user joining the planned group: predicted, group listed.
-        let u = ctx
-            .step("cadu joins", Present::new("cadu").groups(["rustible"]))
-            .unwrap();
-        assert!(u.changed && u.is_available());
-        assert_eq!(u.groups, vec!["adm", "rustible", "sudo"]);
-
-        // Membership in the planned group: would change.
-        let m = ctx
-            .step(
-                "member",
-                Membership::of_name("cadu").in_group_named("rustible"),
-            )
-            .unwrap();
-        assert!(m.changed && m.is_available());
-
-        // A planned group with a known gid predicts through `.gid(&grp)`.
-        let grp = ctx
-            .step(
-                "group with gid",
-                crate::group::Present::new("fixed").gid(5000),
-            )
-            .unwrap();
-        assert!(grp.predicted);
-        let u = ctx
-            .step(
-                "user in fixed",
-                Present::new("svc").uid(1002).gid(&*grp).shell("/bin/sh"),
-            )
-            .unwrap();
-        assert!(u.predicted);
-        assert_eq!(u.gid, 5000);
         assert_eq!(
             u.diff.as_ref().unwrap().short(),
-            "exists=yes uid=1002 gid=5000 home=/home/svc shell=/bin/sh"
+            "exists=yes group=app home=/home/app shell=/bin/sh groups=app"
         );
-
-        // ...and identically through the name, `.gid("fixed")`. Two spellings
-        // of one intent: the by-name form used to drop the planned gid and
-        // silently lose the prediction, which is worse than failing.
-        let by_name = ctx
-            .step(
-                "user in fixed by name",
-                Present::new("svc2").uid(1003).gid("fixed").shell("/bin/sh"),
-            )
+        let m = ctx
+            .step("member", Membership::of_name("app").in_group_named("app"))
             .unwrap();
-        assert!(by_name.predicted, "the planned gid is known by name too");
-        assert_eq!(by_name.gid, 5000);
-        assert_eq!(
-            by_name.diff.as_ref().unwrap().short(),
-            "exists=yes uid=1003 gid=5000 home=/home/svc2 shell=/bin/sh"
-        );
+        assert!(m.changed && !m.is_available());
 
-        // A planned group with no gid still blocks prediction by either
-        // spelling: the gid is genuinely unknown (vision 12).
-        let u = ctx
-            .step(
-                "user in a gid-less planned group",
-                Present::new("svc3").uid(1004).gid("rustible"),
-            )
+        // An existing account changing its shell: would change, and the
+        // account is unavailable until `apply` has run.
+        let r = ctx
+            .step("shell", Present::new("cadu").shell("/bin/bash"))
             .unwrap();
-        assert!(!u.predicted);
-        assert!(
-            u.diff.as_ref().unwrap().short().contains("group=rustible"),
-            "the diff names the group it cannot number"
-        );
-
-        // A group nobody planned is still refused in check mode.
-        let err = ctx
-            .step("user", Present::new("svc").groups(["nope"]))
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("group `nope` does not exist"), "{err}");
-        let err = ctx
-            .step("user", Present::new("svc").gid(6000))
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("no group has gid 6000"), "{err}");
+        assert!(r.changed && !r.is_available());
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
 
         assert!(fake.commands().is_empty(), "check mode runs nothing");
-    }
-
-    #[test]
-    fn outside_check_mode_a_planned_group_is_not_accepted() {
-        let fake = Arc::new(base());
-        let sys = fake_sys(&fake);
-        // Simulate the note an earlier `check` would have left.
-        sys.note_would_create("group", "rustible", Some(5000));
-        let err = Present::new("svc")
-            .groups(["rustible"])
-            .check(&sys)
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("group `rustible` does not exist"), "{err}");
-        let err = Present::new("svc")
-            .gid(5000)
-            .check(&sys)
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("no group has gid 5000"), "{err}");
-        let err = Membership::of_name("cadu")
-            .in_group_named("rustible")
-            .check(&sys)
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("group `rustible` does not exist"), "{err}");
+        assert_eq!(fake.content("/etc/passwd").unwrap(), PASSWD);
+        assert_eq!(fake.content("/etc/group").unwrap(), GROUP);
     }
 
     #[test]
@@ -2431,12 +2402,8 @@ mod tests {
             c.diff.short(),
             "exists=yes home=/srv/home/x shell=/bin/bash"
         );
-        assert!(
-            c.predicted.is_none(),
-            "no primary group given, so no honest gid"
-        );
 
-        // With the primary group known the prediction carries the defaults.
+        // The defaults show alongside the ids that were given.
         let c = change(
             Present::new("x")
                 .uid(1500)
@@ -2444,9 +2411,10 @@ mod tests {
                 .check(&fake_sys(&fake))
                 .unwrap(),
         );
-        let predicted = c.predicted.unwrap();
-        assert_eq!(predicted.shell, Path::new("/bin/bash"));
-        assert_eq!(predicted.home, Path::new("/srv/home/x"));
+        assert_eq!(
+            c.diff.short(),
+            "exists=yes uid=1500 gid=4 home=/srv/home/x shell=/bin/bash"
+        );
 
         let fake = Arc::new(
             Fake::new()
@@ -2627,28 +2595,35 @@ mod tests {
     }
 
     #[test]
-    fn check_mode_through_ctx_runs_nothing_and_chains_from_predictions() {
+    fn check_mode_through_ctx_runs_nothing_and_no_would_change_step_has_an_output() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
 
+        // Every id given or none: a would-change step has no output either
+        // way (vision 12), the diff is what the dry run shows.
         let account = ctx
             .step(
                 "user",
                 Present::new("rustible").uid(1002).gid(4).shell("/bin/bash"),
             )
             .unwrap();
-        assert!(account.changed && account.predicted && account.is_available());
-        assert_eq!(account.gid, 4);
-        assert_eq!(account.home, Path::new("/home/rustible"));
-
-        let unpredicted = ctx.step("user", Present::new("nouid")).unwrap();
-        assert!(unpredicted.changed && !unpredicted.is_available());
+        assert!(account.changed && !account.is_available());
+        assert_eq!(
+            account.diff.as_ref().unwrap().short(),
+            "exists=yes uid=1002 gid=4 home=/home/rustible shell=/bin/bash"
+        );
+        let nouid = ctx.step("user", Present::new("nouid")).unwrap();
+        assert!(nouid.changed && !nouid.is_available());
 
         let removed = ctx
             .step("gone", Absent::new("cadu").remove_home(true))
             .unwrap();
-        assert!(removed.changed && removed.is_available());
+        assert!(removed.changed && !removed.is_available());
+        assert_eq!(
+            removed.diff.as_ref().unwrap().short(),
+            "exists=no home=removed"
+        );
 
         let member = ctx
             .step(
@@ -2656,7 +2631,12 @@ mod tests {
                 Membership::of_name("cadu").in_group_named("docker"),
             )
             .unwrap();
-        assert!(member.changed && member.is_available());
+        assert!(member.changed && !member.is_available());
+
+        // Satisfied steps keep their output.
+        let existing = ctx.step("lookup", Existing::named("cadu")).unwrap();
+        assert!(!existing.changed && existing.is_available());
+        assert_eq!(existing.home, Path::new("/home/cadu"));
 
         assert!(fake.commands().is_empty(), "check mode runs nothing");
         assert_eq!(fake.content("/etc/passwd").unwrap(), PASSWD);
@@ -2670,7 +2650,7 @@ mod tests {
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let op = Membership::of_name("cadu").in_group_named("docker");
         let r = ctx.step("member", op.clone()).unwrap();
-        assert!(r.changed && !r.predicted);
+        assert!(r.changed && r.is_available());
         assert_eq!(r.group, "docker");
         assert_eq!(fake.argvs(), vec![vec!["usermod", "-aG", "docker", "cadu"]]);
         // The fake cannot run usermod: plant its effect for the second leg.

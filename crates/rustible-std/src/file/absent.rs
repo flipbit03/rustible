@@ -89,16 +89,13 @@ impl Op for Absent {
                 });
             }
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.path.display().to_string(),
-                changes,
-            },
-            self.report(true),
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.path.display().to_string(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<AbsentReport>) -> Result<AbsentReport> {
+    fn apply(&self, sys: &System, _: Change) -> Result<AbsentReport> {
         // The kernel is the floor: without `.recursive(true)` a populated
         // directory fails here too, not only at check.
         if self.recursive {
@@ -106,7 +103,7 @@ impl Op for Absent {
         } else {
             sys.remove(&self.path)?;
         }
-        Ok(change.predicted.unwrap_or_else(|| self.report(true)))
+        Ok(self.report(true))
     }
 }
 
@@ -219,12 +216,13 @@ mod tests {
     }
 
     #[test]
-    fn absent_in_check_mode_predicts_and_removes_nothing() {
+    fn absent_in_check_mode_reports_would_change_and_removes_nothing() {
         let fake = Arc::new(Fake::new().with_file("/f", "x"));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let r = ctx.step("rm", Absent::at("/f")).unwrap();
-        assert!(r.changed && r.predicted && r.removed);
+        assert!(r.changed && !r.is_available(), "no apply, so no output");
+        assert_eq!(r.diff.as_ref().unwrap().short(), "exists=no");
         assert!(fake.file("/f").is_some());
     }
 

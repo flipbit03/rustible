@@ -41,7 +41,7 @@ pub use error::{
 pub use facts::{Arch, Distro, Facts, Init, Os, Pm};
 pub use op::{Applied, Change, Op, Plan};
 pub use secret::Secret;
-pub use system::{Cmd, Planned, System};
+pub use system::{Cmd, System};
 
 /// What a playbook file imports. Everything needed to write steps and to
 /// implement an [`Op`], and nothing from the runtime, protocol, backend or

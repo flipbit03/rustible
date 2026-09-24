@@ -191,7 +191,7 @@ impl Op for UserKeys {
         }
     }
 
-    fn apply(&self, _: &System, _: Change<Vec<PublicKey>>) -> Result<Vec<PublicKey>> {
+    fn apply(&self, _: &System, _: Change) -> Result<Vec<PublicKey>> {
         bail!("github::UserKeys never changes anything; apply must not be called")
     }
 }
@@ -416,8 +416,7 @@ pub(crate) mod tests {
                 UserKeys::of("flipbit03").fetch_with(canned.clone()),
             )
             .unwrap();
-        assert!(!keys.changed);
-        assert!(!keys.predicted);
+        assert!(!keys.changed && keys.is_available());
         assert_eq!(keys.len(), 3);
         assert_eq!(keys[0].to_line(), RSA);
         assert_eq!(canned.asked(), vec!["https://github.com/flipbit03.keys"]);
@@ -534,7 +533,6 @@ pub(crate) mod tests {
                 &sys,
                 Change {
                     diff: Diff::text("/x", String::new(), String::new()),
-                    predicted: None,
                 },
             )
             .unwrap_err()

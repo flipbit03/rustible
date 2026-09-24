@@ -37,10 +37,18 @@ fn latest_refreshes_the_cache_in_check(ctx: &mut Ctx) -> Result<()> {
     let Plan::Change(change) = op.check(&dry)? else {
         panic!("expected a change: `sl` is not installed");
     };
-    let predicted = change.predicted.expect("Latest predicts its output");
-    assert_eq!(predicted.installed.len(), 1);
+    // The diff is the dry run's whole answer (vision 12): one package, from
+    // absent to the candidate the refreshed lists name.
+    let Diff::Attrs { changes, .. } = &change.diff else {
+        panic!("expected an attribute diff, got {:?}", change.diff);
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (changes[0].name.as_str(), changes[0].from.as_str()),
+        ("sl", "absent")
+    );
     assert!(
-        !predicted.installed[0].version.is_empty(),
+        !changes[0].to.is_empty(),
         "the refreshed lists name a candidate version"
     );
 

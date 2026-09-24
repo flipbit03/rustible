@@ -4,7 +4,8 @@ use rustible::sdk::Applied;
 use rustible_std::apt::InstallReport;
 
 pub fn describe(r: &Applied<InstallReport>) -> String {
-    if r.changed && r.predicted {
+    // A would-change step has no output in check mode (vision 12).
+    if r.changed && !r.is_available() {
         "would install".to_string()
     } else if r.changed {
         format!("installed {}", r.installed.iter().map(|p| format!("{} {}", p.name, p.version)).collect::<Vec<_>>().join(", "))

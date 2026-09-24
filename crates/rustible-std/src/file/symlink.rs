@@ -30,9 +30,8 @@ pub struct SymlinkBuilder {
     link: PathBuf,
 }
 
-/// Output of [`Symlink`]: the desired state echoed back, which is why
-/// `check` can predict it in full and `apply` returns the prediction
-/// unchanged.
+/// Output of [`Symlink`]: the desired state echoed back, since a link has
+/// nothing else to report once it points where it was told to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymlinkReport {
     /// The link itself, as given to [`Symlink::at`].
@@ -127,16 +126,13 @@ impl Op for Symlink {
                 });
             }
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.link.display().to_string(),
-                changes,
-            },
-            self.report(),
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.link.display().to_string(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<SymlinkReport>) -> Result<SymlinkReport> {
+    fn apply(&self, sys: &System, _: Change) -> Result<SymlinkReport> {
         if sys.exists(&self.link)? {
             // Replace atomically: a reader never sees the path missing.
             let mut tmp = self.link.clone().into_os_string();
@@ -147,7 +143,7 @@ impl Op for Symlink {
         } else {
             sys.symlink(&self.target, &self.link)?;
         }
-        Ok(change.predicted.unwrap_or_else(|| self.report()))
+        Ok(self.report())
     }
 }
 
@@ -258,15 +254,15 @@ mod tests {
     }
 
     #[test]
-    fn symlink_in_check_mode_predicts_and_creates_nothing() {
+    fn symlink_in_check_mode_reports_would_change_and_creates_nothing() {
         let fake = Arc::new(Fake::new());
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let r = ctx
             .step("link", Symlink::at("/l").pointing_to("/t"))
             .unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!(r.target, PathBuf::from("/t"));
+        assert!(r.changed && !r.is_available(), "no apply, so no output");
+        assert_eq!(r.diff.as_ref().unwrap().short(), "target=/t");
         assert!(fake.file("/l").is_none());
     }
 
