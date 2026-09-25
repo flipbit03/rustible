@@ -395,9 +395,11 @@ mod tests {
 
     #[test]
     fn apply_reads_the_previous_kernel_name_itself() {
-        // Only the file differs, so the diff never mentions the kernel name;
-        // the report's `previous` is read from the kernel before the change.
-        let fake = Arc::new(box_named("old", "HOME-GAMES").with_cmd("hostnamectl", None, 0, ""));
+        // The report's `previous` is the kernel's name, read by `apply`
+        // itself: the file says one thing, the kernel another, and neither is
+        // the new name, so an `apply` that echoed the new name back, or took
+        // the file's, would show here.
+        let fake = Arc::new(box_named("in-file", "in-kernel").with_cmd("hostnamectl", None, 0, ""));
         let s = sys(&fake);
         let op = Is::new("HOME-GAMES");
         let Plan::Change(c) = op.check(&s).unwrap() else {
@@ -407,7 +409,7 @@ mod tests {
         assert_eq!(
             r,
             HostnameReport {
-                previous: "HOME-GAMES".into(),
+                previous: "in-kernel".into(),
                 current: "HOME-GAMES".into()
             }
         );

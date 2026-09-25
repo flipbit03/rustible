@@ -12,11 +12,14 @@ walk further than the facts allow:
 
 1. **Predictions.** `Change<T>` carries `predicted: Option<T>`, an op's guess
    at its post-apply output, set through `Plan::change_predicting`; `Applied`
-   carries a `predicted: bool` flag. Eighteen ops predict; the rule was
-   "predict by default" (vision 6.2) with per-op rulings on when a guess is
-   honest (`[M6-ug]`, `[M6-so]`, `[M6-sh]`, `[M6-na]` in DECISIONS.md). Four
-   ops (`group::Absent`, `http::Download`, `file::Copy`, `sysctl::Present`)
-   also use the slot as a private channel from `check` to `apply`.
+   carries a `predicted: bool` flag. Twenty-six op types across 17 files
+   predict (27 call sites); the rule was "predict by default" (vision 6.2)
+   with per-op rulings on when a guess is honest (`[M6-ug]`, `[M6-so]`,
+   `[M6-sh]`, `[M6-na]` in DECISIONS.md). Six of them (`apt::Absent`,
+   `apt::Latest`, `file::Directory`, `file::Copy`, `http::Download`,
+   `sysctl::Present`) also use the slot as a private channel from `check` to
+   `apply`, taking an instruction from it; the rest merely return it as
+   `apply`'s output.
 2. **The planned-resource registry.** `System::note_would_create`,
    `would_create`, `would_create_id`, `would_create_id_by_name` and the
    `Planned` type (`system.rs:63-75, 290-345`), added by `[M6-sh] 2026-09-08`
@@ -26,15 +29,25 @@ walk further than the facts allow:
    declining to extend it (`[USING_RUSTIBLE] 2026-09-11` twice, `[OPS]
    2026-09-11`, `[ISSUE-40] 2026-09-17`).
 
-What replaces both is Ansible's rule, verified against `ansible/ansible`
-`devel` on 2026-09-24: in `user.py`'s `main()`, `state == 'present'` on an
-account that does not exist runs `if module.check_mode: module.exit_json(changed=True)`
-before it validates the group, the home's parent, or anything else;
-`authorized_key.py` returns from `keyfile()` under check mode before it looks
-at the directory. A step that would create something reports `changed` and
-asks no further questions; prerequisites are verified when the run is about
-to act. Rustible keeps the part Ansible lacks: reading a would-change step's
-output fails loudly instead of yielding garbage.
+What replaces both is Ansible's rule for a step that would create
+something, verified against `ansible/ansible` `devel` and
+`ansible-collections/ansible.posix` on 2026-09-24: in `user.py`'s `main()`,
+`state == 'present'` on an account that does not exist runs
+`if module.check_mode: module.exit_json(changed=True)` before it validates
+the group, the home's parent, or anything else; `ansible.posix`'s
+`authorized_key` does not look at the directory under check mode
+(`keyfile()`: `if not write or module.check_mode: return keysfile`). A step
+that would create something reports `changed` and asks no further questions;
+prerequisites are verified when the run is about to act. Applied
+consistently, the rule takes Rustible further than Ansible in two places,
+both deliberate: `user.py` still refuses a missing group when the account
+already *exists* (`modify_user_usermod` checks it before anything that
+respects check mode), and `authorized_key` fails a dry run outright when the
+user does not exist and no path was given ("Either user must exist or you
+must provide full path to key file in check mode"), which fails the dry run
+of every first provision. Rustible reports `would change` for both. It also
+keeps the part Ansible lacks: reading a would-change step's output fails
+loudly instead of yielding garbage.
 
 ## 2. The amendment to `docs/01_VISION.md`
 
@@ -157,10 +170,10 @@ Added text:
 **In a dry run the refusal waits.** A prerequisite that another op in the same
 run could create — a group, an account, its home, a parent directory, a unit
 file — is verified when the run is about to act, not while it is only
-looking: under `--check` the op reports `would change` with the prerequisite
-named in its diff, and a real run refuses exactly as this rule says, because
-its `check` runs with check mode off and a dry run's plan never reaches
-`apply`. Section 12 has the reasoning and the limits.
+looking: under `--check` the op reports `would change`, its diff showing the
+state it would set, and a real run refuses exactly as this rule says,
+because its `check` runs with check mode off and a dry run's plan never
+reaches `apply`. Section 12 has the reasoning and the limits.
 ```
 
 ### Hunk 5 — §11.1, the check-mode bullet
@@ -227,11 +240,16 @@ what they showed is recorded so the reversal is not relitigated:
   it and adding a check-mode branch in the op instead, so three different
   answers to one question were in the tree at once.
 
-Ansible's check mode has neither mechanism and one rule: a step that would
-create something reports `changed` and asks no further questions (`user.py`'s
-`main()` exits `changed` under check mode before it validates the group;
-`authorized_key` returns before it looks at the directory). That rule is
-adopted, with the loud failure Ansible lacks.
+Ansible's check mode has neither mechanism and one rule for a step that
+would create something: report `changed` and ask no further questions
+(`user.py`'s `main()` exits `changed` under check mode before it validates
+the group; `ansible.posix.authorized_key` does not look at the directory
+under check mode). That rule is adopted and applied consistently, which
+takes it further than Ansible in two places: Ansible still refuses a
+missing group when the account already exists, and `authorized_key` fails a
+dry run outright when the user does not exist yet, where Rustible reports
+`would change` for both. Added on top is the loud failure Ansible lacks when
+a later step reads what a dry run could not produce.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
@@ -248,13 +266,15 @@ adopted, with the loud failure Ansible lacks.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group, an account, its home, a parent directory, a unit —
-  reports `would change` under check mode instead, naming the prerequisite in
-  its diff. The tolerance is gated on check mode, so a real run's `check`
-  takes the refusal, and a dry run's plan never reaches `apply` (`Ctx::step`
-  returns at its check-mode arm): the refusal is never skipped on a run that
-  can act. What a dry run therefore does not catch is a forgotten
-  prerequisite step; the real run refuses before touching anything, as 6.7
-  requires.
+  reports `would change` under check mode instead; its diff shows the state
+  it would set, which names the prerequisite when the op knows it by name (a
+  group, an account, a unit). The tolerance is gated on check mode, so a
+  real run's `check` takes the refusal, and a dry run's plan never reaches
+  `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
+  skipped on a run that can act. What a dry run therefore does not catch is
+  a forgotten prerequisite step: the real run refuses at that step, before
+  that step touches anything, with the steps before it already applied.
+  That is the trade this rule accepts, and 6.7 still holds at the step.
 - That deferral covers only what another step could supply. A refusal about
   the machine or the request itself — wrong platform, not root, the tool the
   op drives is absent, a malformed key, a sysctl key this kernel does not
@@ -309,15 +329,23 @@ SDK (`rustible-sdk`, public surface):
   event or frame carries `predicted`).
 
 Standard library (`rustible-std`) and `rustible-github`:
-- 27 `change_predicting` call sites in 18 ops become `Plan::change`.
+- 27 `change_predicting` call sites in 17 files become `Plan::change`.
 - `group::Absent`, `http::Download`, `file::Copy`, `sysctl::Present`: `apply`
   takes its instruction from the `Diff` (attributes-only versus content) and
   reads what it needs for its output.
 - `user::Present` (`resolve_primary`, `same_named_group`, the `.groups()`
   check) and `user::Membership`: the registry lookups become "in check mode,
   name the group in the diff and go on; otherwise refuse as today".
-- `ssh::authorized_keys`: its two check-mode branches stay, now as instances
-  of the §12 rule rather than exceptions to it.
+- `ssh::authorized_keys`: the missing-home tolerance from `[ISSUE-40]` stays,
+  now as an instance of the §12 rule; the `in_file` missing-parent arm flips
+  from a differently-worded refusal to a tolerance; and `for_user_name` on an
+  account not in `/etc/passwd` yet is deferred (`Target::deferred_under_check`),
+  which is new.
+- New check-mode tolerances, each gated on `sys.check_mode()`: `file::Attrs`
+  on a missing path, `file::Line`/`file::Block` on a missing file without
+  `.create(true)`, `sysctl::Present` without `/etc/sysctl.d`,
+  `archive::Extracted` without its destination, `http::Download` without its
+  parent directory.
 - `systemd`: a unit `systemctl` cannot find becomes `would change` under
   check mode and the same refusal as today otherwise. This closes the
   `[USING_RUSTIBLE] 2026-09-11` KNOWN GAP and is the one item here that can
@@ -344,7 +372,7 @@ the fix telling the author where to look (Cadu, 2026-09-24).
 ## 4. Acceptance criteria
 
 1. **Nothing left.** `grep -rn "predicted\|change_predicting\|would_create\|note_would_create\|Planned\b" crates examples docs/USING_RUSTIBLE.md CLAUDE.md docs/06_BUILD_PLAN.md` is empty. The words survive only in DECISIONS.md, PROGRESS.md, the spike documents and the vision's own dated reversal.
-2. **The shape.** `Change` has one field. `Applied<T>` has no `predicted`. `System` has no planned list. `Plan::change(diff)` is the only way to build a change.
+2. **The shape.** `Change` has one field. `Applied<T>` has no `predicted`. `System` has no planned list. `Plan::change(diff)` is the only constructor the SDK offers; the struct literal `Change { diff }` stays public so a test can hand `apply` a diff of its own.
 3. **`make` is green**: fmt, clippy with `-D warnings`, the tier 1 and 2 suite, rustdoc with `-D warnings`, `examples/workspace`.
 4. **`make integration` is green** (docker): every container test that asserted a prediction or the registry now asserts the rule.
 5. **The rule is pinned at tier 2**, one test each:
@@ -353,7 +381,7 @@ the fix telling the author where to look (Cadu, 2026-09-24).
    - the same pair for `.groups([..])` and `user::Membership`;
    - `systemd::Enabled` on a unit `systemctl` cannot find: check mode → `would change`; real mode → today's refusal;
    - the four former mailbox ops apply correctly from the diff alone (existing apply tests, adapted).
-6. **A fresh-host dry run walks to the end**, at tier 3: one new integration test in `crates/rustible-std/tests/` that builds a dry `Ctx` over a stock `debian:12` container (the pattern `it_user_busybox.rs` uses) and runs `group::Present` → `user::Present.gid(..)` → `ssh::authorized_keys::Present` → `user::Membership`, asserting every step reports `would change` and none fails; then the same steps through a real `Ctx`, asserting `changed` then `ok`. That is the scenario the registry was built for, proven without it.
+6. **A fresh-host dry run walks to the end**, at tier 3: an integration test that builds a dry `Ctx` over a stock container (the pattern `it_user_busybox.rs` uses) and runs `group::Present` → `user::Present` (supplementary and primary groups not there yet) → `ssh::authorized_keys::Present::for_user_name` → `user::Membership` (group, then user too, not there yet), asserting every step reports `would change` with no output and none fails; then that the steps whose prerequisite is missing refuse through a real `Ctx`, with nothing created; and, in the same test, the real provisioning of group → user → keys → membership reporting `changed` then `ok`. That is the scenario the registry was built for, proven without it.
 7. **Docs say the rule once each**: USING_RUSTIBLE §15 and CLAUDE.md each state "a would-change step has no output in check mode; a prerequisite another step could create is verified when the run acts" in their own words, with no paragraph on how to make an op predict.
 8. **DECISIONS.md and PROGRESS.md** carry the entries; every `Reverse:` names the commit-level undo.
 
@@ -388,10 +416,12 @@ Against the acceptance criteria in section 4:
    CLI's), `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
    --lib`, and `cargo build --manifest-path examples/workspace/Cargo.toml`.
 4. **`make integration` green** (docker, `--no-fail-fast`): every `it_*`
-   binary passed. One container test had to change: `it_authorized_keys`'s
-   `a_dry_run_of_a_first_provision_does_not_fail` read `created_dir` off a
-   dry step, which is exactly the read the rule forbids; it now asserts
-   `!is_available()` and the diff.
+   binary passed. Four container test files changed: three for their
+   prediction and registry assertions (`it_user_group`, `it_user_busybox`,
+   `it_apt_latest`), and one the unit tests could not have warned about:
+   `it_authorized_keys`'s `a_dry_run_of_a_first_provision_does_not_fail`
+   read `created_dir` off a dry step, which is exactly the read the rule
+   forbids; it now asserts `!is_available()` and the diff.
 5. **The rule at tier 2**, one test each, all present: the would-change
    output pin (`file/line.rs`
    `a_would_change_step_has_no_output_in_check_mode`, and `user.rs`'s
@@ -409,12 +439,15 @@ Against the acceptance criteria in section 4:
    file per musl build, so cases go into an existing one): a dry `Ctx` over
    `debian:12`/`ubuntu:24.04` runs `group::Present` → `user::Present` with
    `.groups(..)` → `authorized_keys::Present::for_user_name` → `Membership`
-   → `group::Present.gid(4343)` → `user::Present.gid("rustible-dry2")`, every
+   → `Membership::of_name` for a user not there yet either →
+   `group::Present.gid(4343)` → `user::Present.gid("rustible-dry2")`, every
    step `would change`, none with an output, the last diff naming
-   `group=rustible-dry2`; then the same steps through the real `Ctx` refuse
-   (`does not exist`, `does not exist in /etc/passwd`) and nothing was
-   created. The real half — group, user, keys for that user, membership —
-   is the rest of the same test, `changed` then `ok`.
+   `group=rustible-dry2`; then the two steps whose prerequisite is missing
+   (the user in a missing group, the keys for a missing user) refuse through
+   the real `Ctx` (`does not exist`, `does not exist in /etc/passwd`) and
+   nothing was created. The real provisioning — group, user, keys for that
+   user through `for_user(&account)`, membership — is the rest of the same
+   test, `changed` then `ok`.
 7. **Docs say the rule once each**: `docs/USING_RUSTIBLE.md` §9 and §15,
    `CLAUDE.md` (the op-writing bullets and the testing trap), `README.md`,
    `docs/06_BUILD_PLAN.md` §4; no "so `--check` can predict" remains.

@@ -87,7 +87,14 @@ impl Op for Attrs {
             if sys.check_mode() {
                 let changes = plan_attrs(None, self.mode, self.owner);
                 if changes.is_empty() {
-                    return Ok(Plan::Satisfied(self.report()));
+                    // Nothing to set, but the step still has the path to
+                    // wait for: not `ok`, which would hand a later step an
+                    // output for a path that is not there.
+                    return Ok(Plan::change(Diff::summary(format!(
+                        "{}: does not exist yet; file::Attrs would check it once an earlier \
+                         step creates it",
+                        self.path.display()
+                    ))));
                 }
                 return Ok(Plan::change(Diff::Attrs {
                     subject: self.path.display().to_string(),
@@ -252,11 +259,14 @@ mod tests {
             c.diff.render(),
             "/missing:\n  mode: - -> 0644\n  owner: - -> 1:2\n"
         );
-        // Nothing asked beyond existence: nothing to report either.
-        assert!(matches!(
-            Attrs::at("/missing").check(&dry).unwrap(),
-            Plan::Satisfied(_)
-        ));
+        // Nothing asked beyond existence: still `would change`, never `ok`
+        // with an output for a path that is not there.
+        let c = expect_change(&Attrs::at("/missing"), &dry);
+        assert_eq!(
+            c.diff.render(),
+            "/missing: does not exist yet; file::Attrs would check it once an earlier step \
+             creates it"
+        );
 
         let real = fake_sys(&fake);
         let err = op.check(&real).unwrap_err().chain();

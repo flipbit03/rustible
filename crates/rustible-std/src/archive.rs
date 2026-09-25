@@ -770,16 +770,25 @@ impl Op for Extracted {
     }
 
     fn apply(&self, sys: &System, _: Change) -> Result<ExtractReport> {
-        // The report counts members; read the archive for them the way
-        // `check` did rather than carrying its copy across.
-        let (format, members, skipped) = self.plan(sys)?;
-        let report = self.report(format, &members, skipped);
-        let (_, mut archive) = self.open(sys)?;
+        // The report counts what was written, gathered on the same pass that
+        // writes it: one read of the archive here, as before, not a second
+        // planning pass.
+        let (format, mut archive) = self.open(sys)?;
+        let mut members = vec![];
+        let mut skipped = 0;
         walk(&mut archive, self.strip, &mut |m, data| match m {
-            Some(m) => self.write_member(sys, m, data),
-            None => Ok(()),
+            Some(m) => {
+                self.write_member(sys, m, data)?;
+                members.push(m.clone());
+                Ok(())
+            }
+            None => {
+                skipped += 1;
+                Ok(())
+            }
         })
         .with_context(|| format!("extracting {}", self.src.display()))?;
+        let report = self.report(format, &members, skipped);
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
@@ -1403,6 +1412,16 @@ mod tests {
             err(Extracted::from_path("/tmp/hello.tar").to("/opt"))
                 .contains("/opt does not exist; create it first with file::Directory")
         );
+        // Under --check the missing destination is one an earlier
+        // file::Directory may create (vision 12): would change, nothing written.
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = expect_change(&Extracted::from_path("/tmp/hello.tar").to("/opt"), &dry);
+        assert!(
+            c.diff.short().starts_with("extract /tmp/hello.tar"),
+            "{}",
+            c.diff.short()
+        );
+        assert!(fake.file("/opt").is_none());
         assert!(
             err(Extracted::from_path("/tmp/hello.tar").to("/f"))
                 .contains("/f is not a directory (File)")

@@ -603,6 +603,52 @@ mod tests {
         )
     }
 
+    /// Vision 12 at the SDK: under check mode a would-change step never
+    /// reaches `apply` and has no output; a satisfied step keeps its output
+    /// in either mode.
+    #[test]
+    fn check_mode_step_has_no_output_and_never_applies() {
+        struct Done;
+        impl Op for Done {
+            type Output = u32;
+            fn check(&self, _: &System) -> Result<Plan<u32>> {
+                Ok(Plan::Satisfied(7))
+            }
+            fn apply(&self, _: &System, _: crate::Change) -> Result<u32> {
+                unreachable!("a satisfied op is never applied")
+            }
+        }
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink).with_check_mode(true);
+        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let checks = Arc::new(AtomicU32::new(0));
+        let applies = Arc::new(AtomicU32::new(0));
+        let r = ctx
+            .step(
+                "would",
+                Probe {
+                    checks: checks.clone(),
+                    applies: applies.clone(),
+                    cancel_in_check: None,
+                },
+            )
+            .unwrap();
+        assert!(r.changed && !r.is_available());
+        assert!(r.diff.is_some(), "the diff is what a dry run has to show");
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
+        assert_eq!(
+            (
+                checks.load(Ordering::SeqCst),
+                applies.load(Ordering::SeqCst)
+            ),
+            (1, 0)
+        );
+        let done = ctx.step("done", Done).unwrap();
+        assert!(!done.changed && done.is_available());
+        assert_eq!(*done, 7);
+    }
+
     #[test]
     fn cancelled_run_starts_no_further_step() {
         let (mut ctx, _channel, feeder, sink) = ctx_with_channel();

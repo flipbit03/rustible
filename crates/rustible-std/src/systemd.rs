@@ -182,9 +182,29 @@ impl ActiveState {
 /// the message: `disabled` and `masked` exit 1 with the word on stdout, and a
 /// missing unit exits 1 (older) or 4 (systemd 253+) with `not-found` or
 /// nothing on stdout.
-pub fn parse_is_enabled(stdout: &str, exit: i32) -> EnabledState {
+///
+/// Nothing on stdout with a non-zero exit is `not-found` only when stderr
+/// says so (older systemd writes `No such file or directory` there) or says
+/// nothing. Any other stderr — `Failed to connect to bus`, a permission
+/// error — is `systemctl` failing to answer at all, which is an error and
+/// not a state, so it is refused in check mode as in a real run rather than
+/// read as a unit an earlier step would install.
+pub fn parse_is_enabled(stdout: &str, exit: i32, stderr: &str) -> Result<EnabledState> {
     let word = stdout.lines().next().unwrap_or("").trim();
-    match word {
+    if word.is_empty() && exit != 0 {
+        let e = stderr.trim();
+        let lower = e.to_ascii_lowercase();
+        let says_not_found = e.is_empty()
+            || lower.contains("no such file or directory")
+            || lower.contains("not found")
+            || lower.contains("not-found")
+            || lower.contains("could not be found");
+        if !says_not_found {
+            bail!("`systemctl is-enabled` failed without an answer (exit {exit}): {e}");
+        }
+        return Ok(EnabledState::NotFound);
+    }
+    Ok(match word {
         "enabled" => EnabledState::Enabled,
         "enabled-runtime" => EnabledState::EnabledRuntime,
         "linked" => EnabledState::Linked,
@@ -198,9 +218,8 @@ pub fn parse_is_enabled(stdout: &str, exit: i32) -> EnabledState {
         "generated" => EnabledState::Generated,
         "transient" => EnabledState::Transient,
         "not-found" => EnabledState::NotFound,
-        "" if exit != 0 => EnabledState::NotFound,
         other => EnabledState::Other(other.to_string()),
-    }
+    })
 }
 
 /// Parse `systemctl is-active <unit>`. `inactive` and `failed` exit 3 (4 on
@@ -332,7 +351,8 @@ impl Unit {
             .args(["is-enabled", &self.name])
             .allow_failure()
             .run()?;
-        let enabled = parse_is_enabled(&out.stdout_str(), out.status);
+        let enabled = parse_is_enabled(&out.stdout_str(), out.status, &out.stderr_str())
+            .with_context(|| format!("probing unit `{}` with `{}`", self.name, self.prefix()))?;
         let out = self
             .systemctl(sys)
             .args(["is-active", &self.name])
@@ -1039,7 +1059,11 @@ mod tests {
             ("not-found", 4, EnabledState::NotFound),
         ];
         for (word, exit, want) in table {
-            assert_eq!(parse_is_enabled(&format!("{word}\n"), exit), want, "{word}");
+            assert_eq!(
+                parse_is_enabled(&format!("{word}\n"), exit, "").unwrap(),
+                want,
+                "{word}"
+            );
             assert_eq!(want.as_str(), word);
         }
     }
@@ -1047,13 +1071,35 @@ mod tests {
     #[test]
     fn parse_is_enabled_nonzero_exit_with_meaningful_stdout() {
         // `disabled` exits 1, the word still wins.
-        assert_eq!(parse_is_enabled("disabled\n", 1), EnabledState::Disabled);
-        // Older systemd: nothing on stdout, error on stderr, exit 1.
-        assert_eq!(parse_is_enabled("", 1), EnabledState::NotFound);
-        // Empty stdout with exit 0 is not a known state.
-        assert_eq!(parse_is_enabled("", 0), EnabledState::Other(String::new()));
         assert_eq!(
-            parse_is_enabled("bogus\n", 0),
+            parse_is_enabled("disabled\n", 1, "").unwrap(),
+            EnabledState::Disabled
+        );
+        // Older systemd: nothing on stdout, the reason on stderr, exit 1.
+        assert_eq!(parse_is_enabled("", 1, "").unwrap(), EnabledState::NotFound);
+        assert_eq!(
+            parse_is_enabled(
+                "",
+                1,
+                "Failed to get unit file state for nginx.service: No such file or directory\n"
+            )
+            .unwrap(),
+            EnabledState::NotFound
+        );
+        // Nothing on stdout because systemctl could not answer at all: an
+        // error in both modes, never a unit an earlier step would install.
+        let err = parse_is_enabled("", 1, "Failed to connect to bus: No medium found\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed without an answer (exit 1)"), "{err}");
+        assert!(err.contains("Failed to connect to bus"), "{err}");
+        // Empty stdout with exit 0 is not a known state.
+        assert_eq!(
+            parse_is_enabled("", 0, "").unwrap(),
+            EnabledState::Other(String::new())
+        );
+        assert_eq!(
+            parse_is_enabled("bogus\n", 0, "").unwrap(),
             EnabledState::Other("bogus".into())
         );
     }
@@ -1190,7 +1236,8 @@ mod tests {
     }
 
     fn probes_for(unit: &str, enabled: &str, active: &str) -> Fake {
-        let enabled_status = if EnabledState::is_enabled(&parse_is_enabled(enabled, 0)) {
+        let enabled_status = if EnabledState::is_enabled(&parse_is_enabled(enabled, 0, "").unwrap())
+        {
             0
         } else {
             1

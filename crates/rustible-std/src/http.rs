@@ -1009,6 +1009,13 @@ mod tests {
             err(Download::get("http://h/x").to("/missing/x"))
                 .contains("/missing does not exist; create it first with file::Directory")
         );
+        // Under --check the missing parent is one an earlier file::Directory
+        // may create (vision 12): would change, and no connection is opened
+        // (the host does not resolve, so a fetch would have failed loudly).
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = expect_change(&Download::get("http://h/x").to("/missing/x"), &dry);
+        assert_eq!(c.diff.short(), "GET http://h/x -> /missing/x (missing)");
+        assert!(fake.file("/missing").is_none() && fake.file("/missing/x").is_none());
         assert!(
             err(Download::get("http://h/x").to("/etc/f/x")).contains("/etc/f is not a directory")
         );

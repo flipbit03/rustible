@@ -174,6 +174,11 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         user::Membership::of(&account).in_group_named("rustible-dry"),
     )?;
     assert!(member.changed && !member.is_available());
+    let member = dry.step(
+        "dry membership of a user not there yet either",
+        user::Membership::of_name("rustible-dry-usr").in_group_named("rustible-dry"),
+    )?;
+    assert!(member.changed && !member.is_available());
     let planned_gid = dry.step(
         "dry group with gid",
         group::Present::new("rustible-dry2").gid(4343),

@@ -270,10 +270,12 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   create the home. Fail naming the operation the author wanted. Under
   `--check`, a prerequisite another step in the run could create (a group, an
   account, a parent directory, a unit) is *not* refused: report `would
-  change` with it named in the diff. Gate that on `sys.check_mode()`, so a
-  real run's `check` still refuses; a dry run's plan never reaches `apply`. A
-  refusal about the machine itself — not root, wrong platform, a masked unit
-  — holds in both modes.
+  change`, with the diff showing the state you would set (name the
+  prerequisite when you know it by name). Gate that on `sys.check_mode()`,
+  so a real run's `check` still refuses; a dry run's plan never reaches
+  `apply`. A refusal about the machine itself — not root, wrong platform, a
+  masked unit, `systemctl` unable to answer, no `usermod` on BusyBox — holds
+  in both modes, and the tolerance must not swallow it.
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
 - Everything the operation does to the machine goes through `sys`, including

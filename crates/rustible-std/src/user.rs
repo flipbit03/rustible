@@ -175,8 +175,8 @@ impl From<&Group> for GroupId {
 }
 
 /// The requested primary group as `check` resolved it: an existing group
-/// (gid known) or, in check mode, one an earlier step would create (gid
-/// known only if that step was given one).
+/// (gid known) or, under `--check`, one not on the machine yet that an
+/// earlier step may create (gid known only when it was asked for by number).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Primary {
     name: String,
@@ -713,18 +713,29 @@ impl Present {
             ),
             None => Delta::default(),
         };
-        if current.is_some() && delta.changes_attributes() && Tools::of(sys) == Tools::BusyBox {
+        // Under --check a primary group not on the machine yet resolves with
+        // no gid, so the delta cannot carry it; it is still a gid change that
+        // needs usermod, and the machine lacking usermod is a refusal in
+        // both modes (vision 12).
+        let pending_gid = current.is_some() && matches!(primary, Some(Primary { gid: None, .. }));
+        if current.is_some()
+            && (delta.changes_attributes() || pending_gid)
+            && Tools::of(sys) == Tools::BusyBox
+        {
+            let mut names: Vec<&str> = delta
+                .changes
+                .iter()
+                .filter(|c| c.name != "groups")
+                .map(|c| c.name.as_str())
+                .collect();
+            if pending_gid {
+                names.push("gid");
+            }
             bail!(
                 "user `{}` exists and only BusyBox account tools were found (no `usermod`) to \
                  change its {}; on Alpine `apk add shadow` provides usermod, or drop those builders",
                 self.name,
-                delta
-                    .changes
-                    .iter()
-                    .filter(|c| c.name != "groups")
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names.join(", ")
             );
         }
         Ok(Inspection {
@@ -2104,6 +2115,38 @@ mod tests {
     }
 
     // ---- check mode: a prerequisite another step could create (vision 12) ----
+
+    /// The tolerance covers the group, not the machine: on BusyBox an
+    /// existing account cannot have its primary group changed at all (no
+    /// `usermod`), and that refusal holds under `--check` even when the
+    /// group is one an earlier step would create and so has no gid yet.
+    #[test]
+    fn busybox_refuses_a_primary_group_change_under_check_even_for_a_group_not_there_yet() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", PASSWD)
+                .with_file("/etc/group", GROUP)
+                .with_cmd("adduser", None, 0, ""),
+        );
+        let dry = alpine(fake_sys(&fake)).with_check_mode(true);
+        let err = Present::new("cadu")
+            .gid("web")
+            .check(&dry)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("only BusyBox account tools were found (no `usermod`)"),
+            "{err}"
+        );
+        assert!(err.contains("gid"), "{err}");
+        // The same under a real run, where the missing group is what refuses.
+        let err = Present::new("cadu")
+            .gid("web")
+            .check(&alpine(fake_sys(&fake)))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `web` does not exist"), "{err}");
+    }
 
     /// Vision 12: under `--check` an earlier `group::Present` in the run may
     /// create the primary group, so the step reports the account it would

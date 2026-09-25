@@ -399,6 +399,12 @@ impl Target {
     /// mode, where [`Target::resolve`] refuses as before. Only [`Present`]
     /// asks: revoking keys from an account that does not exist is a refusal
     /// in both modes, since no step in the run can make it meaningful.
+    ///
+    /// This goes further than Ansible: `ansible.posix.authorized_key` fails
+    /// a check-mode run outright when the user does not exist and no path
+    /// was given ("Either user must exist or you must provide full path to
+    /// key file in check mode"), which fails the dry run of every first
+    /// provision. Deferring is the vision 12 rule applied consistently.
     fn deferred_under_check(&self, sys: &System, keys: usize) -> Result<Option<Diff>> {
         let Target::User(name) = self else {
             return Ok(None);
@@ -773,6 +779,16 @@ fn planned_text(diff: &Diff) -> Option<&str> {
     })
 }
 
+/// The file text `check` planned against, when the plan rewrites the file.
+/// `apply` builds its report from this rather than from a fresh read, so
+/// what it reports is what it wrote even if the file moved on in between.
+fn planned_before(diff: &Diff) -> Option<&str> {
+    diff.parts().iter().find_map(|p| match p {
+        Diff::Text { before, .. } => Some(before.as_str()),
+        _ => None,
+    })
+}
+
 /// Write the planned text, and nothing else. The mode and the owner come
 /// from the attributes `check` planned, so this never asks the machine a
 /// question whose answer could have changed since.
@@ -998,10 +1014,14 @@ impl Op for Present {
     fn apply(&self, sys: &System, change: Change) -> Result<KeysReport> {
         let resolved = self.target.resolve(sys)?;
         ensure_same_target(&resolved, &change.diff)?;
-        // The output is what the pure plan says about the file as it stands,
-        // read before the write the way `check` read it.
+        // The output is what the pure plan says against the text the diff
+        // was planned on, so it describes exactly what this step writes; an
+        // attributes-only plan carries no text, and reads the file instead.
         let keys = parse_keys(&self.keys)?;
-        let before = read_existing(sys, &resolved.path)?.map(|(text, _)| text);
+        let before = match planned_before(&change.diff) {
+            Some(text) => Some(text.to_string()),
+            None => read_existing(sys, &resolved.path)?.map(|(text, _)| text),
+        };
         let (_, mut report) = plan_present(before.as_deref().unwrap_or(""), &keys, self.exclusive)
             .into_report(resolved.path.clone());
 
@@ -1202,12 +1222,12 @@ impl Op for Absent {
         };
         let resolved = self.target.resolve(sys)?;
         ensure_same_target(&resolved, &change.diff)?;
-        // The output is what the pure plan says about the file as it stands,
-        // read before the write the way `check` read it.
+        // The output is what the pure plan says against the text the diff
+        // was planned on: exactly what this step writes. `Absent` always
+        // carries text, since it only changes when it rewrites the file.
         let keys = parse_keys(&self.keys)?;
-        let before = read_existing(sys, &resolved.path)?.map(|(text, _)| text);
-        let (_, report) =
-            plan_absent(before.as_deref().unwrap_or(""), &keys).into_report(resolved.path.clone());
+        let before = planned_before(&change.diff).unwrap_or("");
+        let (_, report) = plan_absent(before, &keys).into_report(resolved.path.clone());
         // Attributes first, and the directory's before the file's, the same
         // order `Present` uses: `write_atomic` makes its temporary file
         // inside the directory, so a `~/.ssh` this identity cannot write to

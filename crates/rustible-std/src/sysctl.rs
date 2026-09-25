@@ -280,10 +280,13 @@ impl Op for Present {
         if let Some(new_text) = plan_sysctl_line(&text, &self.key, &self.value) {
             sys.write_atomic(&self.file, new_text.as_bytes())?;
         }
-        // The output wants the value the kernel had, so read it before the
-        // write; whether that write is due is what the diff says.
+        // The output wants the value the kernel had, so read it before
+        // `sysctl -w`; whether that write is due is what the diff says, and
+        // only when the op was asked to apply live at all (the file's own
+        // attribute is named after its path, which nothing stops from being
+        // `live`).
         let previous_live = self.read_live(sys)?;
-        if crate::file::diff_has(&change.diff, "live") {
+        if self.apply_now && crate::file::diff_has(&change.diff, "live") {
             sys.cmd("sysctl")
                 .args(["-w", &format!("{}={}", self.key, self.value)])
                 .run()?;

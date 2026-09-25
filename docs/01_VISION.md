@@ -743,10 +743,10 @@ destination, is a prerequisite and is refused.
 **In a dry run the refusal waits.** A prerequisite that another op in the same
 run could create — a group, an account, its home, a parent directory, a unit
 file — is verified when the run is about to act, not while it is only
-looking: under `--check` the op reports `would change` with the prerequisite
-named in its diff, and a real run refuses exactly as this rule says, because
-its `check` runs with check mode off and a dry run's plan never reaches
-`apply`. Section 12 has the reasoning and the limits.
+looking: under `--check` the op reports `would change`, its diff showing the
+state it would set, and a real run refuses exactly as this rule says,
+because its `check` runs with check mode off and a dry run's plan never
+reaches `apply`. Section 12 has the reasoning and the limits.
 
 ### 6.8 Translations of real Ansible modules
 
@@ -1626,11 +1626,16 @@ what they showed is recorded so the reversal is not relitigated:
   it and adding a check-mode branch in the op instead, so three different
   answers to one question were in the tree at once.
 
-Ansible's check mode has neither mechanism and one rule: a step that would
-create something reports `changed` and asks no further questions (`user.py`'s
-`main()` exits `changed` under check mode before it validates the group;
-`authorized_key` returns before it looks at the directory). That rule is
-adopted, with the loud failure Ansible lacks.
+Ansible's check mode has neither mechanism and one rule for a step that
+would create something: report `changed` and ask no further questions
+(`user.py`'s `main()` exits `changed` under check mode before it validates
+the group; `ansible.posix.authorized_key` does not look at the directory
+under check mode). That rule is adopted and applied consistently, which
+takes it further than Ansible in two places: Ansible still refuses a
+missing group when the account already exists, and `authorized_key` fails a
+dry run outright when the user does not exist yet, where Rustible reports
+`would change` for both. Added on top is the loud failure Ansible lacks when
+a later step reads what a dry run could not produce.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
@@ -1647,13 +1652,15 @@ adopted, with the loud failure Ansible lacks.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group, an account, its home, a parent directory, a unit —
-  reports `would change` under check mode instead, naming the prerequisite in
-  its diff. The tolerance is gated on check mode, so a real run's `check`
-  takes the refusal, and a dry run's plan never reaches `apply` (`Ctx::step`
-  returns at its check-mode arm): the refusal is never skipped on a run that
-  can act. What a dry run therefore does not catch is a forgotten
-  prerequisite step; the real run refuses before touching anything, as 6.7
-  requires.
+  reports `would change` under check mode instead; its diff shows the state
+  it would set, which names the prerequisite when the op knows it by name (a
+  group, an account, a unit). The tolerance is gated on check mode, so a
+  real run's `check` takes the refusal, and a dry run's plan never reaches
+  `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
+  skipped on a run that can act. What a dry run therefore does not catch is
+  a forgotten prerequisite step: the real run refuses at that step, before
+  that step touches anything, with the steps before it already applied.
+  That is the trade this rule accepts, and 6.7 still holds at the step.
 - That deferral covers only what another step could supply. A refusal about
   the machine or the request itself — wrong platform, not root, the tool the
   op drives is absent, a malformed key, a sysctl key this kernel does not
