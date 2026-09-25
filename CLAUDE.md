@@ -272,11 +272,13 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   account, a parent directory, a unit) is *not* refused: report `would
   change`, with the diff showing the state you would set or saying what it
   waits for (name the prerequisite when you know it by name). Gate that on
-  `sys.check_mode()`,
-  so a real run's `check` still refuses; a dry run's plan never reaches
-  `apply`. A refusal about the machine itself — not root, wrong platform, a
-  masked unit, `systemctl` unable to answer, no `usermod` on BusyBox — holds
-  in both modes, and the tolerance must not swallow it.
+  `sys.check_mode()`, so a real run's `check` still refuses; a dry run's plan
+  never reaches `apply`. A refusal about the machine itself — not root, wrong
+  platform, a masked unit, `systemctl` unable to answer, no `usermod` on
+  BusyBox — holds in both modes, and the tolerance must not swallow it. And
+  where Ansible refuses under check mode, so do we: an *existing* account's
+  missing group, keys for an account that does not exist. Check what the
+  Ansible module does before deferring a refusal, and cite the line.
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
 - Everything the operation does to the machine goes through `sys`, including

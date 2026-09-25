@@ -149,10 +149,11 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(line_of(&ctx.sys().read_to_string("/etc/passwd")?, "rustible-nope").is_none());
 
     // Check mode over the real machine, the fresh-host shape (vision 6.6):
-    // group, then the user, keys and membership that depend on it. Every
-    // step reports `would change` and none has an output, because a
-    // prerequisite another step could create is verified only when the run
-    // is about to act (vision 12). Nothing here exists on the machine.
+    // group, then the user and membership that depend on it. Each of those
+    // reports `would change` and none has an output, because a prerequisite
+    // another step could create is verified only when the run is about to
+    // act (vision 12) — except the two refusals Ansible keeps under check
+    // mode, asserted below. Nothing here exists on the machine.
     let mut dry = Ctx::new(
         System::local(true, Arc::new(Collect::default())),
         HostInfo::local(),

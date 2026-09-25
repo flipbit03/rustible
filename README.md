@@ -188,8 +188,9 @@ overrides the inventory.
   no output yet, and reading it returns an error saying so rather than a
   guess.
 - **Prerequisites are refused.** An op that manages a user does not create
-  the group it references; it fails and names the op you wanted. A dry run
-  defers that refusal to the real run, since an earlier step may create it.
+  the group it references; it fails and names the op you wanted. For an
+  account the run is creating, a dry run defers that refusal to the real run,
+  since an earlier step may create the group — the same line Ansible draws.
 
 ## Operations and collections
 

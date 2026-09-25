@@ -497,15 +497,16 @@ ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 ⚠️ **That `Deref` panics in check mode** when the step would have changed. A
 would-change step has no output there: the value only exists once `apply`
 has run, and `apply` never runs under `--check`. A playbook that must survive
-`--check` guards the read, or names the account instead of chaining from it:
+`--check` guards the read:
 
 ```rust
 if account.is_available() {
     ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 }
-// or, with no dependency on the previous step's output:
-ctx.step("keys", authorized_keys::Present::for_user_name("deploy").keys([KEY]))?;
 ```
+
+(`for_user_name("deploy")` is not a way around it: keys for an account that
+does not exist yet are refused under `--check` too, as Ansible refuses them.)
 
 This is the single most common way a playbook that works fails under
 `--check`. See §15.
@@ -902,8 +903,10 @@ if app.is_available() {
 
 In a real run most of these refuse in `check`, before anything is touched,
 naming the operation you wanted — `user`, `group` and `authorized_keys` all
-do. Under `--check` they do not: a prerequisite an earlier step could create
-is reported as `would change`, not refused (§15). ⚠️ `file::Copy` looks only
+do. Under `--check` most do not: a prerequisite an earlier step could create
+is reported as `would change`, not refused, except an existing account's
+missing group and keys for an account that does not exist, which Ansible
+refuses too (§15). ⚠️ `file::Copy` looks only
 at the destination, so a copy into a directory that does not exist fails at
 `apply`, after earlier steps have already changed the machine. Create the
 directory first.
@@ -1164,8 +1167,8 @@ Three things to know:
 - ⚠️ **A step that would change has no output.** Its value only exists once
   `apply` has run, and `apply` never runs here. Reading it fails — and via
   `Deref`, panics (§9). Guard with `.is_available()`, or write the next step
-  so it does not need the value (`for_user_name("deploy")` instead of
-  `for_user(&deploy)`).
+  so it does not need the value (naming an account that already exists, for
+  instance).
 - **A prerequisite an earlier step could create is not refused.** A new
   `user::Present` whose group is not there yet, a `systemd::Enabled` for a
   unit no package has installed yet, a `file::Line` in a file nothing has

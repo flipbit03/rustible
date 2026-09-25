@@ -1199,9 +1199,11 @@ pub struct Member {
 ///
 /// Satisfied when the group's member field lists the user or the group is
 /// the user's primary group. Adds with `usermod -aG` (BusyBox: `addgroup
-/// user group`), which never removes other memberships. In check mode a
-/// group an earlier `group::Present` step would create is accepted and the
-/// step reports `would change`.
+/// user group`), which never removes other memberships. Under `--check`, a
+/// user that does not exist yet is not refused, whatever its group's state,
+/// and the step reports `would change` (Ansible reports a new account
+/// `changed` without validating its groups); an existing user's missing
+/// group is refused in both modes, as Ansible refuses it (vision 12).
 #[derive(Debug, Clone)]
 pub struct Membership {
     user: String,

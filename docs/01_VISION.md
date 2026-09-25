@@ -1654,8 +1654,9 @@ Ansible lacks when a later step reads what a dry run could not produce.
   instead of a loud error.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
-  could create — a group, an account, its home, a parent directory, a unit —
-  reports `would change` under check mode instead; its diff shows the state
+  could create — a group for an account not there yet, that account, its
+  home, a parent directory, a unit; within the two limits Ansible draws above
+  — reports `would change` under check mode instead; its diff shows the state
   it would set, or says what it waits for, and names the prerequisite when
   the op knows it by name (a group, an account, a unit). The tolerance is
   gated on check mode, so a

@@ -245,12 +245,14 @@ Ansible's check mode has neither mechanism and one rule for a step that
 would create something: report `changed` and ask no further questions
 (`user.py`'s `main()` exits `changed` under check mode before it validates
 the group; `ansible.posix.authorized_key` does not look at the directory
-under check mode). That rule is adopted and applied consistently, which
-takes it further than Ansible in two places: Ansible still refuses a
-missing group when the account already exists, and `authorized_key` fails a
-dry run outright when the user does not exist yet, where Rustible reports
-`would change` for both. Added on top is the loud failure Ansible lacks when
-a later step reads what a dry run could not produce.
+under check mode). That rule is adopted, and Ansible's behaviour is
+authoritative where the rule could have been read more broadly (decided
+2026-09-24): an *existing* account's missing group is refused under
+`--check` as in a real run (`user.py` validates it before anything that
+respects check mode), and keys for an account that does not exist yet are
+refused too (`authorized_key`: "Either user must exist or you must provide
+full path to key file in check mode"). Added on top is the loud failure
+Ansible lacks when a later step reads what a dry run could not produce.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
@@ -386,7 +388,7 @@ the fix telling the author where to look (Cadu, 2026-09-24).
    - the same pair for `.groups([..])` and `user::Membership`;
    - `systemd::Enabled` on a unit `systemctl` cannot find: check mode → `would change`; real mode → today's refusal;
    - the four former mailbox ops apply correctly from the diff alone (existing apply tests, adapted).
-6. **A fresh-host dry run walks to the end**, at tier 3: an integration test that builds a dry `Ctx` over a stock container (the pattern `it_user_busybox.rs` uses) and runs `group::Present` → `user::Present` (supplementary and primary groups not there yet) → `ssh::authorized_keys::Present::for_user_name` → `user::Membership` (group, then user too, not there yet), asserting every step reports `would change` with no output and none fails; then that the steps whose prerequisite is missing refuse through a real `Ctx`, with nothing created; and, in the same test, the real provisioning of group → user → keys → membership reporting `changed` then `ok`. That is the scenario the registry was built for, proven without it.
+6. **A fresh-host dry run walks to the end**, at tier 3: an integration test that builds a dry `Ctx` over a stock container (the pattern `it_user_busybox.rs` uses) and runs `group::Present` → `user::Present` (supplementary and primary groups not there yet) → `user::Membership` for a user not there yet, asserting every step reports `would change` with no output and none fails; that the two steps Ansible refuses under check mode refuse here too (`ssh::authorized_keys::Present::for_user_name` for a user not there yet, `Membership` of an existing account in a missing group — revised 2026-09-24 when Ansible's behaviour was made authoritative; the first cut had them deferred); then that the steps whose prerequisite is missing refuse through a real `Ctx`, with nothing created; and, in the same test, the real provisioning of group → user → keys → membership reporting `changed` then `ok`. That is the scenario the registry was built for, proven without it.
 7. **Docs say the rule once each**: USING_RUSTIBLE §15 and CLAUDE.md each state "a would-change step has no output in check mode; a prerequisite another step could create is verified when the run acts" in their own words, with no paragraph on how to make an op predict.
 8. **DECISIONS.md and PROGRESS.md** carry the entries; every `Reverse:` names the commit-level undo.
 
