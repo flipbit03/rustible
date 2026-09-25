@@ -116,11 +116,13 @@ amendments if any, how it was verified>
 
 Each op is one task. The brief is the template above with these fixed parts:
 
-- Governing sections: 6.2 (predict by default, finishing builders), 6.3 (one
-  type per desired state), 6.4 (actions), 6.7 (one resource per op), 7.3 (all
-  I/O through `sys`), 8 (test tiers), 12 (check mode).
+- Governing sections: 6.2 (finishing builders; no predictions since
+  2026-09-24), 6.3 (one type per desired state), 6.4 (actions), 6.7 (one
+  resource per op), 7.3 (all I/O through `sys`), 8 (test tiers), 12 (check
+  mode: a would-change step has no output; a prerequisite another step could
+  create is tolerated under `--check`).
 - Scope: the op struct(s) and builder, the `Op` impl with `check` producing a
-  `Diff` and a prediction, `apply` reusing the prediction, an `Output` struct,
+  `Diff` and `apply` executing it, an `Output` struct,
   rustdoc with the Ansible equivalent named, pure-function tests for the
   planning logic, `Fake`-backend tests for satisfied / change / apply /
   failure / wrong-distro, and a Docker harness test doing changed-then-ok.

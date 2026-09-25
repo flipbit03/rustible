@@ -494,19 +494,19 @@ ctx.log(format!("uid {}", account.uid));          // Deref
 ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 ```
 
-⚠️ **That `Deref` panics in check mode** when the step would have changed and
-the op could not predict its output. `user::Present` on an account that does
-not exist yet predicts only when it can know every field: `.uid()`, `.gid()`,
-and a shell it can determine — on BusyBox (Alpine) there is no default to read,
-so `.shell()` is needed there too. A `.gid("name")` naming a group an earlier
-step would create also does not predict, because there is no gid yet. A playbook that must survive `--check`
-guards it:
+⚠️ **That `Deref` panics in check mode** when the step would have changed. A
+would-change step has no output there: the value only exists once `apply`
+has run, and `apply` never runs under `--check`. A playbook that must survive
+`--check` guards the read:
 
 ```rust
 if account.is_available() {
     ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 }
 ```
+
+(`for_user_name("deploy")` is not a way around it: keys for an account that
+does not exist yet are refused under `--check` too, as Ansible refuses them.)
 
 This is the single most common way a playbook that works fails under
 `--check`. See §15.
@@ -844,7 +844,7 @@ fn main(ctx: &mut Ctx) -> Result<()> {
     let deploy = ctx.step(
         "deploy user",
         user::Present::new("deploy")
-            .uid(3000)                    // uid and gid so --check can predict
+            .uid(3000)
             .gid(3000)
             .shell("/bin/bash")
             .groups(["www-data"]),
@@ -895,17 +895,21 @@ directory's parent, or a destination directory as a side effect. Sequence them:
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
 let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
-// `app` is only readable when the op could predict it, so guard for --check
+// Under --check a step that would change has no output, so guard the read
 if app.is_available() {
     ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
 }
 ```
 
-Most of these refuse in `check`, before anything is touched, naming the
-operation you wanted — `user`, `group` and `authorized_keys` all do.
-⚠️ `file::Copy` is the exception: it looks only at the destination, so a copy
-into a directory that does not exist fails at `apply`, after earlier steps have
-already changed the machine. Create the directory first.
+In a real run most of these refuse in `check`, before anything is touched,
+naming the operation you wanted — `user`, `group` and `authorized_keys` all
+do. Under `--check` most do not: a prerequisite an earlier step could create
+is reported as `would change`, not refused, except an existing account's
+missing group and keys for an account that does not exist, which Ansible
+refuses too (§15). ⚠️ `file::Copy` looks only
+at the destination, so a copy into a directory that does not exist fails at
+`apply`, after earlier steps have already changed the machine. Create the
+directory first.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1158,62 +1162,32 @@ rustible playbook run site --check
 Nothing is modified. Steps report `would change` instead of `changed`, with
 the diff they would have applied.
 
-Two things to know:
+Three things to know:
 
-- ⚠️ **An output that cannot be honestly predicted is unavailable.** An op
-  that would create a user does not invent a uid. Reading such an output
-  fails — and via `Deref`, panics (§9). Guard with `.is_available()`.
+- ⚠️ **A step that would change has no output.** Its value only exists once
+  `apply` has run, and `apply` never runs here. Reading it fails — and via
+  `Deref`, panics (§9). Guard with `.is_available()`, or write the next step
+  so it does not need the value (naming an account that already exists, for
+  instance).
+- **A prerequisite an earlier step could create is not refused.** A new
+  `user::Present` whose group is not there yet, a `systemd::Enabled` for a
+  unit no package has installed yet, a `file::Line` in a file nothing has
+  written yet: each reports `would change`; its diff shows the state it would
+  set, or says what it is waiting for. If the earlier step is actually
+  missing from the playbook, the **real** run refuses at that step, before
+  that step touches anything but after the steps before it have run — so a
+  dry run does not catch a forgotten `group::Present`; the real run does, and
+  stops there. Two things are refused under `--check` anyway, because Ansible
+  refuses them: an **existing** account's missing group, and
+  `authorized_keys` for an account that does not exist yet (chain from the
+  `user::Present` step with `for_user(&account)` behind `is_available()`, or
+  dry-run again once the account exists). Refusals about the machine itself
+  (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
+  key this kernel lacks) hold in both modes.
 - ⚠️ **`apt::Latest::update_cache(..)` refreshes the package lists even in
   check mode**, because its answer is read from them. That is the one place
   `--check` is not entirely read-only, and the run says so when it happens.
   Without `.update_cache(..)` — the default — a dry run writes nothing.
-
-An op that *can* predict does: `apt::Present` knows the candidate version,
-`file::Copy` knows the content it would write.
-
-**A dry run mostly survives a fresh host.** A step does not refuse merely
-because an earlier step's work has not happened yet: a `user::Present` whose
-primary group an earlier `group::Present` would create is accepted, and a
-`file::Copy` into a directory an earlier step would create is accepted. What
-you do not get is *output* for steps that could not predict it, which is §9's
-`is_available()` guard.
-
-⚠️ **The exception is a step whose check asks a *tool* instead of asking
-Rustible.** That cascade is a registry of what earlier steps announced they
-would create, and only the ops that write to it can be read out of it. An op
-that answers by shelling out sees the machine as it is now, not as the
-playbook will leave it — so it refuses, and the dry run reports a failure for
-something a real run would have handled.
-
-`systemd::Enabled` is the one you will hit. Its check runs `systemctl
-is-enabled`, which knows nothing about a unit that has not arrived yet,
-whether it would come from a package:
-
-```rust
-apt::Present::new(["nginx"])            // then
-systemd::Enabled::new("nginx")          // FAILED: unit `nginx` not found
-```
-
-or from the step immediately before it, which is the usual way to ship a
-service:
-
-```rust
-file::Copy::from_str(UNIT).to("/etc/systemd/system/app.service")
-systemd::Enabled::new("app")            // FAILED: unit `app` not found
-```
-
-That is a limit of the dry run rather than a fault in the playbook. Apply once
-and `--check` is meaningful from then on.
-
-It is the *state* operations that do this. `systemd::Enabled` and
-`systemd::Running` have to look the unit up to know whether they are
-satisfied, so they refuse when it is absent. The verbs — `systemd::Restart`,
-`systemd::Reload` — never inspect anything, because they always report
-changed, so they pass a dry run against a unit that does not exist yet. That
-is why §13's `if conf.changed { ... Reload ... }` is fine under `--check`.
-
-`user::Membership` naming a group an earlier `group::Present` would create is
-*not* affected — it consults the registry and passes.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,

@@ -184,11 +184,13 @@ overrides the inventory.
   produces the diff; `apply` executes that decision. Dry run and diff are not
   a per-module afterthought.
 - **Outputs chain.** A step returns a typed value describing what it found or
-  made, and later steps use it. In check mode an op that cannot predict a
-  field leaves it unavailable, and reading it returns an error saying so
-  rather than a guess.
-- **Prerequisites are refused.** An op that manages a user does
-  not create the group it references; it fails and names the op you wanted.
+  made, and later steps use it. In check mode a step that would change has
+  no output yet, and reading it returns an error saying so rather than a
+  guess.
+- **Prerequisites are refused.** An op that manages a user does not create
+  the group it references; it fails and names the op you wanted. For an
+  account the run is creating, a dry run defers that refusal to the real run,
+  since an earlier step may create the group — the same line Ansible draws.
 
 ## Operations and collections
 

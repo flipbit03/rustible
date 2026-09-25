@@ -628,7 +628,7 @@ mod tests {
                 sys.warn("the op has an opinion");
                 Ok(Plan::Satisfied(()))
             }
-            fn apply(&self, _: &System, _: crate::Change<()>) -> crate::Result<()> {
+            fn apply(&self, _: &System, _: crate::Change) -> crate::Result<()> {
                 Ok(())
             }
         }
@@ -706,7 +706,7 @@ mod tests {
             fn check(&self, _: &System) -> crate::Result<Plan<()>> {
                 Err(crate::Error::msg("deeper"))
             }
-            fn apply(&self, _: &System, _: crate::Change<()>) -> crate::Result<()> {
+            fn apply(&self, _: &System, _: crate::Change) -> crate::Result<()> {
                 Ok(())
             }
         }

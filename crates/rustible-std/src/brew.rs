@@ -233,15 +233,13 @@ impl Op for Present {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        // No prediction: brew resolves the version at install time, and an
-        // empty one would be a lie dressed as an answer (vision 12).
         Ok(Plan::change(Diff::Attrs {
             subject: "brew formulae".into(),
             changes,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change<InstallReport>) -> Result<InstallReport> {
+    fn apply(&self, sys: &System, change: Change) -> Result<InstallReport> {
         let brew = brew_bin(sys)?;
         // Install what `check` planned, not what brew says now.
         let missing = planned_names(&change.diff);
@@ -329,33 +327,34 @@ impl Op for Absent {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        // The versions are known now, so the output is honest to predict.
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: "brew formulae".into(),
-                changes,
-            },
-            report,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: "brew formulae".into(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<RemoveReport>) -> Result<RemoveReport> {
+    fn apply(&self, sys: &System, change: Change) -> Result<RemoveReport> {
         let brew = brew_bin(sys)?;
         let present = planned_names(&change.diff);
         ensure!(
             !present.is_empty(),
             "brew::Absent::apply: the plan names no formula to remove"
         );
+        // The output lists what went, with versions: read them before the
+        // uninstall takes them away. What to uninstall is the diff's call.
+        let have = installed(sys, &brew)?;
+        let mut report = RemoveReport::default();
+        for name in &self.names {
+            match have.iter().find(|f| &f.name == name) {
+                Some(f) => report.removed.push(f.clone()),
+                None => report.already_absent.push(name.clone()),
+            }
+        }
         sys.cmd(&brew)
             .arg("uninstall")
             .args(present.iter().cloned())
             .run()?;
-        // `check` always predicts here, so a missing prediction is a bug in
-        // this module rather than a state of the host.
-        match change.predicted {
-            Some(report) => Ok(report),
-            None => bail!("brew::Absent::apply: check did not carry its prediction"),
-        }
+        Ok(report)
     }
 }
 
@@ -481,8 +480,6 @@ mod tests {
         // Only the missing one is in the plan, and the diff is what `apply`
         // reads its work from.
         assert_eq!(planned_names(&c.diff), vec!["ninvaders".to_string()]);
-        // No prediction: brew resolves the version at install time.
-        assert!(c.predicted.is_none());
 
         let report = op.apply(&s, c).unwrap();
         let argvs = fake.argvs();
@@ -558,17 +555,22 @@ mod tests {
     }
 
     #[test]
-    fn absent_predicts_the_version_it_is_about_to_remove() {
+    fn absent_diff_names_the_version_and_apply_reports_what_went() {
         let s = mac_sys("nethack 3.6.7\n");
-        let Plan::Change(c) = Absent::new(["nethack"]).check(&s).unwrap() else {
+        let op = Absent::new(["nethack", "agg"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        let predicted = c.predicted.as_ref().expect("Absent always predicts");
-        assert_eq!(predicted.removed[0].version, "3.6.7");
         assert_eq!(
             c.diff.render(),
             "brew formulae:\n  nethack: installed 3.6.7 -> absent\n"
         );
+        // The version is read from `brew list` before the uninstall takes it;
+        // a name that was never there is reported as already absent.
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(r.removed[0].name, "nethack");
+        assert_eq!(r.removed[0].version, "3.6.7");
+        assert_eq!(r.already_absent, vec!["agg".to_string()]);
     }
 
     #[test]

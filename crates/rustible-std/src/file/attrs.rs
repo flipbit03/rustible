@@ -82,6 +82,25 @@ impl Op for Attrs {
             ref other => bail!("file::Attrs has no implementation for {}", other.name()),
         }
         let Some(stat) = sys.stat(&self.path)? else {
+            // Under --check an earlier step may create the path (vision 12):
+            // report the attributes it would get. A real run refuses.
+            if sys.check_mode() {
+                let changes = plan_attrs(None, self.mode, self.owner);
+                if changes.is_empty() {
+                    // Nothing to set, but the step still has the path to
+                    // wait for: not `ok`, which would hand a later step an
+                    // output for a path that is not there.
+                    return Ok(Plan::change(Diff::summary(format!(
+                        "{}: does not exist yet; file::Attrs would check it once an earlier \
+                         step creates it",
+                        self.path.display()
+                    ))));
+                }
+                return Ok(Plan::change(Diff::Attrs {
+                    subject: self.path.display().to_string(),
+                    changes,
+                }));
+            }
             bail!(
                 "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",
                 self.path.display()
@@ -97,18 +116,15 @@ impl Op for Attrs {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(self.report()));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.path.display().to_string(),
-                changes,
-            },
-            self.report(),
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.path.display().to_string(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<AttrsReport>) -> Result<AttrsReport> {
+    fn apply(&self, sys: &System, _: Change) -> Result<AttrsReport> {
         apply_attrs(sys, &self.path, self.mode, self.owner)?;
-        Ok(change.predicted.unwrap_or_else(|| self.report()))
+        Ok(self.report())
     }
 }
 
@@ -182,7 +198,6 @@ mod tests {
             c.diff.render(),
             "/f:\n  mode: 0644 -> 0600\n  owner: 0:0 -> 1000:1000\n"
         );
-        assert_eq!(c.predicted.as_ref().unwrap().path, PathBuf::from("/f"));
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.path, PathBuf::from("/f"));
         let f = fake.file("/f").unwrap();
@@ -221,13 +236,43 @@ mod tests {
     }
 
     #[test]
-    fn attrs_in_check_mode_predicts_and_changes_nothing() {
+    fn attrs_in_check_mode_reports_would_change_and_changes_nothing() {
         let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
         let r = ctx.step("attrs", Attrs::at("/f").mode(0o600)).unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!(r.path, PathBuf::from("/f"));
+        assert!(r.changed && !r.is_available(), "no apply, so no output");
+        assert_eq!(r.diff.as_ref().unwrap().short(), "mode=0600");
         assert_eq!(fake.file("/f").unwrap().mode, 0o644);
+    }
+
+    /// Vision 12: a path an earlier step in the run could create is not a
+    /// refusal in a dry run; the op reports the attributes it would set. A
+    /// real run still refuses, because it is about to act.
+    #[test]
+    fn attrs_on_a_missing_path_defers_the_refusal_to_a_real_run() {
+        let fake = Arc::new(Fake::new());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let op = Attrs::at("/missing").mode(0o644).owner(1, 2);
+        let c = expect_change(&op, &dry);
+        assert_eq!(
+            c.diff.render(),
+            "/missing:\n  mode: - -> 0644\n  owner: - -> 1:2\n"
+        );
+        // Nothing asked beyond existence: still `would change`, never `ok`
+        // with an output for a path that is not there.
+        let c = expect_change(&Attrs::at("/missing"), &dry);
+        assert_eq!(
+            c.diff.render(),
+            "/missing: does not exist yet; file::Attrs would check it once an earlier step \
+             creates it"
+        );
+
+        let real = fake_sys(&fake);
+        let err = op.check(&real).unwrap_err().chain();
+        assert!(
+            err.contains("/missing does not exist; file::Attrs only sets attributes"),
+            "{err}"
+        );
     }
 }

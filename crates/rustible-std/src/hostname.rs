@@ -148,19 +148,17 @@ impl Op for Is {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: "hostname".into(),
-                changes,
-            },
-            report,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: "hostname".into(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change<HostnameReport>) -> Result<HostnameReport> {
-        let Some(report) = change.predicted else {
-            bail!("hostname::Is::apply received a change without its prediction");
-        };
+    fn apply(&self, sys: &System, _: Change) -> Result<HostnameReport> {
+        // The output wants the name being replaced, which the diff does not
+        // carry when only /etc/hostname differs: read it before changing it.
+        let previous =
+            read_name(sys, KERNEL_HOSTNAME)?.unwrap_or_else(|| sys.facts().hostname.clone());
         if sys.facts().init == Init::Systemd {
             sys.cmd("hostnamectl")
                 .args(["set-hostname", &self.name])
@@ -169,7 +167,10 @@ impl Op for Is {
             sys.write_atomic(ETC_HOSTNAME, format!("{}\n", self.name).as_bytes())?;
             sys.cmd("hostname").arg(&self.name).run()?;
         }
-        Ok(report)
+        Ok(HostnameReport {
+            previous,
+            current: self.name.clone(),
+        })
     }
 }
 
@@ -284,7 +285,6 @@ mod tests {
             c.diff.render(),
             "hostname:\n  /etc/hostname: old -> HOME-GAMES\n"
         );
-        assert_eq!(c.predicted.unwrap().previous, "HOME-GAMES");
     }
 
     #[test]
@@ -294,7 +294,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(c.diff.short(), "kernel=HOME-GAMES");
-        assert_eq!(c.predicted.unwrap().previous, "old");
     }
 
     #[test]
@@ -395,31 +394,37 @@ mod tests {
     }
 
     #[test]
-    fn apply_without_prediction_is_refused() {
-        let fake = Arc::new(Fake::new().with_cmd("hostnamectl", None, 0, ""));
-        let err = Is::new("x")
-            .apply(
-                &sys(&fake),
-                Change {
-                    diff: Diff::summary("x"),
-                    predicted: None,
-                },
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("without its prediction"), "{err}");
-        assert!(fake.argvs().is_empty());
+    fn apply_reads_the_previous_kernel_name_itself() {
+        // The report's `previous` is the kernel's name, read by `apply`
+        // itself: the file says one thing, the kernel another, and neither is
+        // the new name, so an `apply` that echoed the new name back, or took
+        // the file's, would show here.
+        let fake = Arc::new(box_named("in-file", "in-kernel").with_cmd("hostnamectl", None, 0, ""));
+        let s = sys(&fake);
+        let op = Is::new("HOME-GAMES");
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            r,
+            HostnameReport {
+                previous: "in-kernel".into(),
+                current: "HOME-GAMES".into()
+            }
+        );
     }
 
     #[test]
-    fn check_mode_predicts_and_runs_nothing() {
+    fn check_mode_reports_would_change_and_runs_nothing() {
         let fake = Arc::new(box_named("old", "old").with_cmd("hostnamectl", None, 0, ""));
         let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
         let r = ctx.step("name", Is::new("HOME-GAMES")).unwrap();
-        assert!(r.changed && r.predicted && r.is_available());
-        assert_eq!(r.previous, "old");
-        assert_eq!(r.current, "HOME-GAMES");
+        // A would-change step has no output in check mode (vision 12).
+        assert!(r.changed && !r.is_available());
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
         assert!(fake.argvs().is_empty(), "check must run no commands");
         assert_eq!(fake.content(ETC_HOSTNAME).unwrap(), "old\n");
     }

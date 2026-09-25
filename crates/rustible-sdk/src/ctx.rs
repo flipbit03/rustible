@@ -202,10 +202,9 @@ impl Ctx {
     /// not by itself end the playbook; the `?` in the playbook body does.
     ///
     /// The returned [`Applied`] derefs to the op's output and *panics* on
-    /// deref when there is none, which happens for a step that would change
-    /// in check mode unless the op predicted its output. Reach for
-    /// [`Applied::is_available`] or [`Applied::output`] to handle that
-    /// instead of panicking.
+    /// deref when there is none, which is every step that would change in
+    /// check mode (vision doc 12). Reach for [`Applied::is_available`] or
+    /// [`Applied::output`] to handle that instead of panicking.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
@@ -251,7 +250,7 @@ impl Ctx {
             Ok(Plan::Satisfied(out)) => {
                 finish(Status::Ok, None, None);
                 self.bump(|s| s.ok += 1);
-                Applied::new(name, Some(out), false, false, None, t0.elapsed())
+                Applied::new(name, Some(out), false, None, t0.elapsed())
             }
             Ok(Plan::Change(change)) if self.sys.check_mode() => {
                 let note = if op.always_changes() {
@@ -261,15 +260,9 @@ impl Ctx {
                 };
                 finish(Status::WouldChange, Some(change.diff.clone()), note);
                 self.bump(|s| s.would_change += 1);
-                let predicted = change.predicted.is_some();
-                Applied::new(
-                    name,
-                    change.predicted,
-                    true,
-                    predicted,
-                    Some(change.diff),
-                    t0.elapsed(),
-                )
+                // No apply, so no output: the step would change and the
+                // value only exists once it has (vision doc 12).
+                Applied::new(name, None, true, Some(change.diff), t0.elapsed())
             }
             Ok(Plan::Change(change)) => {
                 let diff = change.diff.clone();
@@ -297,7 +290,7 @@ impl Ctx {
                             Some("ran, unchanged".into()),
                         );
                         self.bump(|s| s.ok += 1);
-                        Applied::new(name, Some(out), false, false, Some(diff), t0.elapsed())
+                        Applied::new(name, Some(out), false, Some(diff), t0.elapsed())
                     }
                     Ok(out) => {
                         let note = if op.always_changes() {
@@ -307,7 +300,7 @@ impl Ctx {
                         };
                         finish(Status::Changed, Some(diff.clone()), note);
                         self.bump(|s| s.changed += 1);
-                        Applied::new(name, Some(out), true, false, Some(diff), t0.elapsed())
+                        Applied::new(name, Some(out), true, Some(diff), t0.elapsed())
                     }
                 }
             }
@@ -592,7 +585,7 @@ mod tests {
             }
             Ok(Plan::change(crate::Diff::summary("do it")))
         }
-        fn apply(&self, _: &System, _: crate::Change<()>) -> Result<()> {
+        fn apply(&self, _: &System, _: crate::Change) -> Result<()> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -608,6 +601,52 @@ mod tests {
             feeder,
             sink,
         )
+    }
+
+    /// Vision 12 at the SDK: under check mode a would-change step never
+    /// reaches `apply` and has no output; a satisfied step keeps its output
+    /// in either mode.
+    #[test]
+    fn check_mode_step_has_no_output_and_never_applies() {
+        struct Done;
+        impl Op for Done {
+            type Output = u32;
+            fn check(&self, _: &System) -> Result<Plan<u32>> {
+                Ok(Plan::Satisfied(7))
+            }
+            fn apply(&self, _: &System, _: crate::Change) -> Result<u32> {
+                unreachable!("a satisfied op is never applied")
+            }
+        }
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink).with_check_mode(true);
+        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let checks = Arc::new(AtomicU32::new(0));
+        let applies = Arc::new(AtomicU32::new(0));
+        let r = ctx
+            .step(
+                "would",
+                Probe {
+                    checks: checks.clone(),
+                    applies: applies.clone(),
+                    cancel_in_check: None,
+                },
+            )
+            .unwrap();
+        assert!(r.changed && !r.is_available());
+        assert!(r.diff.is_some(), "the diff is what a dry run has to show");
+        let err = r.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
+        assert_eq!(
+            (
+                checks.load(Ordering::SeqCst),
+                applies.load(Ordering::SeqCst)
+            ),
+            (1, 0)
+        );
+        let done = ctx.step("done", Done).unwrap();
+        assert!(!done.changed && done.is_available());
+        assert_eq!(*done, 7);
     }
 
     #[test]

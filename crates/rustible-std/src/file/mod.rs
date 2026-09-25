@@ -12,8 +12,9 @@
 //! | `lineinfile: state=present` | [`Line`] |
 //! | `blockinfile` | [`Block`] |
 //!
-//! All I/O goes through [`System`] (vision 7). Every op predicts its output
-//! so chained steps keep working in check mode (vision 12).
+//! All I/O goes through [`System`] (vision 7). A step that would change has
+//! no output in check mode, and a file or directory an earlier step could
+//! create is not refused there (vision 12).
 
 use std::path::Path;
 
@@ -147,6 +148,15 @@ pub fn plan_attrs(
     changes
 }
 
+/// Whether an attribute diff `check` produced carries a change named `name`
+/// (`exists`, `live`, ...). `apply` executes the diff rather than deciding
+/// again (vision 6.2), and this is how it reads the decision.
+pub(crate) fn diff_has(diff: &Diff, name: &str) -> bool {
+    diff.parts().iter().any(|part| {
+        matches!(part, Diff::Attrs { changes, .. } if changes.iter().any(|c| c.name == name))
+    })
+}
+
 /// Apply the attributes an op was given. Unconditional: `chmod`/`chown`
 /// are idempotent and `check` already decided a change is due.
 ///
@@ -177,8 +187,16 @@ pub(crate) fn eol_of(text: &str) -> &'static str {
 /// Read a text file for editing. Refuses a symlink: an atomic rewrite would
 /// replace the link with a regular file and leave its target stale, which is
 /// never what an edit meant. Missing is empty text when `create`, else an
-/// error naming the `.create(true)` option.
-pub(crate) fn read_text_or_empty(sys: &System, path: &Path, create: bool) -> Result<String> {
+/// error naming the `.create(true)` option — except under `--check`, where
+/// it is `None`: an earlier step in the run may create the file (a package
+/// shipping its config, a `file::Copy`), and a dry run verifies such a
+/// prerequisite only when it is about to act (vision 12). The caller then
+/// reports the edit it would make once the file exists.
+pub(crate) fn read_text_or_empty(
+    sys: &System,
+    path: &Path,
+    create: bool,
+) -> Result<Option<String>> {
     use rustible_sdk::backend::FileKind;
     match sys.stat(path)? {
         Some(s) if s.kind == FileKind::Symlink => bail!(
@@ -186,13 +204,24 @@ pub(crate) fn read_text_or_empty(sys: &System, path: &Path, create: bool) -> Res
             path.display()
         ),
         Some(s) if s.kind == FileKind::Dir => bail!("{} is a directory", path.display()),
-        Some(_) => sys.read_to_string(path),
-        None if create => Ok(String::new()),
+        Some(_) => sys.read_to_string(path).map(Some),
+        None if create => Ok(Some(String::new())),
+        None if sys.check_mode() => Ok(None),
         None => bail!(
             "{} does not exist (use .create(true) to create it)",
             path.display()
         ),
     }
+}
+
+/// The plan for editing a file that is not there yet, under `--check`: the
+/// edit is reported as due, worded so the reader knows why no diff is shown.
+pub(crate) fn plan_edit_of_missing<T>(op: &str, path: &Path) -> Plan<T> {
+    Plan::change(Diff::summary(format!(
+        "{}: does not exist yet; {op} would edit it once an earlier step creates it \
+         (or use .create(true) to create it here)",
+        path.display()
+    )))
 }
 
 /// Back up (when asked, and the file exists) then write atomically. Returns
@@ -225,7 +254,7 @@ pub(crate) mod testing {
     }
 
     /// Run `check`, insist on a change, return it.
-    pub fn expect_change<O: Op>(op: &O, sys: &System) -> Change<O::Output> {
+    pub fn expect_change<O: Op>(op: &O, sys: &System) -> Change {
         match op.check(sys).unwrap() {
             Plan::Change(c) => c,
             Plan::Satisfied(_) => panic!("expected a change, op was satisfied"),
@@ -295,6 +324,29 @@ mod tests {
         assert_eq!(ch.len(), 2);
         assert_eq!((ch[0].from.as_str(), ch[0].to.as_str()), ("-", "0750"));
         assert_eq!((ch[1].from.as_str(), ch[1].to.as_str()), ("-", "1:2"));
+    }
+
+    #[test]
+    fn diff_has_finds_a_named_change_in_any_attribute_part() {
+        let exists = AttrChange {
+            name: "exists".into(),
+            from: "no".into(),
+            to: "yes".into(),
+        };
+        let attrs = Diff::Attrs {
+            subject: "/d".into(),
+            changes: vec![exists.clone()],
+        };
+        assert!(diff_has(&attrs, "exists"));
+        assert!(!diff_has(&attrs, "mode"));
+        // Inside a `Many`, and not in a text or summary part.
+        let many = Diff::many([Diff::summary("s"), attrs]).unwrap();
+        assert!(diff_has(&many, "exists"));
+        assert!(!diff_has(&Diff::summary("exists"), "exists"));
+        assert!(!diff_has(
+            &Diff::text(Path::new("/f"), "exists\n", "exists: yes\n"),
+            "exists"
+        ));
     }
 
     #[test]

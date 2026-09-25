@@ -290,7 +290,8 @@ fn symlinked_ssh_dir_is_followed_to_the_real_directory(ctx: &mut Ctx) -> Result<
 /// playbook that converges in one pass.
 ///
 /// Check mode only means anything against a dry `Ctx`, since harness bodies
-/// run with it off, so this builds one over the same container.
+/// run with it off, so this builds one over the same container. The dry
+/// step has no output (vision 12); what it says is in its diff.
 #[rustible::integration_test(images = ["debian:12"])]
 fn a_dry_run_of_a_first_provision_does_not_fail(ctx: &mut Ctx) -> Result<()> {
     // An account with no home at all: the shape a dry run sees before
@@ -312,10 +313,9 @@ fn a_dry_run_of_a_first_provision_does_not_fail(ctx: &mut Ctx) -> Result<()> {
         authorized_keys::Present::for_user(&account).keys([K1]),
     )?;
     assert!(planned.changed, "the dry run reports work, not a failure");
-    assert_eq!(
-        planned.created_dir.as_ref(),
-        Some(&account.home.join(".ssh")),
-        "and says it would make the directory"
+    assert!(
+        !planned.is_available(),
+        "and, like every would-change step, has no output (vision 12)"
     );
     let short = planned.diff.as_ref().unwrap().short();
     assert!(short.contains("exists=yes"), "{short}");

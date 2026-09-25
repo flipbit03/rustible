@@ -120,10 +120,10 @@ impl Command {
     /// environment, `/dev/null` on standard input, the runtime's own working
     /// directory, and no `creates`, `removes` or `changed_when`. That last
     /// part means the step always changes. In check mode the command is not
-    /// run at all and the step reports `would change`; `check` predicts
-    /// nothing, so a later step that reads this one's [`CommandOutput`] gets
+    /// run at all and the step reports `would change` with no output, so a
+    /// later step that reads this one's [`CommandOutput`] gets
     /// [`OutputUnavailable`](rustible_sdk::error::OutputUnavailable) instead
-    /// of an invented one.
+    /// of an invented one (vision 12).
     pub fn new(program: impl Into<String>) -> Self {
         Command {
             program: program.into(),
@@ -248,7 +248,7 @@ impl Op for Command {
         ))))
     }
 
-    fn apply(&self, sys: &System, _: Change<CommandOutput>) -> Result<CommandOutput> {
+    fn apply(&self, sys: &System, _: Change) -> Result<CommandOutput> {
         let mut cmd = sys.cmd(&self.program).args(self.args.iter().cloned());
         for (k, v) in &self.env {
             cmd = cmd.env(k, v);

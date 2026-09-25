@@ -258,8 +258,9 @@ pub struct ExtractReport {
 /// [`crate::file::Directory`]) or not a directory, when a member's path is
 /// already a directory where a file goes (or a file or symlink where a
 /// directory goes), and when any directory on a member's path exists as a
-/// symlink on disk. The report is fully predicted (counts are known from
-/// the walk), so chained steps keep working in check mode (vision 12).
+/// symlink on disk. The counts in the diff come from the same walk, so a
+/// dry run shows what an extraction would write; the report itself only
+/// exists once `apply` has run (vision 12).
 ///
 /// **What `apply` does.** Walks the archive again and writes each member
 /// through `sys`: files with `write_atomic` and the archive's permission
@@ -381,6 +382,8 @@ impl Extracted {
         match sys.stat_follow(&self.dest)? {
             Some(s) if s.kind == FileKind::Dir => {}
             Some(s) => bail!("{} is not a directory ({:?})", self.dest.display(), s.kind),
+            // Under --check an earlier file::Directory may create it (vision 12).
+            None if sys.check_mode() => {}
             None => bail!(
                 "{} does not exist; create it first with file::Directory",
                 self.dest.display()
@@ -763,19 +766,29 @@ impl Op for Extracted {
             report.bytes,
             self.dest.display()
         ));
-        Ok(Plan::change_predicting(diff, report))
+        Ok(Plan::change(diff))
     }
 
-    fn apply(&self, sys: &System, change: Change<ExtractReport>) -> Result<ExtractReport> {
-        let Some(report) = change.predicted else {
-            bail!("archive::Extracted::apply received a change without its prediction");
-        };
-        let (_, mut archive) = self.open(sys)?;
+    fn apply(&self, sys: &System, _: Change) -> Result<ExtractReport> {
+        // The report counts what was written, gathered on the same pass that
+        // writes it: one read of the archive here, as before, not a second
+        // planning pass.
+        let (format, mut archive) = self.open(sys)?;
+        let mut members = vec![];
+        let mut skipped = 0;
         walk(&mut archive, self.strip, &mut |m, data| match m {
-            Some(m) => self.write_member(sys, m, data),
-            None => Ok(()),
+            Some(m) => {
+                self.write_member(sys, m, data)?;
+                members.push(m.clone());
+                Ok(())
+            }
+            None => {
+                skipped += 1;
+                Ok(())
+            }
         })
         .with_context(|| format!("extracting {}", self.src.display()))?;
+        let report = self.report(format, &members, skipped);
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
@@ -1052,7 +1065,6 @@ mod tests {
                     format.name()
                 )
             );
-            assert_eq!(c.predicted, Some(hello_report(src, format)));
             let r = op.apply(&sys, c).unwrap();
             assert_eq!(r, hello_report(src, format));
 
@@ -1124,13 +1136,12 @@ mod tests {
             .strip_components(1)
             .owner(1000, 1000);
         let c = expect_change(&op, &sys);
-        let p = c.predicted.as_ref().unwrap();
+        let r = op.apply(&sys, c).unwrap();
         assert_eq!(
-            (p.files, p.dirs, p.symlinks, p.skipped),
+            (r.files, r.dirs, r.symlinks, r.skipped),
             (2, 2, 1, 1),
             "`hello/` itself is skipped"
         );
-        op.apply(&sys, c).unwrap();
         assert!(fake.file("/opt/hello").is_none());
         let run = fake.file("/opt/bin/run").unwrap();
         assert_eq!((run.mode, run.uid, run.gid), (0o755, 1000, 1000));
@@ -1143,9 +1154,10 @@ mod tests {
             "symlinks are not chowned"
         );
         // Stripping everything leaves nothing to do, which is still a change.
-        let c = expect_change(&op.clone().strip_components(9), &sys);
-        let p = c.predicted.as_ref().unwrap();
-        assert_eq!((p.files, p.dirs, p.skipped), (0, 0, 6));
+        let all_stripped = op.clone().strip_components(9);
+        let c = expect_change(&all_stripped, &sys);
+        let r = all_stripped.apply(&sys, c).unwrap();
+        assert_eq!((r.files, r.dirs, r.skipped), (0, 0, 6));
     }
 
     #[test]
@@ -1167,14 +1179,8 @@ mod tests {
         let (fake, sys) = sys_with(&bytes);
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        assert_eq!(
-            (
-                c.predicted.as_ref().unwrap().files,
-                c.predicted.as_ref().unwrap().bytes
-            ),
-            (2, 5)
-        );
-        op.apply(&sys, c).unwrap();
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!((r.files, r.bytes), (2, 5));
         let copy = fake.file("/opt/d/copy").unwrap();
         assert_eq!(
             (copy.mode, copy.bytes.as_slice()),
@@ -1287,7 +1293,10 @@ mod tests {
         ]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.predicted.as_ref().unwrap().files, 2);
+        assert_eq!(
+            c.diff.short(),
+            "extract /tmp/a.tar (tar: 2 files, 0 dirs, 0 symlinks, 6 bytes) into /opt"
+        );
     }
 
     /// A tar holding one member whose header claims `size` bytes but
@@ -1403,6 +1412,16 @@ mod tests {
             err(Extracted::from_path("/tmp/hello.tar").to("/opt"))
                 .contains("/opt does not exist; create it first with file::Directory")
         );
+        // Under --check the missing destination is one an earlier
+        // file::Directory may create (vision 12): would change, nothing written.
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = expect_change(&Extracted::from_path("/tmp/hello.tar").to("/opt"), &dry);
+        assert!(
+            c.diff.short().starts_with("extract /tmp/hello.tar"),
+            "{}",
+            c.diff.short()
+        );
+        assert!(fake.file("/opt").is_none());
         assert!(
             err(Extracted::from_path("/tmp/hello.tar").to("/f"))
                 .contains("/f is not a directory (File)")
@@ -1441,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn check_mode_predicts_and_writes_nothing() {
+    fn check_mode_reports_the_counts_in_the_diff_and_writes_nothing() {
         let fake = Arc::new(
             Fake::new()
                 .with_dir("/opt")
@@ -1455,8 +1474,13 @@ mod tests {
                 Extracted::from_path("/tmp/hello.tar.zst").to("/opt"),
             )
             .unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!((r.files, r.dirs, r.symlinks, r.bytes), (2, 3, 1, 38));
+        // A would-change step has no output (vision 12); the diff says what
+        // the extraction would do.
+        assert!(r.changed && !r.is_available());
+        assert_eq!(
+            r.diff.as_ref().unwrap().short(),
+            "extract /tmp/hello.tar.zst (tar.zst: 2 files, 3 dirs, 1 symlinks, 38 bytes) into /opt"
+        );
         assert!(fake.file("/opt/hello").is_none());
     }
 

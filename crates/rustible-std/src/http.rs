@@ -190,10 +190,9 @@ pub fn validate_url(url: &str) -> std::result::Result<(), String> {
 /// stays untouched until the new bytes are complete. A checksum mismatch
 /// after the download fails the step and writes nothing. A non-2xx status
 /// fails the step naming the status and the URL. Redirects are followed.
-/// `check` does not predict the report when a download is due (size and
-/// digest are unknown until fetched), so a check-mode run that chains from
-/// the step stops with the vision's clear message (vision 12); an
-/// attributes-only change predicts.
+/// `check` never opens the connection: a dry run reports what would be
+/// fetched and why, and a step that would change has no output there
+/// (vision 12).
 ///
 /// **Limits.** The body is held in memory before the atomic write, so this
 /// op is for release tarballs, not disk images, and a body over
@@ -333,6 +332,8 @@ impl Download {
             match sys.stat_follow(parent)? {
                 Some(s) if s.kind == FileKind::Dir => {}
                 Some(_) => bail!("{} is not a directory", parent.display()),
+                // Under --check an earlier file::Directory may create it (vision 12).
+                None if sys.check_mode() => {}
                 None => bail!(
                     "{} does not exist; create it first with file::Directory",
                     parent.display()
@@ -505,18 +506,16 @@ impl Op for Download {
                 if attrs.is_empty() {
                     return Ok(Plan::Satisfied(report));
                 }
-                return Ok(Plan::change_predicting(
-                    Diff::Attrs {
-                        subject: self.dest.display().to_string(),
-                        changes: attrs,
-                    },
-                    report,
-                ));
+                return Ok(Plan::change(Diff::Attrs {
+                    subject: self.dest.display().to_string(),
+                    changes: attrs,
+                }));
             }
             ContentState::Missing => "missing".to_string(),
             ContentState::Stale(why) => why,
         };
-        // Size and digest are unknown until fetched: no prediction.
+        // Size and digest are unknown until fetched; the diff says what would
+        // be fetched and why.
         Ok(Plan::change(Diff::summary(format!(
             "GET {} -> {} ({reason})",
             self.url,
@@ -524,13 +523,27 @@ impl Op for Download {
         ))))
     }
 
-    fn apply(&self, sys: &System, change: Change<DownloadReport>) -> Result<DownloadReport> {
-        // A prediction is only ever attached to an attributes-only change.
-        if let Some(report) = change.predicted {
-            apply_attrs(sys, &self.dest, self.mode, self.owner)?;
-            return Ok(report);
-        }
+    fn apply(&self, sys: &System, change: Change) -> Result<DownloadReport> {
         let checksum = self.parsed_checksum()?;
+        // An attributes-only diff means the content already matched: no
+        // fetch. The report reads the file as it is rather than carrying a
+        // copy of what `check` saw.
+        if matches!(change.diff, Diff::Attrs { .. }) {
+            apply_attrs(sys, &self.dest, self.mode, self.owner)?;
+            let (stat, state) = self.content_state(sys, checksum.as_ref())?;
+            let sha256 = match state {
+                ContentState::Current { sha256 } => sha256,
+                ContentState::Missing | ContentState::Stale(_) => None,
+            };
+            return Ok(DownloadReport {
+                url: self.url.clone(),
+                path: self.dest.clone(),
+                downloaded: false,
+                bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
+                sha256,
+                backup_path: None,
+            });
+        }
         let bytes = self.fetch()?;
         let sha256 = digest(Algorithm::Sha256, &bytes);
         if let Some(c) = &checksum {
@@ -823,7 +836,8 @@ mod tests {
             c.diff.short(),
             "GET http://h/hello.txt -> /opt/hello.txt (force)"
         );
-        assert!(c.predicted.is_none(), "a download is never predicted");
+        // A download is a summary diff: the shape `apply` fetches on.
+        assert!(matches!(c.diff, Diff::Summary(_)));
     }
 
     #[test]
@@ -855,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn attrs_only_change_predicts_and_applies_without_downloading() {
+    fn attrs_only_change_applies_without_downloading() {
         let fake = Arc::new(
             Fake::new()
                 .with_dir("/opt")
@@ -868,18 +882,19 @@ mod tests {
             .owner(10, 20);
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff.short(), "mode=0755 owner=10:20");
+        // An attributes-only diff is the shape `apply` branches on: no
+        // fetch, and the host name above would fail one.
+        assert!(matches!(c.diff, Diff::Attrs { .. }));
+        let r = op.apply(&sys, c).unwrap();
         // No `.checksum`, so the destination is never read or hashed and
         // the report carries no digest: the whole point of the laziness.
         assert_eq!(
-            c.predicted,
-            Some(DownloadReport {
+            r,
+            DownloadReport {
                 sha256: None,
                 ..report("http://nowhere.invalid/hello.txt", false)
-            })
+            }
         );
-        let r = op.apply(&sys, c).unwrap();
-        assert!(!r.downloaded);
-        assert_eq!(r.sha256, None);
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 10, 20));
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
@@ -994,6 +1009,13 @@ mod tests {
             err(Download::get("http://h/x").to("/missing/x"))
                 .contains("/missing does not exist; create it first with file::Directory")
         );
+        // Under --check the missing parent is one an earlier file::Directory
+        // may create (vision 12): would change, and no connection is opened
+        // (the host does not resolve, so a fetch would have failed loudly).
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let c = expect_change(&Download::get("http://h/x").to("/missing/x"), &dry);
+        assert_eq!(c.diff.short(), "GET http://h/x -> /missing/x (missing)");
+        assert!(fake.file("/missing").is_none() && fake.file("/missing/x").is_none());
         assert!(
             err(Download::get("http://h/x").to("/etc/f/x")).contains("/etc/f is not a directory")
         );
@@ -1132,7 +1154,7 @@ mod tests {
                 Download::get(format!("{base}/hello.txt")).to("/opt/hello.txt"),
             )
             .unwrap();
-        assert!(r.changed && !r.predicted && !r.is_available());
+        assert!(r.changed && !r.is_available());
         assert!(fake.file("/opt/hello.txt").is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }

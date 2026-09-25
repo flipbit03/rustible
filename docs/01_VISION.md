@@ -537,25 +537,26 @@ pub trait Op {
     fn check(&self, sys: &System) -> Result<Plan<Self::Output>>;
     /// Perform the change described by the plan. Only called when `check`
     /// returned `Change` and we are not in check mode.
-    fn apply(&self, sys: &System, change: Change<Self::Output>) -> Result<Self::Output>;
+    fn apply(&self, sys: &System, change: Change) -> Result<Self::Output>;
 }
 
 pub enum Plan<T> {
     /// Already in desired state. Carries the output so `step` can return it without applying.
     Satisfied(T),
     /// Something must change.
-    Change(Change<T>),
+    Change(Change),
 }
 
-/// `diff` is what the report shows; `predicted` (opt-in, section 12) is what
-/// the output would be after apply, so chained steps continue in check mode.
-pub struct Change<T> { pub diff: Diff, pub predicted: Option<T> }
-// (Spike 3 finding: `apply` takes `Change<T>` rather than `Plan<T>`; see docs/02_SPIKE_SDK_CORE.md.)
+/// `diff` is what the report shows and what `apply` executes. Nothing else
+/// rides along: a would-change step has no output until `apply` has run
+/// (section 12, revised 2026-09-24).
+pub struct Change { pub diff: Diff }
+// (Spike 3 finding: `apply` takes the change rather than `Plan<T>`; see docs/02_SPIKE_SDK_CORE.md.
+//  `Change` lost its type parameter together with the prediction slot, 2026-09-24.)
 
 pub struct Applied<T> {
-    value: Option<T>,        // None only in check mode when the op did not predict (section 12)
+    value: Option<T>,        // None only in check mode, when the step would change (section 12)
     pub changed: bool,
-    pub predicted: bool,     // value is a prediction
     pub diff: Option<Diff>,
     pub elapsed: Duration,
 }
@@ -576,7 +577,7 @@ pub fn step<O: Op>(&mut self, name, op: O) -> Result<Applied<O::Output>> {
         Plan::Satisfied(out) => { emit(StepFinished { status: Ok }); Applied { value: Some(out), changed: false, .. } }
         Plan::Change(c) if sys.check_mode() => {
             emit(StepFinished { status: WouldChange, diff: c.diff });
-            Applied { value: c.predicted, changed: true, predicted: c.predicted.is_some(), .. }   // no apply
+            Applied { value: None, changed: true, .. }   // no apply, so no output (section 12)
         }
         Plan::Change(c) => {
             sys.set_phase(Applying);   let out = op.apply(&sys, c)?;   sys.set_phase(Idle);
@@ -593,11 +594,21 @@ change that would be applied. The phase markers are what lets `System` refuse
 file mutations during `check` (section 7.3).
 
 **Policies learned in spike 3, now rules for the stdlib:**
-- **Predict by default.** Both ops in the spike already computed their
-  post-apply output while planning, so `Plan::change_predicting(diff, output)` 
-  cost nothing. Every stdlib op predicts unless it genuinely cannot (uid
-  allocation, versions apt has not resolved yet). `apply` may reuse
-  `change.predicted` for what it cannot cheaply recompute.
+- **No predictions** (reversed 2026-09-24; the original rule is kept here for
+  the record). Spike 3 found that both of its ops computed their post-apply
+  output while planning, so handing it over as a prediction cost nothing, and
+  "every stdlib op predicts unless it genuinely cannot" became the rule. Two
+  waves of the stdlib showed where the cost lands: not in the code but in the
+  judgement. Every op that creates something had to rule on which fields it
+  may honestly claim before the tool has run (a uid it has not allocated, the
+  shell BusyBox picks from an environment the op cannot see, a version apt
+  has not resolved), each ruling needed its own decision-log entry, and the
+  report never distinguished a prediction from a fact. A would-change step
+  now has no output in check mode; section 12 has the rule. `apply` executes
+  the `Diff` that `check` produced and reads for itself whatever the diff
+  does not carry (a gid to report, a digest for the output): a read is not a
+  decision, and the change carries no private payload from `check` to
+  `apply`.
 - **Builders end in a finishing call for the one mandatory piece of desired
   state.** `Line::in_path(p).matching(re).backup(true).set(line)`: `set` returns
   the `Op`, so a `Line` without a line cannot be constructed.
@@ -728,6 +739,15 @@ changed; and it still refuses to create the **home directory** itself, which
 belongs to `user::Present::create_home`. Outside a home directory nothing
 changes: a shared directory such as `/etc/sysctl.d`, or a download
 destination, is a prerequisite and is refused.
+
+**In a dry run the refusal waits.** A prerequisite that another op in the same
+run could create — a group, an account, its home, a parent directory, a unit
+file — is verified when the run is about to act, not while it is only
+looking: under `--check` the op reports `would change`, its diff showing the
+state it would set or saying what it waits for, and a real run refuses
+exactly as this rule says, because its `check` runs with check mode off and
+a dry run's plan never reaches `apply`. Section 12 has the reasoning and the
+limits.
 
 ### 6.8 Translations of real Ansible modules
 
@@ -1488,7 +1508,7 @@ impl Ctx {
   `as_user` contexts (they clone a shared counter), so a run has one step
   sequence regardless of how many `Ctx` values exist.
 - **In check mode `changed` means "would change".** A playbook that logs after
-  a changed step should branch on `applied.predicted` to word it honestly
+  a changed step should branch on `ctx.check_mode()` to word it honestly
   (spike 2 caught the `mc` playbook logging "installed mc" in a dry run).
 
 ### 11.2 Example
@@ -1569,7 +1589,7 @@ Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 
-## 12. Check-mode semantics (DECIDED 2026-09-06)
+## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24)
 
 Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change { diff }` does
 not, so in a dry run a step that *would* change has nothing to return, and a
@@ -1580,21 +1600,79 @@ Options considered:
    first change; useless for "what would this playbook do". Rejected.
 2. Continue; the output is unavailable; fail loudly only when a later step
    actually reads it.
-3. Let ops predict their output (`Plan::Change { diff, predicted: Option<T> }`).
-   Most fidelity, more work per op, and a wrong prediction is a lie in a dry run.
+3. Let ops predict their output. Most fidelity, more work per op, and a wrong
+   prediction is a lie in a dry run.
 
-**Decision: 2 as the rule, 3 as opt-in.**
+**Decision (2026-09-06): 2 as the rule, 3 as opt-in. Revised 2026-09-24: 2
+alone.** Two waves of the stdlib were built under the first decision, and
+what they showed is recorded so the reversal is not relitigated:
+
+- Prediction moved the work from code into judgement. Every op that creates
+  something had to rule on which fields it may claim before the tool has run,
+  and the rulings piled up: a new account predicts only with an explicit uid,
+  gid *and* shell; apt only when `apt-cache policy` names a candidate; a
+  download never, except when only its permissions change. Each ruling was a
+  decision-log entry, a guide paragraph and a test.
+- The predictions rarely fired where a dry run matters most. On a fresh host
+  nearly every step creates something, and the honest answer for a created
+  thing was usually "cannot predict", so the playbook author was told to add
+  `.uid(3000).gid(3000)` for the dry run's sake.
+- The report never showed which values were predictions. The distinction
+  existed for the playbook and not for the person reading the run.
+- To let a dry run get past a step that *needs* what an earlier step would
+  create, `System` grew a registry of planned resources
+  (`note_would_create`, 2026-09-08). One op ever wrote to it. Every later gap
+  of the same shape — the unit a package ships, the directory a step would
+  make, the home an account would get — was answered by declining to extend
+  it and adding a check-mode branch in the op instead, so three different
+  answers to one question were in the tree at once.
+
+Ansible's check mode has neither mechanism and one rule for a step that
+would create something: report `changed` and ask no further questions
+(`user.py`'s `main()` exits `changed` under check mode before it validates
+the group; `ansible.posix.authorized_key` does not look at the directory
+under check mode). That rule is adopted, and Ansible's behaviour is
+authoritative where the rule could have been read more broadly (decided
+2026-09-24): an *existing* account's missing group is refused under
+`--check` as in a real run (`user.py` validates it before anything that
+respects check mode), and keys for an account that does not exist yet are
+refused too (`authorized_key`: "Either user must exist or you must provide
+full path to key file in check mode"). Added on top is the loud failure
+Ansible lacks when a later step reads what a dry run could not produce.
+
+**The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
-  the run continues.
-- `Applied<T>` holds `Option<T>` internally in check mode. Reading the output
-  of a would-change step (via `Deref`) fails with: "step `<name>` would have
-  changed; its output is unavailable in check mode". `.changed` and `.diff`
-  remain readable. Playbooks that do not chain get a full dry run; those that
-  chain get as far as the first dependent read, with a clear message.
-- Ops that can predict cheaply may set `predicted` in `Plan::Change`
-  (`user::Present` can predict name, home, shell; not uid). Chained steps then
-  continue, and the report marks the step's output as predicted.
-- Ansible effectively does option 2 with silent garbage instead of a loud error.
+  the run continues. Nothing is applied and nothing is predicted: `Change`
+  carries the diff and no post-apply output.
+- A would-change step's output does not exist. `Applied<T>` holds
+  `Option<T>`; reading the output of a would-change step (via `Deref`) fails
+  with "step `<name>` would have changed; its output is unavailable in check
+  mode". `.changed` and `.diff` remain readable; `.is_available()` is the
+  guard for a playbook that wants to keep going. Playbooks that do not chain
+  get a full dry run; those that chain get as far as the first dependent
+  read, with a clear message. Ansible does the same with silent garbage
+  instead of a loud error.
+- **Prerequisites are verified when the run is about to act.** An op whose
+  `check` would refuse for want of a resource another op in the same run
+  could create — a group for an account not there yet, that account, its
+  home, a parent directory, a unit; within the two limits Ansible draws above
+  — reports `would change` under check mode instead; its diff shows the state
+  it would set, or says what it waits for, and names the prerequisite when
+  the op knows it by name (a group, an account, a unit). The tolerance is
+  gated on check mode, so a
+  real run's `check` takes the refusal, and a dry run's plan never reaches
+  `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
+  skipped on a run that can act. What a dry run therefore does not catch is
+  a forgotten prerequisite step: the real run refuses at that step, before
+  that step touches anything, with the steps before it already applied.
+  That is the trade this rule accepts, and 6.7 still holds at the step.
+- That deferral covers only what another step could supply. A refusal about
+  the machine or the request itself — wrong platform, not root, the tool the
+  op drives is absent, a malformed key, a sysctl key this kernel does not
+  have — stands in check mode as in a real run, because no earlier step
+  changes it.
+- `check` still cannot mutate (7.3), and `apt::Latest` with `.update_cache`
+  is still the one place a dry run writes (6.8).
 
 ## 13. Facts (DECIDED 2026-09-06)
 
@@ -1731,8 +1809,8 @@ Rendered example:
 - **Frame**: one length-prefixed JSON message on the channel.
 - **Remote mode / describe mode / helper mode**: the playbook binary's
   `--remote`, `--describe`, `--helper` flags (section 5.5).
-- **Predicted**: an op's declared post-apply output, returned in check mode
-  instead of applying.
+- **Would change**: a step's status in check mode when `check` found a
+  difference. `apply` does not run and the step has no output (section 12).
 - **`selected` feature**: an empty Cargo feature in every workspace manifest,
   enabled only by CLI builds that set `RUSTIBLE_PLAYBOOK`, so the selected
   build gets its own build-script output directory and never clobbers the
@@ -1787,7 +1865,8 @@ everywhere won. Where `escalate` is defined, a comment says it is Ansible's
    sketches hold; `apply` takes `Change<T>`; prediction is nearly free.
 
 **Spike learnings promoted to policy in this document:** `apply` takes
-`Change<T>` and ops predict by default (6.2); builders end in a finishing call
+`apply` takes the change, not the plan (6.2; the predict-by-default rule that
+came with it was reversed 2026-09-24, section 12); builders end in a finishing call
 (6.2); the mutation guard covers files not commands (7.3); one cargo
 invocation builds all triples, `dist` profile, `rust-lld` per-target linker
 config (5.2, 5.3); content-hash cache path and early ControlMaster (5.2); JSON

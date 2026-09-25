@@ -539,8 +539,13 @@ mod tests {
         );
 
         let r = keys_to_user_via(&mut ctx, canned).unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!(r.added.len(), 3, "Present predicts its report");
+        // A would-change step has no output under --check (vision 12); the
+        // diff is what there is to read.
+        assert!(r.changed && !r.is_available());
+        assert_eq!(
+            r.diff.as_ref().unwrap().short(),
+            "+3 -0 lines mode=0600 owner=1000:1000"
+        );
         assert!(fake.file(AK).is_none());
         assert_eq!(
             finished(&sink)

@@ -26,11 +26,24 @@ pub trait Op {
     type Output;
 
     /// Inspect the system. Never mutates. Returns what would need to happen.
+    ///
+    /// A prerequisite that another op in the same run could create — a
+    /// group, an account, its home, a parent directory, a unit — is refused
+    /// here in a real run and tolerated under [`System::check_mode`], where
+    /// the step reports `would change` and its diff shows the state it would
+    /// set or says what it waits for. A real run's `check` runs with check
+    /// mode off and takes the
+    /// refusal, and a dry run's plan never reaches `apply`, so the refusal
+    /// is never skipped on a run that can act (vision doc 6.7, 12).
+    /// A refusal about the machine or the request itself — wrong platform,
+    /// not root, a malformed input — stands in both modes.
     fn check(&self, sys: &System) -> Result<Plan<Self::Output>>;
 
     /// Perform the change described by the plan. Only called when `check`
-    /// returned `Plan::Change` and we are not in check mode.
-    fn apply(&self, sys: &System, change: Change<Self::Output>) -> Result<Self::Output>;
+    /// returned `Plan::Change` and we are not in check mode. Executes the
+    /// diff `check` produced rather than deciding again; whatever the output
+    /// needs that the diff does not carry, `apply` reads for itself.
+    fn apply(&self, sys: &System, change: Change) -> Result<Self::Output>;
 
     /// True for actions whose `check` always returns `Change` (restart, command).
     /// Only a reporting hint.
@@ -59,46 +72,31 @@ pub enum Plan<T> {
     /// Already in desired state. Carries the output so `step` returns it without applying.
     Satisfied(T),
     /// Something must change.
-    Change(Change<T>),
+    Change(Change),
 }
 
-/// The payload of [`Plan::Change`]: what `check` found, handed straight to
-/// [`Op::apply`] so the work of deciding is not repeated. Ops that predict
-/// commonly return `predicted` as `apply`'s own output.
+/// The payload of [`Plan::Change`]: the diff `check` produced, handed
+/// straight to [`Op::apply`] so the work of deciding is not repeated. It
+/// carries nothing else. A would-change step has no output in check mode
+/// (vision doc 12), and `apply` reads for itself whatever its output needs
+/// beyond the diff.
 #[derive(Debug)]
-pub struct Change<T> {
-    /// What the report shows.
+pub struct Change {
+    /// What the report shows, and what `apply` executes.
     pub diff: Diff,
-    /// Optional: what the output would be after apply. Lets chained steps
-    /// continue in check mode. Ops opt in when prediction is cheap and honest.
-    pub predicted: Option<T>,
 }
 
 impl<T> Plan<T> {
-    /// A change with no predicted output. A later step that reads this
-    /// step's output gets
-    /// [`OutputUnavailable`](crate::error::OutputUnavailable) in check mode,
-    /// which is the honest answer when the value only exists after `apply`.
+    /// A change. In check mode the step finishes `would change` and has no
+    /// output: a later step that reads it gets
+    /// [`OutputUnavailable`](crate::error::OutputUnavailable), which is the
+    /// honest answer for a value that only exists after `apply`.
     pub fn change(diff: Diff) -> Self {
-        Plan::Change(Change {
-            diff,
-            predicted: None,
-        })
+        Plan::Change(Change { diff })
     }
 
-    /// A change carrying the output `apply` would produce, so a check-mode
-    /// run can keep walking through steps that read it. The value is
-    /// returned to the playbook as if it were real, flagged by
-    /// [`Applied::predicted`], so predict only what the op is certain of.
-    pub fn change_predicting(diff: Diff, predicted: T) -> Self {
-        Plan::Change(Change {
-            diff,
-            predicted: Some(predicted),
-        })
-    }
-
-    /// True for [`Plan::Change`], predicting or not. Mostly useful to op
-    /// authors testing their own `check` without running a step.
+    /// True for [`Plan::Change`]. Mostly useful to op authors testing their
+    /// own `check` without running a step.
     pub fn is_change(&self) -> bool {
         matches!(self, Plan::Change(_))
     }
@@ -113,8 +111,6 @@ pub struct Applied<T> {
     /// also for a step that ran and reported nothing changed through
     /// [`Op::changed_by_apply`].
     pub changed: bool,
-    /// True if `value` is a prediction (check mode with an op that predicted).
-    pub predicted: bool,
     /// What `check` reported, `None` when the step was already satisfied.
     /// Kept even when the step is reported `ok`, so `-v` still shows what ran.
     pub diff: Option<Diff>,
@@ -128,7 +124,6 @@ impl<T> Applied<T> {
         step: String,
         value: Option<T>,
         changed: bool,
-        predicted: bool,
         diff: Option<Diff>,
         elapsed: Duration,
     ) -> Self {
@@ -136,14 +131,13 @@ impl<T> Applied<T> {
             step,
             value,
             changed,
-            predicted,
             diff,
             elapsed,
         }
     }
 
-    /// The output, or a clear error if unavailable (check mode, would change,
-    /// op did not predict).
+    /// The output, or a clear error when there is none: the step would
+    /// change and this is check mode, so `apply` never produced one.
     pub fn output(&self) -> Result<&T> {
         self.value.as_ref().ok_or_else(|| {
             crate::error::OutputUnavailable {

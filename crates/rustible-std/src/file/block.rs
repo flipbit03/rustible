@@ -48,8 +48,9 @@ pub const DEFAULT_MARKER: &str = "# {mark} MANAGED BY RUSTIBLE";
 ///
 /// A symbolic link is refused rather than followed (the atomic rewrite would
 /// replace the link), and so is a directory; a missing file is an error
-/// unless `.create(true)`. The file's own line ending is kept and `check`
-/// predicts its [`BlockReport`].
+/// unless `.create(true)` — except under `--check`, where an earlier step
+/// may create it and the edit is reported as due (vision 12). The file's
+/// own line ending is kept.
 #[derive(Debug, Clone)]
 pub struct Block {
     path: PathBuf,
@@ -80,8 +81,7 @@ pub struct BlockReport {
     /// (an empty block that was, or is now, absent).
     pub line_no: usize,
     /// The copy taken before the rewrite, set only when `.backup(true)` and
-    /// `apply` actually wrote. Always `None` on a satisfied step and on the
-    /// prediction `check` returns, because no copy exists until the write.
+    /// `apply` actually wrote. Always `None` on a satisfied step.
     pub backup_path: Option<PathBuf>,
 }
 
@@ -229,7 +229,9 @@ impl Op for Block {
                 "block body contains a line equal to a marker ({l:?}); change the marker with .marker(..)"
             );
         }
-        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
+        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
+            return Ok(super::plan_edit_of_missing("file::Block", &self.path));
+        };
         match plan_block(&text, &begin, &end, &self.block, &self.insert) {
             None => {
                 let lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -242,26 +244,26 @@ impl Op for Block {
                     backup_path: None,
                 }))
             }
-            Some((new_text, line_no)) => Ok(Plan::change_predicting(
-                Diff::text(&self.path, text, new_text),
-                BlockReport {
-                    path: self.path.clone(),
-                    line_no: if self.block.is_empty() { 0 } else { line_no },
-                    backup_path: None,
-                },
-            )),
+            Some((new_text, _)) => Ok(Plan::change(Diff::text(&self.path, text, new_text))),
         }
     }
 
-    fn apply(&self, sys: &System, change: Change<BlockReport>) -> Result<BlockReport> {
+    fn apply(&self, sys: &System, _: Change) -> Result<BlockReport> {
         // Re-plan from the current text rather than trusting the diff copy.
-        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
+        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
+            bail!("{} does not exist; nothing to edit", self.path.display());
+        };
         let (begin, end) = self.markers();
         let Some((after, line_no)) = plan_block(&text, &begin, &end, &self.block, &self.insert)
         else {
+            // The file changed between check and apply and already carries
+            // the block: report where it stands now.
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
             return Ok(BlockReport {
                 path: self.path.clone(),
-                line_no: change.predicted.map(|p| p.line_no).unwrap_or(0),
+                line_no: find_block(&lines, &begin, &end)
+                    .map(|(b, _)| b + 1)
+                    .unwrap_or(0),
                 backup_path: None,
             });
         };
@@ -409,7 +411,6 @@ mod tests {
             .set("10.0.0.1 lab1\n10.0.0.2 lab2\n");
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff.short(), "+4 -0 lines");
-        assert_eq!(c.predicted.as_ref().unwrap().line_no, 2);
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.line_no, 2);
         assert!(r.backup_path.is_some());
@@ -476,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn block_in_check_mode_predicts_and_writes_nothing() {
+    fn block_in_check_mode_reports_would_change_and_writes_nothing() {
         let fake = Arc::new(Fake::new().with_file("/f", "a\n"));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
@@ -486,9 +487,28 @@ mod tests {
                 Block::in_path("/f").insert(Insert::Prepend).set("x"),
             )
             .unwrap();
-        assert!(r.changed && r.predicted);
-        assert_eq!(r.line_no, 1);
+        assert!(r.changed && !r.is_available(), "no apply, so no output");
+        assert_eq!(r.diff.as_ref().unwrap().short(), "+3 -0 lines");
         assert_eq!(fake.content("/f").unwrap(), "a\n");
+    }
+
+    /// Vision 12: a file an earlier step in the run could create (a package
+    /// shipping its config, a `file::Copy`) is not a refusal in a dry run;
+    /// the edit is reported as due, without a text diff since there is no
+    /// text yet. A real run still refuses, as `block_op_default_marker_and_create`
+    /// pins.
+    #[test]
+    fn block_on_a_missing_file_defers_the_refusal_to_a_real_run() {
+        let fake = Arc::new(Fake::new());
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let op = Block::in_path("/etc/new.conf").set("x");
+        let c = expect_change(&op, &dry);
+        assert_eq!(
+            c.diff.render(),
+            "/etc/new.conf: does not exist yet; file::Block would edit it once an earlier \
+             step creates it (or use .create(true) to create it here)"
+        );
+        assert!(fake.file("/etc/new.conf").is_none());
     }
 
     #[test]

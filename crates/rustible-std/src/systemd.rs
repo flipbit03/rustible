@@ -182,9 +182,35 @@ impl ActiveState {
 /// the message: `disabled` and `masked` exit 1 with the word on stdout, and a
 /// missing unit exits 1 (older) or 4 (systemd 253+) with `not-found` or
 /// nothing on stdout.
-pub fn parse_is_enabled(stdout: &str, exit: i32) -> EnabledState {
+///
+/// Nothing on stdout with a non-zero exit is `not-found` only when stderr
+/// says so (older systemd writes `No such file or directory` there) or says
+/// nothing. Any other stderr — `Failed to connect to bus`, a permission
+/// error — is `systemctl` failing to answer at all, which is an error and
+/// not a state, so it is refused in check mode as in a real run rather than
+/// read as a unit an earlier step would install.
+pub fn parse_is_enabled(stdout: &str, exit: i32, stderr: &str) -> Result<EnabledState> {
     let word = stdout.lines().next().unwrap_or("").trim();
-    match word {
+    if word.is_empty() && exit != 0 {
+        let e = stderr.trim();
+        let lower = e.to_ascii_lowercase();
+        // A bus failure ends in the same `No such file or directory` a
+        // missing unit does (`Failed to connect to bus: No such file or
+        // directory` when the user manager is not running), so it is ruled
+        // out first.
+        let could_not_answer = lower.contains("failed to connect to");
+        let says_not_found = !could_not_answer
+            && (e.is_empty()
+                || lower.contains("no such file or directory")
+                || lower.contains("not found")
+                || lower.contains("not-found")
+                || lower.contains("could not be found"));
+        if !says_not_found {
+            bail!("`systemctl is-enabled` failed without an answer (exit {exit}): {e}");
+        }
+        return Ok(EnabledState::NotFound);
+    }
+    Ok(match word {
         "enabled" => EnabledState::Enabled,
         "enabled-runtime" => EnabledState::EnabledRuntime,
         "linked" => EnabledState::Linked,
@@ -198,9 +224,8 @@ pub fn parse_is_enabled(stdout: &str, exit: i32) -> EnabledState {
         "generated" => EnabledState::Generated,
         "transient" => EnabledState::Transient,
         "not-found" => EnabledState::NotFound,
-        "" if exit != 0 => EnabledState::NotFound,
         other => EnabledState::Other(other.to_string()),
-    }
+    })
 }
 
 /// Parse `systemctl is-active <unit>`. `inactive` and `failed` exit 3 (4 on
@@ -332,7 +357,8 @@ impl Unit {
             .args(["is-enabled", &self.name])
             .allow_failure()
             .run()?;
-        let enabled = parse_is_enabled(&out.stdout_str(), out.status);
+        let enabled = parse_is_enabled(&out.stdout_str(), out.status, &out.stderr_str())
+            .with_context(|| format!("probing unit `{}` with `{}`", self.name, self.prefix()))?;
         let out = self
             .systemctl(sys)
             .args(["is-active", &self.name])
@@ -343,9 +369,16 @@ impl Unit {
     }
 
     /// `probe` plus the not-found check every state op wants first.
+    ///
+    /// Under `--check` a unit `systemctl` cannot find is not refused: an
+    /// earlier step in the run may install the package or copy the unit
+    /// file, and a dry run verifies such a prerequisite only when it is
+    /// about to act (vision 12). The op then reports the state it would set,
+    /// from `not-found`. A real run refuses, because it runs `check` with
+    /// check mode off.
     fn probe_existing(&self, sys: &System, op: &str) -> Result<Probe> {
         let p = self.probe(sys)?;
-        if p.enabled == EnabledState::NotFound {
+        if p.enabled == EnabledState::NotFound && !sys.check_mode() {
             bail!(
                 "systemd::{op}: unit `{}` not found by `{} is-enabled`",
                 self.name,
@@ -434,7 +467,9 @@ fn attr(name: &str, from: &str, to: &str) -> AttrChange {
 /// Satisfied when `systemctl is-enabled` answers `enabled`, `enabled-runtime`,
 /// `static`, `alias`, `indirect`, `generated` or `transient` (the unit starts
 /// at boot or needs no enabling). Refuses a `masked` unit rather than
-/// unmasking it (vision 6.7). Predicts its output, so check mode can chain.
+/// unmasking it (vision 6.7). A unit `systemctl` does not know is refused in
+/// a real run and reported `would change` under `--check`, where an earlier
+/// step may install it (vision 12).
 #[derive(Debug, Clone)]
 pub struct Enabled {
     unit: Unit,
@@ -497,16 +532,13 @@ impl Op for Enabled {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(out));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.unit.name.clone(),
-                changes,
-            },
-            out,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.unit.name.clone(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         let mut cmd = self.unit.systemctl(sys).arg("enable");
         if self.now {
             cmd = cmd.arg("--now");
@@ -538,7 +570,8 @@ impl Op for Enabled {
 /// Satisfied when `is-enabled` answers `disabled`, `masked` or `linked`.
 /// Refuses `static`, `generated` and `transient` units with a message, because
 /// they have no `[Install]` section to switch and `systemctl disable` would
-/// silently change nothing. Predicts its output.
+/// silently change nothing. A unit `systemctl` does not know is refused in a
+/// real run and reported `would change` under `--check` (vision 12).
 #[derive(Debug, Clone)]
 pub struct Disabled {
     unit: Unit,
@@ -586,7 +619,10 @@ impl Op for Disabled {
             );
         }
         let mut changes = vec![];
-        if p.enabled.is_enabled() {
+        // `not-found` only reaches here under --check (`probe_existing`): the
+        // unit an earlier step would install is reported as due, not as
+        // already disabled (vision 12).
+        if p.enabled.is_enabled() || p.enabled == EnabledState::NotFound {
             changes.push(attr("enabled", p.enabled.as_str(), "disabled"));
         }
         if self.now && p.active.is_running() {
@@ -600,16 +636,13 @@ impl Op for Disabled {
         if changes.is_empty() {
             return Ok(Plan::Satisfied(out));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.unit.name.clone(),
-                changes,
-            },
-            out,
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.unit.name.clone(),
+            changes,
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         let mut cmd = self.unit.systemctl(sys).arg("disable");
         if self.now {
             cmd = cmd.arg("--now");
@@ -646,7 +679,9 @@ impl Op for Disabled {
 /// `refreshing` or `activating`. `apply` runs `systemctl start` and then
 /// re-reads `is-active`; if the unit is not up, the step fails with the last
 /// 20 lines of its journal. Refuses a `masked` unit (start would fail anyway)
-/// and a unit `systemctl` does not know. Predicts its output.
+/// and, in a real run, a unit `systemctl` does not know; under `--check` that
+/// unit is reported `would change`, since an earlier step may install it
+/// (vision 12).
 #[derive(Debug, Clone)]
 pub struct Running {
     unit: Unit,
@@ -685,20 +720,13 @@ impl Op for Running {
         if p.active.is_running() {
             return Ok(Plan::Satisfied(self.unit.state(&p)));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.unit.name.clone(),
-                changes: vec![attr("active", p.active.as_str(), "active")],
-            },
-            UnitState {
-                unit: self.unit.name.clone(),
-                enabled: p.enabled.is_enabled(),
-                active: true,
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.unit.name.clone(),
+            changes: vec![attr("active", p.active.as_str(), "active")],
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         self.unit
             .systemctl(sys)
             .args(["start", &self.unit.name])
@@ -713,7 +741,9 @@ impl Op for Running {
 ///
 /// Satisfied when `is-active` answers `inactive`, `failed`, `deactivating` or
 /// `maintenance`. `apply` runs `systemctl stop` and re-reads `is-active`,
-/// failing with the journal tail if the unit is still up. Predicts its output.
+/// failing with the journal tail if the unit is still up. A unit `systemctl`
+/// does not know is refused in a real run and reported `would change` under
+/// `--check` (vision 12).
 #[derive(Debug, Clone)]
 pub struct Stopped {
     unit: Unit,
@@ -741,23 +771,25 @@ impl Op for Stopped {
     fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
         self.unit.guard(sys, "Stopped")?;
         let p = self.unit.probe_existing(sys, "Stopped")?;
+        // `not-found` only reaches here under --check (`probe_existing`): the
+        // unit an earlier step would install is reported as due, not as
+        // already stopped (vision 12).
+        if p.enabled == EnabledState::NotFound {
+            return Ok(Plan::change(Diff::Attrs {
+                subject: self.unit.name.clone(),
+                changes: vec![attr("active", "not-found", "inactive")],
+            }));
+        }
         if !p.active.is_running() {
             return Ok(Plan::Satisfied(self.unit.state(&p)));
         }
-        Ok(Plan::change_predicting(
-            Diff::Attrs {
-                subject: self.unit.name.clone(),
-                changes: vec![attr("active", p.active.as_str(), "inactive")],
-            },
-            UnitState {
-                unit: self.unit.name.clone(),
-                enabled: p.enabled.is_enabled(),
-                active: false,
-            },
-        ))
+        Ok(Plan::change(Diff::Attrs {
+            subject: self.unit.name.clone(),
+            changes: vec![attr("active", p.active.as_str(), "inactive")],
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         self.unit
             .systemctl(sys)
             .args(["stop", &self.unit.name])
@@ -775,8 +807,8 @@ impl Op for Stopped {
 /// `service` with `state: restarted`. `check` always reports a change and
 /// runs nothing; `apply` runs an optional `systemctl daemon-reload`, then
 /// `systemctl restart`, then verifies `is-active` and fails with the last 20
-/// journal lines if the unit did not come back up. Predicts nothing: in check
-/// mode its output is unavailable (vision 12).
+/// journal lines if the unit did not come back up. In check mode its output
+/// is unavailable (vision 12).
 #[derive(Debug, Clone)]
 pub struct Restart {
     unit: Unit,
@@ -838,7 +870,7 @@ impl Op for Restart {
         ))))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         run_action(sys, &self.unit, self.daemon_reload, "restart")
     }
 
@@ -852,7 +884,7 @@ impl Op for Restart {
 /// `systemctl reload` fails on a unit that is not running or has no
 /// `ExecReload=`; `.or_restart(true)` uses `systemctl reload-or-restart`
 /// instead, which restarts in those cases. Same `daemon_reload` and
-/// verification as [`Restart`]; predicts nothing.
+/// verification as [`Restart`].
 #[derive(Debug, Clone)]
 pub struct Reload {
     unit: Unit,
@@ -912,7 +944,7 @@ impl Op for Reload {
         ))))
     }
 
-    fn apply(&self, sys: &System, _: Change<UnitState>) -> Result<UnitState> {
+    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
         run_action(sys, &self.unit, self.daemon_reload, self.verb())
     }
 
@@ -993,7 +1025,7 @@ impl Op for DaemonReload {
         ))))
     }
 
-    fn apply(&self, sys: &System, _: Change<()>) -> Result<()> {
+    fn apply(&self, sys: &System, _: Change) -> Result<()> {
         self.manager.systemctl(sys).arg("daemon-reload").run()?;
         Ok(())
     }
@@ -1033,7 +1065,11 @@ mod tests {
             ("not-found", 4, EnabledState::NotFound),
         ];
         for (word, exit, want) in table {
-            assert_eq!(parse_is_enabled(&format!("{word}\n"), exit), want, "{word}");
+            assert_eq!(
+                parse_is_enabled(&format!("{word}\n"), exit, "").unwrap(),
+                want,
+                "{word}"
+            );
             assert_eq!(want.as_str(), word);
         }
     }
@@ -1041,13 +1077,43 @@ mod tests {
     #[test]
     fn parse_is_enabled_nonzero_exit_with_meaningful_stdout() {
         // `disabled` exits 1, the word still wins.
-        assert_eq!(parse_is_enabled("disabled\n", 1), EnabledState::Disabled);
-        // Older systemd: nothing on stdout, error on stderr, exit 1.
-        assert_eq!(parse_is_enabled("", 1), EnabledState::NotFound);
-        // Empty stdout with exit 0 is not a known state.
-        assert_eq!(parse_is_enabled("", 0), EnabledState::Other(String::new()));
         assert_eq!(
-            parse_is_enabled("bogus\n", 0),
+            parse_is_enabled("disabled\n", 1, "").unwrap(),
+            EnabledState::Disabled
+        );
+        // Older systemd: nothing on stdout, the reason on stderr, exit 1.
+        assert_eq!(parse_is_enabled("", 1, "").unwrap(), EnabledState::NotFound);
+        assert_eq!(
+            parse_is_enabled(
+                "",
+                1,
+                "Failed to get unit file state for nginx.service: No such file or directory\n"
+            )
+            .unwrap(),
+            EnabledState::NotFound
+        );
+        // Nothing on stdout because systemctl could not answer at all: an
+        // error in both modes, never a unit an earlier step would install.
+        let err = parse_is_enabled("", 1, "Failed to connect to bus: No medium found\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed without an answer (exit 1)"), "{err}");
+        assert!(err.contains("Failed to connect to bus"), "{err}");
+        // The bus failure that ends in the not-found phrase: still an error.
+        for stderr in [
+            "Failed to connect to bus: No such file or directory\n",
+            "Failed to connect to user scope bus via local transport: No such file or directory\n",
+        ] {
+            let err = parse_is_enabled("", 1, stderr).unwrap_err().to_string();
+            assert!(err.contains("failed without an answer"), "{stderr}: {err}");
+        }
+        // Empty stdout with exit 0 is not a known state.
+        assert_eq!(
+            parse_is_enabled("", 0, "").unwrap(),
+            EnabledState::Other(String::new())
+        );
+        assert_eq!(
+            parse_is_enabled("bogus\n", 0, "").unwrap(),
             EnabledState::Other("bogus".into())
         );
     }
@@ -1184,7 +1250,8 @@ mod tests {
     }
 
     fn probes_for(unit: &str, enabled: &str, active: &str) -> Fake {
-        let enabled_status = if EnabledState::is_enabled(&parse_is_enabled(enabled, 0)) {
+        let enabled_status = if EnabledState::is_enabled(&parse_is_enabled(enabled, 0, "").unwrap())
+        {
             0
         } else {
             1
@@ -1260,14 +1327,7 @@ mod tests {
             .collect()
     }
 
-    fn predicted(plan: &Plan<UnitState>) -> UnitState {
-        let Plan::Change(c) = plan else {
-            panic!("expected change, got {plan:?}")
-        };
-        c.predicted.clone().expect("state ops predict")
-    }
-
-    fn change<T: std::fmt::Debug>(plan: Plan<T>) -> Change<T> {
+    fn change<T: std::fmt::Debug>(plan: Plan<T>) -> Change {
         match plan {
             Plan::Change(c) => c,
             Plan::Satisfied(s) => panic!("expected change, got satisfied {s:?}"),
@@ -1304,12 +1364,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_plans_change_with_diff_and_prediction() {
+    fn enabled_plans_change_with_diff() {
         let fake = Arc::new(probes("disabled", "inactive"));
         let plan = Enabled::new("nginx").check(&sys(&fake)).unwrap();
+        // Without `now`, `active` is not the op's business.
         assert_eq!(attrs(&plan), vec![triple("enabled", "disabled", "enabled")]);
-        // Without `now`, `active` is whatever it is today.
-        assert_eq!(predicted(&plan), state(true, false));
         assert_only_probes(&fake);
     }
 
@@ -1343,7 +1402,6 @@ mod tests {
             .check(&sys(&before))
             .unwrap();
         assert_eq!(attrs(&plan), vec![triple("active", "inactive", "active")]);
-        assert_eq!(predicted(&plan), state(true, true));
 
         let after = Arc::new(with_ok(
             probes("enabled", "active"),
@@ -1401,6 +1459,87 @@ mod tests {
         assert!(err.contains("unit `nginx` not found"), "{err}");
     }
 
+    /// Under --check a unit systemctl cannot find is one an earlier step may
+    /// install (vision 12): the four state ops report the state they would
+    /// set, from `not-found`, and nothing but the probes runs. A real run
+    /// refuses, and a masked unit is refused in both modes: no step in the
+    /// run unmasks it.
+    #[test]
+    fn missing_unit_is_would_change_under_check_and_refused_otherwise() {
+        let dry = |fake: &Arc<Fake>| sys(fake).with_check_mode(true);
+
+        let fake = Arc::new(probes("not-found", "inactive"));
+        let plan = Enabled::new("nginx").check(&dry(&fake)).unwrap();
+        assert_eq!(
+            attrs(&plan),
+            vec![triple("enabled", "not-found", "enabled")]
+        );
+        assert_only_probes(&fake);
+
+        let fake = Arc::new(probes("not-found", "inactive"));
+        let plan = Enabled::new("nginx").now(true).check(&dry(&fake)).unwrap();
+        assert_eq!(
+            attrs(&plan),
+            vec![
+                triple("enabled", "not-found", "enabled"),
+                triple("active", "inactive", "active"),
+            ]
+        );
+
+        let fake = Arc::new(probes("not-found", "inactive"));
+        let plan = Running::new("nginx").check(&dry(&fake)).unwrap();
+        assert_eq!(attrs(&plan), vec![triple("active", "inactive", "active")]);
+
+        // `Disabled` and `Stopped` report the unit as due too, rather than
+        // reading "not there" as "already disabled": the package a later
+        // real run installs may well enable and start it (Debian does).
+        let fake = Arc::new(probes("not-found", "inactive"));
+        let plan = Disabled::new("nginx").check(&dry(&fake)).unwrap();
+        assert_eq!(
+            attrs(&plan),
+            vec![triple("enabled", "not-found", "disabled")]
+        );
+        let plan = Stopped::new("nginx").check(&dry(&fake)).unwrap();
+        assert_eq!(
+            attrs(&plan),
+            vec![triple("active", "not-found", "inactive")]
+        );
+
+        // The real run's `check` refuses, verbatim.
+        for (name, err) in [
+            (
+                "Enabled",
+                Enabled::new("nginx").check(&sys(&fake)).unwrap_err(),
+            ),
+            (
+                "Disabled",
+                Disabled::new("nginx").check(&sys(&fake)).unwrap_err(),
+            ),
+            (
+                "Running",
+                Running::new("nginx").check(&sys(&fake)).unwrap_err(),
+            ),
+            (
+                "Stopped",
+                Stopped::new("nginx").check(&sys(&fake)).unwrap_err(),
+            ),
+        ] {
+            let err = err.chain();
+            assert_eq!(
+                err,
+                format!("systemd::{name}: unit `nginx` not found by `systemctl is-enabled`")
+            );
+        }
+
+        // Masked is about the unit itself, not about a step that has not run.
+        let fake = Arc::new(probes("masked", "inactive"));
+        let err = Enabled::new("nginx")
+            .check(&dry(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("is masked"), "{err}");
+    }
+
     #[test]
     fn enabled_fails_when_still_disabled_after_enable() {
         // One fake: `enable` "succeeds" but is-enabled keeps saying disabled.
@@ -1451,7 +1590,6 @@ mod tests {
         let before = Arc::new(probes("enabled", "active"));
         let plan = Disabled::new("nginx").check(&sys(&before)).unwrap();
         assert_eq!(attrs(&plan), vec![triple("enabled", "enabled", "disabled")]);
-        assert_eq!(predicted(&plan), state(false, true));
 
         let after = Arc::new(with_ok(probes("disabled", "active"), &["disable", "nginx"]));
         let out = Disabled::new("nginx")
@@ -1495,7 +1633,6 @@ mod tests {
                 triple("active", "active", "inactive"),
             ]
         );
-        assert_eq!(predicted(&plan), state(false, false));
 
         let after = Arc::new(with_journal(with_ok(
             probes("disabled", "active"),
@@ -1533,11 +1670,10 @@ mod tests {
     }
 
     #[test]
-    fn running_plans_change_from_failed_with_prediction() {
+    fn running_plans_change_from_failed() {
         let fake = Arc::new(probes("enabled", "failed"));
         let plan = Running::new("nginx").check(&sys(&fake)).unwrap();
         assert_eq!(attrs(&plan), vec![triple("active", "failed", "active")]);
-        assert_eq!(predicted(&plan), state(true, true));
         assert_only_probes(&fake);
     }
 
@@ -1647,7 +1783,6 @@ mod tests {
         let before = Arc::new(probes("enabled", "active"));
         let plan = Stopped::new("nginx").check(&sys(&before)).unwrap();
         assert_eq!(attrs(&plan), vec![triple("active", "active", "inactive")]);
-        assert_eq!(predicted(&plan), state(true, false));
 
         let after = Arc::new(with_ok(probes("enabled", "inactive"), &["stop", "nginx"]));
         let out = Stopped::new("nginx")
@@ -1686,7 +1821,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(c.diff.render(), "systemctl restart nginx");
-        assert!(c.predicted.is_none(), "actions predict nothing");
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
 
         let with_reload = Restart::new("nginx")
@@ -1796,7 +1930,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(c.diff.render(), "systemctl daemon-reload");
-        assert!(c.predicted.is_none(), "actions predict nothing");
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
 
@@ -1849,8 +1982,11 @@ mod tests {
         let r = ctx
             .step("systemd re-reads its units", DaemonReload::new())
             .unwrap();
-        assert!(r.changed && !r.predicted);
-        assert!(!r.is_available(), "an action predicts nothing (vision 12)");
+        assert!(r.changed);
+        assert!(
+            !r.is_available(),
+            "a would-change step has no output (vision 12)"
+        );
         assert_eq!(r.diff.as_ref().unwrap().render(), "systemctl daemon-reload");
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
@@ -2016,7 +2152,7 @@ mod tests {
     // ---- through Ctx: check mode and the mutation guard ----
 
     #[test]
-    fn check_mode_through_ctx_runs_only_probes_and_predicts_state_ops() {
+    fn check_mode_through_ctx_runs_only_probes_and_yields_no_output() {
         let fake = Arc::new(probes("disabled", "inactive"));
         let s = sys(&fake).with_check_mode(true);
         let mut ctx = Ctx::new(s, HostInfo::local());
@@ -2024,14 +2160,15 @@ mod tests {
         let en = ctx
             .step("nginx enabled", Enabled::new("nginx").now(true))
             .unwrap();
-        assert!(en.changed && en.predicted);
-        assert_eq!(*en, state(true, true), "chained reads see the prediction");
+        // A would-change step has no output in check mode (vision 12).
+        assert!(en.changed && !en.is_available());
+        let err = en.output().unwrap_err().to_string();
+        assert!(err.contains("would have changed"), "{err}");
 
         let rs = ctx
             .step("nginx restarted", Restart::new("nginx").daemon_reload(true))
             .unwrap();
-        assert!(rs.changed && !rs.predicted);
-        assert!(!rs.is_available(), "actions predict nothing (vision 12)");
+        assert!(rs.changed && !rs.is_available());
         assert_eq!(
             rs.diff.as_ref().unwrap().render(),
             "systemctl daemon-reload && systemctl restart nginx"
@@ -2058,7 +2195,7 @@ mod tests {
         let fake = Arc::new(with_ok(probes("enabled", "active"), &["restart", "nginx"]));
         let mut ctx = Ctx::new(sys(&fake), HostInfo::local());
         let r = ctx.step("nginx restarted", Restart::new("nginx")).unwrap();
-        assert!(r.changed && !r.predicted);
+        assert!(r.changed);
         assert_eq!(*r, state(true, true));
         assert_eq!(fake.argvs()[0], argv(&["systemctl", "restart", "nginx"]));
 

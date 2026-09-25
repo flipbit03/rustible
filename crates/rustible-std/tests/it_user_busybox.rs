@@ -5,10 +5,11 @@
 //! all. Two of this branch's findings only exist here, so a Fake test is not
 //! enough evidence for either:
 //!
-//! * `user::Present` must not predict a shell it was not given, because
-//!   BusyBox `adduser` takes it from `$SHELL`, else the invoking user's own
-//!   passwd entry, neither of which the op can see. The test shows both
-//!   answers on the same image, so `/bin/sh` was a guess, not a default.
+//! * `user::Present` must not name a shell it was not given in its diff,
+//!   because BusyBox `adduser` takes it from `$SHELL`, else the invoking
+//!   user's own passwd entry, neither of which the op can see. The test
+//!   shows both answers on the same image, so `/bin/sh` was a guess, not a
+//!   default.
 //! * a group named after a new account must become that account's primary
 //!   group, because BusyBox `adduser` dies with "group name is in use" when
 //!   it tries to create a private group that already exists.
@@ -39,35 +40,30 @@ fn passwd_line(ctx: &mut Ctx, name: &str) -> Result<Option<String>> {
 fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
     assert!(ctx.sys().is_root());
 
-    // No `.shell()`: the op must neither predict the account nor name a shell
-    // in the diff, because on BusyBox it cannot know which shell it will get.
-    // Prediction only means anything in check mode, so this claim is made
-    // against a dry `Ctx` over the same real machine; a plain `ctx.step` here
-    // would report `predicted: false` no matter what the op decided, and the
-    // assertion would hold even if the `/bin/sh` guess came back.
+    // No `.shell()`: the op must not name a shell in the diff, because on
+    // BusyBox it cannot know which shell it will get. The diff is what a dry
+    // run shows, so this claim is made against a dry `Ctx` over the same
+    // real machine. A would-change step has no output there (vision 12).
     let mut dry = Ctx::new(
         System::local(true, Arc::new(Collect::default())),
         HostInfo::local(),
     );
-    // uid and gid are pinned in both dry steps (`users` is gid 100 on this
-    // image), so the shell is the only thing left that can block a
-    // prediction. Without one: no prediction, and no `shell=` in the diff.
     let planned = dry.step(
         "dry user without a shell",
         user::Present::new("rustible-ash").uid(4100).gid("users"),
     )?;
     assert!(
-        planned.changed && !planned.predicted,
-        "an unknown shell blocks prediction (vision 12)"
+        planned.changed && !planned.is_available(),
+        "a would-change step has no output in check mode (vision 12)"
     );
     let short = planned.diff.as_ref().unwrap().short();
     assert!(
         !short.contains("shell="),
         "the diff must not name a shell the op was not given: {short}"
     );
-    // With one, everything is knowable and the step predicts. The only
-    // difference between the two steps is `.shell()`, which is what makes the
-    // assertion above a real one rather than a tautology.
+    // With one, the diff names it. The only difference between the two steps
+    // is `.shell()`, which is what makes the assertion above a real one
+    // rather than a tautology.
     let planned = dry.step(
         "dry user with a shell",
         user::Present::new("rustible-ash")
@@ -75,8 +71,7 @@ fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
             .gid("users")
             .shell("/bin/sh"),
     )?;
-    assert!(planned.predicted, "an explicit shell is knowable");
-    assert_eq!(planned.shell, Path::new("/bin/sh"));
+    assert!(planned.changed && !planned.is_available());
     assert!(
         planned
             .diff
@@ -121,7 +116,7 @@ fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
         "and with no $SHELL it took root's, which happens to be /bin/sh here"
     );
 
-    // An explicit shell is still predicted and still applied (`adduser -s`).
+    // An explicit shell is applied (`adduser -s`) and read back.
     let (explicit, _) = changed_then_ok(ctx, "user with a shell", || {
         user::Present::new("rustible-sh").shell("/bin/sh")
     })?;

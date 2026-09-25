@@ -34,9 +34,9 @@ use super::Insert;
 ///
 /// A symbolic link is refused rather than followed, since the atomic rewrite
 /// would replace the link with a regular file, and so is a directory. A
-/// missing file is an error unless `.create(true)`. `check` predicts its
-/// [`LineReport`], so a check-mode run can read `line_no` off a step that
-/// only *would* change.
+/// missing file is an error unless `.create(true)` — except under `--check`,
+/// where an earlier step may create it and the edit is reported as due
+/// (vision 12).
 #[derive(Debug, Clone)]
 pub struct Line {
     path: PathBuf,
@@ -57,8 +57,7 @@ pub struct LineReport {
     /// the write and the report, which nothing here can cause.
     pub line_no: usize,
     /// The copy taken before the rewrite, set only when `.backup(true)` and
-    /// `apply` actually wrote. Always `None` on a satisfied step and on the
-    /// prediction `check` returns, because no copy exists until the write.
+    /// `apply` actually wrote. Always `None` on a satisfied step.
     pub backup_path: Option<PathBuf>,
 }
 
@@ -191,7 +190,9 @@ impl Op for Line {
             Os::Linux | Os::Macos => {}
             ref other => bail!("file::Line has no implementation for {}", other.name()),
         }
-        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
+        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
+            return Ok(super::plan_edit_of_missing("file::Line", &self.path));
+        };
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
             None => {
@@ -203,27 +204,23 @@ impl Op for Line {
                     backup_path: None,
                 }))
             }
-            Some((new_text, line_no)) => Ok(Plan::change_predicting(
-                Diff::text(&self.path, text, new_text),
-                LineReport {
-                    line_no,
-                    backup_path: None,
-                },
-            )),
+            Some((new_text, _)) => Ok(Plan::change(Diff::text(&self.path, text, new_text))),
         }
     }
 
-    fn apply(&self, sys: &System, _change: Change<LineReport>) -> Result<LineReport> {
+    fn apply(&self, sys: &System, _change: Change) -> Result<LineReport> {
         // Re-plan from the current text (cheap, pure) rather than trusting a
         // copy carried in the diff: the file may have moved on since check.
-        let text = super::read_text_or_empty(sys, &self.path, self.create)?;
+        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
+            bail!("{} does not exist; nothing to edit", self.path.display());
+        };
         let Some((after, line_no)) =
             plan_line(&text, self.matching.as_ref(), &self.line, &self.insert)
         else {
             // The file satisfied the op between `check` and here, so nothing
             // is written. Where the line sits is read from the file as it is
-            // now: `check`'s prediction described the text before whatever
-            // changed it, and with duplicates it can name a different line.
+            // now, not from what `check` saw: with duplicates the two can
+            // name different lines.
             return Ok(LineReport {
                 line_no: selected(text.lines(), self.matching.as_ref(), &self.line)
                     .map(|i| i + 1)
@@ -352,7 +349,6 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(change.diff.short(), "+1 -1 lines");
-        assert_eq!(change.predicted.as_ref().unwrap().line_no, 1);
 
         let report = op.apply(&sys, change).unwrap();
         assert_eq!(report.line_no, 1);
@@ -387,24 +383,38 @@ mod tests {
         assert_eq!(report.line_no, 1);
 
         // And apply, reached when the file changed under a stale plan,
-        // agrees rather than falling back to the prediction.
+        // agrees: it reads the file as it stands.
         let change = Change {
             diff: Diff::summary("stale"),
-            predicted: Some(LineReport {
-                line_no: 99,
-                backup_path: None,
-            }),
         };
         assert_eq!(op.apply(&sys, change).unwrap().line_no, 1);
     }
 
+    /// A real run refuses a missing file. A dry run does not (vision 12): an
+    /// earlier step may create it (a package shipping its config, a
+    /// `file::Copy`), so the edit is reported as due, without a text diff
+    /// since there is no text yet.
     #[test]
-    fn line_op_fails_on_missing_file_without_create() {
+    fn line_op_fails_on_missing_file_without_create_except_under_check() {
         let fake = Arc::new(Fake::new());
         let sys = fake_sys(&fake);
         let op = Line::in_path("/nope").set("x");
-        let err = op.check(&sys).unwrap_err().to_string();
-        assert!(err.contains("does not exist"), "{err}");
+        let err = op.check(&sys).unwrap_err().chain();
+        assert!(
+            err.contains("/nope does not exist (use .create(true) to create it)"),
+            "{err}"
+        );
+
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = op.check(&dry).unwrap() else {
+            panic!("expected would change")
+        };
+        assert_eq!(
+            c.diff.render(),
+            "/nope: does not exist yet; file::Line would edit it once an earlier step \
+             creates it (or use .create(true) to create it here)"
+        );
+        assert!(fake.file("/nope").is_none());
     }
 
     #[test]
@@ -429,7 +439,7 @@ mod tests {
                 sys.write_atomic("/x", b"oops")?;
                 Ok(Plan::Satisfied(()))
             }
-            fn apply(&self, _: &System, _: Change<()>) -> Result<()> {
+            fn apply(&self, _: &System, _: Change) -> Result<()> {
                 Ok(())
             }
         }
@@ -443,37 +453,33 @@ mod tests {
         assert!(fake.content("/x").is_none());
     }
 
+    /// Vision 12, the rule itself: a step that would change has no output
+    /// in check mode. `.changed` and `.diff` stay readable, `is_available()`
+    /// says so, and reading the output is a clear error naming the step.
     #[test]
-    fn check_mode_output_unavailable_unless_predicted() {
+    fn a_would_change_step_has_no_output_in_check_mode() {
         let fake = Arc::new(Fake::new().with_file("/f", "a\n"));
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_check_mode(true);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
 
-        // Line predicts, so its output is available in check mode.
         let r = ctx.step("line", Line::in_path("/f").set("b")).unwrap();
-        assert!(r.changed && r.predicted && r.is_available());
-        assert_eq!(r.line_no, 2);
+        assert!(r.changed && !r.is_available());
+        assert_eq!(r.diff.as_ref().unwrap().short(), "+1 -0 lines");
+        let err = r.output().unwrap_err().to_string();
+        assert!(
+            err.contains("would have changed") && err.contains("unavailable in check mode"),
+            "{err}"
+        );
         assert_eq!(
             fake.content("/f").unwrap(),
             "a\n",
             "check mode must not write"
         );
 
-        // An op that does not predict: output unavailable.
-        struct NoPredict;
-        impl Op for NoPredict {
-            type Output = u32;
-            fn check(&self, _: &System) -> Result<Plan<u32>> {
-                Ok(Plan::change(Diff::summary("would do it")))
-            }
-            fn apply(&self, _: &System, _: Change<u32>) -> Result<u32> {
-                Ok(7)
-            }
-        }
-        let r = ctx.step("np", NoPredict).unwrap();
-        assert!(r.changed && !r.is_available());
-        let err = r.output().unwrap_err().to_string();
-        assert!(err.contains("unavailable in check mode"), "{err}");
+        // A satisfied step is unaffected: its output is what the machine has.
+        let r = ctx.step("line", Line::in_path("/f").set("a")).unwrap();
+        assert!(!r.changed && r.is_available());
+        assert_eq!(r.line_no, 1);
     }
 }
