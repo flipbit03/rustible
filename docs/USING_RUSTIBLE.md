@@ -1170,7 +1170,8 @@ Three things to know:
   `user::Present` whose group is not there yet, keys for an account that does
   not exist yet, a `systemd::Enabled` for a unit no package has installed
   yet, a `file::Line` in a file nothing has written yet: each reports `would
-  change`, and its diff shows the state it would set. If the earlier step is
+  change`; its diff shows the state it would set, or says what it is waiting
+  for. If the earlier step is
   actually missing from the playbook, the **real** run refuses at that step,
   before that step touches anything but after the steps before it have run —
   so a dry run does not catch a forgotten `group::Present`; the real run

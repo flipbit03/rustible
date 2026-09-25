@@ -31,7 +31,8 @@ pub trait Op {
     /// group, an account, its home, a parent directory, a unit — is refused
     /// here in a real run and tolerated under [`System::check_mode`], where
     /// the step reports `would change` and its diff shows the state it would
-    /// set. A real run's `check` runs with check mode off and takes the
+    /// set or says what it waits for. A real run's `check` runs with check
+    /// mode off and takes the
     /// refusal, and a dry run's plan never reaches `apply`, so the refusal
     /// is never skipped on a run that can act (vision doc 6.7, 12).
     /// A refusal about the machine or the request itself — wrong platform,

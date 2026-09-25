@@ -194,11 +194,17 @@ pub fn parse_is_enabled(stdout: &str, exit: i32, stderr: &str) -> Result<Enabled
     if word.is_empty() && exit != 0 {
         let e = stderr.trim();
         let lower = e.to_ascii_lowercase();
-        let says_not_found = e.is_empty()
-            || lower.contains("no such file or directory")
-            || lower.contains("not found")
-            || lower.contains("not-found")
-            || lower.contains("could not be found");
+        // A bus failure ends in the same `No such file or directory` a
+        // missing unit does (`Failed to connect to bus: No such file or
+        // directory` when the user manager is not running), so it is ruled
+        // out first.
+        let could_not_answer = lower.contains("failed to connect to");
+        let says_not_found = !could_not_answer
+            && (e.is_empty()
+                || lower.contains("no such file or directory")
+                || lower.contains("not found")
+                || lower.contains("not-found")
+                || lower.contains("could not be found"));
         if !says_not_found {
             bail!("`systemctl is-enabled` failed without an answer (exit {exit}): {e}");
         }
@@ -1093,6 +1099,14 @@ mod tests {
             .to_string();
         assert!(err.contains("failed without an answer (exit 1)"), "{err}");
         assert!(err.contains("Failed to connect to bus"), "{err}");
+        // The bus failure that ends in the not-found phrase: still an error.
+        for stderr in [
+            "Failed to connect to bus: No such file or directory\n",
+            "Failed to connect to user scope bus via local transport: No such file or directory\n",
+        ] {
+            let err = parse_is_enabled("", 1, stderr).unwrap_err().to_string();
+            assert!(err.contains("failed without an answer"), "{stderr}: {err}");
+        }
         // Empty stdout with exit 0 is not a known state.
         assert_eq!(
             parse_is_enabled("", 0, "").unwrap(),

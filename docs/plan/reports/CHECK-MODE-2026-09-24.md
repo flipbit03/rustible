@@ -171,9 +171,10 @@ Added text:
 run could create — a group, an account, its home, a parent directory, a unit
 file — is verified when the run is about to act, not while it is only
 looking: under `--check` the op reports `would change`, its diff showing the
-state it would set, and a real run refuses exactly as this rule says,
-because its `check` runs with check mode off and a dry run's plan never
-reaches `apply`. Section 12 has the reasoning and the limits.
+state it would set or saying what it waits for, and a real run refuses
+exactly as this rule says, because its `check` runs with check mode off and
+a dry run's plan never reaches `apply`. Section 12 has the reasoning and the
+limits.
 ```
 
 ### Hunk 5 — §11.1, the check-mode bullet
@@ -267,8 +268,9 @@ a later step reads what a dry run could not produce.
   `check` would refuse for want of a resource another op in the same run
   could create — a group, an account, its home, a parent directory, a unit —
   reports `would change` under check mode instead; its diff shows the state
-  it would set, which names the prerequisite when the op knows it by name (a
-  group, an account, a unit). The tolerance is gated on check mode, so a
+  it would set, or says what it waits for, and names the prerequisite when
+  the op knows it by name (a group, an account, a unit). The tolerance is
+  gated on check mode, so a
   real run's `check` takes the refusal, and a dry run's plan never reaches
   `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
   skipped on a run that can act. What a dry run therefore does not catch is
@@ -411,9 +413,9 @@ Against the acceptance criteria in section 4:
    `System` has no planned list; `Plan::change(diff)` is the only
    constructor.
 3. **`make` green**: `cargo fmt --all --check`, `cargo clippy --workspace
-   --all-targets -- -D warnings`, `cargo test --workspace` (392 tests in
-   `rustible-std`, 78 in `rustible-sdk`, 33 in `rustible-github`, plus the
-   CLI's), `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+   --all-targets -- -D warnings`, `cargo test --workspace` (394 tests in
+   `rustible-std`, 79 in `rustible-sdk`, 33 in `rustible-github`, plus the
+   CLI's, after the review fixes), `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
    --lib`, and `cargo build --manifest-path examples/workspace/Cargo.toml`.
 4. **`make integration` green** (docker, `--no-fail-fast`): every `it_*`
    binary passed. Four container test files changed: three for their

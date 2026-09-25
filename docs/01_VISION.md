@@ -744,9 +744,10 @@ destination, is a prerequisite and is refused.
 run could create — a group, an account, its home, a parent directory, a unit
 file — is verified when the run is about to act, not while it is only
 looking: under `--check` the op reports `would change`, its diff showing the
-state it would set, and a real run refuses exactly as this rule says,
-because its `check` runs with check mode off and a dry run's plan never
-reaches `apply`. Section 12 has the reasoning and the limits.
+state it would set or saying what it waits for, and a real run refuses
+exactly as this rule says, because its `check` runs with check mode off and
+a dry run's plan never reaches `apply`. Section 12 has the reasoning and the
+limits.
 
 ### 6.8 Translations of real Ansible modules
 
@@ -1653,8 +1654,9 @@ a later step reads what a dry run could not produce.
   `check` would refuse for want of a resource another op in the same run
   could create — a group, an account, its home, a parent directory, a unit —
   reports `would change` under check mode instead; its diff shows the state
-  it would set, which names the prerequisite when the op knows it by name (a
-  group, an account, a unit). The tolerance is gated on check mode, so a
+  it would set, or says what it waits for, and names the prerequisite when
+  the op knows it by name (a group, an account, a unit). The tolerance is
+  gated on check mode, so a
   real run's `check` takes the refusal, and a dry run's plan never reaches
   `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
   skipped on a run that can act. What a dry run therefore does not catch is

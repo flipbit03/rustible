@@ -673,6 +673,36 @@ fn planned_attrs(
     (None, None)
 }
 
+/// Under `--check`, the directory a plan with nothing else to do is waiting
+/// on: the account's home (user forms) or the file's parent (`in_file`),
+/// when it is not there yet. With no key to write and no file to fix such a
+/// plan would otherwise be `ok`, which says "already satisfied" about a
+/// machine where a real run refuses today; `would change`, saying what it
+/// waits for, is the honest answer (vision 12). `None` outside check mode
+/// and whenever the directory exists.
+fn waiting_on_under_check(sys: &System, resolved: &Resolved) -> Result<Option<Diff>> {
+    if !sys.check_mode() {
+        return Ok(None);
+    }
+    let dir = match &resolved.ssh_dir {
+        Some(ssh) => ssh.parent(),
+        None => resolved.path.parent(),
+    }
+    .filter(|p| !p.as_os_str().is_empty());
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    if sys.stat_follow(dir)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(Diff::summary(format!(
+        "{}: does not exist yet; ssh::authorized_keys would manage {} once an earlier step \
+         creates it",
+        dir.display(),
+        resolved.path.display()
+    ))))
+}
+
 /// The attribute changes for an existing `~/.ssh`, and none when the op owns
 /// no directory. Unlike [`plan_ssh_dir`] this never plans a creation: its
 /// caller has already found the file, so the directory holding it is there.
@@ -956,6 +986,9 @@ impl Op for Present {
         // reaches exactly that case: it warns when a GitHub login has no
         // public keys and then runs this op with an empty list.
         if text.is_none() && before_stat.is_none() && dir.create.is_some() {
+            if let Some(waiting) = waiting_on_under_check(sys, &resolved)? {
+                return Ok(Plan::change(waiting));
+            }
             return Ok(Plan::Satisfied(report));
         }
 
@@ -1006,6 +1039,9 @@ impl Op for Present {
             });
         }
         let Some(diff) = Diff::many(parts) else {
+            if let Some(waiting) = waiting_on_under_check(sys, &resolved)? {
+                return Ok(Plan::change(waiting));
+            }
             return Ok(Plan::Satisfied(report));
         };
         Ok(Plan::change(diff))
@@ -1015,15 +1051,23 @@ impl Op for Present {
         let resolved = self.target.resolve(sys)?;
         ensure_same_target(&resolved, &change.diff)?;
         // The output is what the pure plan says against the text the diff
-        // was planned on, so it describes exactly what this step writes; an
-        // attributes-only plan carries no text, and reads the file instead.
+        // was planned on, so it describes exactly what this step writes. An
+        // attributes-only plan carries no text because `check` found every
+        // key already there: say so, as requested, rather than re-read a
+        // file this step does not write and report a change it did not make.
         let keys = parse_keys(&self.keys)?;
-        let before = match planned_before(&change.diff) {
-            Some(text) => Some(text.to_string()),
-            None => read_existing(sys, &resolved.path)?.map(|(text, _)| text),
+        let mut report = match planned_before(&change.diff) {
+            Some(text) => {
+                plan_present(text, &keys, self.exclusive)
+                    .into_report(resolved.path.clone())
+                    .1
+            }
+            None => KeysReport {
+                path: resolved.path.clone(),
+                already_present: dedupe(&keys),
+                ..Default::default()
+            },
         };
-        let (_, mut report) = plan_present(before.as_deref().unwrap_or(""), &keys, self.exclusive)
-            .into_report(resolved.path.clone());
 
         // The directory first: the file goes inside it. Whether it is to be
         // created is what the diff says.
@@ -2099,6 +2143,59 @@ mod tests {
             c.diff.render()
         );
         assert!(fake.file("/home/cadu").is_none());
+    }
+
+    /// With nothing to write, a home (user form) or parent (`in_file`) that
+    /// is not there yet is still `would change` under --check, never `ok`
+    /// with an output: a real run refuses it today, and `ok` would claim the
+    /// step is already satisfied on a machine where it is not.
+    #[test]
+    fn under_check_nothing_to_write_still_waits_on_a_missing_home_or_parent() {
+        let fake = Arc::new(Fake::new().with_file("/etc/passwd", PASSWD));
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let none = Vec::<String>::new;
+
+        let Plan::Change(c) = Present::for_user_name("cadu")
+            .keys(none())
+            .check(&dry)
+            .unwrap()
+        else {
+            panic!("would change, not ok")
+        };
+        assert_eq!(
+            c.diff.render(),
+            "/home/cadu: does not exist yet; ssh::authorized_keys would manage \
+             /home/cadu/.ssh/authorized_keys once an earlier step creates it"
+        );
+        let err = Present::for_user_name("cadu")
+            .keys(none())
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("home directory /home/cadu does not exist"),
+            "{err}"
+        );
+
+        let Plan::Change(c) = Present::in_file("/etc/ssh/keys/root")
+            .keys(none())
+            .check(&dry)
+            .unwrap()
+        else {
+            panic!("would change, not ok")
+        };
+        assert_eq!(
+            c.diff.render(),
+            "/etc/ssh/keys: does not exist yet; ssh::authorized_keys would manage \
+             /etc/ssh/keys/root once an earlier step creates it"
+        );
+        let err = Present::in_file("/etc/ssh/keys/root")
+            .keys(none())
+            .check(&fake_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("/etc/ssh/keys does not exist"), "{err}");
+        assert!(fake.file("/home/cadu").is_none() && fake.file("/etc/ssh/keys").is_none());
     }
 
     /// `stat_follow` reports a dangling symlink as absent, so without an
