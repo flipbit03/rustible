@@ -38,16 +38,16 @@ the group, the home's parent, or anything else; `ansible.posix`'s
 `authorized_key` does not look at the directory under check mode
 (`keyfile()`: `if not write or module.check_mode: return keysfile`). A step
 that would create something reports `changed` and asks no further questions;
-prerequisites are verified when the run is about to act. Applied
-consistently, the rule takes Rustible further than Ansible in two places,
-both deliberate: `user.py` still refuses a missing group when the account
-already *exists* (`modify_user_usermod` checks it before anything that
-respects check mode), and `authorized_key` fails a dry run outright when the
-user does not exist and no path was given ("Either user must exist or you
-must provide full path to key file in check mode"), which fails the dry run
-of every first provision. Rustible reports `would change` for both. It also
-keeps the part Ansible lacks: reading a would-change step's output fails
-loudly instead of yielding garbage.
+prerequisites are verified when the run is about to act. Where the rule
+could have been read more broadly, Ansible's behaviour is authoritative
+(Cadu, 2026-09-24, after the review round below had shown the first cut went
+further): `user.py` refuses a missing group when the account already
+*exists* (`modify_user_usermod` checks it before anything that respects check
+mode), and `authorized_key` fails a dry run outright when the user does not
+exist and no path was given ("Either user must exist or you must provide
+full path to key file in check mode"). Rustible refuses both under `--check`
+too. It also keeps the part Ansible lacks: reading a would-change step's
+output fails loudly instead of yielding garbage.
 
 ## 2. The amendment to `docs/01_VISION.md`
 
@@ -340,9 +340,12 @@ Standard library (`rustible-std`) and `rustible-github`:
   name the group in the diff and go on; otherwise refuse as today".
 - `ssh::authorized_keys`: the missing-home tolerance from `[ISSUE-40]` stays,
   now as an instance of the §12 rule; the `in_file` missing-parent arm flips
-  from a differently-worded refusal to a tolerance; and `for_user_name` on an
-  account not in `/etc/passwd` yet is deferred (`Target::deferred_under_check`),
-  which is new.
+  from a differently-worded refusal to a tolerance. `for_user_name` on an
+  account not in `/etc/passwd` is refused in both modes, as Ansible refuses
+  it (a first cut deferred it; reverted on Cadu's decision).
+- `user::Present` and `user::Membership` defer a missing group only for an
+  account that does not exist yet; an existing account's missing group is
+  refused in both modes, as Ansible refuses it (same decision).
 - New check-mode tolerances, each gated on `sys.check_mode()`: `file::Attrs`
   on a missing path, `file::Line`/`file::Block` on a missing file without
   `.create(true)`, `sysctl::Present` without `/etc/sysctl.d`,
@@ -440,16 +443,18 @@ Against the acceptance criteria in section 4:
    `crates/rustible-std/tests/it_user_group.rs` rather than a new file (one
    file per musl build, so cases go into an existing one): a dry `Ctx` over
    `debian:12`/`ubuntu:24.04` runs `group::Present` → `user::Present` with
-   `.groups(..)` → `authorized_keys::Present::for_user_name` → `Membership`
-   → `Membership::of_name` for a user not there yet either →
+   `.groups(..)` → `Membership::of_name` for a user not there yet →
    `group::Present.gid(4343)` → `user::Present.gid("rustible-dry2")`, every
    step `would change`, none with an output, the last diff naming
-   `group=rustible-dry2`; then the two steps whose prerequisite is missing
-   (the user in a missing group, the keys for a missing user) refuse through
-   the real `Ctx` (`does not exist`, `does not exist in /etc/passwd`) and
-   nothing was created. The real provisioning — group, user, keys for that
-   user through `for_user(&account)`, membership — is the rest of the same
-   test, `changed` then `ok`.
+   `group=rustible-dry2`. In the same dry run the two steps Ansible refuses
+   under check mode refuse here too: `authorized_keys::Present::for_user_name`
+   for a user not there yet (`does not exist in /etc/passwd`) and
+   `Membership::of` an existing account in a missing group (`does not
+   exist`). Then the user step whose group is missing, and the keys step,
+   refuse through the real `Ctx` and nothing was created. The real
+   provisioning — group, user, keys for that user through
+   `for_user(&account)`, membership — is the rest of the same test, `changed`
+   then `ok`.
 7. **Docs say the rule once each**: `docs/USING_RUSTIBLE.md` §9 and §15,
    `CLAUDE.md` (the op-writing bullets and the testing trap), `README.md`,
    `docs/06_BUILD_PLAN.md` §4; no "so `--check` can predict" remains.

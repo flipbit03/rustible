@@ -331,7 +331,9 @@ pub struct KeysReport {
     /// Keys this step deleted, as they were in the file (options and comment
     /// included).
     pub removed: Vec<PublicKey>,
-    /// Requested keys that were already there, as they are in the file.
+    /// Requested keys that were already there, as they are in the file — or
+    /// as requested, when `apply` only repaired attributes and so had no
+    /// reason to read the file again.
     pub already_present: Vec<PublicKey>,
     /// Keys asked to be absent that were not in the file, as requested.
     pub not_present: Vec<PublicKey>,
@@ -392,36 +394,13 @@ fn ensure_absolute_home(home: &Path) -> Result<()> {
 }
 
 impl Target {
-    /// Under `--check`, the plan for a user that is not in `/etc/passwd`
-    /// yet: an earlier `user::Present` in the run may create it, and a dry
-    /// run verifies such a prerequisite only when it is about to act
-    /// (vision 12). `None` when the account is there, or outside check
-    /// mode, where [`Target::resolve`] refuses as before. Only [`Present`]
-    /// asks: revoking keys from an account that does not exist is a refusal
-    /// in both modes, since no step in the run can make it meaningful.
-    ///
-    /// This goes further than Ansible: `ansible.posix.authorized_key` fails
-    /// a check-mode run outright when the user does not exist and no path
-    /// was given ("Either user must exist or you must provide full path to
-    /// key file in check mode"), which fails the dry run of every first
-    /// provision. Deferring is the vision 12 rule applied consistently.
-    fn deferred_under_check(&self, sys: &System, keys: usize) -> Result<Option<Diff>> {
-        let Target::User(name) = self else {
-            return Ok(None);
-        };
-        if !sys.check_mode() || sys.facts().os != Os::Linux {
-            return Ok(None);
-        }
-        let passwd = sys.read_to_string("/etc/passwd")?;
-        if crate::user::lookup_user(&passwd, name)?.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(Diff::summary(format!(
-            "user `{name}` does not exist yet; ssh::authorized_keys would manage \
-             ~{name}/.ssh/authorized_keys ({keys} key(s)) once an earlier step creates it"
-        ))))
-    }
-
+    /// A user that is not in `/etc/passwd` is refused in both modes, under
+    /// `--check` too: `ansible.posix.authorized_key` does the same ("Either
+    /// user must exist or you must provide full path to key file in check
+    /// mode"), and Ansible's behaviour is authoritative here (vision 12). A
+    /// dry run of a first provision therefore stops at the keys step; chain
+    /// from `user::Present` with `for_user(&account)` behind
+    /// `is_available()`, or dry-run once the account exists.
     fn resolve(&self, sys: &System) -> Result<Resolved> {
         match self {
             Target::File(path) => Ok(Resolved {
@@ -959,9 +938,6 @@ impl Op for Present {
 
     fn check(&self, sys: &System) -> Result<Plan<KeysReport>> {
         let keys = parse_keys(&self.keys)?;
-        if let Some(diff) = self.target.deferred_under_check(sys, keys.len())? {
-            return Ok(Plan::change(diff));
-        }
         let resolved = self.target.resolve(sys)?;
         let dir = plan_ssh_dir(sys, &resolved)?;
         let existing = read_existing(sys, &resolved.path)?;
@@ -1983,52 +1959,39 @@ mod tests {
         assert!(err.contains("user `ghost` does not exist"), "{err}");
     }
 
-    /// Under `--check` the account an earlier `user::Present` would create is
-    /// not there yet, and a dry run verifies such a prerequisite only when it
-    /// is about to act (vision 12): `Present` reports the file it would
-    /// manage, `Absent` still refuses, since no step can make revoking keys
-    /// from a missing account meaningful. The real run keeps both refusals.
+    /// An account that is not in `/etc/passwd` is refused by both ops in both
+    /// modes, `--check` included: `ansible.posix.authorized_key` fails a
+    /// check-mode run for a missing user too, and Ansible's behaviour is
+    /// authoritative here (vision 12). The dry run of a first provision
+    /// therefore stops at the keys step unless it chains from the user step
+    /// behind `is_available()`.
     #[test]
-    fn under_check_a_missing_user_is_tolerated_by_present_and_still_refused_by_absent() {
+    fn a_missing_user_is_refused_in_both_modes_as_ansible_does() {
         let fake = fake_with_user();
-        let dry = fake_sys(&fake).with_check_mode(true);
-
-        let Plan::Change(c) = Present::for_user_name("app")
-            .keys([K1, K2])
-            .check(&dry)
-            .unwrap()
-        else {
-            panic!("a dry run of a first provision must not fail")
-        };
-        assert_eq!(
-            c.diff.render(),
-            "user `app` does not exist yet; ssh::authorized_keys would manage \
-             ~app/.ssh/authorized_keys (2 key(s)) once an earlier step creates it"
-        );
+        for sys in [fake_sys(&fake).with_check_mode(true), fake_sys(&fake)] {
+            let err = Present::for_user_name("app")
+                .keys([K1, K2])
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains(
+                    "user `app` does not exist in /etc/passwd; ssh::authorized_keys does not \
+                     create users, use user::Present first"
+                ),
+                "{err}"
+            );
+            let err = Absent::for_user_name("app")
+                .keys([K1])
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains("user `app` does not exist in /etc/passwd"),
+                "{err}"
+            );
+        }
         assert!(fake.file("/home/app").is_none(), "nothing was created");
-
-        let err = Absent::for_user_name("app")
-            .keys([K1])
-            .check(&dry)
-            .unwrap_err()
-            .chain();
-        assert!(
-            err.contains("user `app` does not exist in /etc/passwd"),
-            "{err}"
-        );
-
-        let err = Present::for_user_name("app")
-            .keys([K1])
-            .check(&fake_sys(&fake))
-            .unwrap_err()
-            .chain();
-        assert!(
-            err.contains(
-                "user `app` does not exist in /etc/passwd; ssh::authorized_keys does not \
-                 create users, use user::Present first"
-            ),
-            "{err}"
-        );
     }
 
     /// The headline of issue #40: the step that used to refuse now does the
@@ -2401,6 +2364,40 @@ mod tests {
             format!("# keys\n{K1}\n{K3}\n")
         );
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// An attributes-only plan carries no text, and `apply` writes none: its
+    /// report says what `check` established (every key already there, as
+    /// requested) even when the file moved on in between, rather than
+    /// re-reading it and reporting a key it never wrote.
+    #[test]
+    fn attributes_only_apply_reports_what_check_found_not_what_the_file_says_now() {
+        let fake = fake_with_wrong_attributes();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1, K2]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("the attributes are wrong")
+        };
+        assert!(
+            planned_text(&c.diff).is_none(),
+            "attributes only: {}",
+            c.diff.short()
+        );
+        // Someone removes K1 between check and apply.
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new("/home/cadu/.ssh/authorized_keys"),
+            format!("{K2}\n").as_bytes(),
+        )
+        .unwrap();
+        let r = op.apply(&sys, c).unwrap();
+        assert!(r.added.is_empty() && r.removed.is_empty(), "{r:?}");
+        assert_eq!(r.already_present, vec![key(K1), key(K2)]);
+        assert_eq!(
+            fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
+            format!("{K2}\n"),
+            "apply wrote no content"
+        );
     }
 
     /// A `.ssh` and a key file left wrong by a careless hand, carrying two

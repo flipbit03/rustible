@@ -1,10 +1,10 @@
 //! Docker integration test for `user` and `group` (vision 8, tier 3): the
 //! real `groupadd`/`useradd`/`usermod`/`userdel` as root, with `/etc/passwd`
 //! and `/etc/group` checked afterwards, plus a check-mode dry run of the
-//! fresh-host shape (group, then the user, keys and membership that depend
-//! on it) over the real machine, which is the proof of vision 12's rule
-//! that a dry run does not refuse a prerequisite an earlier step would
-//! create.
+//! fresh-host shape (group, then the user and membership that depend on it)
+//! over the real machine, which is the proof of vision 12's rule that a dry
+//! run does not refuse a prerequisite an earlier step would create — and of
+//! the two places Ansible refuses anyway, which Rustible refuses too.
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group`.
 
 use std::path::Path;
@@ -164,18 +164,31 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         user::Present::new("rustible-dry-usr").groups(["rustible-dry"]),
     )?;
     assert!(dry_user.changed && !dry_user.is_available());
-    let dry_keys = dry.step(
-        "dry keys for a user not there yet",
-        authorized_keys::Present::for_user_name("rustible-dry-usr").keys([KEY]),
-    )?;
-    assert!(dry_keys.changed && !dry_keys.is_available());
+    // Two places where Ansible refuses even under check mode, and so does
+    // Rustible: keys for an account that does not exist (`authorized_key`:
+    // "Either user must exist or you must provide full path to key file in
+    // check mode"), and an existing account's missing group (`user.py`
+    // validates it before anything that respects check mode).
+    let err = dry
+        .step(
+            "dry keys for a user not there yet",
+            authorized_keys::Present::for_user_name("rustible-dry-usr").keys([KEY]),
+        )
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("does not exist in /etc/passwd"), "{err}");
+    let err = dry
+        .step(
+            "dry membership of an existing user in a group not there yet",
+            user::Membership::of(&account).in_group_named("rustible-dry"),
+        )
+        .unwrap_err()
+        .chain();
+    assert!(err.contains("group `rustible-dry` does not exist"), "{err}");
+    // A user not there yet is deferred whatever its group's state: Ansible
+    // reports a new account `changed` without validating its groups.
     let member = dry.step(
-        "dry membership in a group not there yet",
-        user::Membership::of(&account).in_group_named("rustible-dry"),
-    )?;
-    assert!(member.changed && !member.is_available());
-    let member = dry.step(
-        "dry membership of a user not there yet either",
+        "dry membership of a user not there yet",
         user::Membership::of_name("rustible-dry-usr").in_group_named("rustible-dry"),
     )?;
     assert!(member.changed && !member.is_available());

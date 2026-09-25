@@ -1166,18 +1166,21 @@ Three things to know:
   `Deref`, panics (§9). Guard with `.is_available()`, or write the next step
   so it does not need the value (`for_user_name("deploy")` instead of
   `for_user(&deploy)`).
-- **A prerequisite an earlier step could create is not refused.** A
-  `user::Present` whose group is not there yet, keys for an account that does
-  not exist yet, a `systemd::Enabled` for a unit no package has installed
-  yet, a `file::Line` in a file nothing has written yet: each reports `would
-  change`; its diff shows the state it would set, or says what it is waiting
-  for. If the earlier step is
-  actually missing from the playbook, the **real** run refuses at that step,
-  before that step touches anything but after the steps before it have run —
-  so a dry run does not catch a forgotten `group::Present`; the real run
-  does, and stops there. Refusals about the machine itself (not root, wrong
-  platform, a masked unit, no `usermod` on BusyBox, a sysctl key this kernel
-  lacks) hold in both modes.
+- **A prerequisite an earlier step could create is not refused.** A new
+  `user::Present` whose group is not there yet, a `systemd::Enabled` for a
+  unit no package has installed yet, a `file::Line` in a file nothing has
+  written yet: each reports `would change`; its diff shows the state it would
+  set, or says what it is waiting for. If the earlier step is actually
+  missing from the playbook, the **real** run refuses at that step, before
+  that step touches anything but after the steps before it have run — so a
+  dry run does not catch a forgotten `group::Present`; the real run does, and
+  stops there. Two things are refused under `--check` anyway, because Ansible
+  refuses them: an **existing** account's missing group, and
+  `authorized_keys` for an account that does not exist yet (chain from the
+  `user::Present` step with `for_user(&account)` behind `is_available()`, or
+  dry-run again once the account exists). Refusals about the machine itself
+  (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
+  key this kernel lacks) hold in both modes.
 - ⚠️ **`apt::Latest::update_cache(..)` refreshes the package lists even in
   check mode**, because its answer is read from them. That is the one place
   `--check` is not entirely read-only, and the run says so when it happens.

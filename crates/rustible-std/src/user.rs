@@ -11,10 +11,12 @@
 //! take different flags and cannot modify an existing account's attributes.
 //! Nothing here creates a group (vision 6.7): a `.groups([..])` or `.gid(..)`
 //! naming a missing group fails at `check`; use `group::Present` first. Under
-//! `--check` it does not fail: an earlier `group::Present` in the run may
-//! create the group, and a dry run verifies such a prerequisite only when it
-//! is about to act (vision 12), so the step reports `would change` with the
-//! group named in its diff and the real run refuses if it is really missing.
+//! `--check`, for an account that does not exist yet, it does not fail: an
+//! earlier `group::Present` in the run may create the group, so the step
+//! reports `would change` with the group named in its diff and the real run
+//! refuses if it is really missing. An existing account's missing group is
+//! refused in both modes. Both halves are what Ansible's `user` does (vision
+//! 12).
 
 use std::path::PathBuf;
 
@@ -145,8 +147,9 @@ pub enum GroupId {
     /// when no group carries it.
     Id(u32),
     /// A group name, from `.gid("docker")`. Resolved against `/etc/group` at
-    /// `check`; under `--check` a name not there yet is carried into the diff
-    /// as `group=<name>`, since an earlier step may create it (vision 12).
+    /// `check`; under `--check`, for an account that does not exist yet, a
+    /// name not there yet is carried into the diff as `group=<name>`, since
+    /// an earlier step may create it (vision 12).
     Name(String),
 }
 
@@ -175,8 +178,9 @@ impl From<&Group> for GroupId {
 }
 
 /// The requested primary group as `check` resolved it: an existing group
-/// (gid known) or, under `--check`, one not on the machine yet that an
-/// earlier step may create (gid known only when it was asked for by number).
+/// (gid known) or, under `--check` for an account that does not exist yet,
+/// one not on the machine yet that an earlier step may create (gid known
+/// only when it was asked for by number).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Primary {
     name: String,
@@ -491,9 +495,12 @@ struct Inspection {
 ///
 /// Check mode (vision 12): a step that would change has no output, so a
 /// dry run that chains from this step stops at the first read with a clear
-/// message. A group named in `groups` or `gid` that is not on the machine
-/// yet is not refused there — an earlier `group::Present` in the run may
-/// create it — and appears in the diff by name; the real run refuses it.
+/// message. For an account that does not exist yet, a group named in
+/// `groups` or `gid` that is not on the machine yet is not refused there —
+/// an earlier `group::Present` in the run may create it — and appears in
+/// the diff by name; the real run refuses it. For an existing account a
+/// missing group is refused in both modes. This is Ansible's `user`
+/// behaviour in both cases.
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,
@@ -596,12 +603,19 @@ impl Present {
         self
     }
 
-    /// The primary group, which must exist (vision 6.7). Under `--check` a
-    /// missing one is named in the diff and not refused: an earlier
-    /// `group::Present` in the run may create it, and a dry run verifies a
-    /// prerequisite another step could supply only when it is about to act
-    /// (vision 12). The real run runs `check` with check mode off and refuses.
-    fn resolve_primary(&self, sys: &System, group_text: &str) -> Result<Option<Primary>> {
+    /// The primary group, which must exist (vision 6.7). Under `--check`,
+    /// for an account that does not exist yet, a missing one is named in the
+    /// diff and not refused: an earlier `group::Present` in the run may
+    /// create it, and Ansible's `user` validates nothing before it reports
+    /// a new account `changed` in check mode. For an existing account it is
+    /// refused in both modes, as Ansible refuses it (vision 12).
+    fn resolve_primary(
+        &self,
+        sys: &System,
+        group_text: &str,
+        is_new: bool,
+    ) -> Result<Option<Primary>> {
+        let deferred = is_new && sys.check_mode();
         Ok(match &self.gid {
             None => None,
             Some(GroupId::Id(gid)) => match group_by_gid(group_text, *gid) {
@@ -609,7 +623,7 @@ impl Present {
                     name: g.name,
                     gid: Some(g.gid),
                 }),
-                None if sys.check_mode() => Some(Primary {
+                None if deferred => Some(Primary {
                     name: gid.to_string(),
                     gid: Some(*gid),
                 }),
@@ -623,7 +637,7 @@ impl Present {
                     name: g.name,
                     gid: Some(g.gid),
                 }),
-                None if sys.check_mode() => Some(Primary {
+                None if deferred => Some(Primary {
                     name: name.clone(),
                     gid: None,
                 }),
@@ -671,18 +685,21 @@ impl Present {
         let passwd = sys.read_to_string("/etc/passwd")?;
         let group_text = sys.read_to_string("/etc/group")?;
 
-        // A missing supplementary group is refused, except under --check,
-        // where an earlier step may create it (vision 12).
+        let current = lookup_user(&passwd, &self.name)?;
+        // A missing supplementary group is refused, except under --check for
+        // an account that does not exist yet, where an earlier step may
+        // create it; an existing account's is refused in both modes, as
+        // Ansible refuses it (vision 12).
+        let deferred = sys.check_mode() && current.is_none();
         for g in self.groups.iter().flatten() {
-            if lookup_group(&group_text, g)?.is_none() && !sys.check_mode() {
+            if lookup_group(&group_text, g)?.is_none() && !deferred {
                 bail!(
                     "group `{g}` does not exist; user::Present does not create groups, use \
                      group::Present first"
                 );
             }
         }
-        let current = lookup_user(&passwd, &self.name)?;
-        let mut primary = self.resolve_primary(sys, &group_text)?;
+        let mut primary = self.resolve_primary(sys, &group_text, current.is_none())?;
         if primary.is_none() && current.is_none() {
             primary = self.same_named_group(&group_text)?;
         }
@@ -713,29 +730,18 @@ impl Present {
             ),
             None => Delta::default(),
         };
-        // Under --check a primary group not on the machine yet resolves with
-        // no gid, so the delta cannot carry it; it is still a gid change that
-        // needs usermod, and the machine lacking usermod is a refusal in
-        // both modes (vision 12).
-        let pending_gid = current.is_some() && matches!(primary, Some(Primary { gid: None, .. }));
-        if current.is_some()
-            && (delta.changes_attributes() || pending_gid)
-            && Tools::of(sys) == Tools::BusyBox
-        {
-            let mut names: Vec<&str> = delta
-                .changes
-                .iter()
-                .filter(|c| c.name != "groups")
-                .map(|c| c.name.as_str())
-                .collect();
-            if pending_gid {
-                names.push("gid");
-            }
+        if current.is_some() && delta.changes_attributes() && Tools::of(sys) == Tools::BusyBox {
             bail!(
                 "user `{}` exists and only BusyBox account tools were found (no `usermod`) to \
                  change its {}; on Alpine `apk add shadow` provides usermod, or drop those builders",
                 self.name,
-                names.join(", ")
+                delta
+                    .changes
+                    .iter()
+                    .filter(|c| c.name != "groups")
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         Ok(Inspection {
@@ -942,21 +948,6 @@ impl Op for Present {
         let Some(entry) = current else {
             return self.plan_create(sys, primary);
         };
-        // Check mode, existing account, a primary group not on the machine
-        // yet (an earlier step may create it): the group change is real but
-        // its gid cannot be compared.
-        if let Some(Primary { name, gid: None }) = &primary {
-            let mut changes = delta.changes.clone();
-            changes.push(AttrChange {
-                name: "group".into(),
-                from: entry.gid.to_string(),
-                to: name.clone(),
-            });
-            return Ok(Plan::change(Diff::Attrs {
-                subject: format!("user {}", self.name),
-                changes,
-            }));
-        }
         if delta.is_empty() {
             return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
         }
@@ -973,7 +964,7 @@ impl Op for Present {
         let tools = Tools::of(sys);
         if changes.iter().any(|c| c.name == "exists") {
             let group_text = sys.read_to_string("/etc/group")?;
-            let mut primary = self.resolve_primary(sys, &group_text)?;
+            let mut primary = self.resolve_primary(sys, &group_text, true)?;
             if primary.is_none() {
                 primary = self.same_named_group(&group_text)?;
             }
@@ -1264,8 +1255,11 @@ impl Op for Membership {
         validate_name("user", &self.user)?;
         validate_name("group", &self.group)?;
         // Both the user and the group are refused when missing, except under
-        // --check, where an earlier step may create either (vision 12): the
-        // step then reports the membership it would add.
+        // --check for a user that does not exist yet: an earlier step may
+        // create the user, and its group with it, and Ansible's `user`
+        // validates neither before it reports a new account `changed`. An
+        // existing user's missing group is refused in both modes, as Ansible
+        // refuses it (vision 12).
         let passwd = sys.read_to_string("/etc/passwd")?;
         let entry = match lookup_user(&passwd, &self.user)? {
             Some(e) => Some(e),
@@ -1279,7 +1273,7 @@ impl Op for Membership {
         let group_text = sys.read_to_string("/etc/group")?;
         let group = match lookup_group(&group_text, &self.group)? {
             Some(g) => Some(g),
-            None if sys.check_mode() => None,
+            None if sys.check_mode() && entry.is_none() => None,
             None => bail!(
                 "group `{}` does not exist; user::Membership does not create groups, use \
                  group::Present first",
@@ -2116,36 +2110,39 @@ mod tests {
 
     // ---- check mode: a prerequisite another step could create (vision 12) ----
 
-    /// The tolerance covers the group, not the machine: on BusyBox an
-    /// existing account cannot have its primary group changed at all (no
-    /// `usermod`), and that refusal holds under `--check` even when the
-    /// group is one an earlier step would create and so has no gid yet.
+    /// The tolerance is for an account that does not exist yet. An existing
+    /// account's missing group is refused under `--check` exactly as in a
+    /// real run, which is what Ansible's `user` does (`modify_user_usermod`
+    /// validates the group before anything that respects check mode), and
+    /// which also keeps the BusyBox "no `usermod`" refusal from being hidden
+    /// behind a deferred gid.
     #[test]
-    fn busybox_refuses_a_primary_group_change_under_check_even_for_a_group_not_there_yet() {
+    fn an_existing_accounts_missing_group_is_refused_under_check_too() {
         let fake = Arc::new(
             Fake::new()
                 .with_file("/etc/passwd", PASSWD)
                 .with_file("/etc/group", GROUP)
                 .with_cmd("adduser", None, 0, ""),
         );
-        let dry = alpine(fake_sys(&fake)).with_check_mode(true);
-        let err = Present::new("cadu")
-            .gid("web")
-            .check(&dry)
-            .unwrap_err()
-            .chain();
-        assert!(
-            err.contains("only BusyBox account tools were found (no `usermod`)"),
-            "{err}"
-        );
-        assert!(err.contains("gid"), "{err}");
-        // The same under a real run, where the missing group is what refuses.
-        let err = Present::new("cadu")
-            .gid("web")
-            .check(&alpine(fake_sys(&fake)))
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("group `web` does not exist"), "{err}");
+        for sys in [
+            fake_sys(&fake).with_check_mode(true),
+            alpine(fake_sys(&fake)).with_check_mode(true),
+            fake_sys(&fake),
+        ] {
+            let err = Present::new("cadu")
+                .gid("web")
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("group `web` does not exist"), "{err}");
+            let err = Present::new("cadu")
+                .groups(["web"])
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("group `web` does not exist"), "{err}");
+        }
+        assert!(fake.commands().is_empty());
     }
 
     /// Vision 12: under `--check` an earlier `group::Present` in the run may
@@ -2216,9 +2213,14 @@ mod tests {
             c.diff.short(),
             "exists=yes home=/home/app shell=/bin/sh groups=adm,app"
         );
-        // An existing one joining it.
-        let c = change(Present::new("cadu").groups(["app"]).check(&dry).unwrap());
-        assert_eq!(c.diff.short(), "groups=adm,app,sudo");
+        // An existing one joining it is refused even here: Ansible's `user`
+        // validates an existing account's groups under check mode.
+        let err = Present::new("cadu")
+            .groups(["app"])
+            .check(&dry)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("group `app` does not exist"), "{err}");
         assert!(fake.commands().is_empty(), "check mode runs nothing");
 
         let err = Present::new("app")
@@ -2235,31 +2237,14 @@ mod tests {
         );
     }
 
+    /// `Membership` under `--check`: a user that does not exist yet is
+    /// deferred whatever the group's state (Ansible reports a new account
+    /// `changed` without validating its groups); an existing user's missing
+    /// group is refused in both modes, as Ansible refuses it.
     #[test]
-    fn check_mode_defers_an_existing_accounts_primary_group_it_cannot_number() {
+    fn membership_defers_only_a_user_not_there_yet_in_check_mode() {
         let fake = Arc::new(base());
         let dry = fake_sys(&fake).with_check_mode(true);
-        let c = change(Present::new("cadu").gid("app").check(&dry).unwrap());
-        assert_eq!(c.diff.short(), "group=app");
-        let err = Present::new("cadu")
-            .gid("app")
-            .check(&fake_sys(&fake))
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("group `app` does not exist"), "{err}");
-    }
-
-    #[test]
-    fn membership_defers_a_missing_group_or_user_in_check_mode_only() {
-        let fake = Arc::new(base());
-        let dry = fake_sys(&fake).with_check_mode(true);
-        let c = change(
-            Membership::of_name("cadu")
-                .in_group_named("app")
-                .check(&dry)
-                .unwrap(),
-        );
-        assert_eq!(c.diff.short(), "groups=adm,app,sudo");
         let c = change(
             Membership::of_name("ghost")
                 .in_group_named("docker")
@@ -2267,21 +2252,30 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(c.diff.short(), "groups=docker");
+        let c = change(
+            Membership::of_name("ghost")
+                .in_group_named("app")
+                .check(&dry)
+                .unwrap(),
+        );
+        assert_eq!(c.diff.short(), "groups=app");
         assert!(fake.commands().is_empty(), "check mode runs nothing");
 
+        for sys in [dry, fake_sys(&fake)] {
+            let err = Membership::of_name("cadu")
+                .in_group_named("app")
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains(
+                    "group `app` does not exist; user::Membership does not create groups, use \
+                     group::Present first"
+                ),
+                "{err}"
+            );
+        }
         let real = fake_sys(&fake);
-        let err = Membership::of_name("cadu")
-            .in_group_named("app")
-            .check(&real)
-            .unwrap_err()
-            .chain();
-        assert!(
-            err.contains(
-                "group `app` does not exist; user::Membership does not create groups, use \
-                 group::Present first"
-            ),
-            "{err}"
-        );
         let err = Membership::of_name("ghost")
             .in_group_named("docker")
             .check(&real)

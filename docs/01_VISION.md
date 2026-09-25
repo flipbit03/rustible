@@ -1631,12 +1631,14 @@ Ansible's check mode has neither mechanism and one rule for a step that
 would create something: report `changed` and ask no further questions
 (`user.py`'s `main()` exits `changed` under check mode before it validates
 the group; `ansible.posix.authorized_key` does not look at the directory
-under check mode). That rule is adopted and applied consistently, which
-takes it further than Ansible in two places: Ansible still refuses a
-missing group when the account already exists, and `authorized_key` fails a
-dry run outright when the user does not exist yet, where Rustible reports
-`would change` for both. Added on top is the loud failure Ansible lacks when
-a later step reads what a dry run could not produce.
+under check mode). That rule is adopted, and Ansible's behaviour is
+authoritative where the rule could have been read more broadly (decided
+2026-09-24): an *existing* account's missing group is refused under
+`--check` as in a real run (`user.py` validates it before anything that
+respects check mode), and keys for an account that does not exist yet are
+refused too (`authorized_key`: "Either user must exist or you must provide
+full path to key file in check mode"). Added on top is the loud failure
+Ansible lacks when a later step reads what a dry run could not produce.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
