@@ -170,6 +170,25 @@ impl AttrPlan {
         }
         Ok(())
     }
+
+    /// Set only the attributes that differ, owner first: what an op uses
+    /// when `check` found the rest already right and must not touch them.
+    /// `ssh::authorized_keys` relies on it so an unescalated run managing
+    /// its own keys is never asked to `chown` a file it already owns.
+    pub(crate) fn apply_differing(&self, sys: &System, path: &Path) -> Result<()> {
+        if let Some(o) = self.owner_to_set() {
+            sys.set_owner(path, o.uid, o.gid)?;
+        }
+        if let Some(m) = self.mode.filter(Wanted::differs) {
+            sys.set_mode(path, m.want)?;
+        }
+        Ok(())
+    }
+
+    /// The owner this plan changes the path to, when it changes it.
+    pub(crate) fn owner_to_set(&self) -> Option<Owner> {
+        self.owner.filter(Wanted::differs).map(|o| o.want)
+    }
 }
 
 /// Pure planning of the attribute part shared by every op that takes
