@@ -834,7 +834,9 @@ async fn handle_frame(
             if *protocol != PROTOCOL_VERSION {
                 bail!(
                     "protocol mismatch: rustible speaks {PROTOCOL_VERSION}, the binary speaks {protocol}; \
-                     rebuild the workspace against this rustible"
+                     the CLI and every rustible crate in the workspace must be the same release. \
+                     To move the workspace to this CLI's version, see {}",
+                    crate::describe::UPGRADING_URL
                 );
             }
             if playbook != name {

@@ -98,6 +98,9 @@ of time. Managed machines need nothing.
 Rust targets are installed automatically: Rustible probes your hosts, works
 out which architectures are needed, and runs `rustup target add` itself.
 
+To upgrade, see [Upgrading Rustible and a workspace](#upgrading-rustible-and-a-workspace):
+the CLI and every workspace that uses it move together.
+
 **Controllers:** Linux x86_64, Linux aarch64, macOS on Apple silicon or Intel.
 **Targets:** Linux x86_64 and aarch64, any libc; and macOS, Apple silicon or
 Intel, for the operations that make sense there — see §13. Any controller
@@ -162,6 +165,70 @@ whoever opens the repository next — including an agent that has never seen
 Rustible. It names the project and links this guide, which is enough to work
 from cold. It is yours once written; edit it freely, and `init --refresh`
 does not touch it.
+
+### Upgrading Rustible and a workspace
+
+The CLI and the workspace move together, to the same release. Upgrade the CLI:
+
+```sh
+cargo install rustible-cli --locked
+rustible --version                          # rustible 0.5.0, say
+```
+
+Then, in the workspace, move every Rustible crate to that exact version and
+check the result before a real run:
+
+```sh
+V=$(rustible --version | cut -d' ' -f2)
+cargo add rustible@$V rustible-std@$V
+cargo add --build rustible-build@$V
+cargo add rustible-github@$V                # each collection released with Rustible, if listed
+rustible init --refresh .
+cargo build
+cargo tree -i rustible-sdk                  # exactly one version, $V
+rustible playbook run <playbook> --check    # then without --check
+```
+
+`cargo add` rewrites an existing pin in place. The rules behind the procedure:
+
+- **The CLI and the workspace must be the same release.** They speak a wire
+  protocol to each other, and nothing compares their versions: a release that
+  changed the protocol fails with `protocol mismatch` after the build, and
+  one that did not is not checked at all.
+- **Every crate in the build must use that release's `rustible-sdk`.** Before
+  1.0, `"0.5.0"` means 0.5.x only, so a crate left on an older release brings
+  a second `rustible-sdk` into the build. The error is a trait bound —
+  ``the trait bound `UserKeys: Op` is not satisfied`` — with the versions only
+  in a note beneath it. A collection released with Rustible, such as
+  `rustible-github`, shares its version; one published separately has its own
+  numbers, and needs a release of it that depends on the same `rustible-sdk`.
+  `cargo tree -i rustible-sdk` printing one version is the check; when it says
+  the name is ambiguous, `cargo tree -i rustible-sdk@<old>` names the crate
+  still holding the old one.
+- **`cargo update` is not an upgrade.** Before 1.0 it never crosses a minor
+  version; it picks up patch releases of the one you pinned.
+- **`--refresh` rewrites `build.rs` and `src/main.rs`, nothing else.**
+  `Cargo.toml` is yours, so a change to the manifest `rustible init` writes
+  reaches you only by hand. To find one, generate a workspace with the new CLI
+  and compare; differences in the dependency lines are your own additions,
+  anything else is the template's:
+
+  ```sh
+  fresh=$(mktemp -d) && rustible init --name <package> "$fresh"
+  diff "$fresh/Cargo.toml" Cargo.toml
+  ```
+- **A release can raise the minimum Rust version.** If cargo says a crate
+  requires a newer rustc, run `rustup update`.
+
+A workspace made with `--path-deps` follows the checkout, so there is nothing
+to `cargo add`: pull the checkout, reinstall the CLI from it, and refresh, then
+build and `--check` as above.
+
+```sh
+git -C /path/to/rustible pull
+cargo install --path /path/to/rustible/crates/rustible-cli
+rustible init --refresh .
+```
 
 ## 5. The CLI
 

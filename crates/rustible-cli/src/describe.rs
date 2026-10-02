@@ -285,6 +285,11 @@ fn read_key(ws: &Workspace, name: &str) -> Result<String> {
     Ok(cache_key(&source, &lock))
 }
 
+/// Where a protocol mismatch sends the reader: the guide's upgrade procedure,
+/// at the same URL the generated `README.md` links, so a crates.io user can
+/// open it.
+pub const UPGRADING_URL: &str = "https://github.com/flipbit03/rustible/blob/main/docs/USING_RUSTIBLE.md#upgrading-rustible-and-a-workspace";
+
 /// Run `<bin> --describe` and parse it, refusing a protocol we do not speak.
 pub async fn describe_bin(bin: &Path) -> Result<Vec<Describe>> {
     let out = tokio::process::Command::new(bin)
@@ -304,7 +309,8 @@ pub async fn describe_bin(bin: &Path) -> Result<Vec<Describe>> {
     if doc.protocol != PROTOCOL_VERSION {
         bail!(
             "protocol mismatch: this rustible speaks {PROTOCOL_VERSION}, the workspace's binary \
-             speaks {}; align the workspace's rustible dependency with the CLI",
+             speaks {}; the CLI and every rustible crate in the workspace must be the same \
+             release. To move the workspace to this CLI's version, see {UPGRADING_URL}",
             doc.protocol
         );
     }
@@ -469,6 +475,23 @@ mod tests {
         assert_eq!(
             only(vec![doc.playbooks[0].clone()], "hello").unwrap().hosts,
             "local"
+        );
+    }
+
+    /// The protocol-mismatch errors link a heading of the guide by its
+    /// anchor; renaming the heading would leave them pointing at nothing.
+    #[test]
+    fn upgrading_url_names_a_heading_of_the_guide() {
+        let guide = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/USING_RUSTIBLE.md");
+        let text = std::fs::read_to_string(&guide).unwrap();
+        let (_, anchor) = UPGRADING_URL.split_once('#').unwrap();
+        let heading = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("### "))
+            .find(|h| h.to_lowercase().replace(' ', "-") == anchor);
+        assert!(
+            heading.is_some(),
+            "no `### ` heading in the guide for #{anchor}"
         );
     }
 }

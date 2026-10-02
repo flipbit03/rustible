@@ -1589,7 +1589,7 @@ Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 
-## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24)
+## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
 
 Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change { diff }` does
 not, so in a dry run a step that *would* change has nothing to return, and a
@@ -1671,6 +1671,21 @@ Ansible lacks when a later step reads what a dry run could not produce.
   op drives is absent, a malformed key, a sysctl key this kernel does not
   have — stands in check mode as in a real run, because no earlier step
   changes it.
+- **A dry run touches nothing outside the target.** Under `--check` no
+  operation opens a connection to anything beyond the machine it runs on — no
+  request of any method, to any service, however read-only its author
+  believes it to be. A request can be logged, counted against a quota,
+  billed, or have effects its method does not advertise, and none of that is
+  visible from the client; a dry run is only worth running if nobody has to
+  wonder what it did. An operation whose answer depends on remote state
+  reports `would change` under check mode, with a diff saying what it would
+  send and that the remote state was not read; its output is unavailable, as
+  for any would-change step. What this costs is a dry run that cannot report
+  such a step `ok`, and that cost is accepted. Two places in the tree still
+  break this rule, and issue #48 fixes both: `apt::Latest::update_cache`
+  (6.8), which runs `apt-get update` against the distribution's mirrors in
+  `check`, and `rustible_github::UserKeys`, which fetches from GitHub in
+  `check`.
 - `check` still cannot mutate (7.3), and `apt::Latest` with `.update_cache`
   is still the one place a dry run writes (6.8).
 
