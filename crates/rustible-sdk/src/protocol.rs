@@ -379,4 +379,42 @@ mod tests {
         assert_eq!(escalate_password.as_ref().unwrap().as_bytes(), b"hunter2");
         assert!(!format!("{d:?}").contains("hunter2"));
     }
+
+    /// A `Diff` rides in every `StepFinished`, so its JSON is part of the
+    /// format. Making the type opaque (a `#[serde(transparent)]` struct over
+    /// a private enum) must not move a byte: each shape's encoding here is
+    /// exactly what the public enum produced before it, captured from that
+    /// enum, so an orchestrator and a target built either side of the change
+    /// still agree and `PROTOCOL_VERSION` did not move.
+    #[test]
+    fn diff_json_is_byte_identical_to_the_public_enum_encoding() {
+        use crate::diff::{AttrChange, Diff};
+
+        let mode = || Diff::attrs("/etc/x", vec![AttrChange::new("mode", "0644", "0600")]);
+        let cases = [
+            (
+                Diff::text("/etc/hosts", "a\n", "b\n"),
+                r#"{"Text":{"path":"/etc/hosts","before":"a\n","after":"b\n"}}"#,
+            ),
+            (
+                mode(),
+                r#"{"Attrs":{"subject":"/etc/x","changes":[{"name":"mode","from":"0644","to":"0600"}]}}"#,
+            ),
+            (
+                Diff::summary("restarted nginx"),
+                r#"{"Summary":"restarted nginx"}"#,
+            ),
+            (
+                Diff::many([mode(), Diff::text("/k", "", "key\n")]).unwrap(),
+                r#"{"Many":[{"Attrs":{"subject":"/etc/x","changes":[{"name":"mode","from":"0644","to":"0600"}]}},{"Text":{"path":"/k","before":"","after":"key\n"}}]}"#,
+            ),
+        ];
+        for (diff, json) in cases {
+            assert_eq!(serde_json::to_string(&diff).unwrap(), json);
+            // And an older peer's frame reads back into the same diff.
+            let back: Diff = serde_json::from_str(json).unwrap();
+            assert_eq!(back.render(), diff.render());
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
 }

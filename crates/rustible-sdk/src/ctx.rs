@@ -13,7 +13,7 @@ use crate::channel::Channel;
 use crate::error::{Context as _, Error, Result, StepFailed};
 use crate::event::{Event, Level, Status, Summary};
 use crate::facts::Facts;
-use crate::op::{Applied, Op, Plan};
+use crate::op::{Applied, Intent, Op, Plan};
 use crate::protocol::MAX_FRAME_PAYLOAD;
 use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
@@ -252,27 +252,31 @@ impl Ctx {
                 self.bump(|s| s.ok += 1);
                 Applied::new(name, Some(out), false, None, t0.elapsed())
             }
-            Ok(Plan::Change(change)) if self.sys.check_mode() => {
+            Ok(Plan::Change(intent)) if self.sys.check_mode() => {
+                // The one place a step's diff is made: rendered from the
+                // intent, so what the report shows is what `apply` would run.
+                let diff = intent.diff();
                 let note = if op.always_changes() {
                     Some("action".into())
                 } else {
                     None
                 };
-                finish(Status::WouldChange, Some(change.diff.clone()), note);
+                finish(Status::WouldChange, Some(diff.clone()), note);
                 self.bump(|s| s.would_change += 1);
                 // No apply, so no output: the step would change and the
-                // value only exists once it has (vision doc 12).
-                Applied::new(name, None, true, Some(change.diff), t0.elapsed())
+                // value only exists once it has (vision doc 12). The intent
+                // is dropped unexecuted.
+                Applied::new(name, None, true, Some(diff), t0.elapsed())
             }
-            Ok(Plan::Change(change)) => {
-                let diff = change.diff.clone();
+            Ok(Plan::Change(intent)) => {
+                let diff = intent.diff();
                 if let Err(e) = self.shared.channel.check_cancelled() {
                     finish(Status::Failed, Some(diff), Some(e.chain()));
                     self.bump(|s| s.failed += 1);
                     return Err(e.context(StepFailed::cancelled(&name, "not applied")));
                 }
                 self.sys.set_phase(Phase::Applying);
-                let applied = op.apply(&self.sys, change);
+                let applied = op.apply(&self.sys, intent);
                 self.sys.set_phase(Phase::Idle);
                 match applied {
                     Err(e) => {
@@ -576,16 +580,28 @@ mod tests {
         cancel_in_check: Option<Arc<Channel>>,
     }
 
+    /// The probe's whole decision: do it. Unit-shaped, because there is
+    /// nothing to choose between.
+    #[derive(Debug)]
+    struct DoIt;
+
+    impl crate::op::Intent for DoIt {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::summary("do it")
+        }
+    }
+
     impl Op for Probe {
         type Output = ();
-        fn check(&self, _: &System) -> Result<Plan<()>> {
+        type Intent = DoIt;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
             self.checks.fetch_add(1, Ordering::SeqCst);
             if let Some(ch) = &self.cancel_in_check {
                 ch.cancel("cancelled by the orchestrator");
             }
-            Ok(Plan::change(crate::Diff::summary("do it")))
+            Ok(Plan::Change(DoIt))
         }
-        fn apply(&self, _: &System, _: crate::Change) -> Result<()> {
+        fn apply(&self, _: &System, DoIt: DoIt) -> Result<()> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -611,11 +627,12 @@ mod tests {
         struct Done;
         impl Op for Done {
             type Output = u32;
-            fn check(&self, _: &System) -> Result<Plan<u32>> {
+            type Intent = std::convert::Infallible;
+            fn check(&self, _: &System) -> Result<Plan<Self>> {
                 Ok(Plan::Satisfied(7))
             }
-            fn apply(&self, _: &System, _: crate::Change) -> Result<u32> {
-                unreachable!("a satisfied op is never applied")
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<u32> {
+                match intent {}
             }
         }
         let sink = Arc::new(Collect::default());

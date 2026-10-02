@@ -39,7 +39,7 @@ pub use error::{
     StepFailed,
 };
 pub use facts::{Arch, Distro, Facts, Init, Os, Pm};
-pub use op::{Applied, Change, Op, Plan};
+pub use op::{Applied, Intent, Op, Plan};
 pub use secret::Secret;
 pub use system::{Cmd, System};
 
@@ -51,7 +51,7 @@ pub mod prelude {
     pub use crate::diff::{AttrChange, Diff};
     pub use crate::error::{Context, Error, Result};
     pub use crate::facts::{Arch, Distro, Facts, Init, Os, Pm};
-    pub use crate::op::{Applied, Change, Op, Plan};
+    pub use crate::op::{Applied, Intent, Op, Plan};
     pub use crate::secret::Secret;
     pub use crate::system::System;
     pub use crate::{bail, ensure};
