@@ -182,9 +182,10 @@ check the result before a real run:
 V=$(rustible --version | cut -d' ' -f2)
 cargo add rustible@$V rustible-std@$V
 cargo add --build rustible-build@$V
-cargo add rustible-github@$V                # for each rustible-* collection already listed
+cargo add rustible-github@$V                # each collection released with Rustible, if listed
 rustible init --refresh .
 cargo build
+cargo tree -i rustible-sdk                  # exactly one version, $V
 rustible playbook run <playbook> --check    # then without --check
 ```
 
@@ -194,11 +195,16 @@ rustible playbook run <playbook> --check    # then without --check
   protocol to each other, and nothing compares their versions: a release that
   changed the protocol fails with `protocol mismatch` after the build, and
   one that did not is not checked at all.
-- **Every `rustible-*` crate must be on that release, collections included.**
-  Before 1.0, `"0.5.0"` means 0.5.x only, so a crate left on an older release
-  brings a second `rustible-sdk` into the build. The error is a trait bound —
+- **Every crate in the build must use that release's `rustible-sdk`.** Before
+  1.0, `"0.5.0"` means 0.5.x only, so a crate left on an older release brings
+  a second `rustible-sdk` into the build. The error is a trait bound —
   ``the trait bound `UserKeys: Op` is not satisfied`` — with the versions only
-  in a note beneath it.
+  in a note beneath it. A collection released with Rustible, such as
+  `rustible-github`, shares its version; one published separately has its own
+  numbers, and needs a release of it that depends on the same `rustible-sdk`.
+  `cargo tree -i rustible-sdk` printing one version is the check; when it says
+  the name is ambiguous, `cargo tree -i rustible-sdk@<old>` names the crate
+  still holding the old one.
 - **`cargo update` is not an upgrade.** Before 1.0 it never crosses a minor
   version; it picks up patch releases of the one you pinned.
 - **`--refresh` rewrites `build.rs` and `src/main.rs`, nothing else.**
