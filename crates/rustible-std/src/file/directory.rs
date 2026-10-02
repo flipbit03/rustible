@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 
-use super::{Owner, apply_attrs, plan_attrs};
+use super::{AttrPlan, Owner, plan_attrs};
 
 /// Ensure a directory exists, with the given mode and owner. Ansible's
 /// `file` with `state: directory`. Creates missing parents (`mkdir -p`).
@@ -59,10 +59,32 @@ pub struct DirReport {
     pub created: bool,
 }
 
+/// What [`Directory`]'s `check` decided: whether to create the directory,
+/// and the attributes to set on it.
+#[derive(Debug)]
+pub struct DirectoryIntent {
+    path: PathBuf,
+    /// Nothing is at the path: `mkdir -p` it.
+    create: bool,
+    attrs: AttrPlan,
+}
+
+impl Intent for DirectoryIntent {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![];
+        if self.create {
+            changes.push(AttrChange::new("exists", "no", "yes"));
+        }
+        changes.extend(self.attrs.changes());
+        Diff::attrs(self.path.display().to_string(), changes)
+    }
+}
+
 impl Op for Directory {
     type Output = DirReport;
+    type Intent = DirectoryIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<DirReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Directory creates a directory through `sys` and sets mode and owner.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -70,43 +92,35 @@ impl Op for Directory {
             Os::Linux | Os::Macos => {}
             ref other => bail!("file::Directory has no implementation for {}", other.name()),
         }
-        let mut changes = vec![];
         let stat = sys.stat_follow(&self.path)?;
-        match &stat {
-            None => changes.push(AttrChange {
-                name: "exists".into(),
-                from: "no".into(),
-                to: "yes".into(),
-            }),
-            Some(s) if s.kind != FileKind::Dir => {
-                bail!("{} exists and is not a directory", self.path.display())
-            }
-            Some(_) => {}
+        if let Some(s) = &stat
+            && s.kind != FileKind::Dir
+        {
+            bail!("{} exists and is not a directory", self.path.display())
         }
-        changes.extend(plan_attrs(stat.as_ref(), self.mode, self.owner));
-        if changes.is_empty() {
+        let create = stat.is_none();
+        let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
+        if !create && !attrs.differs() {
             return Ok(Plan::Satisfied(DirReport {
                 path: self.path.clone(),
                 created: false,
             }));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.path.display().to_string(),
-            changes,
+        Ok(Plan::Change(DirectoryIntent {
+            path: self.path.clone(),
+            create,
+            attrs,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<DirReport> {
-        // The diff says whether the directory is to be created or only
-        // reshaped; `apply` executes it rather than looking again.
-        let created = super::diff_has(&change.diff, "exists");
-        if created {
-            sys.mkdir_all(&self.path)?;
+    fn apply(&self, sys: &System, intent: DirectoryIntent) -> Result<DirReport> {
+        if intent.create {
+            sys.mkdir_all(&intent.path)?;
         }
-        apply_attrs(sys, &self.path, self.mode, self.owner)?;
+        intent.attrs.apply(sys, &intent.path)?;
         Ok(DirReport {
-            path: self.path.clone(),
-            created,
+            path: intent.path,
+            created: intent.create,
         })
     }
 }
@@ -160,11 +174,11 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Directory::at("/srv/app").mode(0o750).owner(33, 33);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "exists=yes mode=0750 owner=33:33");
+        assert_eq!(c.diff().short(), "exists=yes mode=0750 owner=33:33");
         let r = op.apply(&sys, c).unwrap();
         assert!(
             r.created,
-            "the diff's `exists` change is what apply executes"
+            "the intent's `create` is what apply executes"
         );
         let f = fake.file("/srv/app").unwrap();
         assert_eq!(
@@ -180,9 +194,9 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Directory::at("/srv/app").owner(1000, 1000);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "owner=1000:1000");
+        assert_eq!(c.diff().short(), "owner=1000:1000");
         let r = op.apply(&sys, c).unwrap();
-        assert!(!r.created, "no `exists` change in the diff, so no mkdir");
+        assert!(!r.created, "the intent does not create, so no mkdir");
         let f = fake.file("/srv/app").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 1000, 1000));
     }

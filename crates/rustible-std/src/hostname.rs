@@ -88,10 +88,52 @@ fn read_name(sys: &System, path: &str) -> Result<Option<String>> {
     Ok(Some(text.lines().next().unwrap_or("").trim().to_string()))
 }
 
+/// What [`Is`]'s `check` decided: set the hostname, given the two names it
+/// read. At least one of them differs from the name wanted.
+#[derive(Debug)]
+pub struct SetName {
+    /// What `/etc/hostname` held; `None` when the file is absent.
+    file: Option<String>,
+    /// The kernel's name as `check` read it, which is also the report's
+    /// `previous`.
+    kernel: String,
+    /// The name to set.
+    to: String,
+}
+
+impl SetName {
+    fn file_differs(&self) -> bool {
+        self.file.as_deref() != Some(self.to.as_str())
+    }
+
+    fn kernel_differs(&self) -> bool {
+        self.kernel != self.to
+    }
+}
+
+impl Intent for SetName {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![];
+        if self.file_differs() {
+            let from = self.file.clone().unwrap_or_else(|| "absent".into());
+            changes.push(AttrChange::new(ETC_HOSTNAME, from, self.to.as_str()));
+        }
+        if self.kernel_differs() {
+            changes.push(AttrChange::new(
+                "kernel",
+                self.kernel.as_str(),
+                self.to.as_str(),
+            ));
+        }
+        Diff::attrs("hostname", changes)
+    }
+}
+
 impl Op for Is {
     type Output = HostnameReport;
+    type Intent = SetName;
 
-    fn check(&self, sys: &System) -> Result<Plan<HostnameReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Measured on macOS 26.3: without this, `Is` created an
         // /etc/hostname that macOS never reads, ran `hostname` (which does not
         // survive a reboot), reported `changed`, and reported `ok` on the next
@@ -126,50 +168,39 @@ impl Op for Is {
         let kernel =
             read_name(sys, KERNEL_HOSTNAME)?.unwrap_or_else(|| sys.facts().hostname.clone());
 
-        let mut changes = vec![];
-        if in_file.as_deref() != Some(self.name.as_str()) {
-            changes.push(AttrChange {
-                name: ETC_HOSTNAME.into(),
-                from: in_file.unwrap_or_else(|| "absent".into()),
-                to: self.name.clone(),
-            });
-        }
-        if kernel != self.name {
-            changes.push(AttrChange {
-                name: "kernel".into(),
-                from: kernel.clone(),
-                to: self.name.clone(),
-            });
-        }
-        let report = HostnameReport {
-            previous: kernel,
-            current: self.name.clone(),
+        let intent = SetName {
+            file: in_file,
+            kernel,
+            to: self.name.clone(),
         };
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(report));
+        if !intent.file_differs() && !intent.kernel_differs() {
+            return Ok(Plan::Satisfied(HostnameReport {
+                previous: intent.kernel,
+                current: self.name.clone(),
+            }));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "hostname".into(),
-            changes,
-        }))
+        Ok(Plan::Change(intent))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<HostnameReport> {
-        // The output wants the name being replaced, which the diff does not
-        // carry when only /etc/hostname differs: read it before changing it.
-        let previous =
-            read_name(sys, KERNEL_HOSTNAME)?.unwrap_or_else(|| sys.facts().hostname.clone());
+    fn apply(&self, sys: &System, intent: SetName) -> Result<HostnameReport> {
         if sys.facts().init == Init::Systemd {
+            // hostnamectl sets both, and owns /etc/hostname.
             sys.cmd("hostnamectl")
-                .args(["set-hostname", &self.name])
+                .args(["set-hostname", &intent.to])
                 .run()?;
         } else {
-            sys.write_atomic(ETC_HOSTNAME, format!("{}\n", self.name).as_bytes())?;
-            sys.cmd("hostname").arg(&self.name).run()?;
+            if intent.file_differs() {
+                sys.write_atomic(ETC_HOSTNAME, format!("{}\n", intent.to).as_bytes())?;
+            }
+            if intent.kernel_differs() {
+                sys.cmd("hostname").arg(&intent.to).run()?;
+            }
         }
+        // `previous` is the kernel's name as `check` read it: an
+        // observation, not a prediction.
         Ok(HostnameReport {
-            previous,
-            current: self.name.clone(),
+            previous: intent.kernel,
+            current: intent.to,
         })
     }
 }
@@ -282,7 +313,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "hostname:\n  /etc/hostname: old -> HOME-GAMES\n"
         );
     }
@@ -293,7 +324,7 @@ mod tests {
         let Plan::Change(c) = Is::new("HOME-GAMES").check(&sys(&fake)).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "kernel=HOME-GAMES");
+        assert_eq!(c.diff().short(), "kernel=HOME-GAMES");
     }
 
     #[test]
@@ -303,7 +334,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "hostname:\n  /etc/hostname: absent -> new\n  kernel: old -> new\n"
         );
     }
@@ -394,9 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_reads_the_previous_kernel_name_itself() {
-        // The report's `previous` is the kernel's name, read by `apply`
-        // itself: the file says one thing, the kernel another, and neither is
+    fn previous_is_the_kernel_name_check_read() {
+        // The report's `previous` is the kernel's name as `check` read it and
+        // the intent carried: the file says one thing, the kernel another, and neither is
         // the new name, so an `apply` that echoed the new name back, or took
         // the file's, would show here.
         let fake = Arc::new(box_named("in-file", "in-kernel").with_cmd("hostnamectl", None, 0, ""));

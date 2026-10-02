@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use regex::Regex;
 use rustible_sdk::prelude::*;
 
-use super::Insert;
+use super::{Insert, TextEdit};
 
 /// Ensure a line is present in a file, replacing the line matched by `matching`
 /// if any. Ansible's `lineinfile` with `state: present`.
@@ -181,8 +181,9 @@ pub fn plan_line(
 
 impl Op for Line {
     type Output = LineReport;
+    type Intent = TextEdit;
 
-    fn check(&self, sys: &System) -> Result<Plan<LineReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Line edits file text through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -191,7 +192,10 @@ impl Op for Line {
             ref other => bail!("file::Line has no implementation for {}", other.name()),
         }
         let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            return Ok(super::plan_edit_of_missing("file::Line", &self.path));
+            return Ok(Plan::Change(TextEdit::AwaitFile {
+                op: "file::Line",
+                path: self.path.clone(),
+            }));
         };
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
@@ -204,31 +208,19 @@ impl Op for Line {
                     backup_path: None,
                 }))
             }
-            Some((new_text, _)) => Ok(Plan::change(Diff::text(&self.path, text, new_text))),
+            Some((after, line_no)) => Ok(Plan::Change(TextEdit::Rewrite {
+                path: self.path.clone(),
+                before: text,
+                after,
+                line_no,
+            })),
         }
     }
 
-    fn apply(&self, sys: &System, _change: Change) -> Result<LineReport> {
-        // Re-plan from the current text (cheap, pure) rather than trusting a
-        // copy carried in the diff: the file may have moved on since check.
-        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            bail!("{} does not exist; nothing to edit", self.path.display());
-        };
-        let Some((after, line_no)) =
-            plan_line(&text, self.matching.as_ref(), &self.line, &self.insert)
-        else {
-            // The file satisfied the op between `check` and here, so nothing
-            // is written. Where the line sits is read from the file as it is
-            // now, not from what `check` saw: with duplicates the two can
-            // name different lines.
-            return Ok(LineReport {
-                line_no: selected(text.lines(), self.matching.as_ref(), &self.line)
-                    .map(|i| i + 1)
-                    .unwrap_or(0),
-                backup_path: None,
-            });
-        };
-        let backup_path = super::write_with_backup(sys, &self.path, self.backup, after.as_bytes())?;
+    fn apply(&self, sys: &System, intent: TextEdit) -> Result<LineReport> {
+        // Writes the text `check` planned, which is the text the diff
+        // showed; the file is not read and merged again here.
+        let (line_no, backup_path) = intent.write(sys, self.backup)?;
         Ok(LineReport {
             line_no,
             backup_path,
@@ -348,7 +340,7 @@ mod tests {
         let Plan::Change(change) = plan else {
             panic!("expected change")
         };
-        assert_eq!(change.diff.short(), "+1 -1 lines");
+        assert_eq!(change.diff().short(), "+1 -1 lines");
 
         let report = op.apply(&sys, change).unwrap();
         assert_eq!(report.line_no, 1);
@@ -381,13 +373,70 @@ mod tests {
             panic!("expected satisfied")
         };
         assert_eq!(report.line_no, 1);
+    }
 
-        // And apply, reached when the file changed under a stale plan,
-        // agrees: it reads the file as it stands.
-        let change = Change {
-            diff: Diff::summary("stale"),
+    /// The report and the write come from one value: the diff a dry run
+    /// shows is rendered from the same `after` text `apply` writes. Pure: an
+    /// intent built by hand, no file and no `System`.
+    #[test]
+    fn the_diff_is_rendered_from_the_text_apply_writes() {
+        let intent = TextEdit::Rewrite {
+            path: "/etc/x".into(),
+            before: "a=1\n".into(),
+            after: "a=1\nb=2\n".into(),
+            line_no: 2,
         };
-        assert_eq!(op.apply(&sys, change).unwrap().line_no, 1);
+        assert_eq!(
+            intent.diff().render(),
+            "--- /etc/x (before)\n+++ /etc/x (after)\n@@ -1 +1,2 @@\n a=1\n+b=2\n"
+        );
+    }
+
+    /// `apply` executes the text `check` planned. The file changes between
+    /// the two, and what lands is the planned text, not a merge of the line
+    /// into the new content: the race is accepted, as in Ansible, and what
+    /// was shown is what ran.
+    #[test]
+    fn apply_writes_the_planned_text_even_if_the_file_moved_on() {
+        let fake = Arc::new(Fake::new().with_file("/etc/x", "a=1\n"));
+        let sys = fake_sys(&fake);
+        let op = Line::in_path("/etc/x").matching("^b=").set("b=2");
+        let intent = op.check(&sys).unwrap();
+        let Plan::Change(intent) = intent else {
+            panic!("expected change")
+        };
+
+        rustible_sdk::backend::Backend::write(&*fake, std::path::Path::new("/etc/x"), b"c=3\n")
+            .unwrap();
+        let report = op.apply(&sys, intent).unwrap();
+        assert_eq!(fake.content("/etc/x").unwrap(), "a=1\nb=2\n");
+        assert_eq!(report.line_no, 2, "where the planned text puts the line");
+    }
+
+    /// The old `apply` planned again and, finding the file already
+    /// satisfied, wrote nothing while the step still reported `changed`. It
+    /// now writes what it planned, so a `changed` step always wrote.
+    #[test]
+    fn apply_never_reports_changed_having_written_nothing() {
+        let fake = Arc::new(Fake::new().with_file("/etc/x", "a=1\n"));
+        let sys = fake_sys(&fake);
+        let op = Line::in_path("/etc/x").set("b=2").backup(true);
+        let Plan::Change(intent) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        // Someone else adds the line first.
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            std::path::Path::new("/etc/x"),
+            b"a=1\nb=2\n",
+        )
+        .unwrap();
+        let report = op.apply(&sys, intent).unwrap();
+        assert!(
+            report.backup_path.is_some(),
+            "the planned text was written, after a backup"
+        );
+        assert_eq!(fake.content("/etc/x").unwrap(), "a=1\nb=2\n");
     }
 
     /// A real run refuses a missing file. A dry run does not (vision 12): an
@@ -410,7 +459,7 @@ mod tests {
             panic!("expected would change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/nope: does not exist yet; file::Line would edit it once an earlier step \
              creates it (or use .create(true) to create it here)"
         );
@@ -435,12 +484,13 @@ mod tests {
         struct Bad;
         impl Op for Bad {
             type Output = ();
-            fn check(&self, sys: &System) -> Result<Plan<()>> {
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> Result<Plan<Self>> {
                 sys.write_atomic("/x", b"oops")?;
                 Ok(Plan::Satisfied(()))
             }
-            fn apply(&self, _: &System, _: Change) -> Result<()> {
-                Ok(())
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
             }
         }
         let fake = Arc::new(Fake::new());

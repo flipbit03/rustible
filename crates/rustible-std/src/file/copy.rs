@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 
-use super::{Owner, apply_attrs, plan_attrs};
+use super::{AttrPlan, Owner, plan_attrs};
 
 /// Above this size a content change is reported as a byte-count summary
 /// instead of a unified diff, whatever the encoding.
@@ -138,28 +138,81 @@ impl CopyBuilder {
     }
 }
 
+/// A content change as the report shows it: the two texts when both are
+/// small UTF-8, their sizes otherwise. Holds only what the rendering needs,
+/// so a large file is never carried twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContentChange {
+    /// Both sides within [`TEXT_DIFF_LIMIT`] and valid UTF-8.
+    Text { before: String, after: String },
+    /// Anything else: binary, or too large to diff.
+    Sizes { before: usize, after: usize },
+}
+
+impl ContentChange {
+    pub(crate) fn of(old: Option<&[u8]>, new: &[u8]) -> Self {
+        let old = old.unwrap_or_default();
+        if old.len() <= TEXT_DIFF_LIMIT
+            && new.len() <= TEXT_DIFF_LIMIT
+            && let (Ok(before), Ok(after)) = (std::str::from_utf8(old), std::str::from_utf8(new))
+        {
+            return ContentChange::Text {
+                before: before.into(),
+                after: after.into(),
+            };
+        }
+        ContentChange::Sizes {
+            before: old.len(),
+            after: new.len(),
+        }
+    }
+
+    pub(crate) fn diff(&self, path: &Path) -> Diff {
+        match self {
+            ContentChange::Text { before, after } => {
+                Diff::text(path, before.as_str(), after.as_str())
+            }
+            ContentChange::Sizes { before, after } => Diff::summary(format!(
+                "{}: {before} bytes -> {after} bytes",
+                path.display()
+            )),
+        }
+    }
+}
+
 /// The diff for a content change: unified text when both sides are small
 /// UTF-8, a byte-count summary otherwise.
 pub fn content_diff(path: &Path, old: Option<&[u8]>, new: &[u8]) -> Diff {
-    let old = old.unwrap_or_default();
-    if old.len() <= TEXT_DIFF_LIMIT
-        && new.len() <= TEXT_DIFF_LIMIT
-        && let (Ok(before), Ok(after)) = (std::str::from_utf8(old), std::str::from_utf8(new))
-    {
-        return Diff::text(path, before, after);
+    ContentChange::of(old, new).diff(path)
+}
+
+/// What [`Copy`]'s `check` decided: whether to rewrite the content, and the
+/// attributes to set. The bytes to write stay on the op.
+#[derive(Debug)]
+pub struct CopyIntent {
+    dest: PathBuf,
+    /// `Some` when the content differs: rewrite the file (after a backup,
+    /// when asked). Carries what the report shows of the change.
+    rewrite: Option<ContentChange>,
+    attrs: AttrPlan,
+}
+
+impl Intent for CopyIntent {
+    fn diff(&self) -> Diff {
+        match &self.rewrite {
+            // A content change is reported as the content; the attributes
+            // that come with it are set, and not listed.
+            Some(content) => content.diff(&self.dest),
+            None => Diff::attrs(self.dest.display().to_string(), self.attrs.changes()),
+        }
     }
-    Diff::summary(format!(
-        "{}: {} bytes -> {} bytes",
-        path.display(),
-        old.len(),
-        new.len()
-    ))
 }
 
 impl Op for Copy {
     type Output = CopyReport;
+    type Intent = CopyIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<CopyReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Copy writes a file through `sys` and sets mode and owner; nothing in it is a Linux concept.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -180,41 +233,31 @@ impl Op for Copy {
         };
         let content_changed = old.as_deref() != Some(new.as_slice());
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
-        let report = CopyReport {
-            content_changed,
-            path: self.dest.clone(),
-            backup_path: None,
-            bytes: new.len(),
-        };
-        if !content_changed && attrs.is_empty() {
-            return Ok(Plan::Satisfied(report));
+        if !content_changed && !attrs.differs() {
+            return Ok(Plan::Satisfied(CopyReport {
+                content_changed,
+                path: self.dest.clone(),
+                backup_path: None,
+                bytes: new.len(),
+            }));
         }
-        let diff = if content_changed {
-            content_diff(&self.dest, old.as_deref(), &new)
-        } else {
-            Diff::Attrs {
-                subject: self.dest.display().to_string(),
-                changes: attrs,
-            }
-        };
-        Ok(Plan::change(diff))
+        Ok(Plan::Change(CopyIntent {
+            dest: self.dest.clone(),
+            rewrite: content_changed.then(|| ContentChange::of(old.as_deref(), &new)),
+            attrs,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<CopyReport> {
+    fn apply(&self, sys: &System, intent: CopyIntent) -> Result<CopyReport> {
         let bytes = self.source_bytes(sys)?;
-        // Execute the diff: attributes-only means the content already
-        // matched; any other shape (a text diff, a byte-count summary) is a
-        // rewrite.
-        let rewrite = !matches!(change.diff, Diff::Attrs { .. });
-        let backup_path = if rewrite {
-            super::write_with_backup(sys, &self.dest, self.backup, &bytes)?
-        } else {
-            None
+        let backup_path = match intent.rewrite {
+            Some(_) => super::write_with_backup(sys, &intent.dest, self.backup, &bytes)?,
+            None => None,
         };
-        apply_attrs(sys, &self.dest, self.mode, self.owner)?;
+        intent.attrs.apply(sys, &intent.dest)?;
         Ok(CopyReport {
-            content_changed: rewrite,
-            path: self.dest.clone(),
+            content_changed: intent.rewrite.is_some(),
+            path: intent.dest,
             backup_path,
             bytes: bytes.len(),
         })
@@ -300,11 +343,11 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Copy::from_bytes(b"a=1\nb=3\n").to("/etc/x.conf");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "+1 -1 lines");
+        assert_eq!(c.diff().short(), "+1 -1 lines");
         assert!(
-            c.diff.render().contains("-b=2\n+b=3"),
+            c.diff().render().contains("-b=2\n+b=3"),
             "{}",
-            c.diff.render()
+            c.diff().render()
         );
 
         let r = op.apply(&sys, c).unwrap();
@@ -322,7 +365,7 @@ mod tests {
         let op = Copy::from_str("hello\n").to("/new").mode(0o640);
         let c = expect_change(&op, &sys);
         // Creation is a text diff against an empty "before".
-        assert_eq!(c.diff.short(), "+1 -0 lines");
+        assert_eq!(c.diff().short(), "+1 -0 lines");
         op.apply(&sys, c).unwrap();
         let f = fake.file("/new").unwrap();
         assert_eq!(
@@ -337,7 +380,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Copy::from_bytes([0u8, 159, 146, 150, 1, 2]).to("/bin/blob");
         let c = expect_change(&op, &sys);
-        assert!(matches!(&c.diff, Diff::Summary(s) if s == "/bin/blob: 4 bytes -> 6 bytes"));
+        assert_eq!(c.diff().render(), "/bin/blob: 4 bytes -> 6 bytes");
         op.apply(&sys, c).unwrap();
         assert_eq!(fake.file("/bin/blob").unwrap().bytes.len(), 6);
     }
@@ -346,9 +389,16 @@ mod tests {
     fn copy_large_text_falls_back_to_summary() {
         let big = "x".repeat(TEXT_DIFF_LIMIT + 1);
         let d = content_diff(Path::new("/f"), Some(b"small"), big.as_bytes());
-        assert!(matches!(d, Diff::Summary(_)));
+        assert_eq!(d.render(), "/f: 5 bytes -> 65537 bytes");
+        assert_eq!(
+            ContentChange::of(Some(b"small"), big.as_bytes()),
+            ContentChange::Sizes {
+                before: 5,
+                after: TEXT_DIFF_LIMIT + 1
+            }
+        );
         let d = content_diff(Path::new("/f"), None, b"small");
-        assert!(matches!(d, Diff::Text { .. }));
+        assert_eq!(d.short(), "+1 -0 lines");
     }
 
     #[test]
@@ -380,7 +430,7 @@ mod tests {
             .owner(7, 8)
             .backup(true);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "mode=0600 owner=7:8");
+        assert_eq!(c.diff().short(), "mode=0600 owner=7:8");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.backup_path, None, "no content change, so no backup");
         let f = fake.file("/etc/x").unwrap();

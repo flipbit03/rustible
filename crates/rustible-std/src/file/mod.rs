@@ -16,7 +16,7 @@
 //! no output in check mode, and a file or directory an earlier step could
 //! create is not refused there (vision 12).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use rustible_sdk::backend::Stat;
@@ -104,79 +104,89 @@ impl Owner {
     }
 }
 
+/// One attribute an op was given: the value `check` found on the path
+/// (`None` when the path does not exist yet) and the value wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wanted<T> {
+    pub(crate) now: Option<T>,
+    pub(crate) want: T,
+}
+
+impl<T: PartialEq> Wanted<T> {
+    fn differs(&self) -> bool {
+        self.now.as_ref() != Some(&self.want)
+    }
+}
+
+/// The attribute half of a file op's intent, shared by every op that takes
+/// `.mode()` and `.owner()`: each attribute the op was given, with what
+/// `check` found on the path. Built by [`plan_attrs`]; an op's intent holds
+/// it, its `diff` renders the rows that differ with [`AttrPlan::changes`],
+/// and its `apply` sets the attributes with [`AttrPlan::apply`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttrPlan {
+    /// The permission bits wanted, file type bits already masked off.
+    pub(crate) mode: Option<Wanted<u32>>,
+    pub(crate) owner: Option<Wanted<Owner>>,
+}
+
+impl AttrPlan {
+    /// True when an attribute the op was given differs from the path, or
+    /// the path does not exist yet. False when nothing was asked.
+    pub fn differs(&self) -> bool {
+        self.mode.is_some_and(|m| m.differs()) || self.owner.is_some_and(|o| o.differs())
+    }
+
+    /// The rows the report shows: one per differing attribute, mode first,
+    /// with `-` for a path that does not exist yet.
+    pub fn changes(&self) -> Vec<AttrChange> {
+        let mut changes = vec![];
+        if let Some(m) = self.mode.filter(Wanted::differs) {
+            let from = m.now.map_or_else(|| "-".into(), |now| format!("{now:04o}"));
+            changes.push(AttrChange::new("mode", from, format!("{:04o}", m.want)));
+        }
+        if let Some(o) = self.owner.filter(Wanted::differs) {
+            let from = o.now.map_or_else(|| "-".into(), |now| now.label());
+            changes.push(AttrChange::new("owner", from, o.want.label()));
+        }
+        changes
+    }
+
+    /// Set every attribute the op was given, differing or not: an op calls
+    /// this when its step changes, and `chmod`/`chown` are idempotent. Also
+    /// what keeps a wanted mode correct across the other half of the change
+    /// (a rewrite, an owner change).
+    ///
+    /// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on
+    /// anything that is not a directory, so the owner is set *first* and the
+    /// mode after it. The other order silently drops the setuid bit of a
+    /// `.mode(0o4755).owner(..)` op and still reports success.
+    pub(crate) fn apply(&self, sys: &System, path: &Path) -> Result<()> {
+        if let Some(o) = self.owner {
+            sys.set_owner(path, o.want.uid, o.want.gid)?;
+        }
+        if let Some(m) = self.mode {
+            sys.set_mode(path, m.want)?;
+        }
+        Ok(())
+    }
+}
+
 /// Pure planning of the attribute part shared by every op that takes
-/// `.mode()` and `.owner()`: which of the wanted attributes differ from
-/// `current` (`None` when the path does not exist yet, rendered as `-`).
-/// Mode comparison ignores the file type bits (`& 0o7777`).
-pub fn plan_attrs(
-    current: Option<&Stat>,
-    mode: Option<u32>,
-    owner: Option<Owner>,
-) -> Vec<AttrChange> {
-    let mut changes = vec![];
-    if let Some(want) = mode {
-        let want = want & 0o7777;
-        match current {
-            Some(s) if s.mode & 0o7777 == want => {}
-            Some(s) => changes.push(AttrChange {
-                name: "mode".into(),
-                from: format!("{:04o}", s.mode & 0o7777),
-                to: format!("{want:04o}"),
-            }),
-            None => changes.push(AttrChange {
-                name: "mode".into(),
-                from: "-".into(),
-                to: format!("{want:04o}"),
-            }),
-        }
+/// `.mode()` and `.owner()`: each wanted attribute against `current` (`None`
+/// when the path does not exist yet). Mode comparison ignores the file type
+/// bits (`& 0o7777`).
+pub fn plan_attrs(current: Option<&Stat>, mode: Option<u32>, owner: Option<Owner>) -> AttrPlan {
+    AttrPlan {
+        mode: mode.map(|want| Wanted {
+            now: current.map(|s| s.mode & 0o7777),
+            want: want & 0o7777,
+        }),
+        owner: owner.map(|want| Wanted {
+            now: current.map(Owner::of),
+            want,
+        }),
     }
-    if let Some(want) = owner {
-        match current {
-            Some(s) if Owner::of(s) == want => {}
-            Some(s) => changes.push(AttrChange {
-                name: "owner".into(),
-                from: Owner::of(s).label(),
-                to: want.label(),
-            }),
-            None => changes.push(AttrChange {
-                name: "owner".into(),
-                from: "-".into(),
-                to: want.label(),
-            }),
-        }
-    }
-    changes
-}
-
-/// Whether an attribute diff `check` produced carries a change named `name`
-/// (`exists`, `live`, ...). `apply` executes the diff rather than deciding
-/// again (vision 6.2), and this is how it reads the decision.
-pub(crate) fn diff_has(diff: &Diff, name: &str) -> bool {
-    diff.parts().iter().any(|part| {
-        matches!(part, Diff::Attrs { changes, .. } if changes.iter().any(|c| c.name == name))
-    })
-}
-
-/// Apply the attributes an op was given. Unconditional: `chmod`/`chown`
-/// are idempotent and `check` already decided a change is due.
-///
-/// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on anything
-/// that is not a directory, so the owner is set *first* and the mode after
-/// it. The other order silently drops the setuid bit of a
-/// `.mode(0o4755).owner(..)` op and still reports success.
-pub(crate) fn apply_attrs(
-    sys: &System,
-    path: &Path,
-    mode: Option<u32>,
-    owner: Option<Owner>,
-) -> Result<()> {
-    if let Some(o) = owner {
-        sys.set_owner(path, o.uid, o.gid)?;
-    }
-    if let Some(mode) = mode {
-        sys.set_mode(path, mode & 0o7777)?;
-    }
-    Ok(())
 }
 
 /// The line terminator a text uses, so a rewrite keeps CRLF files CRLF.
@@ -214,14 +224,77 @@ pub(crate) fn read_text_or_empty(
     }
 }
 
-/// The plan for editing a file that is not there yet, under `--check`: the
-/// edit is reported as due, worded so the reader knows why no diff is shown.
-pub(crate) fn plan_edit_of_missing<T>(op: &str, path: &Path) -> Plan<T> {
-    Plan::change(Diff::summary(format!(
-        "{}: does not exist yet; {op} would edit it once an earlier step creates it \
-         (or use .create(true) to create it here)",
-        path.display()
-    )))
+/// The intent of an op that edits a text file in place, [`Line`] and
+/// [`Block`]: the text `check` read and the text it decided to write. `apply`
+/// writes exactly that text, so the diff a dry run shows is the edit a real
+/// run makes, and a file that changed between `check` and `apply` is
+/// overwritten with the planned text rather than merged again (the race is
+/// accepted, as in Ansible).
+#[derive(Debug)]
+pub enum TextEdit {
+    /// Write `after` over the file.
+    Rewrite {
+        /// The file, for the diff header.
+        path: PathBuf,
+        /// The text `check` read; empty when `.create(true)` met no file.
+        before: String,
+        /// The whole text to write.
+        after: String,
+        /// 1-based line in `after` where the edit sits, for the report; 0
+        /// for an edit that leaves nothing behind (an emptied block).
+        line_no: usize,
+    },
+    /// The file does not exist yet and an earlier step may create it. Only
+    /// `check` under `--check` produces this, so it is reported and never
+    /// applied; a real run's `check` refuses the missing file instead.
+    AwaitFile {
+        /// The op's name as the report gives it, `file::Line`.
+        op: &'static str,
+        /// The file the op would edit.
+        path: PathBuf,
+    },
+}
+
+impl Intent for TextEdit {
+    fn diff(&self) -> Diff {
+        match self {
+            TextEdit::Rewrite {
+                path,
+                before,
+                after,
+                ..
+            } => Diff::text(path, before.as_str(), after.as_str()),
+            // Worded so the reader knows why no text diff is shown.
+            TextEdit::AwaitFile { op, path } => Diff::summary(format!(
+                "{}: does not exist yet; {op} would edit it once an earlier step creates it \
+                 (or use .create(true) to create it here)",
+                path.display()
+            )),
+        }
+    }
+}
+
+impl TextEdit {
+    /// Execute the edit: back up when asked, then write the planned text.
+    /// Returns the line the edit sits on and the backup path.
+    pub(crate) fn write(self, sys: &System, backup: bool) -> Result<(usize, Option<PathBuf>)> {
+        match self {
+            TextEdit::Rewrite {
+                path,
+                after,
+                line_no,
+                ..
+            } => {
+                let backup_path = write_with_backup(sys, &path, backup, after.as_bytes())?;
+                Ok((line_no, backup_path))
+            }
+            // The same refusal a real run's `check` gives.
+            TextEdit::AwaitFile { path, .. } => bail!(
+                "{} does not exist (use .create(true) to create it)",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// Back up (when asked, and the file exists) then write atomically. Returns
@@ -253,8 +326,8 @@ pub(crate) mod testing {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
-    /// Run `check`, insist on a change, return it.
-    pub fn expect_change<O: Op>(op: &O, sys: &System) -> Change {
+    /// Run `check`, insist on a change, return its intent.
+    pub fn expect_change<O: Op>(op: &O, sys: &System) -> O::Intent {
         match op.check(sys).unwrap() {
             Plan::Change(c) => c,
             Plan::Satisfied(_) => panic!("expected a change, op was satisfied"),
@@ -281,9 +354,9 @@ mod tests {
     #[test]
     fn plan_attrs_nothing_wanted_or_all_equal_is_empty() {
         let s = stat(0o644, 1000, 1000);
-        assert!(plan_attrs(Some(&s), None, None).is_empty());
-        assert!(plan_attrs(None, None, None).is_empty());
-        assert!(
+        assert!(!plan_attrs(Some(&s), None, None).differs());
+        assert!(!plan_attrs(None, None, None).differs());
+        assert!(!
             plan_attrs(
                 Some(&s),
                 Some(0o644),
@@ -292,61 +365,65 @@ mod tests {
                     gid: 1000
                 })
             )
-            .is_empty()
+            .differs()
         );
     }
 
     #[test]
     fn plan_attrs_reports_mode_and_owner_changes() {
         let s = stat(0o644, 0, 0);
-        let ch = plan_attrs(Some(&s), Some(0o600), Some(Owner { uid: 33, gid: 33 }));
-        let rendered: Vec<String> = ch
-            .iter()
-            .map(|c| format!("{}:{}->{}", c.name, c.from, c.to))
-            .collect();
-        assert_eq!(rendered, vec!["mode:0644->0600", "owner:0:0->33:33"]);
+        let plan = plan_attrs(Some(&s), Some(0o600), Some(Owner { uid: 33, gid: 33 }));
+        assert!(plan.differs());
+        assert_eq!(
+            Diff::attrs("/f", plan.changes()).render(),
+            "/f:\n  mode: 0644 -> 0600\n  owner: 0:0 -> 33:33\n"
+        );
     }
 
     #[test]
     fn plan_attrs_ignores_file_type_bits() {
         // A stat that (wrongly) carries S_IFREG must still compare equal.
         let s = stat(0o100644, 0, 0);
-        assert!(plan_attrs(Some(&s), Some(0o644), None).is_empty());
-        assert!(plan_attrs(Some(&s), Some(0o100644), None).is_empty());
-        let ch = plan_attrs(Some(&s), Some(0o100600), None);
-        assert_eq!(ch[0].from, "0644");
-        assert_eq!(ch[0].to, "0600");
+        assert!(!plan_attrs(Some(&s), Some(0o644), None).differs());
+        assert!(!plan_attrs(Some(&s), Some(0o100644), None).differs());
+        let plan = plan_attrs(Some(&s), Some(0o100600), None);
+        assert_eq!(
+            plan.mode,
+            Some(Wanted {
+                now: Some(0o644),
+                want: 0o600
+            })
+        );
     }
 
     #[test]
     fn plan_attrs_on_missing_path_renders_dash() {
-        let ch = plan_attrs(None, Some(0o750), Some(Owner { uid: 1, gid: 2 }));
-        assert_eq!(ch.len(), 2);
-        assert_eq!((ch[0].from.as_str(), ch[0].to.as_str()), ("-", "0750"));
-        assert_eq!((ch[1].from.as_str(), ch[1].to.as_str()), ("-", "1:2"));
+        let plan = plan_attrs(None, Some(0o750), Some(Owner { uid: 1, gid: 2 }));
+        assert_eq!(
+            Diff::attrs("/d", plan.changes()).render(),
+            "/d:\n  mode: - -> 0750\n  owner: - -> 1:2\n"
+        );
     }
 
+    /// Only the differing attributes are rows in the report, but every
+    /// attribute the op was given is set when the step applies: `chown`
+    /// clears setuid, so a mode that already matched is set again after an
+    /// owner change.
     #[test]
-    fn diff_has_finds_a_named_change_in_any_attribute_part() {
-        let exists = AttrChange {
-            name: "exists".into(),
-            from: "no".into(),
-            to: "yes".into(),
-        };
-        let attrs = Diff::Attrs {
-            subject: "/d".into(),
-            changes: vec![exists.clone()],
-        };
-        assert!(diff_has(&attrs, "exists"));
-        assert!(!diff_has(&attrs, "mode"));
-        // Inside a `Many`, and not in a text or summary part.
-        let many = Diff::many([Diff::summary("s"), attrs]).unwrap();
-        assert!(diff_has(&many, "exists"));
-        assert!(!diff_has(&Diff::summary("exists"), "exists"));
-        assert!(!diff_has(
-            &Diff::text(Path::new("/f"), "exists\n", "exists: yes\n"),
-            "exists"
+    fn attr_plan_reports_what_differs_and_sets_everything_wanted() {
+        let s = stat(0o4755, 0, 0);
+        let plan = plan_attrs(Some(&s), Some(0o4755), Some(Owner { uid: 5, gid: 6 }));
+        assert_eq!(Diff::attrs("/f", plan.changes()).short(), "owner=5:6");
+
+        let fake = std::sync::Arc::new(rustible_sdk::backend::Fake::new().with_file_mode(
+            "/f",
+            "",
+            0o4755,
         ));
+        let sys = testing::fake_sys(&fake);
+        plan.apply(&sys, Path::new("/f")).unwrap();
+        let f = fake.file("/f").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
     }
 
     #[test]

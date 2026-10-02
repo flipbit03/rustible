@@ -193,10 +193,51 @@ impl Present {
     }
 }
 
+/// What [`Present`]'s `check` decided: rewrite the drop-in, set the live
+/// value, or both, with what it read of each.
+#[derive(Debug)]
+pub struct SysctlIntent {
+    key: String,
+    value: String,
+    path: PathBuf,
+    /// The file's text as `check` read it (empty when the file is new), and
+    /// the text to write. `None` when the file already persists the value.
+    file: Option<(String, String)>,
+    /// The kernel's value as `check` read it, `None` when the kernel has no
+    /// such key. The report's `previous_live`: a read, not a prediction.
+    live: Option<String>,
+    /// Run `sysctl -w`: the op applies live and the kernel's value differs.
+    set_live: bool,
+}
+
+impl Intent for SysctlIntent {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![];
+        if let Some((before, _)) = &self.file {
+            changes.push(AttrChange::new(
+                self.path.display().to_string(),
+                value_in(before, &self.key).unwrap_or_else(|| "absent".into()),
+                self.value.as_str(),
+            ));
+        }
+        if self.set_live
+            && let Some(current) = &self.live
+        {
+            changes.push(AttrChange::new(
+                "live",
+                current.as_str(),
+                self.value.as_str(),
+            ));
+        }
+        Diff::attrs(format!("sysctl {}", self.key), changes)
+    }
+}
+
 impl Op for Present {
     type Output = SysctlReport;
+    type Intent = SysctlIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<SysctlReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Until this gate existed, a mac only escaped by accident: the
         // refusal was "/etc/sysctl.d does not exist", so creating that
         // directory was enough to make `Present` write a file macOS never
@@ -241,61 +282,43 @@ impl Op for Present {
             );
         }
 
-        let mut changes = vec![];
-        if plan_sysctl_line(&text, &self.key, &self.value).is_some() {
-            changes.push(AttrChange {
-                name: self.file.display().to_string(),
-                from: value_in(&text, &self.key).unwrap_or_else(|| "absent".into()),
-                to: self.value.clone(),
-            });
+        let file = plan_sysctl_line(&text, &self.key, &self.value).map(|after| (text, after));
+        let set_live = self.apply_now
+            && live
+                .as_deref()
+                .is_some_and(|current| normalize(current) != normalize(&self.value));
+        if file.is_none() && !set_live {
+            return Ok(Plan::Satisfied(SysctlReport {
+                key: self.key.clone(),
+                value: self.value.clone(),
+                previous_live: live,
+                file: self.file.clone(),
+            }));
         }
-        if self.apply_now
-            && let Some(current) = &live
-            && normalize(current) != normalize(&self.value)
-        {
-            changes.push(AttrChange {
-                name: "live".into(),
-                from: current.clone(),
-                to: self.value.clone(),
-            });
-        }
-        let report = SysctlReport {
+        Ok(Plan::Change(SysctlIntent {
             key: self.key.clone(),
             value: self.value.clone(),
-            previous_live: live,
-            file: self.file.clone(),
-        };
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(report));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("sysctl {}", self.key),
-            changes,
+            path: self.file.clone(),
+            file,
+            live,
+            set_live,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<SysctlReport> {
-        // The diff carries no text, so re-plan against the file as it is now.
-        let text = self.read_file(sys)?;
-        if let Some(new_text) = plan_sysctl_line(&text, &self.key, &self.value) {
-            sys.write_atomic(&self.file, new_text.as_bytes())?;
+    fn apply(&self, sys: &System, intent: SysctlIntent) -> Result<SysctlReport> {
+        if let Some((_, text)) = &intent.file {
+            sys.write_atomic(&intent.path, text.as_bytes())?;
         }
-        // The output wants the value the kernel had, so read it before
-        // `sysctl -w`; whether that write is due is what the diff says, and
-        // only when the op was asked to apply live at all (the file's own
-        // attribute is named after its path, which nothing stops from being
-        // `live`).
-        let previous_live = self.read_live(sys)?;
-        if self.apply_now && crate::file::diff_has(&change.diff, "live") {
+        if intent.set_live {
             sys.cmd("sysctl")
-                .args(["-w", &format!("{}={}", self.key, self.value)])
+                .args(["-w", &format!("{}={}", intent.key, intent.value)])
                 .run()?;
         }
         Ok(SysctlReport {
-            key: self.key.clone(),
-            value: self.value.clone(),
-            previous_live,
-            file: self.file.clone(),
+            key: intent.key,
+            value: intent.value,
+            previous_live: intent.live,
+            file: intent.path,
         })
     }
 }
@@ -486,7 +509,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "sysctl net.ipv4.ip_forward:\n  /etc/sysctl.d/99-rustible.conf: absent -> 1\n"
         );
         op.apply(&s, c).unwrap();
@@ -509,7 +532,7 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "live=1");
+        assert_eq!(c.diff().short(), "live=1");
         let r = op.apply(&s, c).unwrap();
         assert_eq!(r.previous_live.as_deref(), Some("0"));
         assert_eq!(
@@ -530,7 +553,7 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "/etc/sysctl.d/99-rustible.conf=1 live=1");
+        assert_eq!(c.diff().short(), "/etc/sysctl.d/99-rustible.conf=1 live=1");
         op.apply(&s, c).unwrap();
         assert_eq!(
             fake.content(DEFAULT_FILE).unwrap(),
@@ -547,7 +570,7 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "/etc/sysctl.d/99-rustible.conf=1");
+        assert_eq!(c.diff().short(), "/etc/sysctl.d/99-rustible.conf=1");
         op.apply(&s, c).unwrap();
         assert!(fake.argvs().is_empty());
         assert_eq!(
@@ -615,7 +638,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "sysctl net.ipv4.ip_forward:\n  /etc/sysctl.d/99-rustible.conf: absent -> 1\n  live: 0 -> 1\n"
         );
         assert!(fake.file(DEFAULT_FILE).is_none());
@@ -656,34 +679,54 @@ mod tests {
         assert!(err.contains("needs root") && err.contains("cadu"), "{err}");
     }
 
-    /// `apply` executes the diff `check` produced (vision 6.2): the live write
-    /// happens when the diff carries a `live` change and not otherwise, even
-    /// though the kernel value differs here.
+    /// `apply` executes the intent `check` produced (vision 6.2): the live
+    /// write happens when the intent says so and not otherwise, even though
+    /// the kernel value differs here. Before the intent, this was decided by
+    /// searching the diff for an attribute named `live`, which a drop-in
+    /// whose path rendered as `live` would also have matched.
     #[test]
-    fn apply_runs_sysctl_w_only_when_the_diff_says_so() {
+    fn apply_runs_sysctl_w_only_when_the_intent_says_so() {
         let fake = Arc::new(box_with(None, Some("0")));
         let s = sys(&fake);
-        let r = Present::new(KEY, "1")
-            .apply(
-                &s,
-                Change {
-                    diff: Diff::Attrs {
-                        subject: format!("sysctl {KEY}"),
-                        changes: vec![AttrChange {
-                            name: DEFAULT_FILE.into(),
-                            from: "absent".into(),
-                            to: "1".into(),
-                        }],
-                    },
-                },
-            )
-            .unwrap();
+        let intent = SysctlIntent {
+            key: KEY.into(),
+            value: "1".into(),
+            path: DEFAULT_FILE.into(),
+            file: Some((String::new(), "net.ipv4.ip_forward = 1\n".into())),
+            live: Some("0".into()),
+            set_live: false,
+        };
+        assert_eq!(
+            intent.diff().render(),
+            "sysctl net.ipv4.ip_forward:\n  /etc/sysctl.d/99-rustible.conf: absent -> 1\n"
+        );
+        let r = Present::new(KEY, "1").apply(&s, intent).unwrap();
         assert_eq!(
             fake.content(DEFAULT_FILE).unwrap(),
             "net.ipv4.ip_forward = 1\n"
         );
-        assert!(fake.argvs().is_empty(), "no live change in the diff");
-        assert_eq!(r.previous_live.as_deref(), Some("0"), "read, not carried");
+        assert!(fake.argvs().is_empty(), "the intent sets nothing live");
+        assert_eq!(r.previous_live.as_deref(), Some("0"));
+    }
+
+    /// `previous_live` is what `check` read, carried in the intent: an
+    /// observation, not a prediction, so a kernel value that moves between
+    /// `check` and `apply` does not change the report.
+    #[test]
+    fn previous_live_is_what_check_read() {
+        let fake = Arc::new(box_with(None, Some("0")));
+        let s = sys(&fake);
+        let op = Present::new(KEY, "1");
+        let Plan::Change(intent) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"7\n").unwrap();
+        let r = op.apply(&s, intent).unwrap();
+        assert_eq!(r.previous_live.as_deref(), Some("0"));
+        assert_eq!(
+            fake.argvs(),
+            vec![vec!["sysctl", "-w", "net.ipv4.ip_forward=1"]]
+        );
     }
 
     #[test]

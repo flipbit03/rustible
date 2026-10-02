@@ -54,10 +54,40 @@ impl Absent {
     }
 }
 
+/// What [`Absent`]'s `check` decided: remove what it found at the path, as
+/// a single entry or as a tree.
+#[derive(Debug)]
+pub struct AbsentIntent {
+    path: PathBuf,
+    /// What `check` found there.
+    kind: FileKind,
+    /// Entries `check` counted in a directory; 0 for anything else.
+    entries: usize,
+    /// Remove a directory and everything in it (`rm -r`), which only a
+    /// `.recursive(true)` op on a directory decides. Otherwise one entry is
+    /// removed, and the kernel refuses a directory populated since `check`.
+    tree: bool,
+}
+
+impl Intent for AbsentIntent {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![AttrChange::new(
+            "exists",
+            format!("yes ({})", format!("{:?}", self.kind).to_lowercase()),
+            "no",
+        )];
+        if self.entries > 0 {
+            changes.push(AttrChange::new("entries", self.entries.to_string(), "0"));
+        }
+        Diff::attrs(self.path.display().to_string(), changes)
+    }
+}
+
 impl Op for Absent {
     type Output = AbsentReport;
+    type Intent = AbsentIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<AbsentReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Absent removes a path through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -68,40 +98,31 @@ impl Op for Absent {
         let Some(stat) = sys.stat(&self.path)? else {
             return Ok(Plan::Satisfied(self.report(false)));
         };
-        let mut changes = vec![AttrChange {
-            name: "exists".into(),
-            from: format!("yes ({})", format!("{:?}", stat.kind).to_lowercase()),
-            to: "no".into(),
-        }];
+        let mut entries = 0;
         if stat.kind == FileKind::Dir {
-            let entries = sys.read_dir(&self.path)?.len();
+            entries = sys.read_dir(&self.path)?.len();
             if entries > 0 && !self.recursive {
                 bail!(
                     "{} is a directory with {entries} entries; use .recursive(true) to remove it",
                     self.path.display()
                 );
             }
-            if entries > 0 {
-                changes.push(AttrChange {
-                    name: "entries".into(),
-                    from: entries.to_string(),
-                    to: "0".into(),
-                });
-            }
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.path.display().to_string(),
-            changes,
+        Ok(Plan::Change(AbsentIntent {
+            path: self.path.clone(),
+            kind: stat.kind,
+            entries,
+            tree: self.recursive && stat.kind == FileKind::Dir,
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<AbsentReport> {
+    fn apply(&self, sys: &System, intent: AbsentIntent) -> Result<AbsentReport> {
         // The kernel is the floor: without `.recursive(true)` a populated
         // directory fails here too, not only at check.
-        if self.recursive {
-            sys.remove_all(&self.path)?;
+        if intent.tree {
+            sys.remove_all(&intent.path)?;
         } else {
-            sys.remove(&self.path)?;
+            sys.remove(&intent.path)?;
         }
         Ok(self.report(true))
     }
@@ -169,7 +190,7 @@ mod tests {
 
         let op = Absent::at("/etc/l");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.render(), "/etc/l:\n  exists: yes (symlink) -> no\n");
+        assert_eq!(c.diff().render(), "/etc/l:\n  exists: yes (symlink) -> no\n");
         assert!(op.apply(&sys, c).unwrap().removed);
         assert!(fake.file("/etc/l").is_none());
         assert!(
@@ -179,7 +200,7 @@ mod tests {
 
         let op = Absent::at("/etc/f");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "exists=no");
+        assert_eq!(c.diff().short(), "exists=no");
         assert!(op.apply(&sys, c).unwrap().removed);
         assert!(fake.file("/etc/f").is_none());
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
@@ -191,7 +212,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Absent::at("/empty");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "exists=no");
+        assert_eq!(c.diff().short(), "exists=no");
         op.apply(&sys, c).unwrap();
         assert!(fake.file("/empty").is_none());
     }
@@ -210,7 +231,7 @@ mod tests {
 
         let op = Absent::at("/d").recursive(true);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "exists=no entries=0");
+        assert_eq!(c.diff().short(), "exists=no entries=0");
         op.apply(&sys, c).unwrap();
         assert!(fake.file("/d").is_none() && fake.file("/d/a").is_none());
     }
