@@ -170,15 +170,6 @@ fn installed(sys: &System, brew: &str) -> Result<Vec<Formula>> {
     Ok(parse_list_versions(&out.stdout_str()))
 }
 
-/// The names `check` wrote into the diff, which is how `apply` learns what to
-/// do without inspecting the host again.
-fn planned_names(diff: &Diff) -> Vec<String> {
-    match diff {
-        Diff::Attrs { changes, .. } => changes.iter().map(|c| c.name.clone()).collect(),
-        _ => vec![],
-    }
-}
-
 // ---------------------------------------------------------------- Present
 
 /// Ensure formulae are installed. `homebrew: state=present`.
@@ -203,10 +194,31 @@ impl Present {
     }
 }
 
+/// What [`Present`]'s `check` decided: install these formulae, which brew
+/// does not have, with the `brew` it found.
+#[derive(Debug)]
+pub struct Install {
+    brew: String,
+    names: Vec<String>,
+}
+
+impl Intent for Install {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            "brew formulae",
+            self.names
+                .iter()
+                .map(|name| AttrChange::new(name.as_str(), "absent", "installed"))
+                .collect(),
+        )
+    }
+}
+
 impl Op for Present {
     type Output = InstallReport;
+    type Intent = Install;
 
-    fn check(&self, sys: &System) -> Result<Plan<InstallReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         let brew = require_brew_not_root(sys, "Present")?;
         ensure!(
             !self.names.is_empty(),
@@ -219,34 +231,28 @@ impl Op for Present {
         }
         let have = installed(sys, &brew)?;
         let mut report = InstallReport::default();
-        let mut changes = vec![];
+        let mut missing = vec![];
         for name in &self.names {
             match have.iter().find(|f| &f.name == name) {
                 Some(f) => report.already_present.push(f.clone()),
-                None => changes.push(AttrChange {
-                    name: name.clone(),
-                    from: "absent".into(),
-                    to: "installed".into(),
-                }),
+                None => missing.push(name.clone()),
             }
         }
-        if changes.is_empty() {
+        if missing.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "brew formulae".into(),
-            changes,
+        Ok(Plan::Change(Install {
+            brew,
+            names: missing,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<InstallReport> {
-        let brew = brew_bin(sys)?;
+    fn apply(&self, sys: &System, intent: Install) -> Result<InstallReport> {
         // Install what `check` planned, not what brew says now.
-        let missing = planned_names(&change.diff);
-        ensure!(
-            !missing.is_empty(),
-            "brew::Present::apply: the plan names no formula to install"
-        );
+        let Install {
+            brew,
+            names: missing,
+        } = intent;
         sys.cmd(&brew)
             .arg("install")
             .args(missing.iter().cloned())
@@ -294,10 +300,37 @@ impl Absent {
     }
 }
 
+/// What [`Absent`]'s `check` decided: uninstall these formulae, each with
+/// the version `brew list` showed, using the `brew` it found.
+#[derive(Debug)]
+pub struct Uninstall {
+    brew: String,
+    formulae: Vec<Formula>,
+}
+
+impl Intent for Uninstall {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            "brew formulae",
+            self.formulae
+                .iter()
+                .map(|f| {
+                    AttrChange::new(
+                        f.name.as_str(),
+                        format!("installed {}", f.version),
+                        "absent",
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 impl Op for Absent {
     type Output = RemoveReport;
+    type Intent = Uninstall;
 
-    fn check(&self, sys: &System) -> Result<Plan<RemoveReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         let brew = require_brew_not_root(sys, "Absent")?;
         ensure!(
             !self.names.is_empty(),
@@ -310,51 +343,39 @@ impl Op for Absent {
         }
         let have = installed(sys, &brew)?;
         let mut report = RemoveReport::default();
-        let mut changes = vec![];
-        for name in &self.names {
-            match have.iter().find(|f| &f.name == name) {
-                Some(f) => {
-                    changes.push(AttrChange {
-                        name: name.clone(),
-                        from: format!("installed {}", f.version),
-                        to: "absent".into(),
-                    });
-                    report.removed.push(f.clone());
-                }
-                None => report.already_absent.push(name.clone()),
-            }
-        }
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(report));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "brew formulae".into(),
-            changes,
-        }))
-    }
-
-    fn apply(&self, sys: &System, change: Change) -> Result<RemoveReport> {
-        let brew = brew_bin(sys)?;
-        let present = planned_names(&change.diff);
-        ensure!(
-            !present.is_empty(),
-            "brew::Absent::apply: the plan names no formula to remove"
-        );
-        // The output lists what went, with versions: read them before the
-        // uninstall takes them away. What to uninstall is the diff's call.
-        let have = installed(sys, &brew)?;
-        let mut report = RemoveReport::default();
         for name in &self.names {
             match have.iter().find(|f| &f.name == name) {
                 Some(f) => report.removed.push(f.clone()),
                 None => report.already_absent.push(name.clone()),
             }
         }
+        if report.removed.is_empty() {
+            return Ok(Plan::Satisfied(report));
+        }
+        Ok(Plan::Change(Uninstall {
+            brew,
+            formulae: report.removed,
+        }))
+    }
+
+    fn apply(&self, sys: &System, intent: Uninstall) -> Result<RemoveReport> {
+        let Uninstall { brew, formulae } = intent;
         sys.cmd(&brew)
             .arg("uninstall")
-            .args(present.iter().cloned())
+            .args(formulae.iter().map(|f| f.name.clone()))
             .run()?;
-        Ok(report)
+        // What went, with the versions `check` read before the uninstall
+        // took them.
+        let already_absent = self
+            .names
+            .iter()
+            .filter(|name| !formulae.iter().any(|f| &f.name == *name))
+            .cloned()
+            .collect();
+        Ok(RemoveReport {
+            removed: formulae,
+            already_absent,
+        })
     }
 }
 
@@ -477,9 +498,9 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        // Only the missing one is in the plan, and the diff is what `apply`
+        // Only the missing one is in the plan, and the intent is what `apply`
         // reads its work from.
-        assert_eq!(planned_names(&c.diff), vec!["ninvaders".to_string()]);
+        assert_eq!(c.diff().render(), "brew formulae:\n  ninvaders: absent -> installed\n");
 
         let report = op.apply(&s, c).unwrap();
         let argvs = fake.argvs();
@@ -562,7 +583,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "brew formulae:\n  nethack: installed 3.6.7 -> absent\n"
         );
         // The version is read from `brew list` before the uninstall takes it;
