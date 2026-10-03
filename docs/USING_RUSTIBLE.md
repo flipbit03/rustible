@@ -512,8 +512,10 @@ ctx.skip(name: impl Into<String>, reason: impl Into<String>)
 // The closure returns a Result, so end it with `Ok(..)` and use `?` on the
 // block itself. A step belongs to every block open while it runs, whichever
 // `Ctx` ran it (an `as_root()` bound earlier included). A block has no result
-// of its own: `Block<T>` derefs to what the closure returned, and has
-// `.output()`. Return what a later step needs, e.g. the `Applied` that matters.
+// of its own: `Block<T>` derefs to what the closure returned, so its fields
+// and methods work directly. Return what a later step needs, e.g. the
+// `Applied` that matters. The block's own `.completed()`, `.value()` and
+// `.into_value()` say whether it was cut short under --check.
 ctx.block(name, |ctx| -> Result<T> { ... }) -> Result<Block<T>>
 
 // What this machine is (§10).

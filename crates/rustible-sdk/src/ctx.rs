@@ -756,12 +756,12 @@ impl Ctx {
 /// dry run visible, put the dependent `if` inside a block of its own:
 /// `ctx.block("restart", |ctx| { if cfg.changed { .. } Ok(()) })?`.
 ///
-/// `Block`'s own [`Block::is_available`], [`Block::output`] and
-/// [`Block::into_output`] are about the block's value, and shadow the
-/// methods of the same names on an [`Applied`] it holds: with the pattern
-/// above, `cfg.is_available()` says whether the block was cut short, not
-/// whether the step has an output. Fields still reach the `Applied` through
-/// `Deref`; for the inner check write `cfg.output()?.is_available()`.
+/// `Block`'s own accessors, [`Block::completed`], [`Block::value`] and
+/// [`Block::into_value`], are named apart from a step's on purpose, so that
+/// everything on the returned value is reachable directly through `Deref`:
+/// with the pattern above, `cfg.changed`, `cfg.is_available()` and
+/// `cfg.output()` are the `Applied`'s. On a block that was cut short, those
+/// reads are cut short too.
 #[derive(Debug)]
 pub struct Block<T> {
     value: Option<T>,
@@ -775,12 +775,12 @@ impl<T> Block<T> {
     /// output the block needed when it was ended under `--check`. An
     /// enclosing block absorbs that error like any other read of a missing
     /// output.
-    pub fn output(&self) -> Result<&T> {
+    pub fn value(&self) -> Result<&T> {
         self.value.as_ref().ok_or_else(|| self.unavailable().into())
     }
 
-    /// [`Block::output`] by value.
-    pub fn into_output(self) -> Result<T> {
+    /// [`Block::value`] by value.
+    pub fn into_value(self) -> Result<T> {
         match self.value {
             Some(v) => Ok(v),
             None => Err(OutputUnavailable {
@@ -790,9 +790,9 @@ impl<T> Block<T> {
         }
     }
 
-    /// Whether the block got as far as returning a value: false exactly when
-    /// it was ended under `--check` by a missing output.
-    pub fn is_available(&self) -> bool {
+    /// Whether the block ran to the end and returned a value: false exactly
+    /// when it was cut short under `--check` by a missing output.
+    pub fn completed(&self) -> bool {
         self.value.is_some()
     }
 
@@ -1376,10 +1376,10 @@ mod tests {
                 Ok(*a + *c)
             })
             .unwrap();
-        assert!(b.is_available());
+        assert!(b.completed());
         assert_eq!(*b, 7);
-        assert_eq!(*b.output().unwrap(), 7);
-        assert_eq!(b.into_output().unwrap(), 7);
+        assert_eq!(*b.value().unwrap(), 7);
+        assert_eq!(b.into_value().unwrap(), 7);
     }
 
     #[test]
@@ -1532,7 +1532,7 @@ mod tests {
                 Ok(n)
             })
             .unwrap();
-        assert!(!b.is_available());
+        assert!(!b.completed());
         ctx.step("after", ok(0)).unwrap();
         assert_eq!(warnings(&sink), [format!("[folder] {MISSING}")]);
         assert_eq!(
@@ -1556,7 +1556,7 @@ mod tests {
                 Ok(*got + 1)
             })
             .unwrap();
-        assert!(!b.is_available());
+        assert!(!b.completed());
         ctx.step("after", ok(1)).unwrap();
         assert_eq!(warnings(&sink), [format!("[folder] {MISSING}")]);
         assert_eq!(
@@ -1579,7 +1579,7 @@ mod tests {
                 Ok(*got)
             })
             .unwrap();
-        let err = b.output().unwrap_err();
+        let err = b.value().unwrap_err();
         assert_eq!(
             err.downcast_ref::<OutputUnavailable>().unwrap().step,
             "read"
@@ -1589,7 +1589,7 @@ mod tests {
             payload.downcast::<OutputUnavailable>().unwrap().step,
             "read"
         );
-        let err = b.into_output().unwrap_err();
+        let err = b.into_value().unwrap_err();
         assert_eq!(
             err.downcast_ref::<OutputUnavailable>().unwrap().step,
             "read"
@@ -1607,7 +1607,7 @@ mod tests {
                     let got = ctx.step("read", change(1))?;
                     Ok(*got)
                 })?;
-                assert!(!inner.is_available());
+                assert!(!inner.completed());
                 ctx.step("outer goes on", ok(1))?;
                 Ok("done")
             })
@@ -1638,16 +1638,16 @@ mod tests {
                     let v = if through_deref {
                         *inner
                     } else {
-                        *inner.output()?
+                        *inner.value()?
                     };
                     ctx.step("never reached", ok(v))?;
                     Ok(v)
                 })
                 .unwrap();
-            assert!(!outer.is_available());
+            assert!(!outer.completed());
             assert_eq!(
                 outer
-                    .output()
+                    .value()
                     .unwrap_err()
                     .downcast_ref::<OutputUnavailable>()
                     .unwrap()
@@ -1671,7 +1671,7 @@ mod tests {
         let (mut ctx, sink) = ctx_in(true);
         let got = ctx.step("read", change(1)).unwrap();
         let b = ctx.block("uses it", |_| Ok(*got + 1)).unwrap();
-        assert!(!b.is_available());
+        assert!(!b.completed());
         assert_eq!(warnings(&sink), [format!("[uses it] {MISSING}")]);
     }
 
@@ -1819,7 +1819,7 @@ mod tests {
     fn a_child_that_outlives_a_block_is_outside_it() {
         let (mut ctx, sink) = ctx_in(false);
         let b = ctx.block("b", |ctx| Ok(ctx.as_root())).unwrap();
-        let mut escaped = b.into_output().unwrap();
+        let mut escaped = b.into_value().unwrap();
         escaped.step("after", change(1)).unwrap();
         // Used in a later sibling block, it belongs to that block instead.
         ctx.block("sibling", |_| {
@@ -2058,7 +2058,7 @@ mod tests {
                 Ok(*got)
             })
             .unwrap();
-        assert!(!b.is_available());
+        assert!(!b.completed());
         let missing: Applied<u32> =
             Applied::new("read".into(), None, true, None, std::time::Duration::ZERO);
         assert!(catching(AssertUnwindSafe(|| *missing)).is_err());
@@ -2283,7 +2283,7 @@ mod tests {
             let names: Vec<String> = finished_steps(&sink).into_iter().map(|(n, _)| n).collect();
             let label = format!("check={check_mode} conf={conf_changes} cut={cut_short}");
             if cut_short {
-                assert!(!restarted.is_available(), "{label}");
+                assert!(!restarted.completed(), "{label}");
                 assert!(!names.contains(&"Restart app".to_string()), "{label}");
                 assert_eq!(
                     warnings(&sink),
@@ -2316,5 +2316,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Cadu's decision: `Block`'s accessors are named apart ----
+
+    /// `Block`'s accessors are `completed`, `value` and `into_value`, so a
+    /// block holding an `Applied` is transparent: `is_available()` and
+    /// `output()` on it are the step's, through `Deref`.
+    #[test]
+    fn a_block_holding_a_step_is_transparent_to_the_steps_methods() {
+        // --check, not cut short, the step would change: the block completed,
+        // and the step has no output.
+        let (mut ctx, _sink) = ctx_in(true);
+        let cfg = ctx
+            .block("Configure app", |ctx| ctx.step("app.conf", change(1)))
+            .unwrap();
+        assert!(cfg.completed());
+        assert!(!cfg.is_available(), "Applied::is_available, through Deref");
+        assert!(cfg.changed);
+        let err = cfg.output().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<OutputUnavailable>().unwrap().step,
+            "app.conf"
+        );
+
+        // --check, cut short: the block did not complete, and its value
+        // names the step it was waiting for.
+        let (mut ctx, _sink) = ctx_in(true);
+        let earlier = ctx.step("read", change(1)).unwrap();
+        let cfg = ctx
+            .block("Configure app", |ctx| {
+                let _ = *earlier;
+                ctx.step("app.conf", change(1))
+            })
+            .unwrap();
+        assert!(!cfg.completed());
+        let err = cfg.value().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<OutputUnavailable>().unwrap().step,
+            "read"
+        );
+
+        // A real run: everything is there.
+        let (mut ctx, _sink) = ctx_in(false);
+        let cfg = ctx
+            .block("Configure app", |ctx| ctx.step("app.conf", change(7)))
+            .unwrap();
+        assert!(cfg.completed());
+        assert!(cfg.is_available());
+        assert!(cfg.changed);
+        assert_eq!(*cfg.output().unwrap(), 7);
+        assert_eq!(**cfg.value().unwrap(), 7);
     }
 }
