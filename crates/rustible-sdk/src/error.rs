@@ -228,8 +228,9 @@ pub(crate) fn catching<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
 /// It is a context layer, not a cause: it renders as the outermost part of
 /// [`Error::chain`] exactly as the plain string it replaced did, and its
 /// reason for being a type is [`Error::step_failed`], which lets the runtime
-/// fill [`Event::Failed::step`](crate::event::Event::Failed) without parsing
-/// the chain back apart.
+/// fill [`Event::Failed`](crate::event::Event::Failed)'s `step` and `blocks`
+/// without parsing the chain back apart, and tell which failed step's error
+/// left the playbook ([`StepFailed::id`]).
 #[derive(Debug, thiserror::Error)]
 #[error("step `{step}`{suffix}")]
 pub struct StepFailed {
@@ -241,6 +242,15 @@ pub struct StepFailed {
     /// `apply` failed; `" not started"` or `" not applied"` when the run was
     /// cancelled on one side of `apply` and the step never ran.
     pub suffix: String,
+    /// The [`Ctx::block`](crate::ctx::Ctx::block)s the step ran inside,
+    /// outermost first, as its `StepStarted` reported them; empty at the top
+    /// level and for a layer built by hand. Not part of the rendered chain:
+    /// a reporter prints it as the `[outer][inner]` prefix it puts on the
+    /// step line.
+    pub blocks: Vec<String>,
+    /// The failed step's id, set by `Ctx::step` only, and private so a
+    /// layer built by hand cannot claim a step it did not come from.
+    id: Option<u32>,
 }
 
 impl StepFailed {
@@ -249,6 +259,8 @@ impl StepFailed {
         StepFailed {
             step: step.into(),
             suffix: String::new(),
+            blocks: Vec::new(),
+            id: None,
         }
     }
 
@@ -258,7 +270,36 @@ impl StepFailed {
         StepFailed {
             step: step.into(),
             suffix: format!(" {suffix}"),
+            blocks: Vec::new(),
+            id: None,
         }
+    }
+
+    /// The `StepStarted` id of the step this layer belongs to, when
+    /// `Ctx::step` attached it to a step it counted as failed. `None` for a
+    /// step stopped before it started (no id was drawn) and for a layer
+    /// built with [`StepFailed::at`] or [`StepFailed::cancelled`] outside
+    /// the SDK.
+    ///
+    /// Names repeat freely (a retry loop reuses one), so this, not the name,
+    /// is how the runtime tells which failed step's error left the playbook
+    /// and so failed the host, and which the playbook caught.
+    pub fn id(&self) -> Option<u32> {
+        self.id
+    }
+
+    /// Tie the layer to the failed step `id`, inside `blocks`.
+    pub(crate) fn of_step(self, id: u32, blocks: Vec<String>) -> Self {
+        StepFailed {
+            id: Some(id),
+            blocks,
+            ..self
+        }
+    }
+
+    /// The block path alone, for a step that drew no id.
+    pub(crate) fn in_blocks(self, blocks: Vec<String>) -> Self {
+        StepFailed { blocks, ..self }
     }
 }
 

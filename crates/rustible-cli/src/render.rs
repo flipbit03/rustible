@@ -32,10 +32,25 @@ struct HostState {
     /// Something outside the playbook went wrong: connect, upload, protocol.
     error: Option<String>,
     exit: Option<i32>,
-    /// A step reported `Failed` with its chain in `note`; the binary's
-    /// `Failed` frame normally follows and prints it once. If it does not
-    /// (the playbook swallowed the error), the chain prints from here.
-    pending_fail: Option<(String, String)>,
+    /// A step reported `Failed` with its chain in `note`. If its error is
+    /// the one that failed the host, the binary's `Failed` frame for the same
+    /// step follows and prints the chain once. If it does not (the playbook
+    /// caught the error: the step is `recovered`), the chain prints from
+    /// here, before whatever comes next.
+    pending_fail: Option<PendingFail>,
+}
+
+/// A failed step's chain, held back until it is known whether a `Failed`
+/// frame will print it.
+struct PendingFail {
+    blocks: Vec<String>,
+    step: String,
+    chain: String,
+    /// Lines from outside any step that arrived while the chain was held
+    /// back, typically the playbook's own word on the failure it caught
+    /// (`ctx.warn(format!("skipping: {e}"))`). They print after the chain,
+    /// so the reason a step failed comes before what was done about it.
+    after: Vec<String>,
 }
 
 pub struct Renderer<W: Write> {
@@ -76,9 +91,11 @@ impl<W: Write> Renderer<W> {
     /// A line that belongs to the step in flight when there is one, else
     /// prints now.
     fn nested(&mut self, host: &str, text: String) {
-        match &mut self.state(host).open {
-            Some(buf) => buf.push(text),
-            None => self.line(host, &text),
+        let st = self.state(host);
+        match (&mut st.open, &mut st.pending_fail) {
+            (Some(buf), _) => buf.push(text),
+            (None, Some(p)) => p.after.push(text),
+            (None, None) => self.line(host, &text),
         }
     }
 
@@ -88,8 +105,14 @@ impl<W: Write> Renderer<W> {
                 self.line(host, &l);
             }
         }
-        if let Some((step, chain)) = self.state(host).pending_fail.take() {
-            self.line(host, &format!("FAILED at `{step}`: {chain}"));
+        if let Some(p) = self.state(host).pending_fail.take() {
+            self.line(
+                host,
+                &format!("FAILED at {}: {}", failed_at(&p.blocks, &p.step), p.chain),
+            );
+            for l in p.after {
+                self.line(host, &l);
+            }
         }
     }
 
@@ -160,7 +183,12 @@ impl<W: Write> Renderer<W> {
                 let mut pending = None;
                 match note {
                     Some(chain) if *status == Status::Failed => {
-                        pending = Some((name.clone(), chain.clone()));
+                        pending = Some(PendingFail {
+                            blocks: blocks.clone(),
+                            step: name.clone(),
+                            chain: chain.clone(),
+                            after: vec![],
+                        });
                     }
                     Some(n) => {
                         let _ = write!(tail, "   {n}");
@@ -216,17 +244,28 @@ impl<W: Write> Renderer<W> {
                     self.nested(host, text);
                 }
             }
-            Event::Failed { step, error, cmd } => {
+            Event::Failed {
+                step,
+                blocks,
+                error,
+                cmd,
+            } => {
                 let (step, error) = split_step(step.as_deref(), error);
-                // The frame carries the chain; the step line's copy is not needed.
+                // The frame carries the chain; the step line's copy is not
+                // needed when it is the same step, at the same place. What
+                // was held back behind it still prints, before this line.
                 if let Some(p) = &self.state(host).pending_fail
-                    && step == Some(p.0.as_str())
+                    && step == Some(p.step.as_str())
+                    && *blocks == p.blocks
                 {
-                    self.state(host).pending_fail = None;
+                    let held = self.state(host).pending_fail.take();
+                    for l in held.map(|p| p.after).unwrap_or_default() {
+                        self.line(host, &l);
+                    }
                 }
                 self.flush(host);
                 let text = match step {
-                    Some(s) => format!("FAILED at `{s}`: {error}"),
+                    Some(s) => format!("FAILED at {}: {error}", failed_at(blocks, s)),
                     None => format!("FAILED: {error}"),
                 };
                 self.line(host, &text);
@@ -249,16 +288,17 @@ impl<W: Write> Renderer<W> {
         }
     }
 
-    /// The summary table. Returns whether any host failed: a failed step,
-    /// a non-zero exit, no summary at all, or an orchestrator-side error.
+    /// The summary table. Returns whether any host failed: a `failed`
+    /// count (never `recovered`, which is a failure the playbook caught), a
+    /// non-zero exit, no summary at all, or an orchestrator-side error.
     pub fn finish(&mut self) -> bool {
         let mut any_failed = false;
         let mut out = String::new();
         let w = self.width.max(4);
         let _ = writeln!(
             out,
-            "\n{:<w$}  {:>3}  {:>7}  {:>12}  {:>7}  {:>6}  {:>8}",
-            "host", "ok", "changed", "would change", "skipped", "failed", "warnings"
+            "\n{:<w$}  {:>3}  {:>7}  {:>12}  {:>7}  {:>6}  {:>9}  {:>8}",
+            "host", "ok", "changed", "would change", "skipped", "failed", "recovered", "warnings"
         );
         for host in &self.order {
             let st = &self.hosts[host];
@@ -277,12 +317,13 @@ impl<W: Write> Renderer<W> {
                 (Some(s), None) => {
                     let _ = writeln!(
                         out,
-                        "{host:<w$}  {:>3}  {:>7}  {:>12}  {:>7}  {:>6}  {:>8}{}",
+                        "{host:<w$}  {:>3}  {:>7}  {:>12}  {:>7}  {:>6}  {:>9}  {:>8}{}",
                         s.ok,
                         s.changed,
                         s.would_change,
                         s.skipped,
                         s.failed,
+                        s.recovered,
                         s.warnings,
                         match st.exit {
                             Some(c) if c != 0 && s.failed == 0 => format!("  exit {c}"),
@@ -318,6 +359,17 @@ fn argv_text(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Where a step failed, after `FAILED at`: its block path as the step line
+/// prints it, then its name quoted, so a repeated name inside a block is
+/// told apart from the same name elsewhere.
+fn failed_at(blocks: &[String], step: &str) -> String {
+    if blocks.is_empty() {
+        format!("`{step}`")
+    } else {
+        format!("{} `{step}`", block_prefix(blocks))
+    }
 }
 
 fn status_word(s: Status) -> &'static str {
@@ -517,9 +569,9 @@ mod tests {
 [arm  ]  mc present .............................................. changed
 [arm  ]    $ apt-get (as self, exit 0, 4500ms)
 
-host    ok  changed  would change  skipped  failed  warnings
-local    1        0             0        0       0         0
-arm      0        1             0        0       0         0
+host    ok  changed  would change  skipped  failed  recovered  warnings
+local    1        0             0        0       0          0         0
+arm      0        1             0        0       0          0         0
 ";
         assert_eq!(out, expected);
     }
@@ -554,6 +606,7 @@ arm      0        1             0        0       0         0
     fn failure_renders_per_vision_14() {
         let failed = Event::Failed {
             step: None,
+            blocks: vec![],
             error: "step `nginx present`: installing nginx: `apt-get install -y nginx` exited 100"
                 .into(),
             cmd: Some(CmdFailed {
@@ -665,6 +718,7 @@ arm      0        1             0        0       0         0
                 "local",
                 &Event::Failed {
                     step: None,
+                    blocks: vec![],
                     error: "step `x`: boom: deeper".into(),
                     cmd: None,
                 },
@@ -686,6 +740,8 @@ arm      0        1             0        0       0         0
             "{reported}"
         );
 
+        // The playbook caught the error and carried on: the step is
+        // `recovered`, the host did not fail, and the chain still prints.
         let swallowed = render(0, |r| {
             r.event("local", &step_started(1, "x"));
             r.event("local", &finished);
@@ -694,11 +750,15 @@ arm      0        1             0        0       0         0
             r.event(
                 "local",
                 &Event::Finished(Summary {
-                    failed: 1,
+                    recovered: 1,
                     ok: 1,
                     ..Default::default()
                 }),
             );
+            r.exited("local", 0);
+            r.event("arm", &Event::Finished(Summary::default()));
+            r.exited("arm", 0);
+            assert!(!r.finish(), "a recovered failure does not fail the host");
         });
         assert!(
             swallowed.contains(
@@ -708,6 +768,213 @@ arm      0        1             0        0       0         0
             "{swallowed}"
         );
         assert!(swallowed.find("FAILED at").unwrap() < swallowed.find("y ....").unwrap());
+        assert!(
+            swallowed.ends_with(
+                "\nhost    ok  changed  would change  skipped  failed  recovered  warnings
+local    1        0             0        0       0          1         0
+arm      0        0             0        0       0          0         0
+"
+            ),
+            "{swallowed}"
+        );
+    }
+
+    /// The issue's own example: a retry loop that heals on its third
+    /// attempt. Both failed attempts print `FAILED` and their chain, live;
+    /// the last attempt prints its status; the recap counts the two
+    /// failures as `recovered`, and the host is not failed.
+    #[test]
+    fn a_retry_that_heals_shows_every_failure_and_fails_nothing() {
+        let attempt = |id: u32, status: Status| {
+            let mut ev = step_finished(id, "wait for the api", status);
+            if let Event::StepFinished { note, .. } = &mut ev
+                && status == Status::Failed
+            {
+                *note = Some("`curl -fsS http://127.0.0.1:8080/health` exited 7".into());
+            }
+            ev
+        };
+        let mut r = Renderer::new(Vec::new(), &["web1".into()], 0);
+        for (id, status) in [
+            (1, Status::Failed),
+            (2, Status::Failed),
+            (3, Status::Changed),
+        ] {
+            r.event("web1", &step_started(id, "wait for the api"));
+            r.event("web1", &attempt(id, status));
+        }
+        r.event(
+            "web1",
+            &Event::Finished(Summary {
+                ok: 4,
+                changed: 1,
+                recovered: 2,
+                ..Default::default()
+            }),
+        );
+        r.exited("web1", 0);
+        assert!(!r.finish());
+        let out = String::from_utf8(r.w).unwrap();
+        let expected = "\
+[web1]  wait for the api ........................................ FAILED
+[web1]  FAILED at `wait for the api`: `curl -fsS http://127.0.0.1:8080/health` exited 7
+[web1]  wait for the api ........................................ FAILED
+[web1]  FAILED at `wait for the api`: `curl -fsS http://127.0.0.1:8080/health` exited 7
+[web1]  wait for the api ........................................ changed
+
+host   ok  changed  would change  skipped  failed  recovered  warnings
+web1    4        1             0        0       0          2         0
+";
+        assert_eq!(out, expected);
+    }
+
+    /// A host that failed is failed whatever else it recovered from, and
+    /// both columns say so.
+    #[test]
+    fn failed_and_recovered_on_one_host_fail_it() {
+        let out = render(0, |r| {
+            r.event(
+                "local",
+                &Event::Finished(Summary {
+                    failed: 1,
+                    recovered: 4,
+                    ..Default::default()
+                }),
+            );
+            r.exited("local", 2);
+            r.event("arm", &Event::Finished(Summary::default()));
+            r.exited("arm", 0);
+            assert!(r.finish());
+        });
+        assert!(
+            out.contains(
+                "local    0        0             0        0       1          4         0\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The closing `FAILED at` line names the step's block path, as its
+    /// step line does: names repeat, and blocks make repeats likelier.
+    #[test]
+    fn the_failed_at_line_names_the_steps_blocks() {
+        let path = ["outer", "inner"];
+        let mut finished = in_block(step_finished(1, "boom", Status::Failed), &path);
+        if let Event::StepFinished { note, .. } = &mut finished {
+            *note = Some("`/bin/sh -c exit 3` exited 3".into());
+        }
+        let failed = Event::Failed {
+            step: Some("boom".into()),
+            blocks: path.map(String::from).to_vec(),
+            error: "step `boom`: `/bin/sh -c exit 3` exited 3".into(),
+            cmd: None,
+        };
+        let out = render(0, |r| {
+            r.event("local", &in_block(step_started(1, "boom"), &path));
+            r.event("local", &finished);
+            r.event("local", &failed);
+        });
+        assert_eq!(
+            out,
+            "\
+[local]  [outer][inner] boom ..................................... FAILED
+[local]  FAILED at [outer][inner] `boom`: `/bin/sh -c exit 3` exited 3
+"
+        );
+
+        // Caught, the held-back chain carries the path the same way.
+        let out = render(0, |r| {
+            r.event("local", &in_block(step_started(1, "boom"), &path));
+            r.event("local", &finished);
+            r.event("local", &Event::Finished(Summary::default()));
+        });
+        assert!(
+            out.ends_with(
+                "[local]  FAILED at [outer][inner] `boom`: `/bin/sh -c exit 3` exited 3\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// What the playbook says about a failure it caught comes after the
+    /// reason the step failed, not before it; and when the error escapes
+    /// instead, the chain still prints once, from the frame.
+    #[test]
+    fn a_line_after_a_held_back_chain_prints_after_it() {
+        let mut finished = step_finished(1, "optional thing", Status::Failed);
+        if let Event::StepFinished { note, .. } = &mut finished {
+            *note = Some("`false` exited 1".into());
+        }
+        let warn = Event::Log {
+            level: Level::Warn,
+            msg: "skipping: `false` exited 1".into(),
+        };
+        let caught = render(0, |r| {
+            r.event("local", &step_started(1, "optional thing"));
+            r.event("local", &finished);
+            r.event("local", &warn);
+            r.event("local", &step_started(2, "next"));
+            r.event("local", &step_finished(2, "next", Status::Ok));
+        });
+        assert_eq!(
+            caught,
+            "\
+[local]  optional thing .......................................... FAILED
+[local]  FAILED at `optional thing`: `false` exited 1
+[local]    WARNING: skipping: `false` exited 1
+[local]  next .................................................... ok
+"
+        );
+
+        let escaped = render(0, |r| {
+            r.event("local", &step_started(1, "optional thing"));
+            r.event("local", &finished);
+            r.event("local", &warn);
+            r.event(
+                "local",
+                &Event::Failed {
+                    step: Some("optional thing".into()),
+                    blocks: vec![],
+                    error: "step `optional thing`: `false` exited 1".into(),
+                    cmd: None,
+                },
+            );
+        });
+        assert_eq!(
+            escaped,
+            "\
+[local]  optional thing .......................................... FAILED
+[local]    WARNING: skipping: `false` exited 1
+[local]  FAILED at `optional thing`: `false` exited 1
+"
+        );
+    }
+
+    /// The held-back chain is dropped only for a `Failed` frame naming the
+    /// same step in the same blocks. A caught failure of `boom` inside a
+    /// block, followed by a different `boom`'s error failing the host, is
+    /// two failures, and both chains print.
+    #[test]
+    fn a_held_back_chain_is_dropped_only_for_the_same_step_in_the_same_blocks() {
+        let mut finished = in_block(step_finished(2, "boom", Status::Failed), &["b"]);
+        if let Event::StepFinished { note, .. } = &mut finished {
+            *note = Some("caught one".into());
+        }
+        let out = render(0, |r| {
+            r.event("local", &in_block(step_started(2, "boom"), &["b"]));
+            r.event("local", &finished);
+            r.event(
+                "local",
+                &Event::Failed {
+                    step: Some("boom".into()),
+                    blocks: vec![],
+                    error: "step `boom`: escaped one".into(),
+                    cmd: None,
+                },
+            );
+        });
+        assert!(out.contains("FAILED at [b] `boom`: caught one\n"), "{out}");
+        assert!(out.contains("FAILED at `boom`: escaped one\n"), "{out}");
     }
 
     /// A step name holding a backtick and a colon splits the chain in the
@@ -732,6 +999,7 @@ arm      0        1             0        0       0         0
                 "local",
                 &Event::Failed {
                     step: Some(name.into()),
+                    blocks: vec![],
                     error: chain.clone(),
                     cmd: None,
                 },

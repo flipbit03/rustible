@@ -151,9 +151,9 @@ rustible playbook run playbooks/hello.rs -vv      # every command the run execut
 A run ends with a table, one row per host:
 
 ```
-host    ok  changed  would change  skipped  failed  warnings
-local    1        1             0        0       0         0
-web1     2        0             0        0       0         0
+host    ok  changed  would change  skipped  failed  recovered  warnings
+local    1        1             0        0       0          0         0
+web1     2        0             0        0       0          0         0
 ```
 
 Vars come from the inventory, typed per playbook:

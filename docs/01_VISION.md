@@ -373,8 +373,8 @@ enum Event {
     StepSkipped  { id, blocks, name, reason },
     Log { level: Debug | Info | Warn, msg },
     CmdRan { identity, argv: Vec<String>, status: i32, elapsed_ms },   // rendered at -vv
-    Failed { step: Option<String>, error: String },
-    Finished(Summary),   // ok, changed, would_change, skipped, failed, warnings
+    Failed { step: Option<String>, blocks, error: String },   // the host failed (14)
+    Finished(Summary),   // ok, changed, would_change, skipped, failed, recovered, warnings
 }
 
 enum Status { Ok, Changed, WouldChange, Skipped, Failed }
@@ -1682,9 +1682,11 @@ where the dry run stopped seeing.
   outside any block, the playbook body for that host — with a warning naming
   the block and the step whose output was read. (Read inside an operation's
   own `check`, the missing output is that step's failure instead: the step
-  fails and is counted, and nothing is absorbed.) The block yields no value
+  fails like any other, `failed` when its error leaves the playbook and
+  `recovered` when the playbook catches it (14), and nothing is absorbed.) The block yields no value
   and the run continues after it. This is not a failure: nothing failed, the
-  dry run could not see further. Playbooks are written as if every output
+  dry run could not see further, and it is counted neither `failed` nor
+  `recovered`. Playbooks are written as if every output
   exists, without guards; `.is_available()` remains for a playbook that wants
   to branch inside a block rather than end it. In a real run every step has
   applied and the read cannot fail. Ansible carries on with silent garbage;
@@ -1784,8 +1786,12 @@ output, never report `changed`, and most resources do not need one.
 
 ## 14. Error model (DECIDED 2026-09-06)
 
-**Semantics** are Ansible's: a failed step fails that host and the run
-continues on the other hosts. In code that is `?` on `ctx.step`. Ignoring is
+**Semantics** are Ansible's: a failed step whose error leaves the playbook
+fails that host, and the run continues on the other hosts. In code that is
+`?` on `ctx.step`. A failure the playbook catches is still reported as a
+failed step but does not fail the host: the summary counts it as
+`recovered`, Ansible's `ignored` and `rescued` in one column. A cancelled run
+and a panic always fail the host. Ignoring is
 `let _ = ctx.step(..)` or `.ok()`; rescue is `if let Err(e) = ctx.step(..)`;
 retry is a loop. None of these need to know the error's kind, and no playbook
 or op is expected to match on errors.
@@ -1819,15 +1825,23 @@ types that the orchestrator can `downcast_ref` for rendering:
 `MutationDuringCheck { path }`, `OutputUnavailable { step }`,
 `CmdFailed { argv, status, stderr }`. Playbooks never need them.
 
-**On the wire.** `Failed { step, error }` carries the rendered chain as text,
-plus the structured fields of a `CmdFailed` when present, so `-v` can show
-the command and its stderr separately.
+**On the wire.** `Failed { step, blocks, error }` carries the rendered chain
+as text, the failed step's block path, plus the structured fields of a
+`CmdFailed` when present, so `-v` can show the command and its stderr
+separately.
 
 Rendered example:
 
 ```
 [web1]  FAILED at `nginx present`: installing nginx: `apt-get install -y nginx` exited 100
         E: Unable to locate package nginx
+```
+
+Inside a block, the closing line names the block path as the step line does:
+
+```
+[web1]  [outer][inner] boom ..................................... FAILED
+[web1]  FAILED at [outer][inner] `boom`: `/bin/sh -c exit 3` exited 3
 ```
 ## 15. Glossary
 
@@ -1853,6 +1867,9 @@ Rendered example:
   operation; it returns what its closure returns.
 - **Skip**: `ctx.skip(name, reason)`, a step deliberately not run, counted in
   the summary.
+- **Recovered**: a step that failed and whose error the playbook caught and
+  carried on from (a retry, a fallback, an optional step); shown `FAILED`,
+  counted in the summary, and never fails the host (14).
 - **Parameter** (inventory): a connection or escalation setting `rustible`
   itself understands, written as a property on a host or group node.
 - **Var** (inventory): a value for the playbook, written only inside a `vars`

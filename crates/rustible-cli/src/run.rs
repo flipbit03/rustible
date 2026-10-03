@@ -236,11 +236,7 @@ impl Output {
                 }
             }
             Output::Json { failed, .. } => {
-                if let Up::Event(Event::Finished(s)) = up
-                    && s.failed > 0
-                {
-                    *failed = true;
-                }
+                *failed |= reports_a_failed_host(up);
                 self.json(
                     host,
                     "frame",
@@ -307,6 +303,13 @@ impl Output {
             Output::Json { failed, .. } => *failed,
         }
     }
+}
+
+/// Whether a frame says its host failed: a summary counting a `failed`
+/// step. `recovered` is a failure the playbook caught and never fails a
+/// host, so it is not read here; the frame carries it to `--json` as is.
+fn reports_a_failed_host(up: &Up) -> bool {
+    matches!(up, Up::Event(Event::Finished(s)) if s.failed > 0)
 }
 
 type Shared = Arc<Mutex<Output>>;
@@ -1096,6 +1099,27 @@ host "solo" addr="10.0.0.9"
         let solo = ssh_target(&inv.resolve("solo").unwrap()).unwrap();
         assert_eq!(solo.port, None, "built-in port stays with ssh");
         assert_eq!(solo.user.as_deref(), Some("cadu"), "from defaults");
+    }
+
+    /// `--json`'s verdict reads `failed` and nothing else: a host that only
+    /// recovered from failures did not fail, and the frame carries
+    /// `recovered` to the script as it is.
+    #[test]
+    fn json_fails_a_host_on_failed_and_never_on_recovered() {
+        use rustible_sdk::event::Summary;
+        let finished = |failed, recovered| {
+            Up::Event(Event::Finished(Summary {
+                failed,
+                recovered,
+                ..Default::default()
+            }))
+        };
+        assert!(!reports_a_failed_host(&finished(0, 0)));
+        assert!(!reports_a_failed_host(&finished(0, 3)));
+        assert!(reports_a_failed_host(&finished(1, 0)));
+        assert!(reports_a_failed_host(&finished(1, 4)));
+        let json = serde_json::to_value(finished(0, 3)).unwrap();
+        assert_eq!(json["Event"]["Finished"]["recovered"], 3, "{json}");
     }
 
     #[test]

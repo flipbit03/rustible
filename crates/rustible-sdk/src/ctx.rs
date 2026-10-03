@@ -79,12 +79,18 @@ impl HostInfo {
 }
 
 /// State every `Ctx` of a run shares: one step sequence and summary across
-/// `as_user` clones (vision doc 11.1), the blocks open right now, the
-/// channel, and the directory streamed files land in, removed when the run's
-/// last `Ctx` drops.
+/// `as_user` clones (vision doc 11.1), the steps that failed, the blocks open
+/// right now, the channel, and the directory streamed files land in, removed
+/// when the run's last `Ctx` drops.
 pub(crate) struct Shared {
     pub(crate) step_counter: Cell<u32>,
+    /// Every counter but `failed` and `recovered`, which only the runtime
+    /// can fill: whether a failed step failed the host depends on what the
+    /// playbook did with its error, known once the entry returns.
     pub(crate) summary: RefCell<Summary>,
+    /// Every step that finished `Failed`, in order, for the runtime to
+    /// classify as `failed` or `recovered` (vision doc 14).
+    failures: RefCell<Vec<FailedStep>>,
     /// The [`Ctx::block`]s running right now, outermost first. A step
     /// belongs to the blocks open while it runs, whichever `Ctx` value it
     /// went through: a `ctx.as_root()` bound before a block and used inside
@@ -160,6 +166,20 @@ struct BlockFrame {
     name: String,
 }
 
+/// A step that finished `Failed`, as the runtime needs it to decide whether
+/// the failure failed the host or the playbook caught it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailedStep {
+    /// The step's id, which the [`StepFailed`] layer on its error carries
+    /// too: how the runtime recognises the error that left the playbook.
+    pub(crate) id: u32,
+    /// The run was cancelled when the step failed: it was stopped between
+    /// `check` and `apply`, or the op gave up because of the cancellation.
+    /// A cancelled run fails the host whatever the playbook does with the
+    /// error, so such a step is never `recovered`.
+    pub(crate) cancelled: bool,
+}
+
 impl Ctx {
     /// A context with no orchestrator behind it: steps work, `local_file`
     /// and friends fail. Tests and ad-hoc use.
@@ -188,6 +208,7 @@ impl Ctx {
             shared: Rc::new(Shared {
                 step_counter: Cell::new(0),
                 summary: RefCell::new(Summary::default()),
+                failures: RefCell::new(Vec::new()),
                 channel,
                 run_id: run_id.into(),
                 tempdir: OnceCell::new(),
@@ -206,7 +227,10 @@ impl Ctx {
     /// or `ok` when the op's [`Op::changed_by_apply`] reports that running
     /// it altered nothing. Whichever way it goes, one `StepStarted` and one
     /// `StepFinished` event are emitted and exactly one counter in the run
-    /// summary moves.
+    /// summary moves. For a failed step that counter is chosen when the
+    /// playbook returns: `failed` when its error is the one that left the
+    /// playbook or the run was cancelled, `recovered` when the playbook
+    /// caught it and carried on (vision doc 14).
     ///
     /// `name` is what the report shows and what error messages quote. It is
     /// not an identifier: nothing dedupes on it and repeats are fine.
@@ -216,7 +240,10 @@ impl Ctx {
     /// Cancellation is tested before `check` and again after it, so a
     /// `Cancel` frame stops the run between steps and never interrupts an
     /// `apply` half way through (vision doc 5.5, 16.10). A failed step does
-    /// not by itself end the playbook; the `?` in the playbook body does.
+    /// not by itself end the playbook or fail the host; the `?` in the
+    /// playbook body does. Catching the error instead (`.ok()`, `if let
+    /// Err`, a retry loop) keeps the host's verdict with what the playbook
+    /// returns.
     ///
     /// The returned [`Applied`] derefs to the op's output. A step that would
     /// change in check mode has none (vision doc 12); reading it, through
@@ -227,10 +254,11 @@ impl Ctx {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
         // mid-apply, and no further step starts (vision doc 5.5, 16.10).
-        self.shared
-            .channel
-            .check_cancelled()
-            .with_context(|| StepFailed::cancelled(&name, "not started"))?;
+        // No id is drawn and no step event emitted, so there is nothing to
+        // record: the runtime fails the host on the cancelled run itself.
+        self.shared.channel.check_cancelled().with_context(|| {
+            StepFailed::cancelled(&name, "not started").in_blocks(self.block_path())
+        })?;
         let id = self.next_id();
         let identity = self.sys.identity().label();
         let sink = self.sys.sink().clone();
@@ -246,7 +274,7 @@ impl Ctx {
         // Every exit below goes through here, and this is where the status
         // is counted: one place, so the counters and the report agree.
         let finish = |status: Status, diff: Option<crate::Diff>, note: Option<String>| {
-            self.record(status);
+            self.record(id, status);
             sink.emit(Event::StepFinished {
                 id,
                 blocks: blocks.clone(),
@@ -257,6 +285,14 @@ impl Ctx {
                 note,
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             });
+        };
+        // Every failure leaves through here: finished `Failed` with the chain
+        // as its note, then returned with the `StepFailed` layer naming this
+        // step by id, so the runtime can tell whether it is the error that
+        // left the playbook.
+        let failed = |e: Error, diff: Option<crate::Diff>, layer: StepFailed| -> Error {
+            finish(Status::Failed, diff, Some(e.chain()));
+            e.context(layer.of_step(id, blocks.clone()))
         };
 
         // A missing output read inside the op itself (an op holding another
@@ -275,10 +311,7 @@ impl Ctx {
         };
 
         let result = match checked {
-            Err(e) => {
-                finish(Status::Failed, None, Some(e.chain()));
-                return Err(e.context(StepFailed::at(&name)));
-            }
+            Err(e) => return Err(failed(e, None, StepFailed::at(&name))),
             Ok((Plan::Satisfied(out), _)) => {
                 finish(Status::Ok, None, None);
                 Applied::new(name, Some(out), false, None, t0.elapsed())
@@ -288,10 +321,7 @@ impl Ctx {
                 // intent, so what the report shows is what `apply` would run.
                 let diff = match in_op(|| Ok(intent.diff())) {
                     Ok(d) => d,
-                    Err(e) => {
-                        finish(Status::Failed, None, Some(e.chain()));
-                        return Err(e.context(StepFailed::at(&name)));
-                    }
+                    Err(e) => return Err(failed(e, None, StepFailed::at(&name))),
                 };
                 let note = if always_changes {
                     Some("action".into())
@@ -307,24 +337,18 @@ impl Ctx {
             Ok((Plan::Change(intent), always_changes)) => {
                 let diff = match in_op(|| Ok(intent.diff())) {
                     Ok(d) => d,
-                    Err(e) => {
-                        finish(Status::Failed, None, Some(e.chain()));
-                        return Err(e.context(StepFailed::at(&name)));
-                    }
+                    Err(e) => return Err(failed(e, None, StepFailed::at(&name))),
                 };
                 if let Err(e) = self.shared.channel.check_cancelled() {
-                    finish(Status::Failed, Some(diff), Some(e.chain()));
-                    return Err(e.context(StepFailed::cancelled(&name, "not applied")));
+                    let layer = StepFailed::cancelled(&name, "not applied");
+                    return Err(failed(e, Some(diff), layer));
                 }
                 let applied = {
                     let _phase = PhaseGuard::enter(&self.sys, Phase::Applying);
                     op.apply(&self.sys, intent)
                 };
                 match applied {
-                    Err(e) => {
-                        finish(Status::Failed, Some(diff), Some(e.chain()));
-                        return Err(e.context(StepFailed::at(&name)));
-                    }
+                    Err(e) => return Err(failed(e, Some(diff), StepFailed::at(&name))),
                     Ok(out) if !op.changed_by_apply(&out) => {
                         // The op ran and decided nothing changed (a command
                         // with `changed_when`). Reported `ok`; the diff stays
@@ -700,13 +724,18 @@ impl Ctx {
         f(&mut self.shared.summary.borrow_mut());
     }
 
-    /// A step's verdict, counted once in the summary.
-    fn record(&self, status: Status) {
+    /// A step's verdict, counted once. A failure is not counted yet but
+    /// recorded, with whether the run was cancelled by then: the runtime
+    /// classifies it once the playbook has returned (vision doc 14).
+    fn record(&self, id: u32, status: Status) {
         self.bump(|s| match status {
             Status::Ok => s.ok += 1,
             Status::Changed => s.changed += 1,
             Status::WouldChange => s.would_change += 1,
-            Status::Failed => s.failed += 1,
+            Status::Failed => self.shared.failures.borrow_mut().push(FailedStep {
+                id,
+                cancelled: self.shared.channel.is_cancelled(),
+            }),
         });
     }
 
@@ -719,8 +748,21 @@ impl Ctx {
             .collect()
     }
 
+    /// The counters so far, with `failed` and `recovered` still 0: those are
+    /// the runtime's to fill from [`Ctx::failures`].
     pub(crate) fn summary(&self) -> Summary {
         self.shared.summary.borrow().clone()
+    }
+
+    /// Every step that finished `Failed` so far, in order.
+    pub(crate) fn failures(&self) -> Vec<FailedStep> {
+        self.shared.failures.borrow().clone()
+    }
+
+    /// Whether the run has been cancelled, which fails the host whatever the
+    /// playbook returns.
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        self.shared.channel.check_cancelled()
     }
 }
 
@@ -1045,7 +1087,14 @@ mod tests {
             e,
             Event::StepFinished { status: Status::Failed, note: Some(n), .. } if n.contains("cancelled")
         )));
-        assert_eq!(ctx.summary().failed, 1);
+        assert_eq!(
+            ctx.failures(),
+            [FailedStep {
+                id: 1,
+                cancelled: true
+            }],
+            "recorded as stopped by the cancellation, so never `recovered`"
+        );
     }
 
     // ---- what is reported is what runs ----
@@ -1774,6 +1823,108 @@ mod tests {
         assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
     }
 
+    // ---- #44: a failed step is recorded, not counted ----
+
+    /// A failed step's error names the step by the id its `StepStarted`
+    /// drew and by the blocks it ran in, and the same id is recorded for
+    /// the runtime to classify. Nothing is counted yet: whether it failed
+    /// the host depends on what the playbook does with the error.
+    #[test]
+    fn a_failed_step_is_recorded_by_id_and_its_error_carries_id_and_blocks() {
+        let (mut ctx, sink) = ctx_in(false);
+        ctx.step("one", ok(1)).unwrap();
+        let err = ctx
+            .block("outer", |ctx| {
+                ctx.block("inner", |ctx| {
+                    ctx.as_root()
+                        .step("fails", reporting(Outcome::Fails))
+                        .map(drop)
+                })
+            })
+            .unwrap_err();
+        let layer = err.step_failed().unwrap();
+        assert_eq!(layer.step, "fails");
+        assert_eq!(layer.blocks, ["outer", "inner"]);
+        assert_eq!(layer.id(), Some(2));
+        let started = sink.events().into_iter().find_map(|e| match e {
+            Event::StepStarted { id, name, .. } if name == "fails" => Some(id),
+            _ => None,
+        });
+        assert_eq!(started, Some(2));
+        assert_eq!(
+            ctx.failures(),
+            [FailedStep {
+                id: 2,
+                cancelled: false
+            }]
+        );
+        let s = ctx.summary();
+        assert_eq!((s.ok, s.failed, s.recovered), (1, 0, 0));
+        // `Event::failed` reads the same layer.
+        let Event::Failed { step, blocks, .. } = Event::failed(&err) else {
+            unreachable!()
+        };
+        assert_eq!(step.as_deref(), Some("fails"));
+        assert_eq!(blocks, ["outer", "inner"]);
+    }
+
+    struct FailsInCheck;
+
+    impl Op for FailsInCheck {
+        type Output = ();
+        type Intent = std::convert::Infallible;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            Err(Error::msg("no"))
+        }
+        fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+            match intent {}
+        }
+    }
+
+    /// The `check` and `apply` failure paths both record the step, by the
+    /// id each drew, and neither as cancelled (the cancellation path is
+    /// `cancel_during_check_skips_apply_and_fails_the_step`).
+    #[test]
+    fn every_failure_path_records_the_step() {
+        let (mut ctx, _sink) = ctx_in(false);
+        ctx.step("check fails", FailsInCheck).unwrap_err();
+        ctx.step("fine", ok(1)).unwrap();
+        let err = ctx
+            .step("apply fails", reporting(Outcome::Fails))
+            .unwrap_err();
+        assert_eq!(err.step_failed().unwrap().id(), Some(3));
+        assert_eq!(
+            ctx.failures(),
+            [
+                FailedStep {
+                    id: 1,
+                    cancelled: false
+                },
+                FailedStep {
+                    id: 3,
+                    cancelled: false
+                }
+            ]
+        );
+    }
+
+    /// A step refused before it started drew no id and emitted nothing, so
+    /// nothing is recorded; its error still names the blocks it was in.
+    #[test]
+    fn a_step_refused_before_it_started_records_nothing_and_names_its_blocks() {
+        let (mut ctx, channel, _feeder, _sink) = ctx_with_channel();
+        channel.cancel("cancelled by the orchestrator");
+        let err = ctx
+            .block("b", |ctx| ctx.step("second", ok(1)).map(drop))
+            .unwrap_err();
+        let layer = err.step_failed().unwrap();
+        assert_eq!(
+            (layer.id(), layer.blocks.as_slice()),
+            (None, &["b".to_string()][..])
+        );
+        assert!(ctx.failures().is_empty());
+    }
+
     /// `Applied`'s `Deref` unwinds with the typed payload, not a string
     /// panic, so a catcher can tell it from a bug.
     #[test]
@@ -1921,7 +2072,7 @@ mod tests {
                 ]
             );
             let s = ctx.summary();
-            assert_eq!((s.would_change, s.failed), (1, 1));
+            assert_eq!((s.would_change, ctx.failures().len()), (1, 1));
             assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
             ctx.sys()
                 .write_atomic("/after", b"x")
@@ -1941,7 +2092,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.step_failed().unwrap().step, "renders it");
         assert!(err.chain().contains("step `read` would have changed"));
-        assert_eq!(ctx.summary().failed, 1);
+        assert_eq!(ctx.failures().len(), 1);
         assert!(sink.events().iter().any(|e| matches!(
             e,
             Event::StepFinished { name, status: Status::Failed, .. } if name == "renders it"
@@ -2231,7 +2382,7 @@ mod tests {
             e,
             Event::StepFinished { name, status: Status::Failed, .. } if name == "asks"
         )));
-        assert_eq!(ctx.summary().failed, 1);
+        assert_eq!(ctx.failures().len(), 1);
         assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
     }
 

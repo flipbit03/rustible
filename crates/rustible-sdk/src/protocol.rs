@@ -34,7 +34,10 @@ use crate::secret::Secret;
 /// is gone, and `Os`, `Distro`, `Pm`, `Init` gain the macOS variants.
 /// 5: `Ctx::block` — `BlockStarted`/`BlockFinished` replace
 /// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: the host's verdict is what the playbook returns — `Summary.recovered`
+/// counts the failed steps the playbook caught, `Summary.failed` only those
+/// that failed the host, and `Failed` carries the step's `blocks`.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -470,10 +473,9 @@ mod tests {
 
     /// Version 5 is `Ctx::block`: the block events replace the section
     /// events, and every step event carries the block path instead of a
-    /// depth. Pinned here so the shape and the number move together.
+    /// depth.
     #[test]
     fn protocol_5_carries_block_paths() {
-        assert_eq!(PROTOCOL_VERSION, 5);
         let started = Event::BlockStarted {
             blocks: vec!["a".into(), "b".into()],
         };
@@ -520,6 +522,44 @@ mod tests {
         assert_eq!(blocks, ["a"]);
         // A version-4 frame, with `depth` and no `blocks`, does not read.
         let old = r#"{"StepSkipped":{"id":3,"depth":1,"name":"n","reason":"r"}}"#;
+        assert!(serde_json::from_str::<Event>(old).is_err());
+    }
+
+    /// Version 6 is the host's verdict as the playbook returns it (#44):
+    /// `Summary` gains `recovered` beside a `failed` that no longer counts
+    /// every failed step, and `Failed` names the failed step's block path.
+    /// The meaning of `failed` moved with it, so a version-5 peer would
+    /// disagree about a host without failing to parse anything: the number
+    /// is what stops a mixed pair. Pinned here so the shape and the number
+    /// move together.
+    #[test]
+    fn protocol_6_carries_recovered_and_the_failed_steps_blocks() {
+        assert_eq!(PROTOCOL_VERSION, 6);
+        let summary = crate::event::Summary {
+            ok: 4,
+            changed: 1,
+            failed: 0,
+            recovered: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Event::Finished(summary)).unwrap(),
+            r#"{"Finished":{"ok":4,"changed":1,"would_change":0,"skipped":0,"failed":0,"recovered":2,"warnings":0}}"#
+        );
+        let failed = Event::Failed {
+            step: Some("boom".into()),
+            blocks: vec!["outer".into(), "inner".into()],
+            error: "step `boom`: nope".into(),
+            cmd: None,
+        };
+        let json = r#"{"Failed":{"step":"boom","blocks":["outer","inner"],"error":"step `boom`: nope","cmd":null}}"#;
+        assert_eq!(serde_json::to_string(&failed).unwrap(), json);
+        let Event::Failed { blocks, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not Failed")
+        };
+        assert_eq!(blocks, ["outer", "inner"]);
+        // A version-5 summary, with no `recovered`, does not read.
+        let old = r#"{"Finished":{"ok":1,"changed":0,"would_change":0,"skipped":0,"failed":0,"warnings":0}}"#;
         assert!(serde_json::from_str::<Event>(old).is_err());
     }
 }
