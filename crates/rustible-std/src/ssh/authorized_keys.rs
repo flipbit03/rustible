@@ -1708,7 +1708,7 @@ mod tests {
     ///
     /// The rendered diff is asserted whole because of what is *missing* from
     /// it. The file is already owned by the account, so no `owner` line is
-    /// planned — and `apply` sets only what the diff names, so no `chown`
+    /// planned — and `apply` sets only what the intent says differs, so no `chown`
     /// happens. That is what keeps an unescalated run working: `chown` needs
     /// root, and a run managing its own keys must not be asked to give away
     /// a file it already owns just because the mode was wrong.
@@ -2471,7 +2471,7 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
-    /// `apply` sets the attributes the diff names and no others. The
+    /// `apply` sets the attributes the intent plans and no others. The
     /// `in_file` form is where that is observable: it plans nothing for a
     /// file that already exists, so an `apply` that chmodded from its own
     /// desired state instead of from the plan would change this mode.

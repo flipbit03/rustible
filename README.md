@@ -181,8 +181,8 @@ overrides the inventory.
   `systemd::Enabled`, `user::Present`. Things that are genuinely actions get
   verbs and always report changed: `systemd::Restart`, `shell::Command`.
 - **Every op defines both halves.** `check` decides what would change and
-  produces the diff; `apply` executes that decision. Dry run and diff are not
-  a per-module afterthought.
+  returns it as a typed intent; `apply` executes that intent, and the diff is
+  rendered from it. Dry run and diff are not a per-module afterthought.
 - **Outputs chain.** A step returns a typed value describing what it found or
   made, and later steps use it. In check mode a step that would change has
   no output yet, and reading it returns an error saying so rather than a

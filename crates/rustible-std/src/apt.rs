@@ -1146,7 +1146,7 @@ mod tests {
         };
         assert_eq!(c.diff().short(), "apache2=removed");
 
-        // The report is read from dpkg before apt-get takes the package.
+        // The version reported is the one `check` read from dpkg, carried in the intent.
         let r = op.apply(&s, c).unwrap();
         assert_eq!(r.removed[0].name, "apache2");
         assert_eq!(r.removed[0].version, "2.4.62-1");

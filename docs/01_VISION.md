@@ -811,10 +811,11 @@ let sshd = ctx.step("Disable password auth",
 // sshd.changed, sshd.backup_path: Option<PathBuf>, sshd.line_no
 ```
 `check` reads the file, finds the line by regex (or exact match), and returns
-`Satisfied` if it already equals the target, otherwise `Change` with the rewritten text (the line replaced in place, or inserted at the position `insertafter`/`insertbefore` picks). `apply` optionally backs up, applies
-the diff to the text, and writes atomically. The pure "given text and regex,
-produce new text and diff" logic is a free function so it can be unit-tested with
-strings.
+`Satisfied` if it already equals the target, otherwise `Change` with the
+rewritten text (the line replaced in place, or inserted at the position
+`insertafter`/`insertbefore` picks). `apply` optionally backs up and writes the
+planned text atomically. The pure "given text and regex, produce new text" logic
+is a free function so it can be unit-tested with strings.
 
 **`ansible.builtin.systemd`**
 ```rust
@@ -1864,7 +1865,7 @@ The verdict column says whether deciding late has a cost.
 | 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
 | 3 | ~~Playbook-to-bin mapping~~ | decided 2026-09-07 | Build-script discovery of files marked `#[rustible::playbook]`, one playbook per shipped binary via `RUSTIBLE_PLAYBOOK` (section 9). |
 | 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
-| 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`, `Many`; more variants for package sets, permissions, services | M6 | Additive; ops construct variants, nobody matches exhaustively. |
+| 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`, `Many`; more variants for package sets, permissions, services | M6 | Additive; ops build a `Diff` through its constructors, and nothing outside the SDK can match one (it is opaque since #43). |
 | 6 | **Output rendering**: per-host buffering vs live interleaving, verbosity levels, machine-readable mode | M3, then iterate | Orchestrator UX, not API. |
 | 7 | **Target-side cache cleanup** for `~/.cache/rustible/bin/` | whenever | Trivial. |
 | 8 | **`doas` specifics** for `escalate="doas"` | M5 | Same shape as sudo. |
@@ -1901,8 +1902,8 @@ everywhere won. Where `escalate` is defined, a comment says it is Ansible's
 3. ~~**SDK core**~~: **done 2026-09-06**, see `docs/02_SPIKE_SDK_CORE.md`. The
    sketches hold; `apply` takes `Change<T>`; prediction is nearly free.
 
-**Spike learnings promoted to policy in this document:** `apply` takes
-`apply` takes the change, not the plan (6.2; the predict-by-default rule that
+**Spike learnings promoted to policy in this document:**
+`apply` takes the intent, not the plan (6.2; the predict-by-default rule that
 came with it was reversed 2026-09-24, section 12); builders end in a finishing call
 (6.2); the mutation guard covers files not commands (7.3); one cargo
 invocation builds all triples, `dist` profile, `rust-lld` per-target linker

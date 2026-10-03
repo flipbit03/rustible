@@ -339,7 +339,7 @@ while the thing is broken.
 - **An op's behaviour**: satisfied, change, apply, failure, refusal → tier 2.
   The `Fake` lets you plant a tool's output and assert on the op's reaction,
   which is why `check` must do all the thinking and `apply` must execute the
-  plan rather than re-inspecting.
+  intent rather than re-inspecting.
 - **Anything where the answer comes from a real tool** → tier 3. This is the
   source of truth for how `useradd`, `apt-get`, `systemctl` and friends
   behave, and it has earned it: it caught that `useradd` refuses to create a

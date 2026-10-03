@@ -589,7 +589,7 @@ mod tests {
             c.diff().render(),
             "brew formulae:\n  nethack: installed 3.6.7 -> absent\n"
         );
-        // The version is read from `brew list` before the uninstall takes it;
+        // The version is the one `check` read from `brew list`, carried in the intent;
         // a name that was never there is reported as already absent.
         let r = op.apply(&s, c).unwrap();
         assert_eq!(r.removed[0].name, "nethack");
