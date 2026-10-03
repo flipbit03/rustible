@@ -267,21 +267,26 @@ impl Ctx {
         // `in_op` turns the typed payload into an error, which takes the
         // check-failed path below and carries `StepFailed`, so no block
         // absorbs it (vision doc 12).
-        let plan = {
+        // `always_changes` is the op's code too, so it is asked here, under
+        // the same catch, rather than later outside it.
+        let checked = {
             let _phase = PhaseGuard::enter(&self.sys, Phase::Checking);
-            in_op(|| op.check(&self.sys))
+            in_op(|| {
+                let plan = op.check(&self.sys)?;
+                Ok((plan, op.always_changes()))
+            })
         };
 
-        let result = match plan {
+        let result = match checked {
             Err(e) => {
                 finish(Status::Failed, None, Some(e.chain()));
                 return Err(e.context(StepFailed::at(&name)));
             }
-            Ok(Plan::Satisfied(out)) => {
+            Ok((Plan::Satisfied(out), _)) => {
                 finish(Status::Ok, None, None);
                 Applied::new(name, Some(out), false, None, t0.elapsed())
             }
-            Ok(Plan::Change(intent)) if self.sys.check_mode() => {
+            Ok((Plan::Change(intent), always_changes)) if self.sys.check_mode() => {
                 // The one place a step's diff is made: rendered from the
                 // intent, so what the report shows is what `apply` would run.
                 let diff = match in_op(|| Ok(intent.diff())) {
@@ -291,7 +296,7 @@ impl Ctx {
                         return Err(e.context(StepFailed::at(&name)));
                     }
                 };
-                let note = if op.always_changes() {
+                let note = if always_changes {
                     Some("action".into())
                 } else {
                     None
@@ -302,7 +307,7 @@ impl Ctx {
                 // is dropped unexecuted.
                 Applied::new(name, None, true, Some(diff), t0.elapsed())
             }
-            Ok(Plan::Change(intent)) => {
+            Ok((Plan::Change(intent), always_changes)) => {
                 let diff = match in_op(|| Ok(intent.diff())) {
                     Ok(d) => d,
                     Err(e) => {
@@ -335,7 +340,7 @@ impl Ctx {
                         Applied::new(name, Some(out), false, Some(diff), t0.elapsed())
                     }
                     Ok(out) => {
-                        let note = if op.always_changes() {
+                        let note = if always_changes {
                             Some("action".into())
                         } else {
                             None
@@ -536,16 +541,23 @@ impl Ctx {
             name: name.into(),
             changed: Cell::new(false),
         });
-        // Open while the closure runs, and closed on every way out: the
-        // closure runs under `catching`, so the pop below is always reached.
-        self.shared.blocks.borrow_mut().push(frame.clone());
-        let path = self.block_path();
+        let mut path = self.block_path();
+        path.push(frame.name.clone());
         let sink = self.sys.sink().clone();
+        // Emitted before the frame is pushed, so a sink that panics here
+        // leaves no frame behind.
         sink.emit(Event::BlockStarted {
             blocks: path.clone(),
         });
+        // Open while the closure runs, and closed on every way out: the
+        // closure runs under `catching`, so the pop below is always reached.
+        self.shared.blocks.borrow_mut().push(frame.clone());
         let outcome = catching(|| f(self));
-        self.shared.blocks.borrow_mut().pop();
+        let popped = self.shared.blocks.borrow_mut().pop();
+        debug_assert!(
+            popped.is_some_and(|p| Rc::ptr_eq(&p, &frame)),
+            "blocks nest strictly: the frame closed is the one this block opened"
+        );
         let finished = || {
             sink.emit(Event::BlockFinished {
                 blocks: path.clone(),
@@ -1876,9 +1888,21 @@ mod tests {
         let b = ctx.block("b", |ctx| Ok(ctx.as_root())).unwrap();
         let mut escaped = b.into_output().unwrap();
         escaped.step("after", change(1)).unwrap();
-        assert_eq!(finished_steps(&sink), [("after".into(), path(&[]))]);
-        let outer = ctx.block("outer", |_| Ok(())).unwrap();
-        assert!(!outer.changed);
+        // Used in a later sibling block, it belongs to that block instead.
+        let sibling = ctx
+            .block("sibling", |_| {
+                escaped.step("in sibling", change(1))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(sibling.changed);
+        assert_eq!(
+            finished_steps(&sink),
+            [
+                ("after".into(), path(&[])),
+                ("in sibling".into(), path(&["sibling"]))
+            ]
+        );
     }
 
     // ---- review: a missing output read inside an op ----
@@ -2135,5 +2159,152 @@ mod tests {
         assert!(stdout.contains("1 passed"), "the probe ran: {stdout}");
         assert!(!stderr.contains("panicked"), "{stderr}");
         assert!(!stdout.contains("panicked"), "{stdout}");
+    }
+
+    // ---- review 2: every way out closes the block ----
+
+    /// The path the last step reported: what a step after a block sees.
+    fn last_path(sink: &Collect) -> Vec<String> {
+        finished_steps(sink).pop().expect("a step finished").1
+    }
+
+    /// `let _ = ctx.block(..)` around a failing step, then carrying on, is
+    /// the realistic case: a frame left open would prefix every later step
+    /// and mark it changed.
+    #[test]
+    fn a_block_that_returned_an_error_is_closed() {
+        for bail in [false, true] {
+            let (mut ctx, sink) = ctx_in(false);
+            let r = ctx.block("x", |ctx| {
+                if bail {
+                    crate::bail!("nope")
+                }
+                ctx.step("fails", reporting(Outcome::Fails)).map(drop)
+            });
+            assert!(r.is_err());
+            ctx.step("after", change(1)).unwrap();
+            assert_eq!(last_path(&sink), path(&[]));
+            assert!(ctx.shared.blocks.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_block_left_by_a_foreign_panic_is_closed() {
+        let (mut ctx, sink) = ctx_in(true);
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = ctx.block("x", |_| -> Result<()> { std::panic::panic_any(1u8) });
+        }));
+        assert!(caught.is_err());
+        ctx.step("after", ok(1)).unwrap();
+        assert_eq!(last_path(&sink), path(&[]));
+    }
+
+    #[test]
+    fn a_block_left_by_a_real_run_missing_output_is_closed() {
+        let (mut ctx, sink) = ctx_in(false);
+        let missing: Applied<u32> = Applied::new(
+            "nowhere".into(),
+            None,
+            true,
+            None,
+            std::time::Duration::ZERO,
+        );
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = ctx.block("x", |_| Ok(*missing));
+        }));
+        assert!(caught.is_err());
+        ctx.step("after", ok(1)).unwrap();
+        assert_eq!(last_path(&sink), path(&[]));
+    }
+
+    /// A sink that panics the first time it sees `BlockStarted`.
+    #[derive(Default)]
+    struct PanicsOnBlockStarted {
+        fired: std::sync::atomic::AtomicBool,
+        events: Collect,
+    }
+
+    impl crate::event::EventSink for PanicsOnBlockStarted {
+        fn emit(&self, event: Event) {
+            if matches!(event, Event::BlockStarted { .. })
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                std::panic::panic_any("sink failed");
+            }
+            self.events.emit(event);
+        }
+    }
+
+    #[test]
+    fn a_sink_that_panics_on_block_started_leaves_no_frame() {
+        let sink = Arc::new(PanicsOnBlockStarted::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink.clone());
+        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = ctx.block("leaked", |_| Ok(()));
+        }));
+        assert!(caught.is_err());
+        ctx.step("after", change(1)).unwrap();
+        assert_eq!(last_path(&sink.events), path(&[]));
+    }
+
+    // ---- review 2: the catcher count comes back down ----
+
+    /// On one thread: after `catching` returns, whether its body panicked
+    /// or not, no catcher is counted, so a missing output read outside any
+    /// catcher is again a panic with its message.
+    #[test]
+    fn the_catcher_count_comes_back_down_on_this_thread() {
+        let missing: Applied<u32> =
+            Applied::new("read".into(), None, true, None, std::time::Duration::ZERO);
+        let read_outside = || {
+            let payload = std::panic::catch_unwind(AssertUnwindSafe(|| *missing)).unwrap_err();
+            assert!(
+                payload.downcast_ref::<String>().is_some(),
+                "a message, so no catcher is still counted"
+            );
+        };
+        assert!(catching(|| std::panic::panic_any(1u8)).is_err());
+        read_outside();
+        assert!(catching(|| ()).is_ok());
+        read_outside();
+    }
+
+    // ---- review 2: `always_changes` is the op's code too ----
+
+    /// An op whose `always_changes` reads a missing output.
+    struct AsksTooLate(Applied<u32>);
+
+    impl Op for AsksTooLate {
+        type Output = ();
+        type Intent = DoIt;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            Ok(Plan::Change(DoIt))
+        }
+        fn apply(&self, _: &System, DoIt: DoIt) -> Result<()> {
+            Ok(())
+        }
+        fn always_changes(&self) -> bool {
+            *self.0 > 0
+        }
+    }
+
+    #[test]
+    fn a_missing_output_read_in_always_changes_fails_that_step() {
+        let (mut ctx, sink) = ctx_in(true);
+        let err = ctx
+            .block("b", |ctx| {
+                let got = ctx.step("read", change(1))?;
+                ctx.step("asks", AsksTooLate(got))?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(err.step_failed().unwrap().step, "asks");
+        assert!(sink.events().iter().any(|e| matches!(
+            e,
+            Event::StepFinished { name, status: Status::Failed, .. } if name == "asks"
+        )));
+        assert_eq!(ctx.summary().failed, 1);
+        assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
     }
 }
