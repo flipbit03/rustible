@@ -42,7 +42,6 @@
 //! label `rustible.integration=1`, so a run killed half way leaves something
 //! `docker ps -q --filter label=rustible.integration` can find.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -354,7 +353,7 @@ fn inside(spec: &Spec, image: &str, body: Body) {
     // libtest prints `test <name> ... ` without a newline before the body runs.
     println!();
     let t0 = Instant::now();
-    let outcome = catch_unwind(AssertUnwindSafe(|| body(&mut ctx)));
+    let outcome = crate::error::catching(|| body(&mut ctx));
     let error = match outcome {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(e.chain()),
@@ -402,7 +401,12 @@ fn inside(spec: &Spec, image: &str, body: Body) {
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
+    // `Applied`'s and `Block`'s `Deref` unwind with this typed payload. The
+    // harness runs bodies with check mode off, where it cannot normally
+    // occur, but when it does its message is the useful one.
+    if let Some(u) = payload.downcast_ref::<crate::error::OutputUnavailable>() {
+        u.to_string()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -842,6 +846,21 @@ fn status_word(s: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed payload `Deref` unwinds with reports its own message, not
+    /// "non-string panic payload".
+    #[test]
+    fn panic_message_reads_the_output_unavailable_payload() {
+        let payload =
+            crate::error::catching(|| -> () { crate::error::OutputUnavailable::throw("read") })
+                .unwrap_err();
+        assert_eq!(
+            panic_message(&payload),
+            "step `read` would have changed; its output is unavailable in check mode"
+        );
+        let payload = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        assert_eq!(panic_message(&payload), "boom");
+    }
 
     #[test]
     fn test_path_at_crate_root_is_the_name() {

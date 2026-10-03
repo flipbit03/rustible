@@ -40,5 +40,7 @@ lto = "fat"
 codegen-units = 1
 opt-level = "z"
 # The runtime turns a playbook panic into a reported failure with `catch_unwind`;
-# `abort` would kill the remote binary with no report.
+# `abort` would kill the remote binary with no report. `--check` depends on it
+# too: a read of a would-change step's output unwinds to the enclosing
+# `ctx.block`, which ends there with a warning; under `abort` it kills the host.
 panic = "unwind"

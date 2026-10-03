@@ -5,11 +5,21 @@
 //! never map errors by hand. A handful of SDK signals stay as concrete types
 //! inside the chain so the orchestrator can render them specially.
 
+use std::cell::Cell;
 use std::fmt;
 use std::path::PathBuf;
 
 /// The one error type. Wraps `anyhow::Error`; converts from anything.
-pub struct Error(anyhow::Error);
+pub struct Error {
+    inner: anyhow::Error,
+    /// Set once a [`Ctx::block`](crate::ctx::Ctx::block) has printed this
+    /// error's `block ended with an error` line, so the blocks enclosing it
+    /// pass it on without printing it a second time. It sticks to the error
+    /// for good: [`Error::context`] keeps it, and nothing clears it, so an
+    /// error a playbook catches and returns later is not announced again.
+    /// Nothing outside the SDK sees it.
+    pub(crate) shown_by_block: bool,
+}
 
 /// The result type every SDK, op, and playbook signature uses. Fixing the
 /// error side to [`Error`] is what makes `?` accept a foreign error without
@@ -19,12 +29,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     /// A plain message error. `bail!` uses this.
     pub fn msg(m: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
-        Error(anyhow::Error::msg(m))
+        Error::wrap(anyhow::Error::msg(m))
     }
 
     /// Wrap with a context layer: ``"installing nginx: <inner>"``.
     pub fn context(self, c: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
-        Error(self.0.context(c))
+        Error {
+            inner: self.inner.context(c),
+            shown_by_block: self.shown_by_block,
+        }
+    }
+
+    fn wrap(inner: anyhow::Error) -> Self {
+        Error {
+            inner,
+            shown_by_block: false,
+        }
     }
 
     /// The whole chain rendered on one line, outermost first.
@@ -34,7 +54,7 @@ impl Error {
 
     /// Look for a typed signal anywhere in the chain.
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
-        self.0.chain().find_map(|e| e.downcast_ref::<T>())
+        self.inner.chain().find_map(|e| e.downcast_ref::<T>())
     }
 
     /// The failed command, if one is in the chain.
@@ -53,7 +73,7 @@ impl Error {
     /// Unlike [`Error::downcast_ref`] this looks at context layers as well
     /// as at the errors themselves, because a context layer is what this is.
     pub fn step_failed(&self) -> Option<&StepFailed> {
-        self.0.downcast_ref::<StepFailed>()
+        self.inner.downcast_ref::<StepFailed>()
     }
 }
 
@@ -61,13 +81,13 @@ impl fmt::Display for Error {
     /// `{}` prints the outermost message, `{:#}` the whole chain (anyhow's
     /// own convention).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        fmt::Display::fmt(&self.inner, f)
     }
 }
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        fmt::Debug::fmt(&self.inner, f)
     }
 }
 
@@ -78,7 +98,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(e: E) -> Self {
-        Error(anyhow::Error::new(e))
+        Error::wrap(anyhow::Error::new(e))
     }
 }
 
@@ -135,12 +155,71 @@ pub struct MutationDuringCheck {
 }
 
 /// A would-change step's output was read in check mode (vision 12).
+///
+/// It arrives two ways: as an error, from [`Applied::output`] and its
+/// friends, and as an unwind payload, from `Applied`'s and `Block`'s `Deref`,
+/// which have no `Result` to return. Under `--check`, read in playbook code
+/// between steps, either one ends the innermost enclosing [`Ctx::block`]
+/// with a warning, or the playbook body for that host when there is no
+/// block; nothing fails. Read inside an operation's own `check` (or its
+/// intent's `diff`), it is that step's failure instead: the step fails and
+/// is counted, and nothing is absorbed.
+///
+/// [`Applied::output`]: crate::op::Applied::output
+/// [`Ctx::block`]: crate::ctx::Ctx::block
 #[derive(Debug, thiserror::Error)]
 #[error("step `{step}` would have changed; its output is unavailable in check mode")]
 pub struct OutputUnavailable {
     /// The name passed to `ctx.step`, so the message names the playbook line
     /// whose output was read rather than the one that would have produced it.
     pub step: String,
+}
+
+impl OutputUnavailable {
+    /// Unwind for a `Deref` that has no `Result` to return.
+    ///
+    /// When one of the SDK's catchers is on this thread's stack
+    /// ([`catching`]: `Ctx::block`, `Ctx::step`, the runtime, the container
+    /// harness), this is `resume_unwind` with a typed payload: the panic hook
+    /// does not run, so nothing is printed, and the catcher tells it from a
+    /// real bug by its type. With no catcher (a unit test driving a dry
+    /// `Ctx` by hand, another thread), nobody would report it, so it is an
+    /// ordinary `panic!` carrying the message, and the hook prints it. The
+    /// same holds in a binary built with `panic = "abort"`, where nothing is
+    /// caught at all: the process dies, and the hook's message is the only
+    /// reason anyone gets.
+    pub(crate) fn throw(step: &str) -> ! {
+        let unavailable = OutputUnavailable {
+            step: step.to_string(),
+        };
+        if unwinds_silently(cfg!(panic = "unwind"), CATCHERS.with(Cell::get)) {
+            std::panic::resume_unwind(Box::new(unavailable))
+        } else {
+            panic!("{unavailable}")
+        }
+    }
+}
+
+/// Whether [`OutputUnavailable::throw`] may skip the panic hook: only when
+/// panics unwind, so a catcher can receive the payload, and one is on the
+/// stack to do so.
+fn unwinds_silently(unwind: bool, catchers: u32) -> bool {
+    unwind && catchers > 0
+}
+
+thread_local! {
+    /// How many [`catching`] frames are on this thread's stack.
+    static CATCHERS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// `catch_unwind`, counted, so [`OutputUnavailable::throw`] knows whether
+/// anything will receive its typed payload. Every SDK site that catches a
+/// panic goes through here.
+pub(crate) fn catching<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    CATCHERS.with(|c| c.set(c.get() + 1));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CATCHERS.with(|c| c.set(c.get() - 1));
+    caught
 }
 
 /// The step a failure happened in, as [`Ctx::step`](crate::ctx::Ctx::step)
@@ -255,6 +334,19 @@ macro_rules! ensure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed, hook-free unwind only when something can receive it: a
+    /// catcher on the stack, and panics that unwind at all. Otherwise the
+    /// read is a panic with its message, which the hook prints, so a
+    /// `panic = "abort"` binary still says why it died.
+    #[test]
+    fn a_missing_output_unwinds_silently_only_to_a_catcher_that_can_catch() {
+        assert!(unwinds_silently(true, 1));
+        assert!(unwinds_silently(true, 3));
+        assert!(!unwinds_silently(true, 0), "no catcher on the stack");
+        assert!(!unwinds_silently(false, 1), "built with panic = \"abort\"");
+        assert!(!unwinds_silently(false, 0));
+    }
 
     #[test]
     fn foreign_errors_convert_with_question_mark() {

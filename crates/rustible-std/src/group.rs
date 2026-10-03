@@ -225,8 +225,23 @@ pub(crate) fn validate_field(what: &str, value: &str) -> Result<()> {
 /// creation and is ignored for an existing group, as in Ansible.
 ///
 /// Check mode (vision 12): a step that would change has no output, so a
-/// dry run that chains from this step — `.gid(&grp)` on the next one —
-/// stops there with a clear message rather than carrying a made-up gid.
+/// dry run that chains from this step ends the enclosing `ctx.block` there
+/// with a warning, rather than carrying a made-up gid; the run goes on after
+/// the block:
+///
+/// ```no_run
+/// use rustible_sdk::prelude::*;
+/// use rustible_std::{group, user};
+///
+/// fn app_account(ctx: &mut Ctx) -> Result<()> {
+///     ctx.block("app account", |ctx| {
+///         let grp = ctx.step("app group", group::Present::new("app"))?;
+///         ctx.step("app user", user::Present::new("app").gid(&*grp))?;
+///         Ok(())
+///     })?;
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,

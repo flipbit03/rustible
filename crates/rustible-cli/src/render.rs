@@ -4,17 +4,25 @@
 //! them into one stream where a step is printed as a unit: its line, then
 //! everything that happened inside it (`CmdRan` at `-vv`, logs). Hosts
 //! therefore interleave by whole steps, never by half a step. What happens
-//! outside a step (facts, sections, top-level logs) prints as it comes.
-//! A summary table closes the run.
+//! outside a step (facts, top-level logs) prints as it comes. A step inside
+//! a `ctx.block` carries the block path as a `[outer][inner] ` prefix on its
+//! own line, so every line stands on its own however hosts interleave; a
+//! block prints no line of its own. A summary table closes the run.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 
-use rustible_sdk::event::{Event, Level, Status, Summary};
+use rustible_sdk::event::{Event, Level, Status, Summary, block_prefix};
 
-/// Column the status starts in on a step line.
-const NAME_WIDTH: usize = 44;
+/// Column the status starts in on a step line, counted from the start of the
+/// label. 57 is where the mock-ups in issue #47 put it: a block prefix plus
+/// a step name, `[DCIM folder is receive-only] Read folder config `, is 49
+/// characters, and still gets a dot leader. With a host label of a dozen
+/// characters and `would change`, a status-only line ends near column 85,
+/// inside a 100-column terminal. A longer label still pushes the status
+/// right rather than being cut.
+const NAME_WIDTH: usize = 57;
 
 #[derive(Default)]
 struct HostState {
@@ -113,7 +121,6 @@ impl<W: Write> Renderer<W> {
     }
 
     pub fn event(&mut self, host: &str, ev: &Event) {
-        let indent = |d: u8| "  ".repeat(d as usize);
         match ev {
             Event::Facts(f) => {
                 if self.verbosity >= 1 {
@@ -130,17 +137,15 @@ impl<W: Write> Renderer<W> {
                     self.line(host, &text);
                 }
             }
-            Event::SectionStarted { depth, name } => {
-                self.flush(host);
-                self.line(host, &format!("{}{name}", indent(*depth)));
-            }
-            Event::SectionFinished { .. } => {}
+            // A block is a grouping, not a step: the steps inside carry its
+            // path, so it has no line of its own.
+            Event::BlockStarted { .. } | Event::BlockFinished { .. } => {}
             Event::StepStarted { .. } => {
                 self.flush(host);
                 self.state(host).open = Some(vec![]);
             }
             Event::StepFinished {
-                depth,
+                blocks,
                 name,
                 identity,
                 status,
@@ -165,7 +170,7 @@ impl<W: Write> Renderer<W> {
                 if identity != "self" {
                     let _ = write!(tail, "   as {identity}");
                 }
-                let text = step_line(*depth, name, status_word(*status), &tail);
+                let text = step_line(blocks, name, status_word(*status), &tail);
                 let buffered = self.state(host).open.take().unwrap_or_default();
                 self.line(host, &text);
                 if self.verbosity >= 1
@@ -173,7 +178,7 @@ impl<W: Write> Renderer<W> {
                     && matches!(status, Status::Changed | Status::WouldChange)
                 {
                     for l in d.render().lines() {
-                        self.line(host, &format!("{}    | {l}", indent(*depth)));
+                        self.line(host, &format!("    | {l}"));
                     }
                 }
                 for l in buffered {
@@ -182,13 +187,13 @@ impl<W: Write> Renderer<W> {
                 self.state(host).pending_fail = pending;
             }
             Event::StepSkipped {
-                depth,
+                blocks,
                 name,
                 reason,
                 ..
             } => {
                 self.flush(host);
-                let text = step_line(*depth, name, "skipped", &format!("   {reason}"));
+                let text = step_line(blocks, name, "skipped", &format!("   {reason}"));
                 self.line(host, &text);
             }
             Event::Log { level, msg } => match level {
@@ -324,8 +329,14 @@ fn status_word(s: Status) -> &'static str {
     }
 }
 
-fn step_line(depth: u8, name: &str, status: &str, tail: &str) -> String {
-    let label = format!("{}{name} ", "  ".repeat(depth as usize));
+/// `[outer][inner] name ....... status   tail`. The block prefix is part of
+/// the label, so it counts toward `NAME_WIDTH` like the name does.
+fn step_line(blocks: &[String], name: &str, status: &str, tail: &str) -> String {
+    let label = if blocks.is_empty() {
+        format!("{name} ")
+    } else {
+        format!("{} {name} ", block_prefix(blocks))
+    };
     if tail.is_empty() {
         format!("{label:.<NAME_WIDTH$} {status}")
     } else {
@@ -421,7 +432,7 @@ mod tests {
     fn step_started(id: u32, name: &str) -> Event {
         Event::StepStarted {
             id,
-            depth: 0,
+            blocks: vec![],
             name: name.into(),
             identity: "self".into(),
         }
@@ -430,7 +441,7 @@ mod tests {
     fn step_finished(id: u32, name: &str, status: Status) -> Event {
         Event::StepFinished {
             id,
-            depth: 0,
+            blocks: vec![],
             name: name.into(),
             identity: "self".into(),
             status,
@@ -499,11 +510,11 @@ mod tests {
             assert!(!r.finish());
         });
         let expected = "\
-[local]  mc present ................................. ok
+[local]  mc present .............................................. ok
 [local]    $ dpkg-query -W mc (as self, exit 0, 12ms)
 [local]    debug: already there
 [local]    done
-[arm  ]  mc present ................................. changed
+[arm  ]  mc present .............................................. changed
 [arm  ]    $ apt-get (as self, exit 0, 4500ms)
 
 host    ok  changed  would change  skipped  failed  warnings
@@ -669,7 +680,7 @@ arm      0        1             0        0       0         0
         assert_eq!(reported.matches("boom: deeper").count(), 1, "{reported}");
         assert!(
             reported.contains(
-                "[local]  x .......................................... FAILED
+                "[local]  x ....................................................... FAILED
 "
             ),
             "{reported}"
@@ -761,5 +772,188 @@ arm      0        1             0        0       0         0
             (Some("a b"), "cause: deeper")
         );
         assert_eq!(split_step(None, "panic: boom"), (None, "panic: boom"));
+    }
+
+    // ---- blocks ----
+
+    fn in_block(ev: Event, path: &[&str]) -> Event {
+        let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+        match ev {
+            Event::StepStarted {
+                id, name, identity, ..
+            } => Event::StepStarted {
+                id,
+                blocks: path,
+                name,
+                identity,
+            },
+            Event::StepFinished {
+                id,
+                name,
+                identity,
+                status,
+                diff,
+                note,
+                elapsed_ms,
+                ..
+            } => Event::StepFinished {
+                id,
+                blocks: path,
+                name,
+                identity,
+                status,
+                diff,
+                note,
+                elapsed_ms,
+            },
+            other => other,
+        }
+    }
+
+    fn block(started: bool, path: &[&str]) -> Event {
+        let blocks = path.iter().map(|s| s.to_string()).collect();
+        if started {
+            Event::BlockStarted { blocks }
+        } else {
+            Event::BlockFinished { blocks }
+        }
+    }
+
+    /// Every line stands on its own: a step inside a block carries the whole
+    /// path, nested blocks included, aligned like any other step, and the
+    /// block itself prints nothing. Two hosts interleaving their blocks is
+    /// exactly the case a heading line plus indentation could not survive.
+    #[test]
+    fn steps_in_blocks_carry_the_path_and_hosts_interleave_cleanly() {
+        const DCIM: &str = "DCIM";
+        let mut read = step_finished(1, "Read folder config", Status::WouldChange);
+        if let Event::StepFinished { diff, .. } = &mut read {
+            *diff = Some(rustible_sdk::Diff::summary(
+                "GET http://x (not sent under --check)",
+            ));
+        }
+        let out = render(0, |r| {
+            r.event("local", &block(true, &[DCIM]));
+            r.event("arm", &block(true, &[DCIM]));
+            r.event(
+                "local",
+                &in_block(step_started(1, "Read folder config"), &[DCIM]),
+            );
+            r.event(
+                "arm",
+                &in_block(step_started(1, "Read folder config"), &[DCIM]),
+            );
+            r.event("arm", &in_block(read.clone(), &[DCIM]));
+            r.event(
+                "arm",
+                &Event::Log {
+                    level: Level::Warn,
+                    msg: "[DCIM] not evaluated further under --check: needs the output of \
+                          step `Read folder config`, which would change and so has none"
+                        .into(),
+                },
+            );
+            r.event("arm", &block(false, &[DCIM]));
+            r.event(
+                "local",
+                &in_block(step_finished(1, "Read folder config", Status::Ok), &[DCIM]),
+            );
+            r.event("local", &block(true, &[DCIM, "inner"]));
+            r.event(
+                "local",
+                &in_block(step_started(2, "Set type"), &[DCIM, "inner"]),
+            );
+            r.event(
+                "local",
+                &in_block(
+                    step_finished(2, "Set type", Status::Changed),
+                    &[DCIM, "inner"],
+                ),
+            );
+            r.event("local", &block(false, &[DCIM, "inner"]));
+            r.event("local", &block(false, &[DCIM]));
+            r.event("arm", &step_started(2, "Restart syncthing"));
+            r.event(
+                "arm",
+                &step_finished(2, "Restart syncthing", Status::WouldChange),
+            );
+        });
+        let expected = "\
+[arm  ]  [DCIM] Read folder config ............................... would change    GET http://x (not sent under --check)
+[arm  ]    WARNING: [DCIM] not evaluated further under --check: needs the output of step `Read folder config`, which would change and so has none
+[local]  [DCIM] Read folder config ............................... ok
+[local]  [DCIM][inner] Set type .................................. changed
+[arm  ]  Restart syncthing ....................................... would change
+";
+        assert_eq!(out, expected);
+    }
+
+    /// A prefix longer than the name column pushes the status right, as a
+    /// long name does; it is never cut.
+    #[test]
+    fn a_long_prefix_counts_toward_the_name_column() {
+        let path = ["a block with a rather long name", "and another one, longer"];
+        assert_eq!(
+            step_line(&path.map(String::from), "step", "ok", ""),
+            "[a block with a rather long name][and another one, longer] step  ok"
+        );
+        assert_eq!(
+            step_line(&["b".to_string()], "step", "ok", ""),
+            "[b] step ................................................ ok"
+        );
+        assert_eq!(
+            step_line(&[], "step", "skipped", "   why"),
+            "step .................................................... skipped         why"
+        );
+    }
+
+    /// Under a prefixed step the diff keeps a fixed indent: there is no depth
+    /// to indent by any more.
+    #[test]
+    fn diff_lines_under_a_prefixed_step_have_a_fixed_indent() {
+        let mut ev = step_finished(1, "conf", Status::Changed);
+        if let Event::StepFinished { diff, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::text("/etc/x", "a\n", "b\n"));
+        }
+        let out = render(1, |r| {
+            r.event("local", &in_block(step_started(1, "conf"), &["a", "b"]));
+            r.event("local", &in_block(ev, &["a", "b"]));
+        });
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("[local]  [a][b] conf ......"), "{out}");
+        assert!(lines.len() > 1, "{out}");
+        for l in &lines[1..] {
+            assert!(l.starts_with("[local]      | "), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_step_in_a_block_carries_the_prefix() {
+        let out = render(0, |r| {
+            r.event(
+                "local",
+                &Event::StepSkipped {
+                    id: 1,
+                    blocks: vec!["a".into()],
+                    name: "restart".into(),
+                    reason: "config unchanged".into(),
+                },
+            );
+        });
+        assert_eq!(
+            out,
+            "[local]  [a] restart ............................................. skipped         config unchanged\n"
+        );
+    }
+
+    #[test]
+    fn block_events_print_nothing() {
+        let out = render(2, |r| {
+            r.event("local", &block(true, &["a"]));
+            r.event("local", &block(true, &["a", "b"]));
+            r.event("local", &block(false, &["a", "b"]));
+            r.event("local", &block(false, &["a"]));
+        });
+        assert_eq!(out, "");
     }
 }

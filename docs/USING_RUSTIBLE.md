@@ -477,7 +477,7 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 **A plain `fn` further down the playbook file is not an extraction.** Use one
 to name the phases of a long play, or for a group repeated within it; the
 file still reads top to bottom. A long playbook that is merely long gets
-`ctx.section(..)` (§8). Bulk private to one playbook — a template, a parser —
+`ctx.block(..)` (§8). Bulk private to one playbook — a template, a parser —
 goes in a sibling file declared with `mod helpers;` (§7).
 
 **Converting an Ansible repository?** A `roles/` entry used by several
@@ -488,11 +488,14 @@ because YAML got long; a Rust file does not have that problem.
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
-| `ctx.section(..)` | grouping a long playbook, without moving anything at all |
+| `ctx.block(..)` | grouping steps under one name in the output, and returning a value from them |
 | a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
 | `mod helpers;` | bulk private to this one playbook |
 | `src/lib.rs` | a **second playbook** needs it |
 | a collection crate (§13) | reuse across workspaces or teams |
+
+A plain `fn` is still the unit of reuse. A block groups one place in a
+playbook under a name; it is not for sharing code.
 
 ## 8. `Ctx`: everything a playbook can do
 
@@ -505,9 +508,15 @@ ctx.step(name: impl Into<String>, op: impl Op) -> Result<Applied<O::Output>>
 // Record that a step was deliberately not run. Shows as `skipped`.
 ctx.skip(name: impl Into<String>, reason: impl Into<String>)
 
-// Group steps under a heading in the output. The closure returns a Result,
-// so end it with `Ok(())` and use `?` on the section itself.
-ctx.section(name, |ctx| -> Result<T> { ... }) -> Result<T>
+// Group steps under one name: each prints as `[name] step ... status`.
+// The closure returns a Result, so end it with `Ok(..)` and use `?` on the
+// block itself. A step belongs to every block open while it runs, whichever
+// `Ctx` ran it (an `as_root()` bound earlier included). A block has no result
+// of its own: `Block<T>` derefs to what the closure returned, so its fields
+// and methods work directly. Return what a later step needs, e.g. the
+// `Applied` that matters. The block's own `.completed()`, `.value()` and
+// `.into_value()` say whether it was cut short under --check.
+ctx.block(name, |ctx| -> Result<T> { ... }) -> Result<Block<T>>
 
 // What this machine is (§10).
 ctx.facts() -> &Facts
@@ -561,22 +570,31 @@ ctx.log(format!("uid {}", account.uid));          // Deref
 ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
 ```
 
-⚠️ **That `Deref` panics in check mode** when the step would have changed. A
-would-change step has no output there: the value only exists once `apply`
-has run, and `apply` never runs under `--check`. A playbook that must survive
-`--check` guards the read:
+Under `--check` a step that would change has **no output**: the value only
+exists once `apply` has run, and `apply` never runs there. Reading it, by
+`Deref` or by `.output()?`, ends the enclosing `ctx.block` with a warning,
+and the run goes on after the block; outside any block it ends that host's
+dry run the same way. Nothing fails and no guard is needed. Wrap a dependent
+group in a block, so a dry run still shows the rest of the playbook:
 
 ```rust
-if account.is_available() {
-    ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
-}
+let keys = ctx.block("deploy account", |ctx| {
+    let account = ctx.step("user", user::Present::new("deploy"))?;
+    ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))
+})?;
+if keys.changed { /* ... */ }    // the `keys` step's field, through the block
 ```
 
-(`for_user_name("deploy")` is not a way around it: keys for an account that
-does not exist yet are refused under `--check` too, as Ansible refuses them.)
+```
+[web1]  [deploy account] user ................................... would change    exists=yes home=/home/deploy shell=/bin/sh
+[web1]    WARNING: [deploy account] not evaluated further under --check: needs the output of step `user`, which would change and so has none
+```
 
-This is the single most common way a playbook that works fails under
-`--check`. See §15.
+`.is_available()` is for branching inside a block instead of ending it.
+Reading through a block that was ended this way (`keys.changed` above) is cut
+short the same way, so the `if` neither runs nor skips on a guess. At the top
+level, as here, that ends the host's dry run with the warning; to keep the
+rest visible, put the dependent `if` inside a block of its own.
 
 ## 10. Facts
 
@@ -961,11 +979,11 @@ directory's parent, or a destination directory as a side effect. Sequence them:
 
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
-let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
-// Under --check a step that would change has no output, so guard the read
-if app.is_available() {
+ctx.block("app account", |ctx| {
+    let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
     ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
-}
+    Ok(())
+})?;
 ```
 
 In a real run most of these refuse in `check`, before anything is touched,
@@ -1138,9 +1156,9 @@ rustible playbook run site
 Each step is a line:
 
 ```
-[web1]  nginx installed ............................ changed    nginx=1.24.0-2
-[web1]  deploy user ................................ ok
-[web1]  nginx.conf ................................. changed    +3 -1 lines
+[web1]  nginx installed ......................................... changed         nginx=1.24.0-2
+[web1]  deploy user ............................................. ok
+[web1]  nginx.conf .............................................. changed         +3 -1 lines
 ```
 
 `-v` adds diffs and facts. `-vv` adds every command executed.
@@ -1232,10 +1250,11 @@ the diff they would have applied.
 Three things to know:
 
 - ⚠️ **A step that would change has no output.** Its value only exists once
-  `apply` has run, and `apply` never runs here. Reading it fails — and via
-  `Deref`, panics (§9). Guard with `.is_available()`, or write the next step
-  so it does not need the value (naming an account that already exists, for
-  instance).
+  `apply` has run, and `apply` never runs here. Reading it ends the
+  enclosing `ctx.block`, or outside any block that host's dry run, with
+  `WARNING: [block] not evaluated further under --check: …`, and the run
+  carries on after the block (§9). Nothing failed: the dry run could not see
+  further. Keep a dependent group in a block so the rest stays visible.
 - **A prerequisite an earlier step could create is not refused.** A new
   `user::Present` whose group is not there yet, a `systemd::Enabled` for a
   unit no package has installed yet, a `file::Line` in a file nothing has
@@ -1247,8 +1266,8 @@ Three things to know:
   stops there. Two things are refused under `--check` anyway, because Ansible
   refuses them: an **existing** account's missing group, and
   `authorized_keys` for an account that does not exist yet (chain from the
-  `user::Present` step with `for_user(&account)` behind `is_available()`, or
-  dry-run again once the account exists). Refusals about the machine itself
+  `user::Present` step with `for_user(&account)`, or dry-run again once the
+  account exists). Refusals about the machine itself
   (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
   key this kernel lacks) hold in both modes.
 - ⚠️ **`apt::Latest::update_cache(..)` refreshes the package lists even in
@@ -1267,7 +1286,7 @@ the whole shape of the real run, conditionals included.
 |---|---|
 | ``no host or group named `all` `` | there is no implicit `all` group (§6); exits 3 |
 | `cannot find module or crate 'apt' in this scope` | missing `use rustible_std::apt;` (§7) |
-| a step panics under `--check` only | `Deref` on an unavailable output (§9, §15) |
+| `not evaluated further under --check` | a read of a would-change step's output; the dry run did not evaluate the rest of that block (§9, §15) |
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
 | ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
 | `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |

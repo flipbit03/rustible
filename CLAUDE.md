@@ -280,8 +280,10 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   carries what `check` observed and decided and nothing `apply` will
   produce; there is no prediction to fill in, and `apply` reads for itself
   whatever its output needs beyond the intent (a gid to report, a digest).
-  A later step that reads a would-change step's output under `--check` fails
-  with a clear message (vision 12).
+  A later read of a would-change step's output in playbook code under
+  `--check` ends the innermost enclosing `ctx.block` (or that host's dry
+  run) with a warning; nothing fails (vision 12). Read inside an op's
+  `check`, it fails that step.
 - **Refuse, do not invent — in a real run.** An operation that manages a user
   does not create the group it references, and `authorized_keys` does not
   create the home. Fail naming the operation the author wanted. Under

@@ -104,6 +104,13 @@ pub trait Op {
     /// is never skipped on a run that can act (vision doc 6.7, 12).
     /// A refusal about the machine or the request itself — wrong platform,
     /// not root, a malformed input — stands in both modes.
+    ///
+    /// An op must not depend on another step's output under check mode: a
+    /// would-change step has none. If `check` (or [`Op::always_changes`], or
+    /// the intent's `diff`) reads one anyway, through `Deref` or `.output()?`, this step fails with
+    /// [`OutputUnavailable`](crate::error::OutputUnavailable) and is counted
+    /// failed. Only a read in playbook code, between steps, ends the
+    /// enclosing `ctx.block` without failing anything.
     fn check(&self, sys: &System) -> Result<Plan<Self>>;
 
     /// Execute the intent `check` produced. Only called when `check`
@@ -246,8 +253,10 @@ impl<T> Applied<T> {
     }
 
     /// Whether an output is there to read: false exactly when
-    /// [`Applied::output`] would fail and `Deref` would panic. A playbook
-    /// that wants to keep going in check mode branches on this.
+    /// [`Applied::output`] would fail and `Deref` would unwind. Under
+    /// `--check` a playbook needs no guard, since the read ends the enclosing
+    /// [`Ctx::block`](crate::ctx::Ctx::block) with a warning; this is for one
+    /// that wants to branch inside the block rather than end it.
     pub fn is_available(&self) -> bool {
         self.value.is_some()
     }
@@ -256,15 +265,20 @@ impl<T> Applied<T> {
 impl<T> Deref for Applied<T> {
     type Target = T;
 
-    /// Panics with the same message as `output()` when the value is
-    /// unavailable. The runtime turns the panic into a failed step.
+    /// The output. When there is none (a would-change step under `--check`)
+    /// it unwinds with a typed [`OutputUnavailable`] payload rather than
+    /// panicking: nothing is printed, and the innermost enclosing
+    /// [`Ctx::block`](crate::ctx::Ctx::block), or the runtime outside any
+    /// block, ends that part of the dry run with a warning. That is for a
+    /// read in playbook code between steps: read inside an operation's own
+    /// `check`, it is that step's failure instead, counted, and nothing is
+    /// absorbed.
+    ///
+    /// [`OutputUnavailable`]: crate::error::OutputUnavailable
     fn deref(&self) -> &T {
         match &self.value {
             Some(v) => v,
-            None => panic!(
-                "step `{}` would have changed; its output is unavailable in check mode",
-                self.step
-            ),
+            None => crate::error::OutputUnavailable::throw(&self.step),
         }
     }
 }
