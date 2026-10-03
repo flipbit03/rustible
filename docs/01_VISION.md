@@ -811,9 +811,7 @@ let sshd = ctx.step("Disable password auth",
 // sshd.changed, sshd.backup_path: Option<PathBuf>, sshd.line_no
 ```
 `check` reads the file, finds the line by regex (or exact match), and returns
-`Satisfied` if it already equals the target, `Change { diff: line_replace }` if it
-differs, or `Change { diff: line_insert }` if absent (insert position from
-`.insert(Append | After(re) | Before(re))`). `apply` optionally backs up, applies
+`Satisfied` if it already equals the target, otherwise `Change` with the rewritten text (the line replaced in place, or inserted at the position `insertafter`/`insertbefore` picks). `apply` optionally backs up, applies
 the diff to the text, and writes atomically. The pure "given text and regex,
 produce new text and diff" logic is a free function so it can be unit-tested with
 strings.
