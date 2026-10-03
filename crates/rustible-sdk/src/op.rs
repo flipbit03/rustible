@@ -246,8 +246,10 @@ impl<T> Applied<T> {
     }
 
     /// Whether an output is there to read: false exactly when
-    /// [`Applied::output`] would fail and `Deref` would panic. A playbook
-    /// that wants to keep going in check mode branches on this.
+    /// [`Applied::output`] would fail and `Deref` would unwind. Under
+    /// `--check` a playbook needs no guard, since the read ends the enclosing
+    /// [`Ctx::block`](crate::ctx::Ctx::block) with a warning; this is for one
+    /// that wants to branch inside the block rather than end it.
     pub fn is_available(&self) -> bool {
         self.value.is_some()
     }
@@ -256,15 +258,17 @@ impl<T> Applied<T> {
 impl<T> Deref for Applied<T> {
     type Target = T;
 
-    /// Panics with the same message as `output()` when the value is
-    /// unavailable. The runtime turns the panic into a failed step.
+    /// The output. When there is none (a would-change step under `--check`)
+    /// it unwinds with a typed [`OutputUnavailable`] payload rather than
+    /// panicking: nothing is printed, and the innermost enclosing
+    /// [`Ctx::block`](crate::ctx::Ctx::block), or the runtime outside any
+    /// block, ends that part of the dry run with a warning.
+    ///
+    /// [`OutputUnavailable`]: crate::error::OutputUnavailable
     fn deref(&self) -> &T {
         match &self.value {
             Some(v) => v,
-            None => panic!(
-                "step `{}` would have changed; its output is unavailable in check mode",
-                self.step
-            ),
+            None => crate::error::OutputUnavailable::throw(&self.step),
         }
     }
 }

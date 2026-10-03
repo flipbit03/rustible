@@ -367,10 +367,10 @@ enum Up {
 
 enum Event {
     Facts(Facts),
-    SectionStarted { depth, name },  SectionFinished { depth, name },
-    StepStarted  { id, depth, name, identity },
-    StepFinished { id, depth, name, identity, status: Status, diff: Option<Diff>, note: Option<String>, elapsed_ms },
-    StepSkipped  { id, depth, name, reason },
+    BlockStarted { blocks },  BlockFinished { blocks },   // blocks: the path, outermost first
+    StepStarted  { id, blocks, name, identity },
+    StepFinished { id, blocks, name, identity, status: Status, diff: Option<Diff>, note: Option<String>, elapsed_ms },
+    StepSkipped  { id, blocks, name, reason },
     Log { level: Debug | Info | Warn, msg },
     CmdRan { identity, argv: Vec<String>, status: i32, elapsed_ms },   // rendered at -vv
     Failed { step: Option<String>, error: String },
@@ -1476,7 +1476,7 @@ pub struct Ctx {
     host: HostInfo,         // from the Start frame
     channel: Channel,       // framed up/down link to the orchestrator
     step_counter: u32,
-    section_depth: u8,
+    blocks: Rc<[Rc<BlockFrame>]>,   // the enclosing ctx.block path; each frame records whether a step inside changed
 }
 
 impl Ctx {
@@ -1492,7 +1492,7 @@ impl Ctx {
 
     // ---- tier 2 ----
     pub fn skip(&mut self, name, reason);     // record a deliberately-not-run step
-    pub fn section<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T>; // output grouping
+    pub fn block<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Block<T>>; // grouping; derives .changed
     pub fn as_user(&self, name: &str) -> Ctx; // same channel/host, different identity
     pub fn as_root(&self) -> Ctx;             // literally as_user("root"), never follows the inventory
     pub fn as_escalated(&self) -> Ctx;        // as_user(host.escalate_user): the inventory's privileged account
@@ -1517,8 +1517,13 @@ impl Ctx {
 - **`skip` is explicit and optional.** An `if` that does not run a step makes it
   vanish from the output; `skip` records it with a reason and the summary counts
   it, for the "twelve steps, three did not apply, here is why" report.
-- **`section` is output-only** grouping (indented block under a heading), so a
-  collection helper emitting several steps reads as one unit. Sections nest.
+- **`block` is a grouping, not an operation.** It draws no step id, moves no
+  counter and has no line of its own; every step inside is printed with a
+  `[outer][inner] ` prefix, so a line stands on its own however hosts
+  interleave. It returns `Block<T>`: the closure's value, and `.changed`,
+  derived from the steps inside (nested blocks and `as_user` children
+  included) rather than declared. Under `--check` it is where a read of a
+  missing output ends (section 12). Blocks nest.
 - **`bail!`** (re-exported) is Ansible's `fail` module.
 - **Tier 3 calls are blocking calls over the channel** (remote-brain): `barrier`
   sends a frame up and waits for `BarrierRelease`; `run_once` is a barrier plus
@@ -1526,7 +1531,7 @@ impl Ctx {
 - **`HostInfo`** (from the `Start` frame) carries `name`, `groups`, and the
   parameters that matter on the target: `escalate_user` (for `as_escalated`)
   and `connection`. Never `addr` or `port`; those are the orchestrator's.
-- **`step` numbering and the summary are shared** across `section` and
+- **`step` numbering and the summary are shared** across `block` and
   `as_user` contexts (they clone a shared counter), so a run has one step
   sequence regardless of how many `Ctx` values exist.
 - **In check mode `changed` means "would change".** A playbook that logs after
@@ -1546,13 +1551,13 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     }
     ctx.step("nginx present", apt::Present::new(["nginx"]))?;
 
-    let cfg = ctx.section("Configure nginx", |ctx| {
-        let conf = ctx.step("Render site config",
+    let cfg = ctx.block("Configure nginx", |ctx| {
+        ctx.step("Render site config",
             file::Template::render(Site { domain: &vars.domain, workers: vars.workers })
                 .to("/etc/nginx/sites-available/app"))?;
         ctx.step("Enable site",
             file::Symlink::at("/etc/nginx/sites-enabled/app").pointing_to("/etc/nginx/sites-available/app"))?;
-        Ok(conf)
+        Ok(())
     })?;
 
     if cfg.changed { ctx.step("nginx restarted", systemd::Restart::new("nginx"))?; }
@@ -1659,21 +1664,27 @@ authoritative where the rule could have been read more broadly (decided
 `--check` as in a real run (`user.py` validates it before anything that
 respects check mode), and keys for an account that does not exist yet are
 refused too (`authorized_key`: "Either user must exist or you must provide
-full path to key file in check mode"). Added on top is the loud failure
-Ansible lacks when a later step reads what a dry run could not produce.
+full path to key file in check mode"). Added on top is what Ansible lacks
+when a later step reads what a dry run could not produce: a warning saying
+where the dry run stopped seeing.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
   the run continues. Nothing is applied and nothing is predicted: the intent
   carries what `check` observed and decided, and no post-apply output.
 - A would-change step's output does not exist. `Applied<T>` holds
-  `Option<T>`; reading the output of a would-change step (via `Deref`) fails
-  with "step `<name>` would have changed; its output is unavailable in check
-  mode". `.changed` and `.diff` remain readable; `.is_available()` is the
-  guard for a playbook that wants to keep going. Playbooks that do not chain
-  get a full dry run; those that chain get as far as the first dependent
-  read, with a clear message. Ansible does the same with silent garbage
-  instead of a loud error.
+  `Option<T>`; reading it, through `.output()` or through `Deref`, raises
+  `OutputUnavailable` naming the step. `.changed` and `.diff` remain
+  readable. Under `--check` that read ends the innermost enclosing
+  `ctx.block` — or, outside any block, the playbook body for that host —
+  with a warning naming the block and the step whose output was read. The
+  block yields no value and the run continues after it. This is not a
+  failure: nothing failed, the dry run could not see further. Playbooks are
+  written as if every output exists, without guards; `.is_available()`
+  remains for a playbook that wants to branch inside a block rather than end
+  it. In a real run every step has applied and the read cannot fail. Ansible
+  carries on with silent garbage; Rustible says where the dry run stopped
+  seeing.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group for an account not there yet, that account, its
@@ -1834,7 +1845,8 @@ Rendered example:
 - **Escalate**: Ansible's `become`. Running the binary or a step as another
   user, root by default. Named `escalate` because `become` is a reserved Rust
   keyword (section 16).
-- **Section**: `ctx.section(name, |ctx| ..)`, output-only grouping of steps.
+- **Block**: `ctx.block(name, |ctx| ..)`, a named grouping of steps, not an
+  operation; its `.changed` says whether any step inside changed.
 - **Skip**: `ctx.skip(name, reason)`, a step deliberately not run, counted in
   the summary.
 - **Parameter** (inventory): a connection or escalation setting `rustible`

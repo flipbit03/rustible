@@ -32,7 +32,9 @@ use crate::secret::Secret;
 /// `FetchChunk`), `Start.escalate_password`, base64 byte fields.
 /// 4: `Facts.package_managers` (a set) replaces `package_manager`, `Pm::Other`
 /// is gone, and `Os`, `Distro`, `Pm`, `Init` gain the macOS variants.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// 5: `Ctx::block` — `BlockStarted`/`BlockFinished` replace
+/// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -416,5 +418,33 @@ mod tests {
             assert_eq!(back.render(), diff.render());
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+    }
+
+    /// Version 5 is `Ctx::block`: the block events replace the section
+    /// events, and every step event carries the block path instead of a
+    /// depth. Pinned here so the shape and the number move together.
+    #[test]
+    fn protocol_5_carries_block_paths() {
+        assert_eq!(PROTOCOL_VERSION, 5);
+        let started = Event::BlockStarted {
+            blocks: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(&started).unwrap(),
+            r#"{"BlockStarted":{"blocks":["a","b"]}}"#
+        );
+        let skipped = Event::StepSkipped {
+            id: 3,
+            blocks: vec!["a".into()],
+            name: "n".into(),
+            reason: "r".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&skipped).unwrap(),
+            r#"{"StepSkipped":{"id":3,"blocks":["a"],"name":"n","reason":"r"}}"#
+        );
+        // A version-4 frame, with `depth` and no `blocks`, does not read.
+        let old = r#"{"StepSkipped":{"id":3,"depth":1,"name":"n","reason":"r"}}"#;
+        assert!(serde_json::from_str::<Event>(old).is_err());
     }
 }

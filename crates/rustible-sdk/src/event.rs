@@ -67,23 +67,21 @@ pub enum Event {
     /// reporter can label the host from this without waiting for a step;
     /// `rustible` prints the line at `-v` and drops it otherwise.
     Facts(Facts),
-    /// A [`Ctx::section`](crate::ctx::Ctx::section) opened. Grouping only:
-    /// no work is attached to it and no counter moves.
-    SectionStarted {
-        /// Nesting level of the section itself, so the steps inside it carry
-        /// `depth + 1`. Reporters indent two spaces per level.
-        depth: u8,
-        /// The heading the playbook passed, verbatim.
-        name: String,
+    /// A [`Ctx::block`](crate::ctx::Ctx::block) opened. A block is a
+    /// grouping, not an operation: it draws no step id, moves no counter and
+    /// has no line of its own. Both reporters here print nothing for it; the
+    /// steps inside carry the path themselves.
+    BlockStarted {
+        /// The full path, outermost first, ending with this block's own name.
+        blocks: Vec<String>,
     },
-    /// The section's closure returned, whether it succeeded or not. Emitted
-    /// even when the body errored, so a consumer tracking nesting never
-    /// leaks a level. `rustible` ignores it outright and relies on `depth`.
-    SectionFinished {
-        /// Matches the `depth` of the `SectionStarted` it closes.
-        depth: u8,
-        /// Matches the `name` of the `SectionStarted` it closes.
-        name: String,
+    /// The block's closure is done, on every exit: a value, an error, an
+    /// output absorbed under `--check`, and before a panic that is not the
+    /// block's to absorb is resumed. A consumer tracking nesting never leaks
+    /// a level.
+    BlockFinished {
+        /// The same path as the `BlockStarted` it closes.
+        blocks: Vec<String>,
     },
     /// A step is about to run: emitted by `Ctx::step` before `check`, so the
     /// step line for a slow check is already claimed. A reporter should
@@ -92,8 +90,10 @@ pub enum Event {
         /// Per-run counter starting at 1, drawn by steps and skips alike.
         /// Pairs this event with its `StepFinished`.
         id: u32,
-        /// Enclosing `Ctx::section` nesting, 0 at the top level.
-        depth: u8,
+        /// The enclosing [`Ctx::block`](crate::ctx::Ctx::block) names,
+        /// outermost first; empty at the top level. Reporters print it as a
+        /// `[outer][inner] ` prefix on the step line ([`block_prefix`]).
+        blocks: Vec<String>,
         /// The step label the playbook passed to `Ctx::step`.
         name: String,
         /// Who the op runs as: `self`, or the user name when the step came
@@ -110,7 +110,7 @@ pub enum Event {
         /// Repeated from `StepStarted` so a consumer that joined late, or
         /// one reading JSON lines out of context, needs no state to render
         /// the line.
-        depth: u8,
+        blocks: Vec<String>,
         /// Repeated from `StepStarted`.
         name: String,
         /// Repeated from `StepStarted`.
@@ -145,8 +145,8 @@ pub enum Event {
         /// From the same per-run counter as steps, so ids stay unique and
         /// ordered across both.
         id: u32,
-        /// Enclosing `Ctx::section` nesting, 0 at the top level.
-        depth: u8,
+        /// The enclosing block path, outermost first, as on `StepStarted`.
+        blocks: Vec<String>,
         /// The label the playbook would have given the step.
         name: String,
         /// The playbook's own words for why, printed on the step line where
@@ -207,6 +207,13 @@ pub enum Event {
     /// absence is information: `rustible` prints `no summary (binary exited
     /// N before finishing)` for that host and fails the run.
     Finished(Summary),
+}
+
+/// A block path as every line inside it is prefixed: `[outer][inner]`, and
+/// the empty string at the top level. The step line adds one space after it;
+/// a warning that names a block spells its own path the same way.
+pub fn block_prefix(blocks: &[String]) -> String {
+    blocks.iter().map(|b| format!("[{b}]")).collect()
 }
 
 impl Event {
@@ -375,7 +382,7 @@ pub struct Compact<W: Write + Send> {
 
 impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
-    /// per step, section and warning. At 1 it adds `debug` logs, the full
+    /// per step and warning, a step inside a block prefixed with its path. At 1 it adds `debug` logs, the full
     /// diff under a changed step, and the failing command's stderr. At 2 it
     /// adds a `$` line per [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
@@ -395,9 +402,11 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 "facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
                 f.distro, f.distro_version, f.arch, f.package_managers, f.cpus, f.memory_mb, f.user
             ),
-            Event::SectionStarted { name, .. } => writeln!(w, "section: {name}"),
-            Event::SectionFinished { .. } | Event::StepStarted { .. } => Ok(()),
+            Event::BlockStarted { .. }
+            | Event::BlockFinished { .. }
+            | Event::StepStarted { .. } => Ok(()),
             Event::StepFinished {
+                blocks,
                 name,
                 identity,
                 status,
@@ -421,7 +430,7 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 if identity != "self" {
                     tail.push_str(&format!("  as {identity}"));
                 }
-                let r = writeln!(w, "{status_s}: {name}{tail}");
+                let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
                 if self.verbosity >= 1
                     && let Some(d) = diff
                     && matches!(status, Status::Changed | Status::WouldChange)
@@ -432,7 +441,12 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 }
                 r
             }
-            Event::StepSkipped { name, reason, .. } => writeln!(w, "skipped: {name}  {reason}"),
+            Event::StepSkipped {
+                blocks,
+                name,
+                reason,
+                ..
+            } => writeln!(w, "skipped: {}{name}  {reason}", step_prefix(&blocks)),
             Event::Log { level, msg } => match level {
                 Level::Debug if self.verbosity < 1 => Ok(()),
                 Level::Debug => writeln!(w, "debug: {msg}"),
@@ -474,6 +488,16 @@ impl<W: Write + Send> EventSink for Compact<W> {
     }
 }
 
+/// [`block_prefix`] plus the space that separates it from a step name, or
+/// nothing at all at the top level.
+fn step_prefix(blocks: &[String]) -> String {
+    if blocks.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", block_prefix(blocks))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +524,62 @@ mod tests {
         ] {
             assert!(!emitted_by(s).is_empty());
         }
+    }
+
+    /// The compact printer prefixes a step inside a block with its path and
+    /// prints nothing for the block itself, like `rustible`'s renderer.
+    #[test]
+    fn compact_prefixes_steps_in_blocks_and_prints_no_block_line() {
+        let printer = Compact::new(Vec::new(), 0);
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        printer.emit(Event::BlockStarted {
+            blocks: path(&["a"]),
+        });
+        printer.emit(Event::BlockStarted {
+            blocks: path(&["a", "b"]),
+        });
+        printer.emit(Event::StepFinished {
+            id: 1,
+            blocks: path(&["a", "b"]),
+            name: "inner".into(),
+            identity: "self".into(),
+            status: Status::Changed,
+            diff: None,
+            note: None,
+            elapsed_ms: 0,
+        });
+        printer.emit(Event::StepSkipped {
+            id: 2,
+            blocks: path(&["a"]),
+            name: "skipped".into(),
+            reason: "why".into(),
+        });
+        printer.emit(Event::BlockFinished {
+            blocks: path(&["a", "b"]),
+        });
+        printer.emit(Event::BlockFinished {
+            blocks: path(&["a"]),
+        });
+        printer.emit(Event::StepFinished {
+            id: 3,
+            blocks: vec![],
+            name: "top".into(),
+            identity: "self".into(),
+            status: Status::Ok,
+            diff: None,
+            note: None,
+            elapsed_ms: 0,
+        });
+        let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "changed: [a][b] inner\nskipped: [a] skipped  why\nok: top\n"
+        );
+    }
+
+    #[test]
+    fn block_prefix_renders_the_path() {
+        assert_eq!(block_prefix(&[]), "");
+        assert_eq!(block_prefix(&["a".into(), "b c".into()]), "[a][b c]");
     }
 }

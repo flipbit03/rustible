@@ -28,7 +28,8 @@ use serde_json::Value;
 
 use crate::backend::serve_helper;
 use crate::channel::{Channel, Feeder};
-use crate::ctx::{Ctx, HostInfo};
+use crate::ctx::{Ctx, HostInfo, not_evaluated_further};
+use crate::error::OutputUnavailable;
 use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink, WarnCounter};
 use crate::protocol::{self, Down, FrameSink, Up};
 use crate::registry::{Named, describe_all};
@@ -466,25 +467,53 @@ fn execute(
     let entry = named.playbook.entry;
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry(&mut ctx, vars)));
+    // The playbook body is the outermost block (vision doc 12): under
+    // `--check`, a read of a would-change step's output that no `ctx.block`
+    // absorbed ends this host's dry run here, with the same warning a block
+    // gives and no prefix. Nothing failed, so the host is not counted as
+    // failed. Outside check mode it is an error like any other.
+    let check_mode = ctx.check_mode();
     let failed = match outcome {
         Ok(Ok(())) => false,
-        Ok(Err(e)) => {
-            sink.emit(Event::failed(e.step_failed().map(|s| s.step.clone()), &e));
-            true
-        }
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "panic".into());
-            sink.emit(Event::Failed {
-                step: None,
-                error: format!("panic: {msg}"),
-                cmd: None,
-            });
-            true
-        }
+        Ok(Err(e)) => match e.downcast_ref::<OutputUnavailable>() {
+            Some(u) if check_mode => {
+                ctx.warn(not_evaluated_further("", &u.step));
+                false
+            }
+            _ => {
+                sink.emit(Event::failed(e.step_failed().map(|s| s.step.clone()), &e));
+                true
+            }
+        },
+        Err(payload) => match payload.downcast::<OutputUnavailable>() {
+            Ok(u) if check_mode => {
+                ctx.warn(not_evaluated_further("", &u.step));
+                false
+            }
+            Ok(u) => {
+                // `Deref` unwinds with this typed payload; reported as the
+                // error it stands for rather than as `panic: panic`.
+                sink.emit(Event::Failed {
+                    step: None,
+                    error: u.to_string(),
+                    cmd: None,
+                });
+                true
+            }
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic".into());
+                sink.emit(Event::Failed {
+                    step: None,
+                    error: format!("panic: {msg}"),
+                    cmd: None,
+                });
+                true
+            }
+        },
     };
 
     let mut summary = ctx.summary();
@@ -770,5 +799,209 @@ mod tests {
             playbook: &NO_VARS,
         }];
         assert!(check_vars(&only, None, "[]").is_ok());
+    }
+
+    // ---- the playbook body is the outermost block ----
+
+    /// A step that would change, so under `--check` it has no output.
+    struct WouldChange;
+
+    #[derive(Debug)]
+    struct Go;
+
+    impl crate::op::Intent for Go {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::summary("go")
+        }
+    }
+
+    impl crate::op::Op for WouldChange {
+        type Output = u32;
+        type Intent = Go;
+        fn check(&self, _: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            Ok(crate::op::Plan::Change(Go))
+        }
+        fn apply(&self, _: &crate::system::System, Go: Go) -> crate::Result<u32> {
+            Ok(1)
+        }
+    }
+
+    /// Runs `playbook` through `execute`, as a host run does, and returns the
+    /// exit code with every event.
+    fn run(playbook: &'static Playbook, check_mode: bool) -> (ExitCode, Vec<Event>) {
+        let sink = Arc::new(crate::event::Collect::default());
+        let named = Named {
+            name: "under-test",
+            playbook,
+        };
+        let code = execute(
+            &named,
+            HostInfo::local(),
+            Value::Null,
+            check_mode,
+            sink.clone(),
+            Channel::detached(),
+            None,
+            "test".into(),
+        );
+        (code, sink.events())
+    }
+
+    fn summary_of(events: &[Event]) -> crate::event::Summary {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::Finished(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the run finished")
+    }
+
+    fn warnings_in(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    level: crate::event::Level::Warn,
+                    msg,
+                } => Some(msg.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn failed_in(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Failed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const TOP_LEVEL: &str = "not evaluated further under --check: needs the output of step \
+                             `read`, which would change and so has none";
+
+    static DEREF_AT_TOP: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |ctx, _| {
+            let got = ctx.step("read", WouldChange)?;
+            let n = *got;
+            ctx.step("never reached", WouldChange)?;
+            let _ = n;
+            Ok(())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    static QUESTION_MARK_AT_TOP: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |ctx, _| {
+            let got = ctx.step("read", WouldChange)?;
+            let n = *got.output()?;
+            ctx.step("never reached", WouldChange)?;
+            let _ = n;
+            Ok(())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// Under `--check` nothing failed: the dry run could not see further.
+    /// The host ends with the unprefixed warning, succeeds, and counts no
+    /// failure, whichever way the output was read.
+    #[test]
+    fn under_check_a_top_level_missing_output_ends_the_dry_run_without_failing() {
+        for playbook in [&DEREF_AT_TOP, &QUESTION_MARK_AT_TOP] {
+            let (code, events) = run(playbook, true);
+            assert_eq!(code, ExitCode::SUCCESS);
+            let s = summary_of(&events);
+            assert_eq!((s.failed, s.would_change, s.warnings), (0, 1, 1));
+            assert_eq!(warnings_in(&events), [TOP_LEVEL]);
+            assert!(failed_in(&events).is_empty(), "{events:#?}");
+        }
+    }
+
+    static RETURNS_UNAVAILABLE: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |_, _| {
+            Err(crate::error::OutputUnavailable {
+                step: "by hand".into(),
+            }
+            .into())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// Outside `--check` the runtime absorbs nothing: the error fails the
+    /// host as before.
+    #[test]
+    fn a_real_run_fails_the_host_on_output_unavailable() {
+        let (code, events) = run(&RETURNS_UNAVAILABLE, false);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_eq!(summary_of(&events).failed, 1);
+        assert_eq!(
+            failed_in(&events),
+            ["step `by hand` would have changed; its output is unavailable in check mode"]
+        );
+        assert!(warnings_in(&events).is_empty());
+    }
+
+    static PANICS_IN_A_BLOCK: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |ctx, _| {
+            ctx.block("b", |_| -> crate::Result<()> { panic!("boom") })?;
+            Ok(())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// A real panic is nobody's to absorb, in check mode included: the block
+    /// resumes it and the runtime reports it as it always has.
+    #[test]
+    fn under_check_a_panic_in_a_block_still_fails_the_host() {
+        let (code, events) = run(&PANICS_IN_A_BLOCK, true);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_eq!(summary_of(&events).failed, 1);
+        assert_eq!(failed_in(&events), ["panic: boom"]);
+        assert!(warnings_in(&events).is_empty());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BlockFinished { blocks } if blocks == &["b"])),
+            "BlockFinished before the panic was resumed"
+        );
+    }
+
+    static DEREF_IN_A_REAL_RUN: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |_, _| {
+            // A real run cannot produce this; the payload is thrown directly
+            // to show how the runtime words it if it ever does.
+            crate::error::OutputUnavailable::throw("by hand")
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// The typed payload, unabsorbed, is reported by its own message rather
+    /// than as an anonymous panic.
+    #[test]
+    fn an_unabsorbed_deref_payload_reports_a_clean_message() {
+        let (code, events) = run(&DEREF_IN_A_REAL_RUN, false);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_eq!(
+            failed_in(&events),
+            ["step `by hand` would have changed; its output is unavailable in check mode"]
+        );
     }
 }

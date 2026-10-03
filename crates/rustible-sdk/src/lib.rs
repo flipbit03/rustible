@@ -32,7 +32,7 @@ pub mod __private {
     pub use serde_json;
 }
 
-pub use ctx::{Ctx, HostInfo};
+pub use ctx::{Block, Ctx, HostInfo};
 pub use diff::{AttrChange, Diff};
 pub use error::{
     CmdFailed, Context, Error, IoAt, MutationDuringCheck, OutputUnavailable, Result, SpawnFailed,
@@ -47,7 +47,7 @@ pub use system::{Cmd, System};
 /// implement an [`Op`], and nothing from the runtime, protocol, backend or
 /// channel modules, which a playbook never names.
 pub mod prelude {
-    pub use crate::ctx::Ctx;
+    pub use crate::ctx::{Block, Ctx};
     pub use crate::diff::{AttrChange, Diff};
     pub use crate::error::{Context, Error, Result};
     pub use crate::facts::{Arch, Distro, Facts, Init, Os, Pm};

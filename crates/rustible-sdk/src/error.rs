@@ -9,7 +9,14 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// The one error type. Wraps `anyhow::Error`; converts from anything.
-pub struct Error(anyhow::Error);
+pub struct Error {
+    inner: anyhow::Error,
+    /// Set once a [`Ctx::block`](crate::ctx::Ctx::block) has printed this
+    /// error's `block ended with an error` line, so the blocks enclosing it
+    /// pass it on without printing it a second time. Kept through
+    /// [`Error::context`]; nothing outside the SDK sees it.
+    pub(crate) shown_by_block: bool,
+}
 
 /// The result type every SDK, op, and playbook signature uses. Fixing the
 /// error side to [`Error`] is what makes `?` accept a foreign error without
@@ -19,12 +26,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     /// A plain message error. `bail!` uses this.
     pub fn msg(m: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
-        Error(anyhow::Error::msg(m))
+        Error::wrap(anyhow::Error::msg(m))
     }
 
     /// Wrap with a context layer: ``"installing nginx: <inner>"``.
     pub fn context(self, c: impl fmt::Display + fmt::Debug + Send + Sync + 'static) -> Self {
-        Error(self.0.context(c))
+        Error {
+            inner: self.inner.context(c),
+            shown_by_block: self.shown_by_block,
+        }
+    }
+
+    fn wrap(inner: anyhow::Error) -> Self {
+        Error {
+            inner,
+            shown_by_block: false,
+        }
     }
 
     /// The whole chain rendered on one line, outermost first.
@@ -34,7 +51,7 @@ impl Error {
 
     /// Look for a typed signal anywhere in the chain.
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<&T> {
-        self.0.chain().find_map(|e| e.downcast_ref::<T>())
+        self.inner.chain().find_map(|e| e.downcast_ref::<T>())
     }
 
     /// The failed command, if one is in the chain.
@@ -53,7 +70,7 @@ impl Error {
     /// Unlike [`Error::downcast_ref`] this looks at context layers as well
     /// as at the errors themselves, because a context layer is what this is.
     pub fn step_failed(&self) -> Option<&StepFailed> {
-        self.0.downcast_ref::<StepFailed>()
+        self.inner.downcast_ref::<StepFailed>()
     }
 }
 
@@ -61,13 +78,13 @@ impl fmt::Display for Error {
     /// `{}` prints the outermost message, `{:#}` the whole chain (anyhow's
     /// own convention).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        fmt::Display::fmt(&self.inner, f)
     }
 }
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+        fmt::Debug::fmt(&self.inner, f)
     }
 }
 
@@ -78,7 +95,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(e: E) -> Self {
-        Error(anyhow::Error::new(e))
+        Error::wrap(anyhow::Error::new(e))
     }
 }
 
@@ -135,12 +152,33 @@ pub struct MutationDuringCheck {
 }
 
 /// A would-change step's output was read in check mode (vision 12).
+///
+/// It arrives two ways: as an error, from [`Applied::output`] and its
+/// friends, and as an unwind payload, from `Applied`'s and `Block`'s `Deref`,
+/// which have no `Result` to return. Under `--check` either one ends the
+/// innermost enclosing [`Ctx::block`] with a warning, or the playbook body
+/// for that host when there is no block; nothing fails.
+///
+/// [`Applied::output`]: crate::op::Applied::output
+/// [`Ctx::block`]: crate::ctx::Ctx::block
 #[derive(Debug, thiserror::Error)]
 #[error("step `{step}` would have changed; its output is unavailable in check mode")]
 pub struct OutputUnavailable {
     /// The name passed to `ctx.step`, so the message names the playbook line
     /// whose output was read rather than the one that would have produced it.
     pub step: String,
+}
+
+impl OutputUnavailable {
+    /// Unwind with this as a typed payload, for a `Deref` that has no
+    /// `Result` to return. `resume_unwind` rather than `panic!`: the panic
+    /// hook does not run, so nothing is printed on stderr, and the catcher
+    /// (`Ctx::block`, the runtime) tells it from a real bug by its type.
+    pub(crate) fn throw(step: &str) -> ! {
+        std::panic::resume_unwind(Box::new(OutputUnavailable {
+            step: step.to_string(),
+        }))
+    }
 }
 
 /// The step a failure happened in, as [`Ctx::step`](crate::ctx::Ctx::step)

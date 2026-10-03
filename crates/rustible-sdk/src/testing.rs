@@ -402,7 +402,12 @@ fn inside(spec: &Spec, image: &str, body: Body) {
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
+    // `Applied`'s and `Block`'s `Deref` unwind with this typed payload. The
+    // harness runs bodies with check mode off, where it cannot normally
+    // occur, but when it does its message is the useful one.
+    if let Some(u) = payload.downcast_ref::<crate::error::OutputUnavailable>() {
+        u.to_string()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -842,6 +847,21 @@ fn status_word(s: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed payload `Deref` unwinds with reports its own message, not
+    /// "non-string panic payload".
+    #[test]
+    fn panic_message_reads_the_output_unavailable_payload() {
+        let payload =
+            std::panic::catch_unwind(|| -> () { crate::error::OutputUnavailable::throw("read") })
+                .unwrap_err();
+        assert_eq!(
+            panic_message(&payload),
+            "step `read` would have changed; its output is unavailable in check mode"
+        );
+        let payload = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        assert_eq!(panic_message(&payload), "boom");
+    }
 
     #[test]
     fn test_path_at_crate_root_is_the_name() {
