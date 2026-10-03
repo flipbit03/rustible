@@ -783,7 +783,7 @@ impl Intent for KeysWrite {
 #[derive(Debug)]
 pub enum KeysIntent {
     /// Write the keys, and bring the file and `~/.ssh` to what sshd needs.
-    Write(KeysWrite),
+    Write(Box<KeysWrite>),
     /// The directory everything waits on (the account's home, or the
     /// `in_file` parent) is not there yet and there is nothing else to do.
     /// Only `check` under `--check` produces this, so it is reported and
@@ -973,9 +973,7 @@ impl Op for Present {
         // depend on something unrelated to it. `rustible_github`'s helper
         // reaches exactly that case: it warns when a GitHub login has no
         // public keys and then runs this op with an empty list.
-        if planned.text.is_none()
-            && before_stat.is_none()
-            && dir.as_ref().is_some_and(|d| d.create)
+        if planned.text.is_none() && before_stat.is_none() && dir.as_ref().is_some_and(|d| d.create)
         {
             if let Some(waiting) = waiting(sys)? {
                 return Ok(Plan::Change(waiting));
@@ -1021,12 +1019,12 @@ impl Op for Present {
             }
             return Ok(Plan::Satisfied(write.into_report(None)));
         }
-        Ok(Plan::Change(KeysIntent::Write(write)))
+        Ok(Plan::Change(KeysIntent::Write(Box::new(write))))
     }
 
     fn apply(&self, sys: &System, intent: KeysIntent) -> Result<KeysReport> {
         let write = match intent {
-            KeysIntent::Write(write) => write,
+            KeysIntent::Write(write) => *write,
             // The refusal a real run's `check` gives for the same machine.
             KeysIntent::Await { dir, path } => bail!(
                 "{} does not exist, so ssh::authorized_keys cannot manage {}",
@@ -1881,11 +1879,7 @@ mod tests {
         let Plan::Change(c) = op.check(&dry).unwrap() else {
             panic!("check mode tolerates a missing home")
         };
-        assert!(
-            creates_ssh_dir(&c),
-            "{}",
-            c.diff().render()
-        );
+        assert!(creates_ssh_dir(&c), "{}", c.diff().render());
 
         // Handing that plan to a real `apply` must not make the home.
         let err = op.apply(&fake_sys(&fake), c).unwrap_err().chain();
@@ -2054,11 +2048,7 @@ mod tests {
         else {
             panic!("a dry run of a first provision must not fail")
         };
-        assert!(
-            creates_ssh_dir(&c),
-            "{}",
-            c.diff().render()
-        );
+        assert!(creates_ssh_dir(&c), "{}", c.diff().render());
         assert!(fake.file("/home/cadu").is_none());
     }
 

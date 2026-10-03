@@ -397,7 +397,7 @@ mod tests {
     /// into the new content: the race is accepted, as in Ansible, and what
     /// was shown is what ran.
     #[test]
-    fn apply_writes_the_planned_text_even_if_the_file_moved_on() {
+    fn apply_writes_what_check_planned_even_if_the_file_moved_on() {
         let fake = Arc::new(Fake::new().with_file("/etc/x", "a=1\n"));
         let sys = fake_sys(&fake);
         let op = Line::in_path("/etc/x").matching("^b=").set("b=2");

@@ -545,15 +545,9 @@ mod tests {
     /// rendered from that same text. Pure: `plan_block` and the intent, no
     /// `System`.
     #[test]
-    fn the_planned_text_is_what_the_diff_shows() {
-        let (after, line_no) = plan_block(
-            "a\n",
-            "# BEGIN m",
-            "# END m",
-            "x\n",
-            &Insert::Append,
-        )
-        .unwrap();
+    fn what_check_planned_is_what_the_diff_shows() {
+        let (after, line_no) =
+            plan_block("a\n", "# BEGIN m", "# END m", "x\n", &Insert::Append).unwrap();
         let intent = TextEdit::Rewrite {
             path: "/etc/x".into(),
             before: "a\n".into(),
@@ -571,7 +565,7 @@ mod tests {
     /// from the file as it is now: content that arrived in between is
     /// overwritten with what the diff showed, not merged with the block.
     #[test]
-    fn apply_writes_the_planned_text_even_if_the_file_moved_on() {
+    fn apply_writes_what_check_planned_even_if_the_file_moved_on() {
         let fake = Arc::new(Fake::new().with_file("/etc/hosts", "127.0.0.1 localhost\n"));
         let sys = fake_sys(&fake);
         let op = Block::in_path("/etc/hosts")

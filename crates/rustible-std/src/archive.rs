@@ -436,7 +436,13 @@ impl Extracted {
         Ok(())
     }
 
-    fn write_member(&self, sys: &System, dest: &Path, m: &Member, data: &mut dyn Read) -> Result<()> {
+    fn write_member(
+        &self,
+        sys: &System,
+        dest: &Path,
+        m: &Member,
+        data: &mut dyn Read,
+    ) -> Result<()> {
         let full = dest.join(&m.path);
         // `chown(2)` clears setuid/setgid on non-directories, so every arm
         // below defers `set_mode` to the tail and the owner is applied

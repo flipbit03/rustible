@@ -754,7 +754,12 @@ impl Present {
 
     /// What creating the missing account means, every field resolved:
     /// the primary group, and the home and shell the tool would default to.
-    fn plan_create(&self, sys: &System, tools: Tools, primary: Option<Primary>) -> Result<Creation> {
+    fn plan_create(
+        &self,
+        sys: &System,
+        tools: Tools,
+        primary: Option<Primary>,
+    ) -> Result<Creation> {
         let defaults = useradd_defaults(sys, tools)?;
         Ok(Creation {
             system: self.system,
@@ -839,11 +844,7 @@ impl Present {
                 }
                 run_tool(cmd.arg(&self.name), tools, "adduser")?;
                 for g in &c.groups {
-                    run_tool(
-                        sys.cmd("addgroup").args([&self.name, g]),
-                        tools,
-                        "addgroup",
-                    )?;
+                    run_tool(sys.cmd("addgroup").args([&self.name, g]), tools, "addgroup")?;
                 }
                 Ok(())
             }
@@ -1354,11 +1355,9 @@ impl Op for Membership {
                 tools,
                 "usermod",
             )?,
-            Tools::BusyBox => run_tool(
-                sys.cmd("addgroup").args([&user, &group]),
-                tools,
-                "addgroup",
-            )?,
+            Tools::BusyBox => {
+                run_tool(sys.cmd("addgroup").args([&user, &group]), tools, "addgroup")?
+            }
         }
         Ok(Member { user, group })
     }

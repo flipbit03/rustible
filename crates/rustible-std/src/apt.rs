@@ -610,7 +610,10 @@ enum Bump {
     /// Not installed: `apt-get install`.
     Install { candidate: String },
     /// Installed at an older version: `apt-get install --only-upgrade`.
-    From { installed: String, candidate: String },
+    From {
+        installed: String,
+        candidate: String,
+    },
 }
 
 impl Intent for Upgrade {
@@ -1260,7 +1263,6 @@ mod tests {
         assert!(err.contains("apt::Absent needs root"), "{err}");
         assert!(fake.argvs().is_empty(), "refusal must not run commands");
     }
-
 
     #[test]
     fn absent_check_mode_runs_only_dpkg_query_and_has_no_output() {

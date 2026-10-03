@@ -502,10 +502,9 @@ impl Intent for DownloadIntent {
         match &self.fetch {
             // Size and digest are unknown until fetched; the diff says what
             // would be fetched and why.
-            Some(Fetch { url, reason }) => Diff::summary(format!(
-                "GET {url} -> {} ({reason})",
-                self.dest.display()
-            )),
+            Some(Fetch { url, reason }) => {
+                Diff::summary(format!("GET {url} -> {} ({reason})", self.dest.display()))
+            }
             None => Diff::attrs(self.dest.display().to_string(), self.attrs.changes()),
         }
     }

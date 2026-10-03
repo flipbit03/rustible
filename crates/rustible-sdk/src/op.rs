@@ -86,7 +86,7 @@ pub trait Op {
 
     /// What `check` decided and `apply` executes; see [`Intent`]. A read-only
     /// op whose `check` never returns [`Plan::Change`] uses
-    /// [`Infallible`](std::convert::Infallible).
+    /// [`Infallible`].
     type Intent: Intent;
 
     /// Inspect the system. Never mutates. Returns what would need to happen,

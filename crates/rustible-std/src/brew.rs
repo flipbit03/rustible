@@ -500,7 +500,10 @@ mod tests {
         };
         // Only the missing one is in the plan, and the intent is what `apply`
         // reads its work from.
-        assert_eq!(c.diff().render(), "brew formulae:\n  ninvaders: absent -> installed\n");
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  ninvaders: absent -> installed\n"
+        );
 
         let report = op.apply(&s, c).unwrap();
         let argvs = fake.argvs();

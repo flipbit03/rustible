@@ -176,10 +176,7 @@ mod tests {
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff().short(), "exists=yes mode=0750 owner=33:33");
         let r = op.apply(&sys, c).unwrap();
-        assert!(
-            r.created,
-            "the intent's `create` is what apply executes"
-        );
+        assert!(r.created, "the intent's `create` is what apply executes");
         let f = fake.file("/srv/app").unwrap();
         assert_eq!(
             (f.kind, f.mode, f.uid, f.gid),

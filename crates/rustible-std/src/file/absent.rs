@@ -190,7 +190,10 @@ mod tests {
 
         let op = Absent::at("/etc/l");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff().render(), "/etc/l:\n  exists: yes (symlink) -> no\n");
+        assert_eq!(
+            c.diff().render(),
+            "/etc/l:\n  exists: yes (symlink) -> no\n"
+        );
         assert!(op.apply(&sys, c).unwrap().removed);
         assert!(fake.file("/etc/l").is_none());
         assert!(

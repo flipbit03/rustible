@@ -122,7 +122,7 @@ impl<T: PartialEq> Wanted<T> {
 /// `.mode()` and `.owner()`: each attribute the op was given, with what
 /// `check` found on the path. Built by [`plan_attrs`]; an op's intent holds
 /// it, its `diff` renders the rows that differ with [`AttrPlan::changes`],
-/// and its `apply` sets the attributes with [`AttrPlan::apply`].
+/// and its `apply` sets the attributes with `AttrPlan::apply`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttrPlan {
     /// The permission bits wanted, file type bits already masked off.
@@ -375,8 +375,8 @@ mod tests {
         let s = stat(0o644, 1000, 1000);
         assert!(!plan_attrs(Some(&s), None, None).differs());
         assert!(!plan_attrs(None, None, None).differs());
-        assert!(!
-            plan_attrs(
+        assert!(
+            !plan_attrs(
                 Some(&s),
                 Some(0o644),
                 Some(Owner {
@@ -434,11 +434,9 @@ mod tests {
         let plan = plan_attrs(Some(&s), Some(0o4755), Some(Owner { uid: 5, gid: 6 }));
         assert_eq!(Diff::attrs("/f", plan.changes()).short(), "owner=5:6");
 
-        let fake = std::sync::Arc::new(rustible_sdk::backend::Fake::new().with_file_mode(
-            "/f",
-            "",
-            0o4755,
-        ));
+        let fake = std::sync::Arc::new(
+            rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o4755),
+        );
         let sys = testing::fake_sys(&fake);
         plan.apply(&sys, Path::new("/f")).unwrap();
         let f = fake.file("/f").unwrap();
