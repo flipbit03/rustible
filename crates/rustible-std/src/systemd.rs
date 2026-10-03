@@ -449,10 +449,125 @@ impl Unit {
 }
 
 fn attr(name: &str, from: &str, to: &str) -> AttrChange {
-    AttrChange {
-        name: name.into(),
-        from: from.into(),
-        to: to.into(),
+    AttrChange::new(name, from, to)
+}
+
+/// What [`Enabled`]'s `check` decided: `systemctl enable`, with `--now`
+/// when the op asks to start the unit too, from the states the probes read.
+#[derive(Debug)]
+pub struct Enable {
+    unit: Unit,
+    now: bool,
+    /// What `is-enabled` answered, when the unit is not enabled yet.
+    enabled: Option<EnabledState>,
+    /// What `is-active` answered, when `--now` has a unit to start.
+    active: Option<ActiveState>,
+}
+
+impl Intent for Enable {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![];
+        if let Some(from) = &self.enabled {
+            changes.push(attr("enabled", from.as_str(), "enabled"));
+        }
+        if let Some(from) = &self.active {
+            changes.push(attr("active", from.as_str(), "active"));
+        }
+        Diff::attrs(self.unit.name.clone(), changes)
+    }
+}
+
+/// What [`Disabled`]'s `check` decided: `systemctl disable`, with `--now`
+/// when the op asks to stop the unit too, from the states the probes read.
+#[derive(Debug)]
+pub struct Disable {
+    unit: Unit,
+    now: bool,
+    /// What `is-enabled` answered, when the unit is enabled (or, under
+    /// `--check`, not installed yet).
+    enabled: Option<EnabledState>,
+    /// What `is-active` answered, when `--now` has a running unit to stop.
+    active: Option<ActiveState>,
+}
+
+impl Intent for Disable {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![];
+        if let Some(from) = &self.enabled {
+            changes.push(attr("enabled", from.as_str(), "disabled"));
+        }
+        if let Some(from) = &self.active {
+            changes.push(attr("active", from.as_str(), "inactive"));
+        }
+        Diff::attrs(self.unit.name.clone(), changes)
+    }
+}
+
+/// What [`Running`]'s `check` decided: `systemctl start`, from the state
+/// `is-active` answered.
+#[derive(Debug)]
+pub struct Start {
+    unit: Unit,
+    from: ActiveState,
+}
+
+impl Intent for Start {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            self.unit.name.clone(),
+            vec![attr("active", self.from.as_str(), "active")],
+        )
+    }
+}
+
+/// What [`Stopped`]'s `check` decided: `systemctl stop`, from the state
+/// `is-active` answered; `None` when the unit is not installed yet, which
+/// only a dry run reports.
+#[derive(Debug)]
+pub struct Stop {
+    unit: Unit,
+    from: Option<ActiveState>,
+}
+
+impl Intent for Stop {
+    fn diff(&self) -> Diff {
+        let from = self.from.as_ref().map_or("not-found", ActiveState::as_str);
+        Diff::attrs(
+            self.unit.name.clone(),
+            vec![attr("active", from, "inactive")],
+        )
+    }
+}
+
+/// What [`Restart`] and [`Reload`] run: an optional `daemon-reload`, then
+/// the verb on the unit. The report is the command line.
+#[derive(Debug)]
+pub struct Bounce {
+    unit: Unit,
+    daemon_reload: bool,
+    verb: &'static str,
+}
+
+impl Intent for Bounce {
+    fn diff(&self) -> Diff {
+        let p = self.unit.prefix();
+        Diff::summary(if self.daemon_reload {
+            format!("{p} daemon-reload && {p} {} {}", self.verb, self.unit.name)
+        } else {
+            format!("{p} {} {}", self.verb, self.unit.name)
+        })
+    }
+}
+
+/// What [`DaemonReload`] runs: `daemon-reload` on this manager.
+#[derive(Debug)]
+pub struct ReloadUnits {
+    manager: Unit,
+}
+
+impl Intent for ReloadUnits {
+    fn diff(&self) -> Diff {
+        Diff::summary(format!("{} daemon-reload", self.manager.prefix()))
     }
 }
 
@@ -504,8 +619,9 @@ impl Enabled {
 
 impl Op for Enabled {
     type Output = UnitState;
+    type Intent = Enable;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Enabled")?;
         let p = self.unit.probe_existing(sys, "Enabled")?;
         if p.enabled.is_masked() {
@@ -517,48 +633,46 @@ impl Op for Enabled {
                 self.unit.name
             );
         }
-        let mut changes = vec![];
-        if !p.enabled.is_enabled() {
-            changes.push(attr("enabled", p.enabled.as_str(), "enabled"));
+        let enabled = (!p.enabled.is_enabled()).then(|| p.enabled.clone());
+        let active = (self.now && !p.active.is_running()).then(|| p.active.clone());
+        if enabled.is_none() && active.is_none() {
+            return Ok(Plan::Satisfied(UnitState {
+                unit: self.unit.name.clone(),
+                enabled: true,
+                active: self.now || p.active.is_running(),
+            }));
         }
-        if self.now && !p.active.is_running() {
-            changes.push(attr("active", p.active.as_str(), "active"));
-        }
-        let out = UnitState {
-            unit: self.unit.name.clone(),
-            enabled: true,
-            active: self.now || p.active.is_running(),
-        };
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(out));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.unit.name.clone(),
-            changes,
+        Ok(Plan::Change(Enable {
+            unit: self.unit.clone(),
+            now: self.now,
+            enabled,
+            active,
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        let mut cmd = self.unit.systemctl(sys).arg("enable");
-        if self.now {
+    fn apply(&self, sys: &System, intent: Enable) -> Result<UnitState> {
+        let Enable { unit, now, .. } = intent;
+        let mut cmd = unit.systemctl(sys).arg("enable");
+        if now {
             cmd = cmd.arg("--now");
         }
-        cmd.arg(&self.unit.name).run()?;
+        cmd.arg(&unit.name).run()?;
         let after = format!(
             "{} enable{} {}",
-            self.unit.prefix(),
-            if self.now { " --now" } else { "" },
-            self.unit.name
+            unit.prefix(),
+            if now { " --now" } else { "" },
+            unit.name
         );
-        let state = if self.now {
-            self.unit.verify_running(sys, &after)?
+        // Read back, not predicted: the unit's state is the tool's answer.
+        let state = if now {
+            unit.verify_running(sys, &after)?
         } else {
-            self.unit.state(&self.unit.probe(sys)?)
+            unit.state(&unit.probe(sys)?)
         };
         ensure!(
             state.enabled,
             "unit `{}` is still not enabled after `{after}`",
-            self.unit.name
+            unit.name
         );
         Ok(state)
     }
@@ -604,8 +718,9 @@ impl Disabled {
 
 impl Op for Disabled {
     type Output = UnitState;
+    type Intent = Disable;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Disabled")?;
         let p = self.unit.probe_existing(sys, "Disabled")?;
         if p.enabled.cannot_be_disabled() {
@@ -618,51 +733,50 @@ impl Op for Disabled {
                 self.unit.name
             );
         }
-        let mut changes = vec![];
         // `not-found` only reaches here under --check (`probe_existing`): the
         // unit an earlier step would install is reported as due, not as
         // already disabled (vision 12).
-        if p.enabled.is_enabled() || p.enabled == EnabledState::NotFound {
-            changes.push(attr("enabled", p.enabled.as_str(), "disabled"));
+        let enabled = (p.enabled.is_enabled() || p.enabled == EnabledState::NotFound)
+            .then(|| p.enabled.clone());
+        let active = (self.now && p.active.is_running()).then(|| p.active.clone());
+        if enabled.is_none() && active.is_none() {
+            return Ok(Plan::Satisfied(UnitState {
+                unit: self.unit.name.clone(),
+                enabled: false,
+                active: !self.now && p.active.is_running(),
+            }));
         }
-        if self.now && p.active.is_running() {
-            changes.push(attr("active", p.active.as_str(), "inactive"));
-        }
-        let out = UnitState {
-            unit: self.unit.name.clone(),
-            enabled: false,
-            active: !self.now && p.active.is_running(),
-        };
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(out));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.unit.name.clone(),
-            changes,
+        Ok(Plan::Change(Disable {
+            unit: self.unit.clone(),
+            now: self.now,
+            enabled,
+            active,
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        let mut cmd = self.unit.systemctl(sys).arg("disable");
-        if self.now {
+    fn apply(&self, sys: &System, intent: Disable) -> Result<UnitState> {
+        let Disable { unit, now, .. } = intent;
+        let mut cmd = unit.systemctl(sys).arg("disable");
+        if now {
             cmd = cmd.arg("--now");
         }
-        cmd.arg(&self.unit.name).run()?;
+        cmd.arg(&unit.name).run()?;
         let after = format!(
             "{} disable{} {}",
-            self.unit.prefix(),
-            if self.now { " --now" } else { "" },
-            self.unit.name
+            unit.prefix(),
+            if now { " --now" } else { "" },
+            unit.name
         );
-        let state = if self.now {
-            self.unit.verify_stopped(sys, &after)?
+        // Read back, not predicted: the unit's state is the tool's answer.
+        let state = if now {
+            unit.verify_stopped(sys, &after)?
         } else {
-            self.unit.state(&self.unit.probe(sys)?)
+            unit.state(&unit.probe(sys)?)
         };
         ensure!(
             !state.enabled,
             "unit `{}` is still enabled after `{after}`",
-            self.unit.name
+            unit.name
         );
         Ok(state)
     }
@@ -706,8 +820,9 @@ impl Running {
 
 impl Op for Running {
     type Output = UnitState;
+    type Intent = Start;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Running")?;
         let p = self.unit.probe_existing(sys, "Running")?;
         if p.enabled.is_masked() {
@@ -720,19 +835,17 @@ impl Op for Running {
         if p.active.is_running() {
             return Ok(Plan::Satisfied(self.unit.state(&p)));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.unit.name.clone(),
-            changes: vec![attr("active", p.active.as_str(), "active")],
+        Ok(Plan::Change(Start {
+            unit: self.unit.clone(),
+            from: p.active,
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        self.unit
-            .systemctl(sys)
-            .args(["start", &self.unit.name])
-            .run()?;
-        let after = format!("{} start {}", self.unit.prefix(), self.unit.name);
-        self.unit.verify_running(sys, &after)
+    fn apply(&self, sys: &System, intent: Start) -> Result<UnitState> {
+        let unit = intent.unit;
+        unit.systemctl(sys).args(["start", &unit.name]).run()?;
+        let after = format!("{} start {}", unit.prefix(), unit.name);
+        unit.verify_running(sys, &after)
     }
 }
 
@@ -767,35 +880,34 @@ impl Stopped {
 
 impl Op for Stopped {
     type Output = UnitState;
+    type Intent = Stop;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Stopped")?;
         let p = self.unit.probe_existing(sys, "Stopped")?;
         // `not-found` only reaches here under --check (`probe_existing`): the
         // unit an earlier step would install is reported as due, not as
         // already stopped (vision 12).
         if p.enabled == EnabledState::NotFound {
-            return Ok(Plan::change(Diff::Attrs {
-                subject: self.unit.name.clone(),
-                changes: vec![attr("active", "not-found", "inactive")],
+            return Ok(Plan::Change(Stop {
+                unit: self.unit.clone(),
+                from: None,
             }));
         }
         if !p.active.is_running() {
             return Ok(Plan::Satisfied(self.unit.state(&p)));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.unit.name.clone(),
-            changes: vec![attr("active", p.active.as_str(), "inactive")],
+        Ok(Plan::Change(Stop {
+            unit: self.unit.clone(),
+            from: Some(p.active),
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        self.unit
-            .systemctl(sys)
-            .args(["stop", &self.unit.name])
-            .run()?;
-        let after = format!("{} stop {}", self.unit.prefix(), self.unit.name);
-        self.unit.verify_stopped(sys, &after)
+    fn apply(&self, sys: &System, intent: Stop) -> Result<UnitState> {
+        let unit = intent.unit;
+        unit.systemctl(sys).args(["stop", &unit.name]).run()?;
+        let after = format!("{} stop {}", unit.prefix(), unit.name);
+        unit.verify_stopped(sys, &after)
     }
 }
 
@@ -840,38 +952,37 @@ impl Restart {
     }
 }
 
-fn action_summary(unit: &Unit, daemon_reload: bool, verb: &str) -> String {
-    let p = unit.prefix();
-    if daemon_reload {
-        format!("{p} daemon-reload && {p} {verb} {}", unit.name)
-    } else {
-        format!("{p} {verb} {}", unit.name)
+impl Bounce {
+    fn run(self, sys: &System) -> Result<UnitState> {
+        let Bounce {
+            unit,
+            daemon_reload,
+            verb,
+        } = self;
+        if daemon_reload {
+            unit.systemctl(sys).arg("daemon-reload").run()?;
+        }
+        unit.systemctl(sys).args([verb, &unit.name]).run()?;
+        let after = format!("{} {verb} {}", unit.prefix(), unit.name);
+        unit.verify_running(sys, &after)
     }
-}
-
-fn run_action(sys: &System, unit: &Unit, daemon_reload: bool, verb: &str) -> Result<UnitState> {
-    if daemon_reload {
-        unit.systemctl(sys).arg("daemon-reload").run()?;
-    }
-    unit.systemctl(sys).args([verb, &unit.name]).run()?;
-    let after = format!("{} {verb} {}", unit.prefix(), unit.name);
-    unit.verify_running(sys, &after)
 }
 
 impl Op for Restart {
     type Output = UnitState;
+    type Intent = Bounce;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Restart")?;
-        Ok(Plan::change(Diff::summary(action_summary(
-            &self.unit,
-            self.daemon_reload,
-            "restart",
-        ))))
+        Ok(Plan::Change(Bounce {
+            unit: self.unit.clone(),
+            daemon_reload: self.daemon_reload,
+            verb: "restart",
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        run_action(sys, &self.unit, self.daemon_reload, "restart")
+    fn apply(&self, sys: &System, intent: Bounce) -> Result<UnitState> {
+        intent.run(sys)
     }
 
     fn always_changes(&self) -> bool {
@@ -934,18 +1045,19 @@ impl Reload {
 
 impl Op for Reload {
     type Output = UnitState;
+    type Intent = Bounce;
 
-    fn check(&self, sys: &System) -> Result<Plan<UnitState>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.unit.guard(sys, "Reload")?;
-        Ok(Plan::change(Diff::summary(action_summary(
-            &self.unit,
-            self.daemon_reload,
-            self.verb(),
-        ))))
+        Ok(Plan::Change(Bounce {
+            unit: self.unit.clone(),
+            daemon_reload: self.daemon_reload,
+            verb: self.verb(),
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<UnitState> {
-        run_action(sys, &self.unit, self.daemon_reload, self.verb())
+    fn apply(&self, sys: &System, intent: Bounce) -> Result<UnitState> {
+        intent.run(sys)
     }
 
     fn always_changes(&self) -> bool {
@@ -1016,17 +1128,17 @@ impl DaemonReload {
 
 impl Op for DaemonReload {
     type Output = ();
+    type Intent = ReloadUnits;
 
-    fn check(&self, sys: &System) -> Result<Plan<()>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         self.manager.guard_manager(sys, "DaemonReload")?;
-        Ok(Plan::change(Diff::summary(format!(
-            "{} daemon-reload",
-            self.manager.prefix()
-        ))))
+        Ok(Plan::Change(ReloadUnits {
+            manager: self.manager.clone(),
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<()> {
-        self.manager.systemctl(sys).arg("daemon-reload").run()?;
+    fn apply(&self, sys: &System, intent: ReloadUnits) -> Result<()> {
+        intent.manager.systemctl(sys).arg("daemon-reload").run()?;
         Ok(())
     }
 
@@ -1313,21 +1425,32 @@ mod tests {
         }
     }
 
-    fn attrs(plan: &Plan<UnitState>) -> Vec<(String, String, String)> {
+    /// The rows of the report a plan renders, as (name, from, to). Read off
+    /// the rendered text, which is what a user sees: a `Diff` has no fields
+    /// to read.
+    fn attrs<O: Op>(plan: &Plan<O>) -> Vec<(String, String, String)>
+    where
+        O::Output: std::fmt::Debug,
+    {
         let Plan::Change(c) = plan else {
             panic!("expected change, got {plan:?}")
         };
-        let Diff::Attrs { subject, changes } = &c.diff else {
-            panic!("expected attrs diff, got {:?}", c.diff)
-        };
-        assert_eq!(subject, "nginx");
-        changes
-            .iter()
-            .map(|a| (a.name.clone(), a.from.clone(), a.to.clone()))
+        let rendered = c.diff().render();
+        let mut lines = rendered.lines();
+        assert_eq!(lines.next(), Some("nginx:"), "{rendered}");
+        lines
+            .map(|l| {
+                let (name, rest) = l.trim().split_once(": ").expect("a row");
+                let (from, to) = rest.split_once(" -> ").expect("a change");
+                triple(name, from, to)
+            })
             .collect()
     }
 
-    fn change<T: std::fmt::Debug>(plan: Plan<T>) -> Change {
+    fn change<O: Op>(plan: Plan<O>) -> O::Intent
+    where
+        O::Output: std::fmt::Debug,
+    {
         match plan {
             Plan::Change(c) => c,
             Plan::Satisfied(s) => panic!("expected change, got satisfied {s:?}"),
@@ -1820,7 +1943,7 @@ mod tests {
         let Plan::Change(c) = plan else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.render(), "systemctl restart nginx");
+        assert_eq!(c.diff().render(), "systemctl restart nginx");
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
 
         let with_reload = Restart::new("nginx")
@@ -1929,7 +2052,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys(&fake)).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.render(), "systemctl daemon-reload");
+        assert_eq!(c.diff().render(), "systemctl daemon-reload");
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
 
