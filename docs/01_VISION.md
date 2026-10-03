@@ -1492,7 +1492,7 @@ impl Ctx {
 
     // ---- tier 2 ----
     pub fn skip(&mut self, name, reason);     // record a deliberately-not-run step
-    pub fn block<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Block<T>>; // grouping; derives .changed
+    pub fn block<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Block<T>>; // grouping; derives .changed()
     pub fn as_user(&self, name: &str) -> Ctx; // same channel/host, different identity
     pub fn as_root(&self) -> Ctx;             // literally as_user("root"), never follows the inventory
     pub fn as_escalated(&self) -> Ctx;        // as_user(host.escalate_user): the inventory's privileged account
@@ -1520,7 +1520,7 @@ impl Ctx {
 - **`block` is a grouping, not an operation.** It draws no step id, moves no
   counter and has no line of its own; every step inside is printed with a
   `[outer][inner] ` prefix, so a line stands on its own however hosts
-  interleave. It returns `Block<T>`: the closure's value, and `.changed`,
+  interleave. It returns `Block<T>`: the closure's value, and `.changed()`,
   derived from the steps run while it is open (nested blocks included,
   through any `Ctx` value, an `as_root()` bound earlier among them) rather
   than declared. Under `--check` it is where a read of a missing output in
@@ -1562,7 +1562,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         Ok(())
     })?;
 
-    if cfg.changed { ctx.step("nginx restarted", systemd::Restart::new("nginx"))?; }
+    if cfg.changed() { ctx.step("nginx restarted", systemd::Restart::new("nginx"))?; }
     else { ctx.skip("nginx restarted", "config unchanged"); }
 
     if ctx.facts().cpus < 2 { ctx.warn("single-CPU host, workers setting will be ignored"); }
@@ -1681,13 +1681,15 @@ where the dry run stopped seeing.
   outside any block, the playbook body for that host — with a warning naming
   the block and the step whose output was read. (Read inside an operation's
   own `check`, the missing output is that step's failure instead: the step
-  fails and is counted, and nothing is absorbed.) The block yields no value
-  and the run continues after it. This is not a failure: nothing failed, the
-  dry run could not see further. Playbooks are written as if every output
-  exists, without guards; `.is_available()` remains for a playbook that wants
-  to branch inside a block rather than end it. In a real run every step has
-  applied and the read cannot fail. Ansible carries on with silent garbage;
-  Rustible says where the dry run stopped seeing.
+  fails and is counted, and nothing is absorbed.) The block yields no value,
+  and its `.changed()` is unknown unless a step inside it already would
+  change, so reading it is cut short the same way; the run continues after it.
+  This is not a failure: nothing failed, the dry run could not see further.
+  Playbooks are written as if every output exists, without guards;
+  `.is_available()` remains for a playbook that wants to branch inside a block
+  rather than end it. In a real run every step has applied and the read cannot
+  fail. Ansible carries on with silent garbage; Rustible says where the dry
+  run stopped seeing.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group for an account not there yet, that account, its
@@ -1849,7 +1851,7 @@ Rendered example:
   user, root by default. Named `escalate` because `become` is a reserved Rust
   keyword (section 16).
 - **Block**: `ctx.block(name, |ctx| ..)`, a named grouping of steps, not an
-  operation; its `.changed` says whether any step inside changed.
+  operation; its `.changed()` says whether any step inside changed.
 - **Skip**: `ctx.skip(name, reason)`, a step deliberately not run, counted in
   the summary.
 - **Parameter** (inventory): a connection or escalation setting `rustible`

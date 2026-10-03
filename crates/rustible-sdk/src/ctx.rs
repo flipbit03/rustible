@@ -487,8 +487,9 @@ impl Ctx {
     /// [`Event::BlockStarted`] and [`Event::BlockFinished`], the second on
     /// every way out.
     ///
-    /// The returned [`Block`] holds the closure's value and `.changed`, true
-    /// when any step run inside it finished `changed` or `would change`.
+    /// The returned [`Block`] holds the closure's value and
+    /// [`Block::changed`], true when any step run inside it finished
+    /// `changed` or `would change`.
     /// "Inside" means while the closure runs, through any `Ctx` value: nested
     /// blocks count, and so does a `ctx.as_root()` bound before the block and
     /// used in it.
@@ -525,7 +526,7 @@ impl Ctx {
     ///         }
     ///         kind.into_output()
     ///     })?;
-    ///     if folder.changed {
+    ///     if folder.changed() {
     ///         ctx.step("Restart syncthing", restart)?;
     ///     }
     ///     Ok(())
@@ -579,7 +580,7 @@ impl Ctx {
                 return Ok(Block {
                     value: Some(value),
                     missing: None,
-                    changed: frame.changed.get(),
+                    marked: frame.changed.get(),
                 });
             }
             // A step that failed is counted and stays a failure, even when
@@ -617,7 +618,7 @@ impl Ctx {
         Ok(Block {
             value: None,
             missing: Some(missing),
-            changed: frame.changed.get(),
+            marked: frame.changed.get(),
         })
     }
 
@@ -739,7 +740,7 @@ impl Ctx {
 }
 
 /// What [`Ctx::block`] returns: the closure's value, and whether any step
-/// inside changed.
+/// inside changed ([`Block::changed`]).
 ///
 /// It reads like [`Applied`], but is not one: a block has no diff, no
 /// elapsed time and no status, and never stands for a step.
@@ -749,7 +750,7 @@ impl Ctx {
 ///
 /// fn next(ctx: &mut Ctx, read: impl Op<Output = u32>) -> Result<u32> {
 ///     let n = ctx.block("count", |ctx| Ok(*ctx.step("read", read)? + 1))?;
-///     if n.changed {
+///     if n.changed() {
 ///         ctx.log("the read changed something");
 ///     }
 ///     // The value, or under --check, if the block was ended early, an
@@ -763,13 +764,9 @@ pub struct Block<T> {
     /// The step whose missing output ended the block under `--check`, so
     /// reading the block's own missing value names it.
     missing: Option<String>,
-    /// True when any step run inside the block (nested blocks included,
-    /// through whichever `Ctx` value) finished `changed` or, under
-    /// `--check`, `would change`.
-    /// `ok` (including `ran, unchanged`), failed and skipped steps leave it
-    /// false. Derived, never declared, so a forgotten `|=` cannot hide a
-    /// change from the step that reacts to it.
-    pub changed: bool,
+    /// Whether a step run inside the block marked it; see
+    /// [`Block::changed`] for when that is the whole answer.
+    marked: bool,
 }
 
 impl<T> Block<T> {
@@ -796,6 +793,40 @@ impl<T> Block<T> {
     /// it was ended under `--check` by a missing output.
     pub fn is_available(&self) -> bool {
         self.value.is_some()
+    }
+
+    /// Whether any step run inside the block (nested blocks included,
+    /// through whichever `Ctx` value) finished `changed` or, under
+    /// `--check`, `would change`. `ok` (including `ran, unchanged`), failed
+    /// and skipped steps do not count. Derived, never declared, so a
+    /// forgotten `|=` cannot hide a change from the step that reacts to it.
+    ///
+    /// A block ended early under `--check` did not see the rest of its
+    /// steps, so whether it would change is known only if a step before the
+    /// cut already would: then this is `true`. Otherwise it is unknown, and
+    /// reading it is cut short exactly like reading the missing value: it
+    /// unwinds with [`OutputUnavailable`] naming the original step, which
+    /// ends the enclosing block (or that host's dry run) with a warning. So
+    /// `if block.changed() { restart }` never runs, or skips, a restart on a
+    /// guess. In a real run it is always known. [`Block::try_changed`] is
+    /// the form that returns the error instead.
+    pub fn changed(&self) -> bool {
+        match self.try_changed() {
+            Ok(changed) => changed,
+            Err(_) => OutputUnavailable::throw(&self.unavailable().step),
+        }
+    }
+
+    /// [`Block::changed`] as a `Result`: `Err(OutputUnavailable)` naming the
+    /// original step when the block was ended early under `--check` before
+    /// any step inside it would change. `?` on it is absorbed like any other
+    /// read of a missing output; matching on it lets a playbook branch.
+    pub fn try_changed(&self) -> Result<bool> {
+        if self.marked || self.value.is_some() {
+            Ok(self.marked)
+        } else {
+            Err(self.unavailable().into())
+        }
     }
 
     fn unavailable(&self) -> OutputUnavailable {
@@ -1378,7 +1409,7 @@ mod tests {
                 Ok(*a + *c)
             })
             .unwrap();
-        assert!(!b.changed);
+        assert!(!b.changed());
         assert!(b.is_available());
         assert_eq!(*b, 7);
         assert_eq!(*b.output().unwrap(), 7);
@@ -1396,7 +1427,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(b.changed);
+        assert!(b.changed());
     }
 
     #[test]
@@ -1410,7 +1441,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(b.changed);
+        assert!(b.changed());
         assert!(b.is_available(), "nothing read the missing output");
     }
 
@@ -1428,7 +1459,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(!b.changed);
+        assert!(!b.changed());
     }
 
     /// The change is marked on every frame of the path, so it reaches the
@@ -1450,10 +1481,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(inner.unwrap().changed, "the innermost frame");
-        assert!(middle.unwrap().changed, "a frame in between");
-        assert!(outer.changed, "the outermost frame");
-        assert!(!quiet.unwrap().changed, "a sibling that changed nothing");
+        assert!(inner.unwrap().changed(), "the innermost frame");
+        assert!(middle.unwrap().changed(), "a frame in between");
+        assert!(outer.changed(), "the outermost frame");
+        assert!(!quiet.unwrap().changed(), "a sibling that changed nothing");
     }
 
     #[test]
@@ -1465,7 +1496,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(b.changed);
+        assert!(b.changed());
         assert_eq!(finished_steps(&sink), [("as root".into(), path(&["b"]))]);
     }
 
@@ -1608,9 +1639,9 @@ mod tests {
                 Ok(n)
             })
             .unwrap();
-        assert!(b.changed, "the read would change");
+        assert!(b.changed(), "the read would change");
         assert!(!b.is_available());
-        if b.changed {
+        if b.changed() {
             ctx.step("restart", change(0)).unwrap();
         }
         assert_eq!(warnings(&sink), [format!("[folder] {MISSING}")]);
@@ -1881,7 +1912,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(b.changed);
+        assert!(b.changed());
         assert_eq!(finished_steps(&sink), [("x".into(), path(&["b"]))]);
     }
 
@@ -1900,7 +1931,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(sibling.changed);
+        assert!(sibling.changed());
         assert_eq!(
             finished_steps(&sink),
             [
@@ -2308,5 +2339,96 @@ mod tests {
         )));
         assert_eq!(ctx.summary().failed, 1);
         assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
+    }
+
+    // ---- Cadu's decision: an absorbed block's `.changed()` ----
+
+    /// The clean reviewer's playbook: a would-change step, a block that
+    /// absorbs a read of it with nothing inside marked, and a restart
+    /// guarded by the block's `.changed()`. Whether the block would change
+    /// is unknown, so the guard is cut short like the read itself: the
+    /// restart neither runs nor is skipped on a guess, and the warning names
+    /// the original step.
+    #[test]
+    fn an_absorbed_blocks_unknown_changed_is_cut_short_like_its_value() {
+        let (mut ctx, sink) = ctx_in(true);
+        let outer = ctx
+            .block("outer", |ctx| {
+                let got = ctx.step("read", change(1))?;
+                let b = ctx.block("uses it", |_| Ok(*got + 1))?;
+                if b.changed() {
+                    ctx.step("restart", change(0))?;
+                }
+                ctx.step("never reached", ok(1))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!outer.is_available());
+        assert_eq!(
+            warnings(&sink),
+            [
+                format!("[outer][uses it] {MISSING}"),
+                format!("[outer] {MISSING}")
+            ]
+        );
+        assert_eq!(
+            finished_steps(&sink),
+            [("read".into(), path(&["outer"]))],
+            "neither the restart nor the step after it ran"
+        );
+    }
+
+    /// The same unknown, through the non-throwing form and through `?`.
+    #[test]
+    fn try_changed_reports_the_unknown_as_the_original_step() {
+        let (mut ctx, _sink) = ctx_in(true);
+        let got = ctx.step("read", change(1)).unwrap();
+        let b = ctx.block("uses it", |_| Ok(*got + 1)).unwrap();
+        let err = b.try_changed().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<OutputUnavailable>().unwrap().step,
+            "read"
+        );
+        let payload = catching(AssertUnwindSafe(|| b.changed())).unwrap_err();
+        assert_eq!(
+            payload.downcast::<OutputUnavailable>().unwrap().step,
+            "read"
+        );
+    }
+
+    /// Absorbed after a step inside already would change: that much is
+    /// known, so `.changed()` is `true` and nothing is cut short.
+    #[test]
+    fn an_absorbed_block_that_already_would_change_is_changed() {
+        let (mut ctx, sink) = ctx_in(true);
+        let b = ctx
+            .block("b", |ctx| {
+                ctx.step("would", change(1))?;
+                let got = ctx.step("read", change(2))?;
+                Ok(*got)
+            })
+            .unwrap();
+        assert!(!b.is_available());
+        assert!(b.changed());
+        assert!(b.try_changed().unwrap());
+        assert_eq!(warnings(&sink).len(), 1, "only the block's own absorption");
+    }
+
+    /// A block that was not absorbed always knows, in either mode.
+    #[test]
+    fn a_block_that_ran_to_the_end_always_knows() {
+        for check_mode in [false, true] {
+            let (mut ctx, _sink) = ctx_in(check_mode);
+            let quiet = ctx
+                .block("quiet", |ctx| ctx.step("ok", ok(1)).map(drop))
+                .unwrap();
+            assert!(!quiet.changed());
+            assert!(!quiet.try_changed().unwrap());
+            let busy = ctx
+                .block("busy", |ctx| ctx.step("x", change(1)).map(drop))
+                .unwrap();
+            assert!(busy.changed());
+            assert!(busy.try_changed().unwrap());
+        }
     }
 }

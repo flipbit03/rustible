@@ -1076,4 +1076,40 @@ mod tests {
         assert!(abort_notice(false, true).is_none());
         assert!(abort_notice(false, false).is_none());
     }
+
+    static RESTART_GUARDED_BY_AN_ABSORBED_BLOCK: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |ctx, _| {
+            let got = ctx.step("read", WouldChange)?;
+            let b = ctx.block("uses it", |_| Ok(*got + 1))?;
+            if b.changed() {
+                ctx.step("restart", WouldChange)?;
+            }
+            Ok(())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// At the top level, the unknown `.changed()` of an absorbed block ends
+    /// the host's dry run with the unprefixed warning naming the original
+    /// step; the guarded restart does not run, and nothing fails.
+    #[test]
+    fn under_check_an_unknown_block_changed_ends_the_dry_run_without_failing() {
+        let (code, events) = run(&RESTART_GUARDED_BY_AN_ABSORBED_BLOCK, true);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let s = summary_of(&events);
+        assert_eq!((s.failed, s.would_change, s.warnings), (0, 1, 2));
+        let missing = "not evaluated further under --check: needs the output of step `read`, \
+                       which would change and so has none";
+        assert_eq!(
+            warnings_in(&events),
+            [format!("[uses it] {missing}"), missing.to_string()]
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::StepStarted { name, .. } if name == "restart"
+        )));
+    }
 }

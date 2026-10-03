@@ -488,7 +488,7 @@ because YAML got long; a Rust file does not have that problem.
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
-| `ctx.block(..)` | grouping steps under one name in the output, and getting `.changed` for the group |
+| `ctx.block(..)` | grouping steps under one name in the output, and getting `.changed()` for the group |
 | a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
 | `mod helpers;` | bulk private to this one playbook |
 | `src/lib.rs` | a **second playbook** needs it |
@@ -510,8 +510,10 @@ ctx.skip(name: impl Into<String>, reason: impl Into<String>)
 
 // Group steps under one name: each prints as `[name] step ... status`.
 // The closure returns a Result, so end it with `Ok(..)` and use `?` on the
-// block itself. `Block<T>` has `.changed` (did any step inside change, or
-// would it under --check), `.output()`, and derefs to the closure's value.
+// block itself. A step belongs to every block open while it runs, whichever
+// `Ctx` ran it (an `as_root()` bound earlier included). `Block<T>` has
+// `.changed()` (did any step inside change, or would it under --check),
+// `.output()`, and derefs to the closure's value.
 ctx.block(name, |ctx| -> Result<T> { ... }) -> Result<Block<T>>
 
 // What this machine is (§10).
@@ -579,7 +581,7 @@ let deploy = ctx.block("deploy account", |ctx| {
     ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
     Ok(())
 })?;
-if deploy.changed { /* ... */ }
+if deploy.changed() { /* ... */ }
 ```
 
 ```
@@ -587,7 +589,10 @@ if deploy.changed { /* ... */ }
 [web1]    WARNING: [deploy account] not evaluated further under --check: needs the output of step `user`, which would change and so has none
 ```
 
-`.is_available()` is for branching inside a block instead of ending it.
+`.is_available()` is for branching inside a block instead of ending it. A
+block ended that way did not see its remaining steps, so its `.changed()` is
+unknown unless a step before the cut already would change; reading it is cut
+short the same way, and the `if` above neither runs nor skips on a guess.
 
 ## 10. Facts
 
