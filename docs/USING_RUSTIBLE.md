@@ -1149,9 +1149,9 @@ rustible playbook run site
 Each step is a line:
 
 ```
-[web1]  nginx installed ............................ changed    nginx=1.24.0-2
-[web1]  deploy user ................................ ok
-[web1]  nginx.conf ................................. changed    +3 -1 lines
+[web1]  nginx installed ......................................... changed         nginx=1.24.0-2
+[web1]  deploy user ............................................. ok
+[web1]  nginx.conf .............................................. changed         +3 -1 lines
 ```
 
 `-v` adds diffs and facts. `-vv` adds every command executed.

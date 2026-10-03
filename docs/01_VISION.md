@@ -491,8 +491,8 @@ Rendered by the orchestrator from the event stream:
 ```
 PLAYBOOK ensure_rustible_user   hosts: local   (x86_64-unknown-linux-musl, cached)
 
-[local]  Ensure rustible user exists ........ changed   uid=1002
-[local]  Install authorized keys ............ changed   +2 keys
+[local]  Ensure rustible user exists ............................. changed         uid=1002
+[local]  Install authorized keys ................................. changed         +2 keys
 
 local    ok=2  changed=2  skipped=0  failed=0     1.2s
 ```
@@ -1618,7 +1618,7 @@ Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 
-## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02, 2026-10-02 for #47)
+## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
 
 Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change(intent)` does
 not, so in a dry run a step that *would* change has nothing to return, and a
