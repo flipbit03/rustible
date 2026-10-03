@@ -2600,9 +2600,8 @@ mod tests {
     fn existing_looks_up_without_root_and_fails_when_missing() {
         let fake = Arc::new(base());
         let sys = not_root(fake_sys(&fake));
-        let Plan::Satisfied(a) = Existing::named("cadu").check(&sys).unwrap() else {
-            panic!("expected satisfied")
-        };
+        // `Existing`'s intent is `Infallible`, so `Satisfied` is the only plan it has.
+        let Plan::Satisfied(a) = Existing::named("cadu").check(&sys).unwrap();
         assert_eq!(a.home, Path::new("/home/cadu"));
         assert_eq!(a.groups, vec!["adm", "sudo"]);
         let err = Existing::named("ghost")

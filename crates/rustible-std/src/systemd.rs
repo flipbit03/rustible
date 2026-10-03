@@ -1951,7 +1951,7 @@ mod tests {
             .check(&sys(&fake))
             .unwrap();
         assert_eq!(
-            change(with_reload).diff.render(),
+            change(with_reload).diff().render(),
             "systemctl daemon-reload && systemctl restart nginx"
         );
     }
@@ -1999,7 +1999,7 @@ mod tests {
         let op = Reload::new("nginx");
         assert!(op.always_changes());
         let plan = op.check(&sys(&fake)).unwrap();
-        assert_eq!(change(plan).diff.render(), "systemctl reload nginx");
+        assert_eq!(change(plan).diff().render(), "systemctl reload nginx");
         let plan = op.check(&sys(&fake)).unwrap();
         let out = op.apply(&sys(&fake), change(plan)).unwrap();
         assert_eq!(out, state(true, true));
@@ -2012,7 +2012,7 @@ mod tests {
         let op = Reload::new("nginx").or_restart(true).daemon_reload(true);
         let plan = op.check(&sys(&fake)).unwrap();
         assert_eq!(
-            change(plan).diff.render(),
+            change(plan).diff().render(),
             "systemctl daemon-reload && systemctl reload-or-restart nginx"
         );
         let plan = op.check(&sys(&fake)).unwrap();
@@ -2072,7 +2072,7 @@ mod tests {
         let op = DaemonReload::new().user(true);
         let plan = op.check(&s).unwrap();
         assert_eq!(
-            change(op.check(&s).unwrap()).diff.render(),
+            change(op.check(&s).unwrap()).diff().render(),
             "systemctl --user daemon-reload"
         );
         op.apply(&s, change(plan)).unwrap();
@@ -2089,10 +2089,10 @@ mod tests {
         let fake = Arc::new(Fake::new());
         assert_eq!(
             change(DaemonReload::default().check(&sys(&fake)).unwrap())
-                .diff
+                .diff()
                 .render(),
             change(DaemonReload::new().check(&sys(&fake)).unwrap())
-                .diff
+                .diff()
                 .render()
         );
     }
@@ -2267,7 +2267,7 @@ mod tests {
         // Actions in user mode carry the flag in their summary too.
         let plan = Restart::new("syncthing").user(true).check(&s).unwrap();
         assert_eq!(
-            change(plan).diff.render(),
+            change(plan).diff().render(),
             "systemctl --user restart syncthing"
         );
     }

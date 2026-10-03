@@ -420,7 +420,7 @@ mod tests {
     fn apply_never_reports_changed_having_written_nothing() {
         let fake = Arc::new(Fake::new().with_file("/etc/x", "a=1\n"));
         let sys = fake_sys(&fake);
-        let op = Line::in_path("/etc/x").set("b=2").backup(true);
+        let op = Line::in_path("/etc/x").backup(true).set("b=2");
         let Plan::Change(intent) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
