@@ -458,13 +458,16 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                // The capacity is a hint from the archive's own header and
-                // nothing bounds it: a base-256 `size` of 2^62 would ask
-                // for an allocation the process cannot survive (Rust
-                // aborts on allocation failure), turning a malicious
-                // tarball into a killed run instead of a refusal. Reserve
-                // a small floor and let `read_to_end` grow it against the
-                // real stream.
+                // The capacity is a hint from the archive's header, as
+                // `check` walked it. A base-256 `size` of 2^62 would ask for
+                // an allocation the process cannot survive (Rust aborts on
+                // allocation failure). `check` already refuses a member
+                // whose claim the stream cannot back, so through `apply`
+                // the size is bounded by the archive `check` read; the clamp
+                // stays as the guard that does not depend on that, pinned by
+                // `write_member_clamps_the_capacity_hint`. Reserve a small
+                // floor and let `read_to_end` grow it against the real
+                // stream.
                 let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
                 let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
@@ -1454,19 +1457,46 @@ mod tests {
     }
 
     #[test]
-    fn an_absurd_header_size_does_not_abort_apply_either() {
-        // `apply` walks the archive again, and `write_member` reserves from
-        // the header before reading. An archive swapped between check and
-        // apply reaches that reservation with an unvalidated size, so the
-        // capacity is a clamped hint, not the claim. Without the clamp
-        // this test does not fail, it aborts the whole test binary.
-        let (_, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
+    fn a_swapped_member_whose_header_lies_fails_the_step() {
+        // `apply` reads each member's data from the archive again. Swapped
+        // after `check` for one with the same name whose header claims 2^62
+        // bytes the stream does not hold, the name check passes and the step
+        // fails when the walk runs out of archive.
+        // The size `write_member` reserves from is the one `check` planned
+        // (4), so this does not reach the clamp:
+        // `write_member_clamps_the_capacity_hint` does.
+        let (fake, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("big", 1u64 << 62))
+        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("f", 1u64 << 62))
             .unwrap();
         let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("EOF") || err.contains("reading"), "{err}");
+        assert!(err.contains("unexpected EOF"), "{err}");
+        // The member's reader hands over whatever the stream still holds and
+        // stops, so that much is written before the walk runs out of archive
+        // and the step fails: a KNOWN GAP (`[ISSUE-43]` in `DECISIONS.md`),
+        // as it was before the intent.
+        assert_eq!(fake.file("/opt/f").map(|f| f.bytes.len()), Some(1536));
+    }
+
+    /// The reservation `write_member` makes from a member's size is clamped,
+    /// whatever the size says. Through `apply` the size is bounded by what
+    /// `check` read, so this calls `write_member` directly with a claim of
+    /// 2^62. Without the clamp this test does not fail, it aborts the whole
+    /// test binary (Rust aborts on allocation failure).
+    #[test]
+    fn write_member_clamps_the_capacity_hint() {
+        let (fake, sys) = sys_with(&raw_tar(&[]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let member = Member {
+            path: "big".into(),
+            kind: Kind::File,
+            mode: 0o644,
+            size: 1u64 << 62,
+        };
+        op.write_member(&sys, Path::new("/opt"), &member, &mut &b"ok"[..])
+            .unwrap();
+        assert_eq!(fake.content("/opt/big").unwrap(), "ok");
     }
 
     #[test]

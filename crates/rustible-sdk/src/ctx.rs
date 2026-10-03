@@ -823,6 +823,11 @@ mod tests {
             finished(&sink),
             (Status::WouldChange, Some(SHOWN.to_string()), None)
         );
+        let summary = ctx.summary();
+        assert_eq!(
+            (summary.would_change, summary.changed, summary.ok),
+            (1, 0, 0)
+        );
     }
 
     #[test]

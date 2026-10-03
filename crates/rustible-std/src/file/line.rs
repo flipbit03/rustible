@@ -459,6 +459,15 @@ mod tests {
              creates it (or use .create(true) to create it here)"
         );
         assert!(fake.file("/nope").is_none());
+
+        // A dry run's intent never reaches `apply`; handed to one anyway, it
+        // refuses as a real `check` does rather than write anything.
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.contains("/nope does not exist (use .create(true) to create it)"),
+            "{err}"
+        );
+        assert!(fake.file("/nope").is_none());
     }
 
     #[test]

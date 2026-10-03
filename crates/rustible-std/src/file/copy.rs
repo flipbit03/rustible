@@ -17,7 +17,9 @@ pub enum CopySource {
     /// Bytes baked into the binary (`include_bytes!`, `include_str!`, or a
     /// string built at run time). Vision 5.6 mechanism 1.
     Bytes(Vec<u8>),
-    /// A path read **on the target** at check time (vision 5.1: the playbook
+    /// A path read **on the target**, by `check` to compare and by `apply`
+    /// again to write: a source that changes in between is written as it
+    /// is then, not as the diff showed it (vision 5.1: the playbook
     /// runs there, so this is not the operator's machine). For a file that
     /// only exists on the controller, embed it or stream it with
     /// `ctx.local_file` instead.
@@ -86,7 +88,8 @@ impl Copy {
         Self::from_bytes(text.as_bytes())
     }
 
-    /// Content read from a file on the target at check time.
+    /// Content read from a file on the target, in `check` and again in
+    /// `apply` (see [`CopySource::LocalPath`]).
     pub fn from_local_path(path: impl Into<PathBuf>) -> CopyBuilder {
         CopyBuilder {
             source: CopySource::LocalPath(path.into()),
@@ -186,7 +189,7 @@ pub fn content_diff(path: &Path, old: Option<&[u8]>, new: &[u8]) -> Diff {
     ContentChange::of(old, new).diff(path)
 }
 
-/// What [`Copy`]'s `check` decided: whether to rewrite the content, and the
+/// What [`Copy`](struct@Copy)'s `check` decided: whether to rewrite the content, and the
 /// attributes to set. The bytes to write stay on the op.
 #[derive(Debug)]
 pub struct CopyIntent {
@@ -249,6 +252,9 @@ impl Op for Copy {
     }
 
     fn apply(&self, sys: &System, intent: CopyIntent) -> Result<CopyReport> {
+        // The bytes stay on the op, so a `LocalPath` source is read again
+        // here: one that changed since `check` is written as it is now, an
+        // accepted race like the other ops' (`[ISSUE-43]`).
         let bytes = self.source_bytes(sys)?;
         let backup_path = match intent.rewrite {
             Some(_) => super::write_with_backup(sys, &intent.dest, self.backup, &bytes)?,

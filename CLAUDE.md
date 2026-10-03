@@ -273,8 +273,9 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   where rewording a report changes what runs. `Diff` is opaque outside the
   SDK for this reason — it can be built and rendered, never matched or read
   field by field — so the only way left to cheat is parsing one of its string
-  forms (`render()`, `{:?}` or its JSON), and that is caught in review. The one structural exception is a composite op, whose intent holds
-  its children's *intents*, never their diffs.
+  forms (`render()`, `{:?}` or its JSON), and that is caught in review. The
+  one structural exception is a composite op, whose intent holds its
+  children's *intents*, never their diffs.
 - **A step that would change has no output in check mode.** The intent
   carries what `check` observed and decided and nothing `apply` will
   produce; there is no prediction to fill in, and `apply` reads for itself
@@ -521,13 +522,17 @@ Each of these has already produced a test that could not fail.
   rewrite through `write` loses them the same way `Local::write` does — so an
   op that sets the mode before the owner, or not at all after a rewrite, now
   fails at tier 2. What it cannot show in the final state is a call that
-  changed nothing: a `chown` to the owner a file already has needs root and
-  leaves no trace. Assert on the calls for that: `fake.attr_calls()` records
-  every `set_mode` and `set_owner` in order (`fake.chowns()` and
+  changed nothing: a `chown` that changes the owner needs root, and one that
+  doesn't is a needless call that also clears setuid, and on a 0600 file
+  leaves no trace at all. Assert on the calls for that: `fake.attr_calls()`
+  records every `set_mode` and `set_owner` in order (`fake.chowns()` and
   `fake.chmods()` filter it), as `authorized_keys`'s
   `a_mode_repair_issues_no_chown_when_the_owner_is_already_right` does. The
-  `Fake` does not know which user runs the op, so a `chown` never fails with
-  `EPERM` there; only a real run shows that.
+  calls a fixture makes through `Backend::set_*` are recorded too, so a test
+  that plants attributes takes the log's length first and asserts on what
+  follows (the `planted` offset there). The `Fake` models `chown` as root
+  does and does not know which user runs the op, so a `chown` never fails
+  with `EPERM` there; only a real run shows that.
 - **`Fake::argvs()` drops stdin.** An op that pipes a payload into a tool must
   assert with `fake.commands()` and read `CmdSpec.stdin`, or the test silently
   ignores the entire payload.

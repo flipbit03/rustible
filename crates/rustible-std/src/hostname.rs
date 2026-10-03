@@ -463,15 +463,23 @@ mod tests {
     #[test]
     fn previous_is_the_kernel_name_check_read() {
         // The report's `previous` is the kernel's name as `check` read it and
-        // the intent carried: the file says one thing, the kernel another, and neither is
-        // the new name, so an `apply` that echoed the new name back, or took
-        // the file's, would show here.
+        // the intent carried: the file says one thing, the kernel another,
+        // and neither is the new name, so an `apply` that echoed the new
+        // name back, or took the file's, would show here. And the kernel's
+        // name moves between `check` and `apply`, so an `apply` that read it
+        // again would report `moved-since`.
         let fake = Arc::new(box_named("in-file", "in-kernel").with_cmd("hostnamectl", None, 0, ""));
         let s = sys(&fake);
         let op = Is::new("HOME-GAMES");
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            std::path::Path::new(KERNEL_HOSTNAME),
+            b"moved-since\n",
+        )
+        .unwrap();
         let r = op.apply(&s, c).unwrap();
         assert_eq!(
             r,

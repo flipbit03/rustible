@@ -250,6 +250,23 @@ mod tests {
         assert!(fake.file("/f").is_some());
     }
 
+    /// `.recursive(true)` is permission to take a tree, and the intent uses
+    /// it only for what `check` found: a file at `check` is removed as one
+    /// entry. A populated directory that appeared there since is refused by
+    /// the kernel rather than taken with `rm -r`.
+    #[test]
+    fn recursive_apply_takes_no_tree_check_did_not_see() {
+        let fake = Arc::new(Fake::new().with_file("/d", "x"));
+        let sys = fake_sys(&fake);
+        let op = Absent::at("/d").recursive(true);
+        let c = expect_change(&op, &sys);
+        Backend::remove(&*fake, std::path::Path::new("/d")).unwrap();
+        Backend::mkdir_all(&*fake, std::path::Path::new("/d")).unwrap();
+        Backend::write(&*fake, std::path::Path::new("/d/late"), b"x").unwrap();
+        assert!(op.apply(&sys, c).is_err(), "no tree was planned");
+        assert!(fake.file("/d/late").is_some());
+    }
+
     #[test]
     fn non_recursive_apply_refuses_a_directory_populated_after_check() {
         let fake = Arc::new(Fake::new().with_dir("/d"));

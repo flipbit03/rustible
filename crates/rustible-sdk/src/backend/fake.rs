@@ -40,6 +40,7 @@ pub struct Canned {
 /// link, though the call changes its target), whether or not the call found
 /// anything to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttrCall {
     /// [`Backend::set_mode`] with these permission bits.
     Chmod {
@@ -59,14 +60,17 @@ pub enum AttrCall {
     },
 }
 
-/// The mode a `chown(2)` leaves on an inode, measured on Linux (debian:12,
-/// as root and as an unprivileged owner; `docs/plan/DECISIONS.md`
-/// `[FAKE-CHOWN]` has the table): on anything that is not a directory, every
-/// successful `chown` clears `S_ISUID`, and clears `S_ISGID` when group
-/// execute is set (setgid without group execute is mandatory locking, and
-/// stays). It does so even when the owner and group are the ones the file
-/// already has, and even for `chown(-1, -1)`. The sticky bit stays, and a
-/// directory keeps every bit.
+/// The mode a `chown(2)` by **root** (`CAP_FSETID`) leaves on an inode,
+/// measured on Linux (debian:12; `docs/plan/DECISIONS.md` `[FAKE-CHOWN]` has
+/// the table): on anything that is not a directory, every successful `chown`
+/// clears `S_ISUID`, and clears `S_ISGID` when group execute is set (setgid
+/// without group execute is mandatory locking, and stays). It does so even
+/// when the owner and group are the ones the file already has, and even for
+/// `chown(-1, -1)`. The sticky bit stays, and a directory keeps every bit.
+///
+/// The `Fake` models root, as it does elsewhere. An unprivileged owner who is
+/// not in the file's group loses setgid without group execute as well
+/// (`2745` became `0745`), which this does not model.
 pub(crate) fn mode_after_chown(kind: FileKind, mode: u32) -> u32 {
     if kind == FileKind::Dir {
         return mode;
@@ -226,9 +230,11 @@ impl Fake {
 
     /// Every [`Backend::set_mode`] and [`Backend::set_owner`] call, in the
     /// order the op made them. The final state is in [`Fake::file`]; this is
-    /// for asserting on what was *asked*: that a step issued no `chown` (which
-    /// needs root) when the owner was already right, or that it set the
-    /// owner before the mode. The `chown` a rewrite does inside
+    /// for asserting on what was *asked*: that a step issued no `chown` when
+    /// the owner was already right (one that changes the owner needs root;
+    /// one that doesn't is a needless call that also clears setuid), or that
+    /// it set the owner before the mode. A fixture's own `Backend::set_*`
+    /// calls are recorded too; take the length first to skip past them. The `chown` a rewrite does inside
     /// [`Backend::write`] is the backend's own, not an op's call, and is not
     /// recorded.
     pub fn attr_calls(&self) -> Vec<AttrCall> {
@@ -434,6 +440,10 @@ impl Backend for Fake {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // The real `copy` (`std::fs::copy`) never `chown`s. Going through
+        // `write` here would clear setuid on an existing destination, which
+        // `Local` does not; harmless today, because the one caller,
+        // `System::backup`, always copies to a new path.
         let bytes = self.read(from)?;
         Backend::write(self, to, &bytes)
     }
@@ -590,6 +600,30 @@ mod tests {
                 (PathBuf::from("/srv/shared"), 0o2775)
             ]
         );
+
+        // Through a symlink: the target changes, and the call is recorded
+        // with the path as passed, the link, not the target it resolved to.
+        let fake = Fake::new()
+            .with_file_mode("/opt/real", "", 0o4755)
+            .with_symlink("/opt/link", "/opt/real");
+        fake.set_owner(Path::new("/opt/link"), 7, 8).unwrap();
+        fake.set_mode(Path::new("/opt/link"), 0o4755).unwrap();
+        assert_eq!(
+            fake.attr_calls(),
+            vec![
+                AttrCall::Chown {
+                    path: "/opt/link".into(),
+                    uid: 7,
+                    gid: 8
+                },
+                AttrCall::Chmod {
+                    path: "/opt/link".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
+        let real = fake.file("/opt/real").unwrap();
+        assert_eq!((real.mode, real.uid, real.gid), (0o4755, 7, 8));
     }
 
     /// A rewrite of an existing file keeps its owner and loses setuid, as

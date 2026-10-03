@@ -1679,6 +1679,21 @@ mod tests {
     }
 
     #[test]
+    fn disabled_fails_when_still_enabled_after_disable() {
+        // One fake: `disable` "succeeds" but is-enabled keeps saying enabled.
+        let fake = Arc::new(with_ok(probes("enabled", "active"), &["disable", "nginx"]));
+        let plan = Disabled::new("nginx").check(&sys(&fake)).unwrap();
+        let err = Disabled::new("nginx")
+            .apply(&sys(&fake), change(plan))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("still enabled after `systemctl disable nginx`"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn enabled_surfaces_systemctl_failure() {
         let fake = Arc::new(probes("disabled", "inactive").with_cmd(
             "systemctl",

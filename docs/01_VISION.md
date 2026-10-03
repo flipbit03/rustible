@@ -813,9 +813,10 @@ let sshd = ctx.step("Disable password auth",
 `check` reads the file, finds the line by regex (or exact match), and returns
 `Satisfied` if it already equals the target, otherwise `Change` with the
 rewritten text (the line replaced in place, or inserted at the position
-`insertafter`/`insertbefore` picks). `apply` optionally backs up and writes the
-planned text atomically. The pure "given text and regex, produce new text" logic
-is a free function so it can be unit-tested with strings.
+`.insert(..)` picks: `Insert::Append` by default, `Prepend`, `After(re)`,
+`Before(re)`). `apply` optionally backs up and writes the planned text
+atomically. The pure "given text and regex, produce new text" logic is a free
+function so it can be unit-tested with strings.
 
 **`ansible.builtin.systemd`**
 ```rust

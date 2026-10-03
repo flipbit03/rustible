@@ -2611,6 +2611,24 @@ mod tests {
         assert_eq!(fake.argvs(), vec![vec!["userdel", "cadu"]]);
     }
 
+    /// The home reported is the one `check` read, carried in the intent:
+    /// `/etc/passwd` changes between `check` and `apply` here, and an `apply`
+    /// that read it again would report the new home.
+    #[test]
+    fn absent_reports_the_home_check_read() {
+        let fake = Arc::new(base().with_cmd("userdel", None, 0, ""));
+        let sys = fake_sys(&fake);
+        let op = Absent::new("cadu").remove_home(true);
+        let c = change(op.check(&sys).unwrap());
+        write(
+            &fake,
+            "/etc/passwd",
+            &PASSWD.replace("/home/cadu", "/srv/moved"),
+        );
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.home.as_deref(), Some(Path::new("/home/cadu")));
+    }
+
     #[test]
     fn absent_on_alpine_uses_deluser() {
         let fake = Arc::new(base().with_cmd("deluser", None, 0, ""));

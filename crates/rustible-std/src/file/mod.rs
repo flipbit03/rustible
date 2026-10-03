@@ -30,13 +30,15 @@ mod directory;
 mod line;
 mod symlink;
 
-pub use absent::{Absent, AbsentReport};
-pub use attrs::{Attrs, AttrsReport};
+pub use absent::{Absent, AbsentIntent, AbsentReport};
+pub use attrs::{Attrs, AttrsIntent, AttrsReport};
 pub use block::{Block, BlockBuilder, BlockReport, DEFAULT_MARKER, plan_block};
-pub use copy::{Copy, CopyBuilder, CopyReport, CopySource, TEXT_DIFF_LIMIT, content_diff};
-pub use directory::{DirReport, Directory};
+pub use copy::{
+    Copy, CopyBuilder, CopyIntent, CopyReport, CopySource, TEXT_DIFF_LIMIT, content_diff,
+};
+pub use directory::{DirReport, Directory, DirectoryIntent};
 pub use line::{Line, LineBuilder, LineReport, plan_line};
-pub use symlink::{Symlink, SymlinkBuilder, SymlinkReport};
+pub use symlink::{Symlink, SymlinkBuilder, SymlinkIntent, SymlinkReport};
 
 /// Where to put a line (or block) that is not present yet. Only consulted
 /// when nothing matched: a line or a marked block that is already in the
@@ -171,15 +173,26 @@ impl AttrPlan {
         Ok(())
     }
 
-    /// Set only the attributes that differ, owner first: what an op uses
-    /// when `check` found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it so an unescalated run managing
-    /// its own keys is never asked to `chown` a file it already owns.
+    /// Set only the attributes that differ: what an op uses when `check`
+    /// found the rest already right and must not touch them.
+    /// `ssh::authorized_keys` relies on it. A `chown` that changes the owner
+    /// needs root and is issued only when the owner is wrong; one to the
+    /// owner the file already has would be a needless call that also clears
+    /// setuid.
+    ///
+    /// When it does `chown`, it sets a wanted mode afterwards even if the
+    /// mode already matched, because the `chown` just cleared setuid (and
+    /// setgid with group execute): owner first, then mode, as
+    /// [`AttrPlan::changes`]' rows promise.
     pub(crate) fn apply_differing(&self, sys: &System, path: &Path) -> Result<()> {
-        if let Some(o) = self.owner_to_set() {
-            sys.set_owner(path, o.uid, o.gid)?;
-        }
-        if let Some(m) = self.mode.filter(Wanted::differs) {
+        let chowned = match self.owner_to_set() {
+            Some(o) => {
+                sys.set_owner(path, o.uid, o.gid)?;
+                true
+            }
+            None => false,
+        };
+        if let Some(m) = self.mode.filter(|m| chowned || m.differs()) {
             sys.set_mode(path, m.want)?;
         }
         Ok(())
@@ -489,8 +502,9 @@ mod tests {
     }
 
     /// `apply_differing` sets only what `check` found wrong: with the owner
-    /// already right, no `chown` is issued at all (it needs root), only the
-    /// `chmod`.
+    /// already right, no `chown` is issued at all, only the `chmod`. (One
+    /// that changes the owner needs root; one that doesn't would be a
+    /// needless call that also clears setuid.)
     #[test]
     fn apply_differing_issues_no_chown_for_an_owner_already_right() {
         let s = stat(0o644, 5, 6);
@@ -501,6 +515,36 @@ mod tests {
         plan.apply_differing(&sys, Path::new("/f")).unwrap();
         assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
         assert_eq!(fake.chmods(), vec![(PathBuf::from("/f"), 0o600)]);
+    }
+
+    /// With only the owner wrong, `apply_differing` still sets the wanted
+    /// mode after its `chown`, because the `chown` cleared setuid: owner
+    /// then mode, and the file ends as asked.
+    #[test]
+    fn apply_differing_sets_the_mode_again_after_a_chown() {
+        let s = stat(0o4755, 0, 0);
+        let plan = plan_attrs(Some(&s), Some(0o4755), Some(Owner { uid: 5, gid: 6 }));
+        let fake = std::sync::Arc::new(
+            rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o4755),
+        );
+        let sys = testing::fake_sys(&fake);
+        plan.apply_differing(&sys, Path::new("/f")).unwrap();
+        let f = fake.file("/f").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+        assert_eq!(
+            fake.attr_calls(),
+            vec![
+                AttrCall::Chown {
+                    path: "/f".into(),
+                    uid: 5,
+                    gid: 6
+                },
+                AttrCall::Chmod {
+                    path: "/f".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
     }
 
     #[test]
