@@ -163,8 +163,11 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
 
 impl Op for UserKeys {
     type Output = Vec<PublicKey>;
+    /// A lookup: `check` never plans a change, so there is no intent and
+    /// `apply` cannot be reached.
+    type Intent = std::convert::Infallible;
 
-    fn check(&self, sys: &System) -> Result<Plan<Vec<PublicKey>>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. github::UserKeys is an HTTPS GET parsed in Rust; nothing
         // touches the host but the network, which is why `sys` is otherwise
         // unused here. Declared anyway, as the worked example for a
@@ -191,8 +194,8 @@ impl Op for UserKeys {
         }
     }
 
-    fn apply(&self, _: &System, _: Change) -> Result<Vec<PublicKey>> {
-        bail!("github::UserKeys never changes anything; apply must not be called")
+    fn apply(&self, _: &System, intent: Self::Intent) -> Result<Vec<PublicKey>> {
+        match intent {}
     }
 }
 
@@ -269,9 +272,8 @@ pub(crate) mod tests {
         mac.os = Os::Macos;
         let sys_mac = base_sys.clone().with_facts(mac);
         let op = UserKeys::of("flipbit03").fetch_with(canned.clone());
-        let Plan::Satisfied(keys) = op.check(&sys_mac).unwrap() else {
-            panic!("a lookup is always satisfied")
-        };
+        // A lookup is always satisfied: its intent is `Infallible`.
+        let Plan::Satisfied(keys) = op.check(&sys_mac).unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(canned.asked().len(), 1);
 
@@ -431,10 +433,10 @@ pub(crate) mod tests {
         let canned = Canned::answering("https://github.com/nokeys.keys", Ok(Response::ok("")));
         let (sys, _) = sys();
         let op = UserKeys::of("nokeys").fetch_with(canned);
-        match op.check(&sys).unwrap() {
-            Plan::Satisfied(keys) => assert!(keys.is_empty()),
-            Plan::Change(_) => panic!("a lookup never plans a change"),
-        }
+        // A lookup's intent is `Infallible`: `Satisfied` is the only plan
+        // it has, and the compiler knows it.
+        let Plan::Satisfied(keys) = op.check(&sys).unwrap();
+        assert!(keys.is_empty());
     }
 
     #[test]
@@ -523,21 +525,6 @@ pub(crate) mod tests {
             .unwrap();
         assert!(keys.is_available());
         assert_eq!(keys.len(), 3);
-    }
-
-    #[test]
-    fn apply_is_never_meaningful() {
-        let (sys, _) = sys();
-        let e = UserKeys::of("flipbit03")
-            .apply(
-                &sys,
-                Change {
-                    diff: Diff::text("/x", String::new(), String::new()),
-                },
-            )
-            .unwrap_err()
-            .chain();
-        assert!(e.contains("never changes"), "{e}");
     }
 
     /// Real HTTPS through `ring` against GitHub. Not part of
