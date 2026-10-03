@@ -488,7 +488,7 @@ because YAML got long; a Rust file does not have that problem.
 | where | what belongs there |
 |---|---|
 | the playbook | the steps, in order — the default |
-| `ctx.block(..)` | grouping steps under one name in the output, and getting `.changed()` for the group |
+| `ctx.block(..)` | grouping steps under one name in the output, and returning a value from them |
 | a `fn` lower in the playbook file | naming the phases of a long play, or repeating a group within it |
 | `mod helpers;` | bulk private to this one playbook |
 | `src/lib.rs` | a **second playbook** needs it |
@@ -511,9 +511,9 @@ ctx.skip(name: impl Into<String>, reason: impl Into<String>)
 // Group steps under one name: each prints as `[name] step ... status`.
 // The closure returns a Result, so end it with `Ok(..)` and use `?` on the
 // block itself. A step belongs to every block open while it runs, whichever
-// `Ctx` ran it (an `as_root()` bound earlier included). `Block<T>` has
-// `.changed()` (did any step inside change, or would it under --check),
-// `.output()`, and derefs to the closure's value.
+// `Ctx` ran it (an `as_root()` bound earlier included). A block has no result
+// of its own: `Block<T>` derefs to what the closure returned, and has
+// `.output()`. Return what a later step needs, e.g. the `Applied` that matters.
 ctx.block(name, |ctx| -> Result<T> { ... }) -> Result<Block<T>>
 
 // What this machine is (§10).
@@ -576,12 +576,11 @@ dry run the same way. Nothing fails and no guard is needed. Wrap a dependent
 group in a block, so a dry run still shows the rest of the playbook:
 
 ```rust
-let deploy = ctx.block("deploy account", |ctx| {
+let keys = ctx.block("deploy account", |ctx| {
     let account = ctx.step("user", user::Present::new("deploy"))?;
-    ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))?;
-    Ok(())
+    ctx.step("keys", authorized_keys::Present::for_user(&account).keys([KEY]))
 })?;
-if deploy.changed() { /* ... */ }
+if keys.changed { /* ... */ }    // the `keys` step's field, through the block
 ```
 
 ```
@@ -589,10 +588,9 @@ if deploy.changed() { /* ... */ }
 [web1]    WARNING: [deploy account] not evaluated further under --check: needs the output of step `user`, which would change and so has none
 ```
 
-`.is_available()` is for branching inside a block instead of ending it. A
-block ended that way did not see its remaining steps, so its `.changed()` is
-unknown unless a step before the cut already would change; reading it is cut
-short the same way, and the `if` above neither runs nor skips on a guess.
+`.is_available()` is for branching inside a block instead of ending it.
+Reading through a block that was ended this way (`keys.changed` above) is cut
+short the same way, so the `if` neither runs nor skips on a guess.
 
 ## 10. Facts
 

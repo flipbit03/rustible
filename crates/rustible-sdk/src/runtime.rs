@@ -1083,8 +1083,12 @@ mod tests {
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
-            let b = ctx.block("uses it", |_| Ok(*got + 1))?;
-            if b.changed() {
+            let cfg = ctx.block("uses it", |ctx| {
+                let _ = *got;
+                ctx.step("conf", WouldChange)
+            })?;
+            // `cfg.changed` is the `Applied`'s field, through `Block`'s Deref.
+            if cfg.changed {
                 ctx.step("restart", WouldChange)?;
             }
             Ok(())
@@ -1092,11 +1096,12 @@ mod tests {
         check_vars: |_| Ok(()),
     };
 
-    /// At the top level, the unknown `.changed()` of an absorbed block ends
-    /// the host's dry run with the unprefixed warning naming the original
-    /// step; the guarded restart does not run, and nothing fails.
+    /// At the top level, reading through an absorbed block (`cfg.changed`
+    /// on the `Applied` it would have returned) ends the host's dry run with
+    /// the unprefixed warning naming the original step; the guarded restart
+    /// does not run, and nothing fails.
     #[test]
-    fn under_check_an_unknown_block_changed_ends_the_dry_run_without_failing() {
+    fn under_check_a_read_through_an_absorbed_block_ends_the_dry_run_without_failing() {
         let (code, events) = run(&RESTART_GUARDED_BY_AN_ABSORBED_BLOCK, true);
         assert_eq!(code, ExitCode::SUCCESS);
         let s = summary_of(&events);
