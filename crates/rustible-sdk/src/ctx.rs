@@ -13,7 +13,7 @@ use crate::channel::Channel;
 use crate::error::{Context as _, Error, Result, StepFailed};
 use crate::event::{Event, Level, Status, Summary};
 use crate::facts::Facts;
-use crate::op::{Applied, Op, Plan};
+use crate::op::{Applied, Intent, Op, Plan};
 use crate::protocol::MAX_FRAME_PAYLOAD;
 use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
@@ -252,27 +252,31 @@ impl Ctx {
                 self.bump(|s| s.ok += 1);
                 Applied::new(name, Some(out), false, None, t0.elapsed())
             }
-            Ok(Plan::Change(change)) if self.sys.check_mode() => {
+            Ok(Plan::Change(intent)) if self.sys.check_mode() => {
+                // The one place a step's diff is made: rendered from the
+                // intent, so what the report shows is what `apply` would run.
+                let diff = intent.diff();
                 let note = if op.always_changes() {
                     Some("action".into())
                 } else {
                     None
                 };
-                finish(Status::WouldChange, Some(change.diff.clone()), note);
+                finish(Status::WouldChange, Some(diff.clone()), note);
                 self.bump(|s| s.would_change += 1);
                 // No apply, so no output: the step would change and the
-                // value only exists once it has (vision doc 12).
-                Applied::new(name, None, true, Some(change.diff), t0.elapsed())
+                // value only exists once it has (vision doc 12). The intent
+                // is dropped unexecuted.
+                Applied::new(name, None, true, Some(diff), t0.elapsed())
             }
-            Ok(Plan::Change(change)) => {
-                let diff = change.diff.clone();
+            Ok(Plan::Change(intent)) => {
+                let diff = intent.diff();
                 if let Err(e) = self.shared.channel.check_cancelled() {
                     finish(Status::Failed, Some(diff), Some(e.chain()));
                     self.bump(|s| s.failed += 1);
                     return Err(e.context(StepFailed::cancelled(&name, "not applied")));
                 }
                 self.sys.set_phase(Phase::Applying);
-                let applied = op.apply(&self.sys, change);
+                let applied = op.apply(&self.sys, intent);
                 self.sys.set_phase(Phase::Idle);
                 match applied {
                     Err(e) => {
@@ -576,16 +580,28 @@ mod tests {
         cancel_in_check: Option<Arc<Channel>>,
     }
 
+    /// The probe's whole decision: do it. Unit-shaped, because there is
+    /// nothing to choose between.
+    #[derive(Debug)]
+    struct DoIt;
+
+    impl crate::op::Intent for DoIt {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::summary("do it")
+        }
+    }
+
     impl Op for Probe {
         type Output = ();
-        fn check(&self, _: &System) -> Result<Plan<()>> {
+        type Intent = DoIt;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
             self.checks.fetch_add(1, Ordering::SeqCst);
             if let Some(ch) = &self.cancel_in_check {
                 ch.cancel("cancelled by the orchestrator");
             }
-            Ok(Plan::change(crate::Diff::summary("do it")))
+            Ok(Plan::Change(DoIt))
         }
-        fn apply(&self, _: &System, _: crate::Change) -> Result<()> {
+        fn apply(&self, _: &System, DoIt: DoIt) -> Result<()> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -611,11 +627,12 @@ mod tests {
         struct Done;
         impl Op for Done {
             type Output = u32;
-            fn check(&self, _: &System) -> Result<Plan<u32>> {
+            type Intent = std::convert::Infallible;
+            fn check(&self, _: &System) -> Result<Plan<Self>> {
                 Ok(Plan::Satisfied(7))
             }
-            fn apply(&self, _: &System, _: crate::Change) -> Result<u32> {
-                unreachable!("a satisfied op is never applied")
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<u32> {
+                match intent {}
             }
         }
         let sink = Arc::new(Collect::default());
@@ -717,6 +734,163 @@ mod tests {
             Event::StepFinished { status: Status::Failed, note: Some(n), .. } if n.contains("cancelled")
         )));
         assert_eq!(ctx.summary().failed, 1);
+    }
+
+    // ---- what is reported is what runs ----
+
+    /// An intent with a diff no other code path could produce by accident,
+    /// so a test can tell the reported diff came from it.
+    #[derive(Debug)]
+    struct Shown;
+
+    const SHOWN: &str =
+        "--- /probe (before)\n+++ /probe (after)\n@@ -1 +1 @@\n-before\n+reported by the intent\n";
+
+    impl crate::op::Intent for Shown {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::text("/probe", "before\n", "reported by the intent\n")
+        }
+    }
+
+    /// What `apply` does with the intent: succeed and count as changed,
+    /// succeed and say nothing changed (`changed_when`), or fail.
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Changed,
+        Unchanged,
+        Fails,
+    }
+
+    struct Reporting {
+        outcome: Outcome,
+        cancel_in_check: Option<Arc<Channel>>,
+    }
+
+    impl Op for Reporting {
+        type Output = bool;
+        type Intent = Shown;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            if let Some(ch) = &self.cancel_in_check {
+                ch.cancel("cancelled by the orchestrator");
+            }
+            Ok(Plan::Change(Shown))
+        }
+        fn apply(&self, _: &System, Shown: Shown) -> Result<bool> {
+            match self.outcome {
+                Outcome::Changed => Ok(true),
+                Outcome::Unchanged => Ok(false),
+                Outcome::Fails => Err(crate::Error::msg("the tool said no")),
+            }
+        }
+        fn changed_by_apply(&self, changed: &bool) -> bool {
+            *changed
+        }
+    }
+
+    /// The one `StepFinished` a step emitted: status, rendered diff, note.
+    fn finished(sink: &Collect) -> (Status, Option<String>, Option<String>) {
+        let mut found = sink.events().into_iter().filter_map(|e| match e {
+            Event::StepFinished {
+                status, diff, note, ..
+            } => Some((status, diff.map(|d| d.render()), note)),
+            _ => None,
+        });
+        let one = found.next().expect("a StepFinished");
+        assert!(found.next().is_none(), "exactly one StepFinished");
+        one
+    }
+
+    fn reporting(outcome: Outcome) -> Reporting {
+        Reporting {
+            outcome,
+            cancel_in_check: None,
+        }
+    }
+
+    /// The headline claim: the diff a step reports is the one its intent
+    /// renders, on every branch of `Ctx::step` that reports a diff.
+    #[test]
+    fn a_would_change_step_reports_the_intents_diff() {
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(Arc::new(Fake::new()), sink.clone()).with_check_mode(true);
+        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let r = ctx.step("dry", reporting(Outcome::Changed)).unwrap();
+        assert_eq!(
+            r.diff.as_ref().map(crate::Diff::render).as_deref(),
+            Some(SHOWN)
+        );
+        assert_eq!(
+            finished(&sink),
+            (Status::WouldChange, Some(SHOWN.to_string()), None)
+        );
+        let summary = ctx.summary();
+        assert_eq!(
+            (summary.would_change, summary.changed, summary.ok),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_changed_step_reports_the_intents_diff() {
+        let (mut ctx, _channel, _feeder, sink) = ctx_with_channel();
+        let r = ctx.step("real", reporting(Outcome::Changed)).unwrap();
+        assert!(r.changed && *r);
+        assert_eq!(
+            r.diff.as_ref().map(crate::Diff::render).as_deref(),
+            Some(SHOWN)
+        );
+        assert_eq!(
+            finished(&sink),
+            (Status::Changed, Some(SHOWN.to_string()), None)
+        );
+    }
+
+    #[test]
+    fn a_ran_unchanged_step_keeps_the_intents_diff_and_says_so() {
+        let (mut ctx, _channel, _feeder, sink) = ctx_with_channel();
+        let r = ctx.step("ran", reporting(Outcome::Unchanged)).unwrap();
+        assert!(!r.changed);
+        assert_eq!(
+            r.diff.as_ref().map(crate::Diff::render).as_deref(),
+            Some(SHOWN)
+        );
+        assert_eq!(
+            finished(&sink),
+            (
+                Status::Ok,
+                Some(SHOWN.to_string()),
+                Some("ran, unchanged".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn a_failed_apply_reports_the_intents_diff() {
+        let (mut ctx, _channel, _feeder, sink) = ctx_with_channel();
+        let err = ctx.step("boom", reporting(Outcome::Fails)).unwrap_err();
+        assert!(err.chain().contains("the tool said no"), "{}", err.chain());
+        let (status, diff, note) = finished(&sink);
+        assert_eq!((status, diff.as_deref()), (Status::Failed, Some(SHOWN)));
+        assert!(note.is_some_and(|n| n.contains("the tool said no")));
+    }
+
+    #[test]
+    fn a_step_cancelled_after_check_reports_the_intents_diff() {
+        let (mut ctx, channel, _feeder, sink) = ctx_with_channel();
+        let op = Reporting {
+            outcome: Outcome::Changed,
+            cancel_in_check: Some(channel),
+        };
+        ctx.step("cancelled", op).unwrap_err();
+        let (status, diff, note) = finished(&sink);
+        assert_eq!((status, diff.as_deref()), (Status::Failed, Some(SHOWN)));
+        assert!(note.is_some_and(|n| n.contains("cancelled")));
+    }
+
+    #[test]
+    fn is_change_tells_the_two_plans_apart() {
+        assert!(Plan::<Reporting>::Change(Shown).is_change());
+        assert!(!Plan::<Reporting>::Satisfied(true).is_change());
     }
 
     #[test]

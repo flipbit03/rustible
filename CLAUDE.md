@@ -229,14 +229,14 @@ The shape matters more than the code, and there is already a checklist for it:
 to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
-`crates/rustible-std/src/sysctl.rs`** — at ~680 lines it is short enough to
-finish and has every part: pure planning functions over file
-text, a `check` that composes a `Diff`, an `apply`, and a test module split
-into `// ---- pure ----` and `// ---- Fake ----`.
-`crates/rustible-std/src/ssh/authorized_keys.rs` is the model for anything
-that belongs to a user; `systemd.rs` and `user.rs` are the deepest but they
-are 2,000 and 2,600 lines, so read them for a specific question rather than
-for orientation.
+`crates/rustible-std/src/sysctl.rs`** — at ~760 lines it is short enough to
+finish and has every part: pure planning functions over file text, a `check`
+that returns a typed intent, an `apply` that executes it, the intent's
+`diff`, and a test module split into `// ---- pure ----` and
+`// ---- Fake ----`. `crates/rustible-std/src/ssh/authorized_keys.rs` is the
+model for anything that belongs to a user; `systemd.rs` and `user.rs` are the
+deepest but they are 2,300 and 2,750 lines, so read them for a specific
+question rather than for orientation.
 
 A new op is a module in `crates/rustible-std/src/`, declared with `pub mod
 <name>;` in that crate's `lib.rs` — a file for a small op, a directory with a
@@ -257,14 +257,31 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
   genuinely actions get verbs and always report changed: `systemd::Restart`,
   `shell::Command`.
-- **`check` does all the thinking** and produces the diff. **`apply` executes
-  that diff**, rather than inspecting the system again. That is what lets the
-  `Fake` tests plant a tool's effect and check the result.
-- **A step that would change has no output in check mode.** `Change` carries
-  the diff and nothing else; there is no prediction to fill in, and `apply`
-  reads for itself whatever its output needs that the diff does not carry (a
-  gid to report, a digest). A later step that reads a would-change step's
-  output under `--check` fails with a clear message (vision 12).
+- **`check` does all the thinking** and produces the op's **intent**: a type
+  of its own (`type Intent` on the `Op`) whose typed fields say what `check`
+  observed and decided. **`apply` executes that intent**, rather than
+  inspecting the system again or planning again, and `ctx.step` renders the
+  step's `Diff` from the same value with `Intent::diff`, so what is reported
+  is what runs. That is what lets the `Fake` tests plant a tool's effect and
+  check the result. Prefer an enum when `apply` has distinct branches, and
+  hold decisions, not payloads the op already has: `apply` still gets
+  `&self`. A read-only op uses `type Intent = Infallible` and its `apply` is
+  `match intent {}`.
+- **An intent never contains a `Diff`, and `apply` never reads one.**
+  `struct ThingIntent(Diff)` compiles, passes every test, and restores the
+  seam the intent exists to close: an `apply` deciding from display strings,
+  where rewording a report changes what runs. `Diff` is opaque outside the
+  SDK for this reason — it can be built and rendered, never matched or read
+  field by field — so the only way left to cheat is parsing one of its string
+  forms (`render()`, `{:?}` or its JSON), and that is caught in review. The
+  one structural exception is a composite op, whose intent holds its
+  children's *intents*, never their diffs.
+- **A step that would change has no output in check mode.** The intent
+  carries what `check` observed and decided and nothing `apply` will
+  produce; there is no prediction to fill in, and `apply` reads for itself
+  whatever its output needs beyond the intent (a gid to report, a digest).
+  A later step that reads a would-change step's output under `--check` fails
+  with a clear message (vision 12).
 - **Refuse, do not invent — in a real run.** An operation that manages a user
   does not create the group it references, and `authorized_keys` does not
   create the home. Fail naming the operation the author wanted. Under
@@ -322,7 +339,7 @@ while the thing is broken.
 - **An op's behaviour**: satisfied, change, apply, failure, refusal → tier 2.
   The `Fake` lets you plant a tool's output and assert on the op's reaction,
   which is why `check` must do all the thinking and `apply` must execute the
-  plan rather than re-inspecting.
+  intent rather than re-inspecting.
 - **Anything where the answer comes from a real tool** → tier 3. This is the
   source of truth for how `useradd`, `apt-get`, `systemctl` and friends
   behave, and it has earned it: it caught that `useradd` refuses to create a
@@ -384,14 +401,14 @@ mod tests {
         let s = sys(&fake);
         let op = Present::new("thing", "after");
 
-        let Plan::Change(c) = op.check(&s).unwrap() else {
+        let Plan::Change(intent) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
         // Assert the rendered diff verbatim: it is what a user reads.
-        assert_eq!(c.diff.render(), "thing:\n  /etc/thing: before -> after\n");
+        assert_eq!(intent.diff().render(), "thing:\n  /etc/thing: before -> after\n");
 
-        // `apply` takes the change `check` produced.
-        op.apply(&s, c).unwrap();
+        // `apply` takes the intent `check` produced.
+        op.apply(&s, intent).unwrap();
 
         // Read the box back: `.content(path)`, `.argvs()`, `.commands()`.
         assert_eq!(fake.content("/etc/thing").unwrap(), "after\n");
@@ -490,7 +507,7 @@ Each of these has already produced a test that could not fail.
   changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
   the second answer by writing into the Fake between the two checks — the
   builders consume `self`, so this goes through the `Backend` trait, as
-  `sysctl.rs:674` does:
+  `sysctl.rs:756` does:
 
   ```rust
   rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"1\n")?;
@@ -499,6 +516,23 @@ Each of these has already produced a test that could not fail.
   There is no equivalent for a command. If you hit that, it is a design
   signal: reading state through a file that `sys` can serve is more testable
   than shelling out for it.
+- **A file's final mode does not say what was asked.** The `Fake` models
+  `chown` as Linux does — it clears setuid, and setgid with group execute, on
+  anything but a directory, even to the owner the file already has, and a
+  rewrite through `write` loses them the same way `Local::write` does — so an
+  op that sets the mode before the owner, or not at all after a rewrite, now
+  fails at tier 2. What it cannot show in the final state is a call that
+  changed nothing: a `chown` that changes the owner needs root, and one that
+  doesn't is a needless call that also clears setuid, and on a 0600 file
+  leaves no trace at all. Assert on the calls for that: `fake.attr_calls()`
+  records every `set_mode` and `set_owner` in order (`fake.chowns()` and
+  `fake.chmods()` filter it), as `authorized_keys`'s
+  `a_mode_repair_issues_no_chown_when_the_owner_is_already_right` does. The
+  calls a fixture makes through `Backend::set_*` are recorded too, so a test
+  that plants attributes takes the log's length first and asserts on what
+  follows (the `planted` offset there). The `Fake` models `chown` as root
+  does and does not know which user runs the op, so a `chown` never fails
+  with `EPERM` there; only a real run shows that.
 - **`Fake::argvs()` drops stdin.** An op that pipes a payload into a tool must
   assert with `fake.commands()` and read `CmdSpec.stdin`, or the test silently
   ignores the entire payload.

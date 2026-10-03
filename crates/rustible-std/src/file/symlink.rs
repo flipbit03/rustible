@@ -74,10 +74,73 @@ impl SymlinkBuilder {
     }
 }
 
+/// What [`Symlink`]'s `check` decided, by what it found at the link's path.
+/// Its contents are private: only `check` builds one.
+#[derive(Debug)]
+pub struct SymlinkIntent(Link);
+
+#[derive(Debug)]
+enum Link {
+    /// Nothing is there: create the link.
+    Create {
+        /// The link's own path.
+        link: PathBuf,
+        /// Where it will point.
+        target: PathBuf,
+    },
+    /// A link pointing elsewhere: replace it atomically.
+    Retarget {
+        /// The link's own path.
+        link: PathBuf,
+        /// Where it points now.
+        from: PathBuf,
+        /// Where it will point.
+        target: PathBuf,
+    },
+    /// Something other than a link, and the op has `.force(true)`: replace
+    /// it atomically.
+    Replace {
+        /// The link's own path.
+        link: PathBuf,
+        /// What is there now.
+        kind: FileKind,
+        /// Where the link will point.
+        target: PathBuf,
+    },
+}
+
+impl Intent for SymlinkIntent {
+    fn diff(&self) -> Diff {
+        let (link, changes) = match &self.0 {
+            Link::Create { link, target } => (
+                link,
+                vec![AttrChange::new("target", "-", target.display().to_string())],
+            ),
+            Link::Retarget { link, from, target } => (
+                link,
+                vec![AttrChange::new(
+                    "target",
+                    from.display().to_string(),
+                    target.display().to_string(),
+                )],
+            ),
+            Link::Replace { link, kind, target } => (
+                link,
+                vec![
+                    AttrChange::new("kind", format!("{kind:?}").to_lowercase(), "symlink"),
+                    AttrChange::new("target", "-", target.display().to_string()),
+                ],
+            ),
+        };
+        Diff::attrs(link.display().to_string(), changes)
+    }
+}
+
 impl Op for Symlink {
     type Output = SymlinkReport;
+    type Intent = SymlinkIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<SymlinkReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Symlink creates a POSIX symlink through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -85,24 +148,20 @@ impl Op for Symlink {
             Os::Linux | Os::Macos => {}
             ref other => bail!("file::Symlink has no implementation for {}", other.name()),
         }
-        let target = self.target.display().to_string();
-        let mut changes = vec![];
-        match sys.stat(&self.link)? {
-            None => changes.push(AttrChange {
-                name: "target".into(),
-                from: "-".into(),
-                to: target,
-            }),
+        let link = self.link.clone();
+        let target = self.target.clone();
+        let intent = match sys.stat(&self.link)? {
+            None => Link::Create { link, target },
             Some(s) if s.kind == FileKind::Symlink => {
                 let current = sys.read_link(&self.link)?;
                 if current == self.target {
                     return Ok(Plan::Satisfied(self.report()));
                 }
-                changes.push(AttrChange {
-                    name: "target".into(),
-                    from: current.display().to_string(),
-                    to: target,
-                });
+                Link::Retarget {
+                    link,
+                    from: current,
+                    target,
+                }
             }
             Some(s) if s.kind == FileKind::Dir => bail!(
                 "{} is a directory; refusing to replace it with a symlink",
@@ -113,35 +172,26 @@ impl Op for Symlink {
                 self.link.display(),
                 s.kind
             ),
-            Some(s) => {
-                changes.push(AttrChange {
-                    name: "kind".into(),
-                    from: format!("{:?}", s.kind).to_lowercase(),
-                    to: "symlink".into(),
-                });
-                changes.push(AttrChange {
-                    name: "target".into(),
-                    from: "-".into(),
-                    to: target,
-                });
-            }
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.link.display().to_string(),
-            changes,
-        }))
+            Some(s) => Link::Replace {
+                link,
+                kind: s.kind,
+                target,
+            },
+        };
+        Ok(Plan::Change(SymlinkIntent(intent)))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<SymlinkReport> {
-        if sys.exists(&self.link)? {
-            // Replace atomically: a reader never sees the path missing.
-            let mut tmp = self.link.clone().into_os_string();
-            tmp.push(format!(".rustible-tmp-{}", std::process::id()));
-            let tmp = std::path::PathBuf::from(tmp);
-            sys.symlink(&self.target, &tmp)?;
-            sys.rename(&tmp, &self.link)?;
-        } else {
-            sys.symlink(&self.target, &self.link)?;
+    fn apply(&self, sys: &System, intent: SymlinkIntent) -> Result<SymlinkReport> {
+        match intent.0 {
+            Link::Create { link, target } => sys.symlink(&target, &link)?,
+            Link::Retarget { link, target, .. } | Link::Replace { link, target, .. } => {
+                // Replace atomically: a reader never sees the path missing.
+                let mut tmp = link.clone().into_os_string();
+                tmp.push(format!(".rustible-tmp-{}", std::process::id()));
+                let tmp = std::path::PathBuf::from(tmp);
+                sys.symlink(&target, &tmp)?;
+                sys.rename(&tmp, &link)?;
+            }
         }
         Ok(self.report())
     }
@@ -201,7 +251,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Symlink::at("/etc/link").pointing_to("/etc/real");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "target=/etc/real");
+        assert_eq!(c.diff().short(), "target=/etc/real");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(
             r,
@@ -223,7 +273,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Symlink::at("/etc/link").pointing_to("/new");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.render(), "/etc/link:\n  target: /old -> /new\n");
+        assert_eq!(c.diff().render(), "/etc/link:\n  target: /old -> /new\n");
         op.apply(&sys, c).unwrap();
         assert_eq!(sys.read_link("/etc/link").unwrap(), PathBuf::from("/new"));
     }
@@ -238,7 +288,7 @@ mod tests {
 
         let op = op.force(true);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "kind=symlink target=/new");
+        assert_eq!(c.diff().short(), "kind=symlink target=/new");
         op.apply(&sys, c).unwrap();
         assert_eq!(fake.file("/etc/link").unwrap().kind, FileKind::Symlink);
         assert_eq!(sys.read_link("/etc/link").unwrap(), PathBuf::from("/new"));

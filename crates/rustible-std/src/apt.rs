@@ -159,23 +159,6 @@ fn installed_version(sys: &System, name: &str) -> Result<Option<String>> {
     })
 }
 
-/// The package names an attribute diff plans to act on, in order.
-fn planned_names(diff: &Diff) -> Vec<String> {
-    planned_changes(diff)
-        .iter()
-        .map(|c| c.name.clone())
-        .collect()
-}
-
-/// The per-package changes an attribute diff plans, in order: `apply`
-/// executes these rather than deciding again (vision 6.2).
-fn planned_changes(diff: &Diff) -> &[AttrChange] {
-    match diff {
-        Diff::Attrs { changes, .. } => changes,
-        _ => &[],
-    }
-}
-
 /// Candidate and installed versions from `apt-cache policy`.
 fn policy(sys: &System, name: &str) -> Result<Policy> {
     let out = sys.cmd("apt-cache").args(["policy", name]).run()?;
@@ -306,42 +289,51 @@ impl Present {
     }
 }
 
+/// What [`Present`]'s `check` decided: install these packages, which dpkg
+/// does not have, in the order the op named them.
+#[derive(Debug)]
+pub struct Install {
+    names: Vec<String>,
+}
+
+impl Intent for Install {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            "apt packages",
+            self.names
+                .iter()
+                .map(|name| AttrChange::new(name.as_str(), "absent", "installed"))
+                .collect(),
+        )
+    }
+}
+
 impl Op for Present {
     type Output = InstallReport;
+    type Intent = Install;
 
-    fn check(&self, sys: &System) -> Result<Plan<InstallReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_apt_root(sys, "Present")?;
         let mut report = InstallReport::default();
-        let mut changes = vec![];
+        let mut missing = vec![];
         for name in &self.names {
             match installed_version(sys, name)? {
                 Some(version) => report.already_present.push(Package {
                     name: name.clone(),
                     version,
                 }),
-                None => changes.push(AttrChange {
-                    name: name.clone(),
-                    from: "absent".into(),
-                    to: "installed".into(),
-                }),
+                None => missing.push(name.clone()),
             }
         }
-        if changes.is_empty() {
+        if missing.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "apt packages".into(),
-            changes,
-        }))
+        Ok(Plan::Change(Install { names: missing }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<InstallReport> {
+    fn apply(&self, sys: &System, intent: Install) -> Result<InstallReport> {
         // Install what `check` planned, not what dpkg says now (vision 6.2).
-        let missing = planned_names(&change.diff);
-        ensure!(
-            !missing.is_empty(),
-            "apt::Present::apply: the plan names no package to install"
-        );
+        let missing = intent.names;
         if let Some(max_age) = self.update_cache {
             update_cache_if_stale(sys, max_age)?;
         }
@@ -414,18 +406,57 @@ impl Absent {
     }
 }
 
+/// What [`Absent`]'s `check` decided: remove (or purge) these packages, each
+/// with what dpkg had for it.
+#[derive(Debug)]
+pub struct Remove {
+    purge: bool,
+    packages: Vec<Removal>,
+}
+
+/// One package [`Absent`] takes away.
+#[derive(Debug)]
+struct Removal {
+    name: String,
+    /// The version dpkg had, which the report names: apt-get takes it.
+    version: String,
+    /// Only the configuration files were left (`deinstall ok
+    /// config-files`), which a purge removes.
+    config_files: bool,
+}
+
+impl Intent for Remove {
+    fn diff(&self) -> Diff {
+        let verb = if self.purge { "purged" } else { "removed" };
+        Diff::attrs(
+            "apt packages",
+            self.packages
+                .iter()
+                .map(|p| {
+                    let from = if p.config_files {
+                        "config-files"
+                    } else {
+                        "installed"
+                    };
+                    AttrChange::new(p.name.as_str(), from, verb)
+                })
+                .collect(),
+        )
+    }
+}
+
 impl Op for Absent {
     type Output = RemoveReport;
+    type Intent = Remove;
 
-    fn check(&self, sys: &System) -> Result<Plan<RemoveReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_apt_root(sys, "Absent")?;
-        let verb = if self.purge { "purged" } else { "removed" };
-        let mut report = RemoveReport::default();
-        let mut changes = vec![];
+        let mut packages = vec![];
+        let mut not_present = vec![];
         for name in &self.names {
             let present = match dpkg_status(sys, name)? {
-                DpkgStatus::Installed(v) => Some((v, "installed")),
-                DpkgStatus::ConfigFiles(v) if self.purge => Some((v, "config-files")),
+                DpkgStatus::Installed(v) => Some((v, false)),
+                DpkgStatus::ConfigFiles(v) if self.purge => Some((v, true)),
                 DpkgStatus::ConfigFiles(_) | DpkgStatus::Unknown => None,
                 DpkgStatus::Other(status) => bail!(
                     "package `{name}` is in dpkg state `{status}`; \
@@ -433,64 +464,51 @@ impl Op for Absent {
                 ),
             };
             match present {
-                Some((version, from)) => {
-                    changes.push(AttrChange {
-                        name: name.clone(),
-                        from: from.into(),
-                        to: verb.into(),
-                    });
-                    report.removed.push(Package {
-                        name: name.clone(),
-                        version,
-                    });
-                }
-                None => report.not_present.push(name.clone()),
+                Some((version, config_files)) => packages.push(Removal {
+                    name: name.clone(),
+                    version,
+                    config_files,
+                }),
+                None => not_present.push(name.clone()),
             }
         }
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(report));
+        if packages.is_empty() {
+            return Ok(Plan::Satisfied(RemoveReport {
+                removed: vec![],
+                not_present,
+            }));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "apt packages".into(),
-            changes,
+        Ok(Plan::Change(Remove {
+            purge: self.purge,
+            packages,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<RemoveReport> {
+    fn apply(&self, sys: &System, intent: Remove) -> Result<RemoveReport> {
         // Remove what `check` planned, not what dpkg says now (vision 6.2).
-        let names = planned_names(&change.diff);
-        ensure!(
-            !names.is_empty(),
-            "apt::Absent::apply: the plan names no package to remove"
-        );
-        // The report wants the versions going away: read them before
-        // apt-get takes them.
-        let mut report = RemoveReport::default();
-        for name in &self.names {
-            if names.contains(name) {
-                let version = match dpkg_status(sys, name)? {
-                    DpkgStatus::Installed(v) | DpkgStatus::ConfigFiles(v) => v,
-                    DpkgStatus::Unknown | DpkgStatus::Other(_) => String::new(),
-                };
-                report.removed.push(Package {
-                    name: name.clone(),
-                    version,
-                });
-            } else {
-                report.not_present.push(name.clone());
-            }
-        }
-        let verb = if self.purge { "purge" } else { "remove" };
+        let Remove { purge, packages } = intent;
+        let verb = if purge { "purge" } else { "remove" };
         apt_get(sys)
             .args([verb, "-y"])
-            .args(names.iter().cloned())
+            .args(packages.iter().map(|p| p.name.clone()))
             .run()?;
         if self.autoremove {
             let mut cmd = apt_get(sys).args(["autoremove", "-y"]);
-            if self.purge {
+            if purge {
                 cmd = cmd.arg("--purge");
             }
             cmd.run()?;
+        }
+        // The versions that went are the ones `check` read.
+        let mut report = RemoveReport::default();
+        for name in &self.names {
+            match packages.iter().find(|p| &p.name == name) {
+                Some(p) => report.removed.push(Package {
+                    name: p.name.clone(),
+                    version: p.version.clone(),
+                }),
+                None => report.not_present.push(name.clone()),
+            }
         }
         Ok(report)
     }
@@ -579,16 +597,56 @@ impl Latest {
     }
 }
 
+/// What [`Latest`]'s `check` decided, package by package, in the order the
+/// op named them: install a missing one, or upgrade an outdated one from the
+/// version dpkg has.
+#[derive(Debug)]
+pub struct Upgrade {
+    packages: Vec<(String, Bump)>,
+}
+
+#[derive(Debug)]
+enum Bump {
+    /// Not installed: `apt-get install`.
+    Install { candidate: String },
+    /// Installed at an older version: `apt-get install --only-upgrade`.
+    From {
+        installed: String,
+        candidate: String,
+    },
+}
+
+impl Intent for Upgrade {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            "apt packages",
+            self.packages
+                .iter()
+                .map(|(name, bump)| match bump {
+                    Bump::Install { candidate } => {
+                        AttrChange::new(name.as_str(), "absent", candidate.as_str())
+                    }
+                    Bump::From {
+                        installed,
+                        candidate,
+                    } => AttrChange::new(name.as_str(), installed.as_str(), candidate.as_str()),
+                })
+                .collect(),
+        )
+    }
+}
+
 impl Op for Latest {
     type Output = UpgradeReport;
+    type Intent = Upgrade;
 
-    fn check(&self, sys: &System) -> Result<Plan<UpgradeReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_apt_root(sys, "Latest")?;
         // Before the candidates are read, not after: `apt-cache policy` can
         // only answer from the lists on disk.
         self.refresh_cache(sys)?;
-        let mut report = UpgradeReport::default();
-        let mut changes = vec![];
+        let mut current = vec![];
+        let mut packages = vec![];
         for name in &self.names {
             let installed = installed_version(sys, name)?;
             let Some(candidate) = policy(sys, name)?.candidate else {
@@ -597,55 +655,39 @@ impl Op for Latest {
                      (unknown name, or the lists need `apt-get update`)"
                 );
             };
-            let package = Package {
-                name: name.clone(),
-                version: candidate.clone(),
-            };
             match installed {
-                None => {
-                    changes.push(AttrChange {
-                        name: name.clone(),
-                        from: "absent".into(),
-                        to: candidate,
-                    });
-                    report.installed.push(package);
-                }
-                Some(v) if v != candidate => {
-                    changes.push(AttrChange {
-                        name: name.clone(),
-                        from: v.clone(),
-                        to: candidate,
-                    });
-                    report.upgraded.push((package, v));
-                }
-                Some(_) => report.current.push(package),
+                None => packages.push((name.clone(), Bump::Install { candidate })),
+                Some(v) if v != candidate => packages.push((
+                    name.clone(),
+                    Bump::From {
+                        installed: v,
+                        candidate,
+                    },
+                )),
+                Some(_) => current.push(Package {
+                    name: name.clone(),
+                    version: candidate,
+                }),
             }
         }
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(report));
+        if packages.is_empty() {
+            return Ok(Plan::Satisfied(UpgradeReport {
+                current,
+                ..UpgradeReport::default()
+            }));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: "apt packages".into(),
-            changes,
-        }))
+        Ok(Plan::Change(Upgrade { packages }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<UpgradeReport> {
-        // Execute the diff: a package coming from `absent` is installed, any
-        // other is upgraded, and its `from` is the version being left.
+    fn apply(&self, sys: &System, intent: Upgrade) -> Result<UpgradeReport> {
         let mut to_install = vec![];
         let mut to_upgrade = vec![];
-        for c in planned_changes(&change.diff) {
-            if c.from == "absent" {
-                to_install.push(c.name.clone());
-            } else {
-                to_upgrade.push((c.name.clone(), c.from.clone()));
+        for (name, bump) in intent.packages {
+            match bump {
+                Bump::Install { .. } => to_install.push(name),
+                Bump::From { installed, .. } => to_upgrade.push((name, installed)),
             }
         }
-        ensure!(
-            !to_install.is_empty() || !to_upgrade.is_empty(),
-            "apt::Latest::apply: the plan names no package to install or upgrade"
-        );
         // No refresh here: `check` always runs first (this plan came from it)
         // and did it, so the candidates apt sees are already the fresh ones.
         if !to_install.is_empty() {
@@ -870,7 +912,7 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "mc=installed");
+        assert_eq!(c.diff().short(), "mc=installed");
         op.apply(&s, c).unwrap();
         let argvs = fake.argvs();
         assert!(
@@ -894,7 +936,7 @@ mod tests {
         let Plan::Change(c) = Present::new(["sl"]).check(&sys(&fake)).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "sl=installed");
+        assert_eq!(c.diff().short(), "sl=installed");
         let argvs = fake.argvs();
         assert!(argvs.iter().all(|a| a[0] == "dpkg-query"), "{argvs:?}");
     }
@@ -926,31 +968,14 @@ mod tests {
             panic!("expected change")
         };
         // Only the missing one is planned, and only it is installed.
-        assert_eq!(c.diff.short(), "mc=installed");
-        // Apply works from the diff alone.
+        assert_eq!(c.diff().short(), "mc=installed");
+        // Apply works from the intent alone.
         let report = op.apply(&s, c).unwrap();
         let argvs = fake.argvs();
         let install = argv_starting(&argvs, &["apt-get", "install"]).unwrap();
         assert!(install.contains(&"mc".into()) && !install.contains(&"zsh".into()));
         assert_eq!(report.installed[0].name, "mc");
         assert_eq!(report.already_present[0].version, "5.9-4");
-    }
-
-    #[test]
-    fn present_apply_refuses_a_plan_with_no_packages() {
-        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
-        let s = sys(&fake);
-        let err = Present::new(["mc"])
-            .apply(
-                &s,
-                Change {
-                    diff: Diff::summary("nothing"),
-                },
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("names no package"), "{err}");
-        assert!(fake.argvs().is_empty(), "nothing ran");
     }
 
     #[test]
@@ -1119,9 +1144,9 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "apache2=removed");
+        assert_eq!(c.diff().short(), "apache2=removed");
 
-        // The report is read from dpkg before apt-get takes the package.
+        // The version reported is the one `check` read from dpkg, carried in the intent.
         let r = op.apply(&s, c).unwrap();
         assert_eq!(r.removed[0].name, "apache2");
         assert_eq!(r.removed[0].version, "2.4.62-1");
@@ -1150,7 +1175,7 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "apache2=purged");
+        assert_eq!(c.diff().short(), "apache2=purged");
         op.apply(&s, c).unwrap();
         let apt: Vec<_> = fake
             .argvs()
@@ -1203,7 +1228,7 @@ mod tests {
             panic!("purge must see config-files as present")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "apt packages:\n  apache2: config-files -> purged\n"
         );
     }
@@ -1237,22 +1262,6 @@ mod tests {
             .to_string();
         assert!(err.contains("apt::Absent needs root"), "{err}");
         assert!(fake.argvs().is_empty(), "refusal must not run commands");
-    }
-
-    #[test]
-    fn absent_apply_refuses_a_plan_naming_no_package() {
-        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
-        let err = Absent::new(["x"])
-            .apply(
-                &sys(&fake),
-                Change {
-                    diff: Diff::summary("x"),
-                },
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("names no package"), "{err}");
-        assert!(fake.argvs().is_empty());
     }
 
     #[test]
@@ -1310,11 +1319,11 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "apt packages:\n  openssl: 3.0.15-1 -> 3.0.16-1\n"
         );
         let r = op.apply(&s, c).unwrap();
-        // The version left behind comes from the diff; the one reported is
+        // The version left behind comes from the intent; the one reported is
         // what dpkg says now, and the fake still answers 3.0.15-1.
         assert_eq!(r.upgraded[0].0.name, "openssl");
         assert_eq!(r.upgraded[0].0.version, "3.0.15-1");
@@ -1341,9 +1350,9 @@ mod tests {
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "sl=5.02-1");
+        assert_eq!(c.diff().short(), "sl=5.02-1");
         let r = op.apply(&s, c).unwrap();
-        // Installed per the diff; the fake dpkg never learns of it, so the
+        // Installed per the intent; the fake dpkg never learns of it, so the
         // version read back is empty rather than the candidate.
         assert_eq!(r.installed[0].name, "sl");
         assert_eq!(r.installed[0].version, "");

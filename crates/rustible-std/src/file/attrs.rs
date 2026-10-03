@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 
-use super::{Owner, apply_attrs, plan_attrs};
+use super::{AttrPlan, Owner, plan_attrs};
 
 /// Ensure an existing path has the given mode and owner. Ansible's `file`
 /// with `state: file` (or `state: directory` on a directory that must
@@ -70,10 +70,39 @@ impl Attrs {
     }
 }
 
+/// What [`Attrs`]'s `check` decided: the attributes to set on the path, with
+/// what it found there, or, under `--check` only, that the path is not there
+/// yet.
+#[derive(Debug)]
+pub struct AttrsIntent {
+    path: PathBuf,
+    attrs: AttrPlan,
+    /// The path does not exist yet and an earlier step may create it. Only
+    /// `check` under `--check` plans this, so it is reported and never
+    /// applied; a real run's `check` refuses the missing path instead, and
+    /// `apply` refuses it too rather than set attributes on nothing.
+    awaits_path: bool,
+}
+
+impl Intent for AttrsIntent {
+    fn diff(&self) -> Diff {
+        if self.awaits_path && !self.attrs.differs() {
+            // Nothing to set, but the step still has the path to wait for.
+            return Diff::summary(format!(
+                "{}: does not exist yet; file::Attrs would check it once an earlier \
+                 step creates it",
+                self.path.display()
+            ));
+        }
+        Diff::attrs(self.path.display().to_string(), self.attrs.changes())
+    }
+}
+
 impl Op for Attrs {
     type Output = AttrsReport;
+    type Intent = AttrsIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<AttrsReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Attrs sets POSIX mode and owner through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -83,28 +112,17 @@ impl Op for Attrs {
         }
         let Some(stat) = sys.stat(&self.path)? else {
             // Under --check an earlier step may create the path (vision 12):
-            // report the attributes it would get. A real run refuses.
+            // report the attributes it would get. With nothing to set the
+            // step is still not `ok`, which would hand a later step an
+            // output for a path that is not there. A real run refuses.
             if sys.check_mode() {
-                let changes = plan_attrs(None, self.mode, self.owner);
-                if changes.is_empty() {
-                    // Nothing to set, but the step still has the path to
-                    // wait for: not `ok`, which would hand a later step an
-                    // output for a path that is not there.
-                    return Ok(Plan::change(Diff::summary(format!(
-                        "{}: does not exist yet; file::Attrs would check it once an earlier \
-                         step creates it",
-                        self.path.display()
-                    ))));
-                }
-                return Ok(Plan::change(Diff::Attrs {
-                    subject: self.path.display().to_string(),
-                    changes,
+                return Ok(Plan::Change(AttrsIntent {
+                    path: self.path.clone(),
+                    attrs: plan_attrs(None, self.mode, self.owner),
+                    awaits_path: true,
                 }));
             }
-            bail!(
-                "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",
-                self.path.display()
-            );
+            return Err(missing(&self.path));
         };
         if stat.kind == FileKind::Symlink {
             bail!(
@@ -112,20 +130,33 @@ impl Op for Attrs {
                 self.path.display()
             );
         }
-        let changes = plan_attrs(Some(&stat), self.mode, self.owner);
-        if changes.is_empty() {
+        let attrs = plan_attrs(Some(&stat), self.mode, self.owner);
+        if !attrs.differs() {
             return Ok(Plan::Satisfied(self.report()));
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: self.path.display().to_string(),
-            changes,
+        Ok(Plan::Change(AttrsIntent {
+            path: self.path.clone(),
+            attrs,
+            awaits_path: false,
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<AttrsReport> {
-        apply_attrs(sys, &self.path, self.mode, self.owner)?;
+    fn apply(&self, sys: &System, intent: AttrsIntent) -> Result<AttrsReport> {
+        if intent.awaits_path {
+            // The refusal a real run's `check` gives for the same machine.
+            return Err(missing(&intent.path));
+        }
+        intent.attrs.apply(sys, &intent.path)?;
         Ok(self.report())
     }
+}
+
+/// The refusal for a path that is not there: this op never creates one.
+fn missing(path: &std::path::Path) -> Error {
+    Error::msg(format!(
+        "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",
+        path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -195,7 +226,7 @@ mod tests {
         let op = Attrs::at("/f").mode(0o600).owner(1000, 1000);
         let c = expect_change(&op, &sys);
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/f:\n  mode: 0644 -> 0600\n  owner: 0:0 -> 1000:1000\n"
         );
         let r = op.apply(&sys, c).unwrap();
@@ -211,7 +242,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Attrs::at("/d").owner(5, 6);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "owner=5:6");
+        assert_eq!(c.diff().short(), "owner=5:6");
         op.apply(&sys, c).unwrap();
         let f = fake.file("/d").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 5, 6));
@@ -256,14 +287,14 @@ mod tests {
         let op = Attrs::at("/missing").mode(0o644).owner(1, 2);
         let c = expect_change(&op, &dry);
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/missing:\n  mode: - -> 0644\n  owner: - -> 1:2\n"
         );
         // Nothing asked beyond existence: still `would change`, never `ok`
         // with an output for a path that is not there.
         let c = expect_change(&Attrs::at("/missing"), &dry);
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/missing: does not exist yet; file::Attrs would check it once an earlier step \
              creates it"
         );
@@ -274,5 +305,14 @@ mod tests {
             err.contains("/missing does not exist; file::Attrs only sets attributes"),
             "{err}"
         );
+
+        // A dry run's intent never reaches `apply`; handed to one anyway, it
+        // refuses as a real `check` does rather than succeed on nothing.
+        let waiting = expect_change(&Attrs::at("/missing"), &dry);
+        let err = Attrs::at("/missing")
+            .apply(&real, waiting)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("/missing does not exist"), "{err}");
     }
 }

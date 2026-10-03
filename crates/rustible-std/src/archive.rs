@@ -262,8 +262,10 @@ pub struct ExtractReport {
 /// dry run shows what an extraction would write; the report itself only
 /// exists once `apply` has run (vision 12).
 ///
-/// **What `apply` does.** Walks the archive again and writes each member
-/// through `sys`: files with `write_atomic` and the archive's permission
+/// **What `apply` does.** Writes each member `check` planned, reading its
+/// data from the archive once more (an archive changed since `check` is
+/// refused at the first member that differs), through `sys`: files with
+/// `write_atomic` and the archive's permission
 /// bits, directories with `mkdir_all`, symlinks replaced if present, hard
 /// links as copies of the already-extracted file. Ownership from the
 /// archive is ignored; `.owner(uid, gid)` sets one owner on every file and
@@ -359,21 +361,15 @@ impl Extracted {
         Ok((format, tar::Archive::new(reader)))
     }
 
-    /// Everything the archive would create, in order, or why it is refused.
-    fn plan(&self, sys: &System) -> Result<(Format, Vec<Member>, usize)> {
+    /// Everything the archive would create, entry by entry in archive order,
+    /// or why it is refused.
+    fn plan(&self, sys: &System) -> Result<(Format, Vec<PlannedEntry>)> {
         let (format, mut archive) = self.open(sys)?;
-        let mut members = vec![];
-        let mut skipped = 0;
-        walk(&mut archive, self.strip, &mut |m, _| {
-            match m {
-                Some(m) => members.push(m.clone()),
-                None => skipped += 1,
-            }
-            Ok(())
-        })
-        .with_context(|| format!("{}: refusing to extract", self.src.display()))?;
+        let entries = walk(&mut archive, self.strip)
+            .with_context(|| format!("{}: refusing to extract", self.src.display()))?;
+        let members: Vec<Member> = entries.iter().filter_map(|e| e.member.clone()).collect();
         self.check_destination(sys, &members)?;
-        Ok((format, members, skipped))
+        Ok((format, entries))
     }
 
     /// The on-disk side of the guard: `dest` is a directory, nothing on a
@@ -440,36 +436,14 @@ impl Extracted {
         Ok(())
     }
 
-    fn report(&self, format: Format, members: &[Member], skipped: usize) -> ExtractReport {
-        let mut r = ExtractReport {
-            src: self.src.clone(),
-            dest: self.dest.clone(),
-            format: Some(format),
-            files: 0,
-            dirs: 0,
-            symlinks: 0,
-            bytes: 0,
-            skipped,
-            extracted: true,
-        };
-        for m in members {
-            match m.kind {
-                Kind::File | Kind::Hardlink(_) => {
-                    r.files += 1;
-                    // The sizes come from the archive's headers and are not
-                    // bounded, so a crafted set can overflow the sum, which
-                    // panics in debug builds.
-                    r.bytes = r.bytes.saturating_add(m.size);
-                }
-                Kind::Dir => r.dirs += 1,
-                Kind::Symlink(_) => r.symlinks += 1,
-            }
-        }
-        r
-    }
-
-    fn write_member(&self, sys: &System, m: &Member, data: &mut dyn Read) -> Result<()> {
-        let full = self.dest.join(&m.path);
+    fn write_member(
+        &self,
+        sys: &System,
+        dest: &Path,
+        m: &Member,
+        data: &mut dyn Read,
+    ) -> Result<()> {
+        let full = dest.join(&m.path);
         // `chown(2)` clears setuid/setgid on non-directories, so every arm
         // below defers `set_mode` to the tail and the owner is applied
         // first. Writing the mode inline would drop the setuid bit of a
@@ -484,13 +458,16 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                // The capacity is a hint from the archive's own header and
-                // nothing bounds it: a base-256 `size` of 2^62 would ask
-                // for an allocation the process cannot survive (Rust
-                // aborts on allocation failure), turning a malicious
-                // tarball into a killed run instead of a refusal. Reserve
-                // a small floor and let `read_to_end` grow it against the
-                // real stream.
+                // The capacity is a hint from the archive's header, as
+                // `check` walked it. A base-256 `size` of 2^62 would ask for
+                // an allocation the process cannot survive (Rust aborts on
+                // allocation failure). `check` already refuses a member
+                // whose claim the stream cannot back, so through `apply`
+                // the size is bounded by the archive `check` read; the clamp
+                // stays as the guard that does not depend on that, pinned by
+                // `write_member_clamps_the_capacity_hint`. Reserve a small
+                // floor and let `read_to_end` grow it against the real
+                // stream.
                 let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
                 let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
@@ -501,7 +478,7 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                let bytes = sys.read(self.dest.join(target))?;
+                let bytes = sys.read(dest.join(target))?;
                 sys.write_atomic(&full, &bytes)?;
             }
             Kind::Symlink(target) => {
@@ -594,10 +571,6 @@ fn zstd_decompress_all(mut input: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// What [`walk`] calls per member: the member (`None` when skipped by
-/// `strip_components` or for an empty path) and a reader of its data.
-type Visit<'a> = dyn FnMut(Option<&Member>, &mut dyn Read) -> Result<()> + 'a;
-
 /// What a member is, for a collision message.
 fn kind_label(kind: &Kind) -> &'static str {
     match kind {
@@ -608,9 +581,10 @@ fn kind_label(kind: &Kind) -> &'static str {
     }
 }
 
-/// Walk every member in order, validating paths and link targets, and hand
-/// each to `visit` with its data. Errors name the member.
-fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<'_>) -> Result<()> {
+/// Walk every member in order, validating paths and link targets, without
+/// reading any data. Errors name the member.
+fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<PlannedEntry>> {
+    let mut out = vec![];
     let mut symlinks: Vec<PathBuf> = vec![];
     let mut files: BTreeSet<PathBuf> = BTreeSet::new();
     // Every path the archive has claimed so far, and what it claimed it as.
@@ -619,14 +593,14 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<
     let mut claimed: std::collections::BTreeMap<PathBuf, &'static str> =
         std::collections::BTreeMap::new();
     for entry in archive.entries().context("reading tar members")? {
-        let mut entry = entry.context("reading tar member")?;
+        let entry = entry.context("reading tar member")?;
         let raw = entry
             .path()
             .context("a member has a path that is not valid UTF-8")?
             .into_owned();
         let normalised = validate_entry_path(&raw).map_err(Error::msg)?;
         let Some(path) = strip_components(&normalised, strip) else {
-            visit(None, &mut std::io::empty())?;
+            out.push(PlannedEntry { raw, member: None });
             continue;
         };
         if let Some(link) = symlinks.iter().find(|l| path.starts_with(l)) {
@@ -720,15 +694,92 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize, visit: &mut Visit<
             mode,
             size,
         };
-        visit(Some(&member), &mut entry)?;
+        out.push(PlannedEntry {
+            raw,
+            member: Some(member),
+        });
     }
-    Ok(())
+    Ok(out)
+}
+
+/// One entry of the archive as `check` walked it: the path the archive
+/// gives it, and the validated member it extracts to (`None` for one
+/// `.strip_components` or an empty path drops).
+#[derive(Debug, Clone)]
+struct PlannedEntry {
+    raw: PathBuf,
+    member: Option<Member>,
+}
+
+/// What [`Extracted`]'s `check` decided: extract these validated members, in
+/// archive order. The member plan is the walk `check` already did, so
+/// `apply` does not validate again; it reads each member's data from the
+/// archive (the bytes stay there, never in the intent) and writes it where
+/// the plan says.
+#[derive(Debug)]
+pub struct Extraction {
+    src: PathBuf,
+    dest: PathBuf,
+    format: Format,
+    entries: Vec<PlannedEntry>,
+}
+
+impl Extraction {
+    /// The counts, from the plan: what `apply` writes is exactly this.
+    fn report(&self) -> ExtractReport {
+        let mut r = ExtractReport {
+            src: self.src.clone(),
+            dest: self.dest.clone(),
+            format: Some(self.format),
+            files: 0,
+            dirs: 0,
+            symlinks: 0,
+            bytes: 0,
+            skipped: 0,
+            extracted: true,
+        };
+        for e in &self.entries {
+            let Some(m) = &e.member else {
+                r.skipped += 1;
+                continue;
+            };
+            match m.kind {
+                Kind::File | Kind::Hardlink(_) => {
+                    r.files += 1;
+                    // The sizes come from the archive's headers and are not
+                    // bounded, so a crafted set can overflow the sum, which
+                    // panics in debug builds.
+                    r.bytes = r.bytes.saturating_add(m.size);
+                }
+                Kind::Dir => r.dirs += 1,
+                Kind::Symlink(_) => r.symlinks += 1,
+            }
+        }
+        r
+    }
+}
+
+impl Intent for Extraction {
+    fn diff(&self) -> Diff {
+        let r = self.report();
+        Diff::summary(format!(
+            "extract {} ({}: {} files, {} dirs, {} symlinks, {} bytes) into {}",
+            self.src.display(),
+            self.format.name(),
+            r.files,
+            r.dirs,
+            r.symlinks,
+            r.bytes,
+            self.dest.display()
+        ))
+    }
 }
 
 impl Op for Extracted {
     type Output = ExtractReport;
+    type Intent = Extraction;
 
-    fn check(&self, sys: &System) -> Result<Plan<ExtractReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. archive::Extracted is a pure-Rust extractor writing through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -754,51 +805,63 @@ impl Op for Extracted {
                 extracted: false,
             }));
         }
-        let (format, members, skipped) = self.plan(sys)?;
-        let report = self.report(format, &members, skipped);
-        let diff = Diff::summary(format!(
-            "extract {} ({}: {} files, {} dirs, {} symlinks, {} bytes) into {}",
-            self.src.display(),
-            format.name(),
-            report.files,
-            report.dirs,
-            report.symlinks,
-            report.bytes,
-            self.dest.display()
-        ));
-        Ok(Plan::change(diff))
+        let (format, entries) = self.plan(sys)?;
+        Ok(Plan::Change(Extraction {
+            src: self.src.clone(),
+            dest: self.dest.clone(),
+            format,
+            entries,
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<ExtractReport> {
-        // The report counts what was written, gathered on the same pass that
-        // writes it: one read of the archive here, as before, not a second
-        // planning pass.
-        let (format, mut archive) = self.open(sys)?;
-        let mut members = vec![];
-        let mut skipped = 0;
-        walk(&mut archive, self.strip, &mut |m, data| match m {
-            Some(m) => {
-                self.write_member(sys, m, data)?;
-                members.push(m.clone());
-                Ok(())
+    fn apply(&self, sys: &System, intent: Extraction) -> Result<ExtractReport> {
+        // One read of the archive, for the data: the members and where they
+        // go are the plan's. An archive swapped since `check` is caught at
+        // the first entry that is not the one the plan has in that place,
+        // so data is never written under another member's name.
+        let (_, mut archive) = self.open(sys)?;
+        let mut planned = intent.entries.iter();
+        let entries = archive
+            .entries()
+            .with_context(|| format!("extracting {}: reading tar members", intent.src.display()))?;
+        for entry in entries {
+            let mut entry = entry.with_context(|| {
+                format!("extracting {}: reading tar member", intent.src.display())
+            })?;
+            let raw = entry
+                .path()
+                .with_context(|| format!("extracting {}", intent.src.display()))?
+                .into_owned();
+            let Some(slot) = planned.next().filter(|slot| slot.raw == raw) else {
+                bail!(
+                    "{}: reading member `{}`, which is not the member `check` walked there; \
+                     the archive changed between check and apply, and nothing further was \
+                     extracted",
+                    intent.src.display(),
+                    raw.display()
+                );
+            };
+            if let Some(m) = &slot.member {
+                self.write_member(sys, &intent.dest, m, &mut entry)
+                    .with_context(|| format!("extracting {}", intent.src.display()))?;
             }
-            None => {
-                skipped += 1;
-                Ok(())
-            }
-        })
-        .with_context(|| format!("extracting {}", self.src.display()))?;
-        let report = self.report(format, &members, skipped);
+        }
+        ensure!(
+            planned.next().is_none(),
+            "{}: the archive ended before every member `check` walked was read; it changed \
+             between check and apply",
+            intent.src.display()
+        );
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
             sys.warn(format!(
                 "archive {} extracted but its creates marker {} does not exist; the next run will extract again",
-                self.src.display(),
+                intent.src.display(),
                 marker.display()
             ));
         }
-        Ok(report)
+        Ok(intent.report())
     }
 
     fn always_changes(&self) -> bool {
@@ -1059,7 +1122,7 @@ mod tests {
             assert!(op.always_changes(), "no creates marker");
             let c = expect_change(&op, &sys);
             assert_eq!(
-                c.diff.short(),
+                c.diff().short(),
                 format!(
                     "extract {src} ({}: 2 files, 3 dirs, 1 symlinks, 38 bytes) into /opt",
                     format.name()
@@ -1294,7 +1357,7 @@ mod tests {
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "extract /tmp/a.tar (tar: 2 files, 0 dirs, 0 symlinks, 6 bytes) into /opt"
         );
     }
@@ -1328,20 +1391,112 @@ mod tests {
         assert!(err.contains("EOF"), "{err}");
     }
 
+    /// A setuid member extracted with `.owner(..)` keeps the bit: the owner
+    /// is set before the mode, because `chown` clears setuid (the `Fake`
+    /// models it). The other order leaves 0755.
     #[test]
-    fn an_absurd_header_size_does_not_abort_apply_either() {
-        // `apply` walks the archive again, and `write_member` reserves from
-        // the header before reading. An archive swapped between check and
-        // apply reaches that reservation with an unvalidated size, so the
-        // capacity is a clamped hint, not the claim. Without the clamp
-        // this test does not fail, it aborts the whole test binary.
-        let (_, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
+    fn a_setuid_member_keeps_the_bit_under_owner() {
+        let mut h = tar::Header::new_gnu();
+        h.set_path("tool").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o4755);
+        h.set_size(2);
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend_from_slice(b"#!");
+        archive.resize(1024, 0);
+        archive.extend_from_slice(&[0u8; 1024]);
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
+        let intent = expect_change(&op, &sys);
+        op.apply(&sys, intent).unwrap();
+        let f = fake.file("/opt/tool").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+    }
+
+    /// `apply` writes the members `check` walked and reads only their data
+    /// from the archive. An archive swapped in between, with a member under
+    /// another name, is refused at that member: its data never lands under
+    /// a name `check` did not validate.
+    #[test]
+    fn apply_refuses_an_archive_whose_member_changed_since_check() {
+        let (fake, sys) = sys_with(&raw_tar(&[
+            ("a", b'0', b"one", ""),
+            ("b", b'0', b"two", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let intent = expect_change(&op, &sys);
+        sys.write_atomic(
+            "/tmp/a.tar",
+            &raw_tar(&[("a", b'0', b"one", ""), ("evil", b'0', b"two", "")]),
+        )
+        .unwrap();
+        let err = op.apply(&sys, intent).unwrap_err().chain();
+        assert!(err.contains("not the member `check` walked"), "{err}");
+        assert!(
+            fake.file("/opt/evil").is_none(),
+            "nothing under the new name"
+        );
+        assert!(fake.file("/opt/b").is_none());
+    }
+
+    /// The same for an archive that lost members: `apply` refuses rather
+    /// than report an extraction it did not finish.
+    #[test]
+    fn apply_refuses_an_archive_that_ends_early() {
+        let (_, sys) = sys_with(&raw_tar(&[
+            ("a", b'0', b"one", ""),
+            ("b", b'0', b"two", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let intent = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &raw_tar(&[("a", b'0', b"one", "")]))
+            .unwrap();
+        let err = op.apply(&sys, intent).unwrap_err().chain();
+        assert!(err.contains("ended before"), "{err}");
+    }
+
+    #[test]
+    fn a_swapped_member_whose_header_lies_fails_the_step() {
+        // `apply` reads each member's data from the archive again. Swapped
+        // after `check` for one with the same name whose header claims 2^62
+        // bytes the stream does not hold, the name check passes and the step
+        // fails when the walk runs out of archive.
+        // The size `write_member` reserves from is the one `check` planned
+        // (4), so this does not reach the clamp:
+        // `write_member_clamps_the_capacity_hint` does.
+        let (fake, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("big", 1u64 << 62))
+        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("f", 1u64 << 62))
             .unwrap();
         let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("EOF") || err.contains("reading"), "{err}");
+        assert!(err.contains("unexpected EOF"), "{err}");
+        // The member's reader hands over whatever the stream still holds and
+        // stops, so that much is written before the walk runs out of archive
+        // and the step fails: a KNOWN GAP (`[ISSUE-43]` in `DECISIONS.md`),
+        // as it was before the intent.
+        assert_eq!(fake.file("/opt/f").map(|f| f.bytes.len()), Some(1536));
+    }
+
+    /// The reservation `write_member` makes from a member's size is clamped,
+    /// whatever the size says. Through `apply` the size is bounded by what
+    /// `check` read, so this calls `write_member` directly with a claim of
+    /// 2^62. Without the clamp this test does not fail, it aborts the whole
+    /// test binary (Rust aborts on allocation failure).
+    #[test]
+    fn write_member_clamps_the_capacity_hint() {
+        let (fake, sys) = sys_with(&raw_tar(&[]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let member = Member {
+            path: "big".into(),
+            kind: Kind::File,
+            mode: 0o644,
+            size: 1u64 << 62,
+        };
+        op.write_member(&sys, Path::new("/opt"), &member, &mut &b"ok"[..])
+            .unwrap();
+        assert_eq!(fake.content("/opt/big").unwrap(), "ok");
     }
 
     #[test]
@@ -1417,9 +1572,9 @@ mod tests {
         let dry = fake_sys(&fake).with_check_mode(true);
         let c = expect_change(&Extracted::from_path("/tmp/hello.tar").to("/opt"), &dry);
         assert!(
-            c.diff.short().starts_with("extract /tmp/hello.tar"),
+            c.diff().short().starts_with("extract /tmp/hello.tar"),
             "{}",
-            c.diff.short()
+            c.diff().short()
         );
         assert!(fake.file("/opt").is_none());
         assert!(

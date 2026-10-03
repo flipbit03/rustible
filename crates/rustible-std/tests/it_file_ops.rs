@@ -58,6 +58,27 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(!third.content_changed);
     assert_eq!(mode(ctx, conf)?, 0o600);
 
+    // Setuid survives a rewrite. The mode already matched when `check`
+    // planned the second write, but replacing the file chowns its new inode,
+    // which clears setuid on a real kernel: every wanted attribute has to be
+    // set again after a rewrite, not only those that differed. The `Fake`
+    // models the clearing too (`copy_rewrite_of_a_setuid_file_keeps_the_bit`);
+    // this is the same property on a real kernel.
+    let suid = "/etc/rustible-test/files/suid";
+    changed_then_ok(ctx, "suid v1", || {
+        file::Copy::from_str("v1\n")
+            .to(suid)
+            .mode(0o4755)
+            .owner(65534, 65534)
+    })?;
+    changed_then_ok(ctx, "suid v2", || {
+        file::Copy::from_str("v2\n")
+            .to(suid)
+            .mode(0o4755)
+            .owner(65534, 65534)
+    })?;
+    assert_eq!(mode(ctx, suid)? & 0o7777, 0o4755);
+
     // Attrs: mode and owner on the existing file (uid 1 = daemon everywhere).
     changed_then_ok(ctx, "attrs", || {
         file::Attrs::at(conf).mode(0o644).owner(1, 1)

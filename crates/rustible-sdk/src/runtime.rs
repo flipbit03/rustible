@@ -624,12 +624,13 @@ mod tests {
         struct WarnsFromCheck;
         impl Op for WarnsFromCheck {
             type Output = ();
-            fn check(&self, sys: &System) -> crate::Result<Plan<()>> {
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> crate::Result<Plan<Self>> {
                 sys.warn("the op has an opinion");
                 Ok(Plan::Satisfied(()))
             }
-            fn apply(&self, _: &System, _: crate::Change) -> crate::Result<()> {
-                Ok(())
+            fn apply(&self, _: &System, intent: Self::Intent) -> crate::Result<()> {
+                match intent {}
             }
         }
 
@@ -703,11 +704,12 @@ mod tests {
         struct Boom;
         impl Op for Boom {
             type Output = ();
-            fn check(&self, _: &System) -> crate::Result<Plan<()>> {
+            type Intent = std::convert::Infallible;
+            fn check(&self, _: &System) -> crate::Result<Plan<Self>> {
                 Err(crate::Error::msg("deeper"))
             }
-            fn apply(&self, _: &System, _: crate::Change) -> crate::Result<()> {
-                Ok(())
+            fn apply(&self, _: &System, intent: Self::Intent) -> crate::Result<()> {
+                match intent {}
             }
         }
 

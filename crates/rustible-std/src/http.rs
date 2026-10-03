@@ -22,7 +22,7 @@ use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 use sha2::Digest;
 
-use crate::file::{Owner, apply_attrs, plan_attrs, write_with_backup};
+use crate::file::{AttrPlan, Owner, plan_attrs, write_with_backup};
 
 /// Default connect and response-header timeout. Ansible's `timeout` is 10s.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -381,18 +381,18 @@ impl Download {
         Ok((Some(stat), state))
     }
 
-    fn fetch(&self) -> Result<Vec<u8>> {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
         let agent = agent(self.timeout);
-        let mut req = agent.get(&self.url);
+        let mut req = agent.get(url);
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
         }
         let mut resp = req
             .call()
-            .map_err(|e| Error::msg(format!("GET {}: {e}", self.url)))?;
+            .map_err(|e| Error::msg(format!("GET {url}: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            bail!("GET {} returned {status}", self.url);
+            bail!("GET {url} returned {status}");
         }
         // Refuse before reading when the server declares a size over the
         // ceiling. A missing or lying `Content-Length` is caught below.
@@ -405,7 +405,7 @@ impl Download {
         {
             bail!(
                 "GET {}: Content-Length {len} exceeds the {} byte limit; raise it with .max_bytes()",
-                self.url,
+                url,
                 self.max_bytes
             );
         }
@@ -421,13 +421,13 @@ impl Download {
             .map_err(|e| {
                 Error::msg(format!(
                     "GET {}: reading the body (limit {} bytes, raise it with .max_bytes()): {e}",
-                    self.url, self.max_bytes
+                    url, self.max_bytes
                 ))
             })?;
         if body.len() as u64 > self.max_bytes {
             bail!(
                 "GET {}: the body is larger than the {} byte limit; raise it with .max_bytes()",
-                self.url,
+                url,
                 self.max_bytes
             );
         }
@@ -478,10 +478,43 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+/// What [`Download`]'s `check` decided: fetch the URL and write it, or only
+/// set the attributes of a file whose content is already right. The body is
+/// fetched by `apply` and never held here; the headers stay on the op.
+#[derive(Debug)]
+pub struct DownloadIntent {
+    dest: PathBuf,
+    /// `Some` when the content is missing or stale.
+    fetch: Option<Fetch>,
+    attrs: AttrPlan,
+}
+
+#[derive(Debug)]
+struct Fetch {
+    url: String,
+    /// Why the file is fetched, for the report: `missing`, or what made the
+    /// present one stale.
+    reason: String,
+}
+
+impl Intent for DownloadIntent {
+    fn diff(&self) -> Diff {
+        match &self.fetch {
+            // Size and digest are unknown until fetched; the diff says what
+            // would be fetched and why.
+            Some(Fetch { url, reason }) => {
+                Diff::summary(format!("GET {url} -> {} ({reason})", self.dest.display()))
+            }
+            None => Diff::attrs(self.dest.display().to_string(), self.attrs.changes()),
+        }
+    }
+}
+
 impl Op for Download {
     type Output = DownloadReport;
+    type Intent = DownloadIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<DownloadReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. http::Download is pure-Rust HTTP and TLS writing a file through `sys`; `ring` cross-compiles for Darwin.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -495,41 +528,42 @@ impl Op for Download {
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
         let reason = match state {
             ContentState::Current { sha256 } => {
-                let report = DownloadReport {
-                    url: self.url.clone(),
-                    path: self.dest.clone(),
-                    downloaded: false,
-                    bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
-                    sha256,
-                    backup_path: None,
-                };
-                if attrs.is_empty() {
-                    return Ok(Plan::Satisfied(report));
+                if !attrs.differs() {
+                    return Ok(Plan::Satisfied(DownloadReport {
+                        url: self.url.clone(),
+                        path: self.dest.clone(),
+                        downloaded: false,
+                        bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
+                        sha256,
+                        backup_path: None,
+                    }));
                 }
-                return Ok(Plan::change(Diff::Attrs {
-                    subject: self.dest.display().to_string(),
-                    changes: attrs,
+                return Ok(Plan::Change(DownloadIntent {
+                    dest: self.dest.clone(),
+                    fetch: None,
+                    attrs,
                 }));
             }
             ContentState::Missing => "missing".to_string(),
             ContentState::Stale(why) => why,
         };
-        // Size and digest are unknown until fetched; the diff says what would
-        // be fetched and why.
-        Ok(Plan::change(Diff::summary(format!(
-            "GET {} -> {} ({reason})",
-            self.url,
-            self.dest.display()
-        ))))
+        Ok(Plan::Change(DownloadIntent {
+            dest: self.dest.clone(),
+            fetch: Some(Fetch {
+                url: self.url.clone(),
+                reason,
+            }),
+            attrs,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<DownloadReport> {
+    fn apply(&self, sys: &System, intent: DownloadIntent) -> Result<DownloadReport> {
         let checksum = self.parsed_checksum()?;
-        // An attributes-only diff means the content already matched: no
-        // fetch. The report reads the file as it is rather than carrying a
-        // copy of what `check` saw.
-        if matches!(change.diff, Diff::Attrs { .. }) {
-            apply_attrs(sys, &self.dest, self.mode, self.owner)?;
+        let DownloadIntent { dest, fetch, attrs } = intent;
+        let Some(Fetch { url, .. }) = fetch else {
+            // The content already matched: no fetch. The report reads the
+            // file as it is rather than carrying a copy of what `check` saw.
+            attrs.apply(sys, &dest)?;
             let (stat, state) = self.content_state(sys, checksum.as_ref())?;
             let sha256 = match state {
                 ContentState::Current { sha256 } => sha256,
@@ -537,14 +571,14 @@ impl Op for Download {
             };
             return Ok(DownloadReport {
                 url: self.url.clone(),
-                path: self.dest.clone(),
+                path: dest,
                 downloaded: false,
                 bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
                 sha256,
                 backup_path: None,
             });
-        }
-        let bytes = self.fetch()?;
+        };
+        let bytes = self.fetch(&url)?;
         let sha256 = digest(Algorithm::Sha256, &bytes);
         if let Some(c) = &checksum {
             let actual = if c.algorithm == Algorithm::Sha256 {
@@ -554,18 +588,18 @@ impl Op for Download {
             };
             ensure!(
                 actual == c.hex,
-                "GET {}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
-                self.url,
+                "GET {url}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
                 c.algorithm.name(),
                 c.hex,
-                self.dest.display()
+                dest.display()
             );
         }
-        let backup_path = write_with_backup(sys, &self.dest, self.backup, &bytes)?;
-        apply_attrs(sys, &self.dest, self.mode, self.owner)?;
+        let backup_path = write_with_backup(sys, &dest, self.backup, &bytes)?;
+        // The rewrite replaced the file: every wanted attribute is set again.
+        attrs.apply(sys, &dest)?;
         Ok(DownloadReport {
-            url: self.url.clone(),
-            path: self.dest.clone(),
+            url,
+            path: dest,
             downloaded: true,
             bytes: bytes.len() as u64,
             sha256: Some(sha256),
@@ -833,11 +867,11 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         let c = expect_change(&op.clone().force(true), &sys);
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "GET http://h/hello.txt -> /opt/hello.txt (force)"
         );
-        // A download is a summary diff: the shape `apply` fetches on.
-        assert!(matches!(c.diff, Diff::Summary(_)));
+        // A download is an intent to fetch, which is what `apply` acts on.
+        assert!(c.fetch.is_some());
     }
 
     #[test]
@@ -853,7 +887,7 @@ mod tests {
             &sys,
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "GET http://h/hello.txt -> /opt/hello.txt (missing)"
         );
         let c = expect_change(
@@ -863,7 +897,7 @@ mod tests {
             &sys,
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "GET http://h/hello.txt -> /opt/other.txt (sha256 is 2d711642b726..., want 86a9660ed957...)"
         );
     }
@@ -881,10 +915,10 @@ mod tests {
             .mode(0o755)
             .owner(10, 20);
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "mode=0755 owner=10:20");
-        // An attributes-only diff is the shape `apply` branches on: no
+        assert_eq!(c.diff().short(), "mode=0755 owner=10:20");
+        // An intent with no fetch is what `apply` branches on: no
         // fetch, and the host name above would fail one.
-        assert!(matches!(c.diff, Diff::Attrs { .. }));
+        assert!(c.fetch.is_none());
         let r = op.apply(&sys, c).unwrap();
         // No `.checksum`, so the destination is never read or hashed and
         // the report carries no digest: the whole point of the laziness.
@@ -1014,7 +1048,7 @@ mod tests {
         // (the host does not resolve, so a fetch would have failed loudly).
         let dry = fake_sys(&fake).with_check_mode(true);
         let c = expect_change(&Download::get("http://h/x").to("/missing/x"), &dry);
-        assert_eq!(c.diff.short(), "GET http://h/x -> /missing/x (missing)");
+        assert_eq!(c.diff().short(), "GET http://h/x -> /missing/x (missing)");
         assert!(fake.file("/missing").is_none() && fake.file("/missing/x").is_none());
         assert!(
             err(Download::get("http://h/x").to("/etc/f/x")).contains("/etc/f is not a directory")

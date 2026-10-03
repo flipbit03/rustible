@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use rustible_sdk::backend::{FileKind, Stat};
 use rustible_sdk::prelude::*;
 
-use crate::file::{Owner, apply_attrs, plan_attrs};
+use crate::file::{AttrPlan, Owner, plan_attrs};
 
 /// The mode `~/.ssh` is held at: what `sshd(8)` recommends, and what
 /// `ansible.posix.authorized_key` sets.
@@ -331,9 +331,7 @@ pub struct KeysReport {
     /// Keys this step deleted, as they were in the file (options and comment
     /// included).
     pub removed: Vec<PublicKey>,
-    /// Requested keys that were already there, as they are in the file — or
-    /// as requested, when `apply` only repaired attributes and so had no
-    /// reason to read the file again.
+    /// Requested keys that were already there, as they are in the file.
     pub already_present: Vec<PublicKey>,
     /// Keys asked to be absent that were not in the file, as requested.
     pub not_present: Vec<PublicKey>,
@@ -494,15 +492,35 @@ fn read_existing(sys: &System, path: &Path) -> Result<Option<(String, Stat)>> {
     }
 }
 
-/// What `check` decided about `~/.ssh`.
-#[derive(Debug, Default)]
-struct SshDir {
-    /// The directory this step will create. `None` when it is already there,
-    /// or when this form of the op owns no directory.
-    create: Option<PathBuf>,
-    /// Attribute differences to report and repair, `exists` included when
-    /// the directory is being created. Empty when it is already right.
-    changes: Vec<AttrChange>,
+/// What `check` decided about `~/.ssh`, in the user forms.
+#[derive(Debug)]
+struct DirPlan {
+    path: PathBuf,
+    /// Absent: this step makes it (and only it, never the home).
+    create: bool,
+    /// Its mode and owner against 0700 and the account.
+    attrs: AttrPlan,
+}
+
+impl DirPlan {
+    /// Whether the directory is part of the change at all.
+    fn changes(&self) -> bool {
+        self.create || self.attrs.differs()
+    }
+
+    /// The directory's block of the report, which renders exactly as the
+    /// `file::Directory` step it replaces would have.
+    fn diff(&self) -> Option<Diff> {
+        if !self.changes() {
+            return None;
+        }
+        let mut changes = vec![];
+        if self.create {
+            changes.push(AttrChange::new("exists", "no", "yes"));
+        }
+        changes.extend(self.attrs.changes());
+        Some(Diff::attrs(self.path.display().to_string(), changes))
+    }
 }
 
 /// Plan `~/.ssh` in the user forms: create it when it is absent, and hold it
@@ -521,10 +539,10 @@ struct SshDir {
 ///
 /// Two refusals survive, both "something unexpected is in the way": `.ssh`
 /// is not a directory, or it is a symlink pointing at nothing.
-fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<SshDir> {
+fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<Option<DirPlan>> {
     let Some(dir) = &resolved.ssh_dir else {
         check_given_parent(sys, &resolved.path)?;
-        return Ok(SshDir::default());
+        return Ok(None);
     };
 
     // `stat_follow`, so a symlinked `.ssh` — a home on shared storage is
@@ -539,10 +557,11 @@ fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<SshDir> {
                 dir.display()
             );
         }
-        return Ok(SshDir {
-            create: None,
-            changes: plan_attrs(Some(&s), Some(SSH_DIR_MODE), resolved.file_owner()),
-        });
+        return Ok(Some(DirPlan {
+            path: dir.clone(),
+            create: false,
+            attrs: plan_attrs(Some(&s), Some(SSH_DIR_MODE), resolved.file_owner()),
+        }));
     }
 
     // `stat_follow` reports a dangling symlink as absent, and `mkdir` would
@@ -581,16 +600,11 @@ fn plan_ssh_dir(sys: &System, resolved: &Resolved) -> Result<SshDir> {
     // all. A run that can act always takes the refusal above, because it
     // runs `check` with check mode off, and `Present::apply` verifies the
     // home once more rather than resting on that.
-    let mut changes = vec![AttrChange {
-        name: "exists".into(),
-        from: "no".into(),
-        to: "yes".into(),
-    }];
-    changes.extend(plan_attrs(None, Some(SSH_DIR_MODE), resolved.file_owner()));
-    Ok(SshDir {
-        create: Some(dir.clone()),
-        changes,
-    })
+    Ok(Some(DirPlan {
+        path: dir.clone(),
+        create: true,
+        attrs: plan_attrs(None, Some(SSH_DIR_MODE), resolved.file_owner()),
+    }))
 }
 
 /// The `in_file` form owns the file it was handed and nothing around it: it
@@ -620,38 +634,6 @@ fn check_given_parent(sys: &System, path: &Path) -> Result<()> {
     }
 }
 
-/// The attributes `check` put in the diff for `subject`, as `apply_attrs`
-/// takes them. `apply` sets exactly these and no others, because the plan is
-/// the instruction — `check` does the thinking, `apply` executes it: a `check` that
-/// found the mode already right does not chmod, so an unescalated run
-/// managing its own keys is never asked to chown a file it already owns.
-fn planned_attrs(
-    diff: &Diff,
-    subject: &Path,
-    mode: u32,
-    owner: Option<Owner>,
-) -> (Option<u32>, Option<Owner>) {
-    let subject = subject.display().to_string();
-    for part in diff.parts() {
-        if let Diff::Attrs {
-            subject: s,
-            changes,
-        } = part
-            && *s == subject
-        {
-            return (
-                changes.iter().any(|c| c.name == "mode").then_some(mode),
-                changes
-                    .iter()
-                    .any(|c| c.name == "owner")
-                    .then_some(owner)
-                    .flatten(),
-            );
-        }
-    }
-    (None, None)
-}
-
 /// Under `--check`, the directory a plan with nothing else to do is waiting
 /// on: the account's home (user forms) or the file's parent (`in_file`),
 /// when it is not there yet. With no key to write and no file to fix such a
@@ -659,7 +641,7 @@ fn planned_attrs(
 /// machine where a real run refuses today; `would change`, saying what it
 /// waits for, is the honest answer (vision 12). `None` outside check mode
 /// and whenever the directory exists.
-fn waiting_on_under_check(sys: &System, resolved: &Resolved) -> Result<Option<Diff>> {
+fn waiting_on_under_check(sys: &System, resolved: &Resolved) -> Result<Option<PathBuf>> {
     if !sys.check_mode() {
         return Ok(None);
     }
@@ -674,86 +656,24 @@ fn waiting_on_under_check(sys: &System, resolved: &Resolved) -> Result<Option<Di
     if sys.stat_follow(dir)?.is_some() {
         return Ok(None);
     }
-    Ok(Some(Diff::summary(format!(
-        "{}: does not exist yet; ssh::authorized_keys would manage {} once an earlier step \
-         creates it",
-        dir.display(),
-        resolved.path.display()
-    ))))
+    Ok(Some(dir.to_path_buf()))
 }
 
-/// The attribute changes for an existing `~/.ssh`, and none when the op owns
-/// no directory. Unlike [`plan_ssh_dir`] this never plans a creation: its
+/// The plan for an existing `~/.ssh`, and none when the op owns no
+/// directory. Unlike [`plan_ssh_dir`] this never plans a creation: its
 /// caller has already found the file, so the directory holding it is there.
-fn plan_existing_dir_attrs(sys: &System, resolved: &Resolved) -> Result<Vec<AttrChange>> {
+fn plan_existing_dir(sys: &System, resolved: &Resolved) -> Result<Option<DirPlan>> {
     let Some(dir) = &resolved.ssh_dir else {
-        return Ok(vec![]);
+        return Ok(None);
     };
     Ok(match sys.stat_follow(dir)? {
-        Some(s) if s.kind == FileKind::Dir => {
-            plan_attrs(Some(&s), Some(SSH_DIR_MODE), resolved.file_owner())
-        }
-        _ => vec![],
-    })
-}
-
-/// `apply` resolves the target a second time, and for [`Target::User`] that
-/// is a second read of `/etc/passwd`. If the account moved in between, every
-/// path in the plan is about a file the machine no longer has: `mkdir_all`
-/// would make the old `~/.ssh`, the write would go to a directory `check`
-/// never inspected, and the attribute parts would match no subject and be
-/// skipped in silence. One comparison of the paths the diff names against
-/// the ones resolved now turns all of that into a refusal.
-fn ensure_same_target(resolved: &Resolved, diff: &Diff) -> Result<()> {
-    let ours = |p: &str| {
-        p == resolved.path.display().to_string()
-            || resolved
-                .ssh_dir
-                .as_ref()
-                .is_some_and(|d| p == d.display().to_string())
-    };
-    let planned = diff.parts().iter().find_map(|part| match part {
-        Diff::Text { path, .. } if !ours(&path.display().to_string()) => {
-            Some(path.display().to_string())
-        }
-        Diff::Attrs { subject, .. } if !ours(subject) => Some(subject.clone()),
+        Some(s) if s.kind == FileKind::Dir => Some(DirPlan {
+            path: dir.clone(),
+            create: false,
+            attrs: plan_attrs(Some(&s), Some(SSH_DIR_MODE), resolved.file_owner()),
+        }),
         _ => None,
-    });
-    if let Some(planned) = planned {
-        bail!(
-            "the account moved between check and apply: this step planned {planned} and now \
-             resolves to {}. Nothing was written. Re-run, and if it keeps happening \
-             something else is editing /etc/passwd while the playbook runs",
-            resolved.path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Whether the diff plans to create `subject`: its attribute part carries an
-/// `exists` change. `apply` creates exactly what `check` said it would.
-fn planned_creation(diff: &Diff, subject: &Path) -> bool {
-    let subject = subject.display().to_string();
-    diff.parts().iter().any(|part| {
-        matches!(part, Diff::Attrs { subject: s, changes }
-            if *s == subject && changes.iter().any(|c| c.name == "exists"))
     })
-}
-
-/// Apply the attribute parts `check` planned for the directory and the file.
-/// Shared by [`Present`] and [`Absent`], which differ in *when* they plan
-/// them, not in how they are applied.
-///
-/// A subject that matches no part means "`check` found nothing to fix here",
-/// which is the common case; it cannot mean "the plan was about another
-/// path", because [`ensure_same_target`] has already refused that.
-fn apply_planned_attrs(sys: &System, resolved: &Resolved, diff: &Diff) -> Result<()> {
-    if let Some(dir) = &resolved.ssh_dir {
-        let (mode, owner) = planned_attrs(diff, dir, SSH_DIR_MODE, resolved.file_owner());
-        apply_attrs(sys, dir, mode, owner)?;
-    }
-    let (mode, owner) = planned_attrs(diff, &resolved.path, KEYS_FILE_MODE, resolved.file_owner());
-    apply_attrs(sys, &resolved.path, mode, owner)
 }
 
 /// Context for a failed `chmod`/`chown`. Without it the step fails with a
@@ -779,32 +699,122 @@ fn attr_context(path: &Path, owner: Option<Owner>) -> String {
     }
 }
 
-/// The new file text in a plan, or `None` when only attributes were wrong
-/// and the contents are already what they should be.
-fn planned_text(diff: &Diff) -> Option<&str> {
-    diff.parts().iter().find_map(|p| match p {
-        Diff::Text { after, .. } => Some(after.as_str()),
-        _ => None,
-    })
+/// What `check` decided for one `authorized_keys` file: the file as it
+/// resolved it, the account's `~/.ssh` (user forms), the text it read and
+/// what the pure planner made of it, and the file's attributes. The intent
+/// of [`Absent`], and of [`Present`] whenever it has work to do.
+///
+/// `apply` acts on these paths and no others: the account is resolved once,
+/// by `check`, so a second read of `/etc/passwd` cannot send the keys
+/// somewhere `check` never inspected.
+#[derive(Debug)]
+pub struct KeysWrite {
+    path: PathBuf,
+    dir: Option<DirPlan>,
+    /// The file's text as `check` read it; empty when there is no file.
+    before: String,
+    /// The pure planner's verdict on `before`: the text to write (`None`
+    /// when the keys are already right) and which keys move.
+    planned: Planned,
+    /// The file's mode and owner. Nothing planned for an `in_file` target
+    /// that already exists.
+    file_attrs: AttrPlan,
 }
 
-/// The file text `check` planned against, when the plan rewrites the file.
-/// `apply` builds its report from this rather than from a fresh read, so
-/// what it reports is what it wrote even if the file moved on in between.
-fn planned_before(diff: &Diff) -> Option<&str> {
-    diff.parts().iter().find_map(|p| match p {
-        Diff::Text { before, .. } => Some(before.as_str()),
-        _ => None,
-    })
+impl KeysWrite {
+    /// True when nothing would change: no directory work, no text, no
+    /// attribute to fix.
+    fn is_noop(&self) -> bool {
+        !self.dir.as_ref().is_some_and(DirPlan::changes)
+            && self.planned.text.is_none()
+            && !self.file_attrs.differs()
+    }
+
+    /// The report: which keys moved, as `check` planned them against the
+    /// text it read, so it describes exactly what this step writes.
+    fn into_report(self, created_dir: Option<PathBuf>) -> KeysReport {
+        let (_, mut report) = self.planned.into_report(self.path);
+        report.created_dir = created_dir;
+        report
+    }
+
+    /// Set the attributes `check` found wrong, and no others: a `check` that
+    /// found the owner already right plans no `chown`, so none is issued (a
+    /// `chown` that changes the owner needs root; one that doesn't would be
+    /// a needless call that also clears setuid).
+    fn fix_dir_attrs(&self, sys: &System) -> Result<()> {
+        if let Some(dir) = &self.dir {
+            dir.attrs
+                .apply_differing(sys, &dir.path)
+                .with_context(|| attr_context(&dir.path, dir.attrs.owner_to_set()))?;
+        }
+        Ok(())
+    }
+
+    fn fix_file_attrs(&self, sys: &System) -> Result<()> {
+        self.file_attrs
+            .apply_differing(sys, &self.path)
+            .with_context(|| attr_context(&self.path, self.file_attrs.owner_to_set()))
+    }
 }
 
-/// Write the planned text, and nothing else. The mode and the owner come
-/// from the attributes `check` planned, so this never asks the machine a
-/// question whose answer could have changed since.
-fn write_file(sys: &System, resolved: &Resolved, text: &str) -> Result<()> {
-    sys.write_atomic(&resolved.path, text.as_bytes())
+impl Intent for KeysWrite {
+    fn diff(&self) -> Diff {
+        // Filesystem order: the directory, then the file's contents, then
+        // the file's attributes.
+        let mut parts = Vec::new();
+        parts.extend(self.dir.as_ref().and_then(DirPlan::diff));
+        if let Some(after) = &self.planned.text {
+            parts.push(Diff::text(&self.path, self.before.as_str(), after.as_str()));
+        }
+        if self.file_attrs.differs() {
+            parts.push(Diff::attrs(
+                self.path.display().to_string(),
+                self.file_attrs.changes(),
+            ));
+        }
+        // `check` returns `Satisfied` for a plan with no part, so this
+        // fallback is never what a report shows.
+        Diff::many(parts)
+            .unwrap_or_else(|| Diff::summary(format!("{}: nothing to change", self.path.display())))
+    }
 }
 
+/// What [`Present`]'s `check` decided. Its contents are private: only
+/// `check` builds one, so a [`KeysWrite`] from [`Absent`] cannot be handed
+/// to `Present::apply`.
+#[derive(Debug)]
+pub struct KeysIntent(Keys);
+
+#[derive(Debug)]
+enum Keys {
+    /// Write the keys, and bring the file and `~/.ssh` to what sshd needs.
+    Write(Box<KeysWrite>),
+    /// The directory everything waits on (the account's home, or the
+    /// `in_file` parent) is not there yet and there is nothing else to do.
+    /// Only `check` under `--check` produces this, so it is reported and
+    /// never applied; a real run's `check` refuses the missing directory.
+    Await {
+        /// The directory that is not there yet.
+        dir: PathBuf,
+        /// The file the op would manage once it is.
+        path: PathBuf,
+    },
+}
+
+impl Intent for KeysIntent {
+    fn diff(&self) -> Diff {
+        match &self.0 {
+            Keys::Write(write) => write.diff(),
+            Keys::Await { dir, path } => Diff::summary(format!(
+                "{}: does not exist yet; ssh::authorized_keys would manage {} once an earlier \
+                 step creates it",
+                dir.display(),
+                path.display()
+            )),
+        }
+    }
+}
 /// Ensure keys are in a user's `authorized_keys`. Ansible's
 /// `ansible.posix.authorized_key` with `state: present`.
 ///
@@ -935,18 +945,26 @@ impl PresentBuilder {
 
 impl Op for Present {
     type Output = KeysReport;
+    type Intent = KeysIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<KeysReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         let keys = parse_keys(&self.keys)?;
         let resolved = self.target.resolve(sys)?;
         let dir = plan_ssh_dir(sys, &resolved)?;
         let existing = read_existing(sys, &resolved.path)?;
         let (before, before_stat) = match existing {
-            Some((text, stat)) => (Some(text), Some(stat)),
-            None => (None, None),
+            Some((text, stat)) => (text, Some(stat)),
+            None => (String::new(), None),
         };
-        let planned = plan_present(before.as_deref().unwrap_or(""), &keys, self.exclusive);
-        let (text, report) = planned.into_report(resolved.path.clone());
+        let planned = plan_present(&before, &keys, self.exclusive);
+        let waiting = |sys: &System| -> Result<Option<KeysIntent>> {
+            Ok(waiting_on_under_check(sys, &resolved)?.map(|dir| {
+                KeysIntent(Keys::Await {
+                    dir,
+                    path: resolved.path.clone(),
+                })
+            }))
+        };
 
         // `~/.ssh` is created to hold a file, never for its own sake: with
         // no key to write and no file to protect, a missing directory stays
@@ -961,11 +979,14 @@ impl Op for Present {
         // depend on something unrelated to it. `rustible_github`'s helper
         // reaches exactly that case: it warns when a GitHub login has no
         // public keys and then runs this op with an empty list.
-        if text.is_none() && before_stat.is_none() && dir.create.is_some() {
-            if let Some(waiting) = waiting_on_under_check(sys, &resolved)? {
-                return Ok(Plan::change(waiting));
+        if planned.text.is_none() && before_stat.is_none() && dir.as_ref().is_some_and(|d| d.create)
+        {
+            if let Some(waiting) = waiting(sys)? {
+                return Ok(Plan::Change(waiting));
             }
-            return Ok(Plan::Satisfied(report));
+            return Ok(Plan::Satisfied(
+                planned.into_report(resolved.path.clone()).1,
+            ));
         }
 
         // The file's mode and owner, planned whether or not it exists yet, so
@@ -978,6 +999,7 @@ impl Op for Present {
         // `in_file` is the exception in the other direction. It was handed a
         // path and told nothing about who should own it, so it sets the mode
         // on a file it creates and leaves one that already exists alone.
+        let writes = planned.text.is_some();
         let file_attrs = match (resolved.file_owner(), &before_stat) {
             // A file that is already there: repaired.
             (Some(o), Some(stat)) => plan_attrs(Some(stat), Some(KEYS_FILE_MODE), Some(o)),
@@ -985,73 +1007,41 @@ impl Op for Present {
             // there is text to write. With nothing to write no file appears,
             // and planning its mode would have `apply` chmod a path that is
             // not there.
-            (Some(o), None) if text.is_some() => plan_attrs(None, Some(KEYS_FILE_MODE), Some(o)),
-            (None, None) if text.is_some() => plan_attrs(None, Some(KEYS_FILE_MODE), None),
-            _ => vec![],
+            (Some(o), None) if writes => plan_attrs(None, Some(KEYS_FILE_MODE), Some(o)),
+            (None, None) if writes => plan_attrs(None, Some(KEYS_FILE_MODE), None),
+            _ => AttrPlan::default(),
         };
 
-        // Filesystem order: the directory, then the file's contents, then
-        // the file's attributes.
-        let mut parts = Vec::new();
-        if !dir.changes.is_empty()
-            && let Some(d) = &resolved.ssh_dir
-        {
-            parts.push(Diff::Attrs {
-                subject: d.display().to_string(),
-                changes: dir.changes,
-            });
-        }
-        if let Some(after) = text {
-            parts.push(Diff::text(
-                &resolved.path,
-                before.unwrap_or_default(),
-                after,
-            ));
-        }
-        if !file_attrs.is_empty() {
-            parts.push(Diff::Attrs {
-                subject: resolved.path.display().to_string(),
-                changes: file_attrs,
-            });
-        }
-        let Some(diff) = Diff::many(parts) else {
-            if let Some(waiting) = waiting_on_under_check(sys, &resolved)? {
-                return Ok(Plan::change(waiting));
-            }
-            return Ok(Plan::Satisfied(report));
+        let write = KeysWrite {
+            path: resolved.path.clone(),
+            dir,
+            before,
+            planned,
+            file_attrs,
         };
-        Ok(Plan::change(diff))
+        if write.is_noop() {
+            if let Some(waiting) = waiting(sys)? {
+                return Ok(Plan::Change(waiting));
+            }
+            return Ok(Plan::Satisfied(write.into_report(None)));
+        }
+        Ok(Plan::Change(KeysIntent(Keys::Write(Box::new(write)))))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<KeysReport> {
-        let resolved = self.target.resolve(sys)?;
-        ensure_same_target(&resolved, &change.diff)?;
-        // The output is what the pure plan says against the text the diff
-        // was planned on, so it describes exactly what this step writes. An
-        // attributes-only plan carries no text because `check` found every
-        // key already there: say so, as requested, rather than re-read a
-        // file this step does not write and report a change it did not make.
-        let keys = parse_keys(&self.keys)?;
-        let mut report = match planned_before(&change.diff) {
-            Some(text) => {
-                plan_present(text, &keys, self.exclusive)
-                    .into_report(resolved.path.clone())
-                    .1
-            }
-            None => KeysReport {
-                path: resolved.path.clone(),
-                already_present: dedupe(&keys),
-                ..Default::default()
-            },
+    fn apply(&self, sys: &System, intent: KeysIntent) -> Result<KeysReport> {
+        let write = match intent.0 {
+            Keys::Write(write) => *write,
+            // The refusal a real run's `check` gives for the same machine.
+            Keys::Await { dir, path } => bail!(
+                "{} does not exist, so ssh::authorized_keys cannot manage {}",
+                dir.display(),
+                path.display()
+            ),
         };
 
-        // The directory first: the file goes inside it. Whether it is to be
-        // created is what the diff says.
-        if let Some(dir) = resolved
-            .ssh_dir
-            .as_ref()
-            .filter(|d| planned_creation(&change.diff, d))
-        {
+        // The directory first: the file goes inside it.
+        let mut created_dir = None;
+        if let Some(dir) = write.dir.as_ref().filter(|d| d.create) {
             // `check` refuses a missing home, and only a dry run — which
             // never reaches `apply` (`Ctx::step` returns at the check-mode
             // arm) — is allowed past that. Verify rather than trust: the only
@@ -1059,38 +1049,27 @@ impl Op for Present {
             // directory root-owned and 0755, and that is the one outcome
             // this op promises never to produce. One `stat` is a cheap price
             // for making the promise structural.
-            let home = dir.parent().unwrap_or(dir.as_path());
+            let home = dir.path.parent().unwrap_or(dir.path.as_path());
             if sys.stat_follow(home)?.is_none() {
                 bail!(
                     "home directory {} disappeared between check and apply; refusing to \
                      create {} because doing so would create the home too, root-owned",
                     home.display(),
-                    dir.display()
+                    dir.path.display()
                 );
             }
-            sys.mkdir_all(dir)?;
-            report.created_dir = Some(dir.clone());
+            sys.mkdir_all(&dir.path)?;
+            created_dir = Some(dir.path.clone());
         }
-        if let Some(dir) = &resolved.ssh_dir {
-            let (mode, owner) =
-                planned_attrs(&change.diff, dir, SSH_DIR_MODE, resolved.file_owner());
-            apply_attrs(sys, dir, mode, owner).with_context(|| attr_context(dir, owner))?;
-        }
+        write.fix_dir_attrs(sys)?;
 
         // Absent when only the attributes were wrong: the keys in the file
         // are already the ones asked for.
-        if let Some(after) = planned_text(&change.diff) {
-            write_file(sys, &resolved, after)?;
+        if let Some(after) = &write.planned.text {
+            sys.write_atomic(&write.path, after.as_bytes())?;
         }
-        let (mode, owner) = planned_attrs(
-            &change.diff,
-            &resolved.path,
-            KEYS_FILE_MODE,
-            resolved.file_owner(),
-        );
-        apply_attrs(sys, &resolved.path, mode, owner)
-            .with_context(|| attr_context(&resolved.path, owner))?;
-        Ok(report)
+        write.fix_file_attrs(sys)?;
+        Ok(write.into_report(created_dir))
     }
 }
 
@@ -1182,17 +1161,17 @@ impl AbsentBuilder {
 
 impl Op for Absent {
     type Output = KeysReport;
+    type Intent = KeysWrite;
 
-    fn check(&self, sys: &System) -> Result<Plan<KeysReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         let keys = parse_keys(&self.keys)?;
         let resolved = self.target.resolve(sys)?;
         let existing = read_existing(sys, &resolved.path)?;
         let (before, before_stat) = match existing {
-            Some((text, stat)) => (Some(text), Some(stat)),
-            None => (None, None),
+            Some((text, stat)) => (text, Some(stat)),
+            None => (String::new(), None),
         };
-        let planned = plan_absent(before.as_deref().unwrap_or(""), &keys);
-        let (text, report) = planned.into_report(resolved.path.clone());
+        let planned = plan_absent(&before, &keys);
 
         // Ansible's `do_write` gate. No key to remove means no write, and a
         // run that writes nothing takes no directory or ownership pass with
@@ -1200,63 +1179,41 @@ impl Op for Absent {
         // leaves even a wrong mode alone. `Present` is the op that asserts
         // what the account's keys should be, and the op to reach for when
         // the attributes are what need fixing.
-        let Some(after) = text else {
-            return Ok(Plan::Satisfied(report));
-        };
+        if planned.text.is_none() {
+            return Ok(Plan::Satisfied(planned.into_report(resolved.path).1));
+        }
 
         // It is rewriting the file, so the pass comes along. `before_stat`
         // is `Some` here: `plan_absent` only removes what it read.
-        let dir_changes = plan_existing_dir_attrs(sys, &resolved)?;
-        let file_changes = match (resolved.file_owner(), &before_stat) {
+        let dir = plan_existing_dir(sys, &resolved)?;
+        let file_attrs = match (resolved.file_owner(), &before_stat) {
             (Some(o), Some(stat)) => plan_attrs(Some(stat), Some(KEYS_FILE_MODE), Some(o)),
-            _ => vec![],
+            _ => AttrPlan::default(),
         };
-
-        let mut parts = Vec::new();
-        if !dir_changes.is_empty()
-            && let Some(dir) = &resolved.ssh_dir
-        {
-            parts.push(Diff::Attrs {
-                subject: dir.display().to_string(),
-                changes: dir_changes,
-            });
-        }
-        parts.push(Diff::text(
-            &resolved.path,
-            before.unwrap_or_default(),
-            after,
-        ));
-        if !file_changes.is_empty() {
-            parts.push(Diff::Attrs {
-                subject: resolved.path.display().to_string(),
-                changes: file_changes,
-            });
-        }
-        let diff = Diff::many(parts).expect("the text part is always there");
-        Ok(Plan::change(diff))
+        Ok(Plan::Change(KeysWrite {
+            path: resolved.path,
+            dir,
+            before,
+            planned,
+            file_attrs,
+        }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<KeysReport> {
-        let Some(after) = planned_text(&change.diff) else {
-            bail!("authorized_keys::Absent::apply received a change with no file text");
-        };
-        let resolved = self.target.resolve(sys)?;
-        ensure_same_target(&resolved, &change.diff)?;
-        // The output is what the pure plan says against the text the diff
-        // was planned on: exactly what this step writes. `Absent` always
-        // carries text, since it only changes when it rewrites the file.
-        let keys = parse_keys(&self.keys)?;
-        let before = planned_before(&change.diff).unwrap_or("");
-        let (_, report) = plan_absent(before, &keys).into_report(resolved.path.clone());
+    fn apply(&self, sys: &System, intent: KeysWrite) -> Result<KeysReport> {
         // Attributes first, and the directory's before the file's, the same
         // order `Present` uses: `write_atomic` makes its temporary file
         // inside the directory, so a `~/.ssh` this identity cannot write to
         // fails the write — even when the `mode: 0500 -> 0700` this step
         // just planned is exactly what would have made it writable.
-        apply_planned_attrs(sys, &resolved, &change.diff)?;
+        intent.fix_dir_attrs(sys)?;
+        intent.fix_file_attrs(sys)?;
         // The file exists: `check` found keys in it, so this never creates.
-        sys.write_atomic(&resolved.path, after.as_bytes())?;
-        Ok(report)
+        // `Absent` only changes when it rewrites the file, so the text is
+        // always there.
+        if let Some(after) = &intent.planned.text {
+            sys.write_atomic(&intent.path, after.as_bytes())?;
+        }
+        Ok(intent.into_report(None))
     }
 }
 
@@ -1264,7 +1221,7 @@ impl Op for Absent {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{AttrCall, Fake};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -1517,7 +1474,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "mode=0700 owner=1000:1001 +0 -1 lines mode=0600 owner=1000:1001"
         );
         assert_eq!(
@@ -1649,8 +1606,10 @@ mod tests {
     /// `Backend` trait, the way `sysctl.rs` drives a second read.
     fn set_attrs(fake: &Arc<Fake>, path: &str, mode: u32, uid: u32, gid: u32) {
         use rustible_sdk::backend::Backend;
-        Backend::set_mode(&**fake, Path::new(path), mode).unwrap();
+        // Owner first: `chown` clears setuid, so a fixture planting one sets
+        // the mode last, as an op does.
         Backend::set_owner(&**fake, Path::new(path), uid, gid).unwrap();
+        Backend::set_mode(&**fake, Path::new(path), mode).unwrap();
     }
 
     /// A `.ssh` that is already right: 0700, owned by cadu. `with_dir`
@@ -1678,7 +1637,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            change.diff.short(),
+            change.diff().short(),
             "+2 -0 lines mode=0600 owner=1000:1001",
             "a created file's mode and owner are planned, not left to apply"
         );
@@ -1735,7 +1694,7 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "mode=0700 owner=1000:1001 +1 -0 lines mode=0600 owner=1000:1001"
         );
         op.apply(&sys, c).unwrap();
@@ -1752,15 +1711,56 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
+    /// With the account already owning `~/.ssh` and the file, a repair of
+    /// their modes issues two `chmod`s and no `chown`, for the directory and
+    /// for the file alike: the `chown` would change nothing, and is a
+    /// needless call that also clears setuid (one that changes the owner
+    /// needs root, which an unescalated run managing its own keys lacks).
+    /// Setting every wanted attribute instead, as `file::Copy` does after a
+    /// rewrite, would `chown` both.
+    #[test]
+    fn a_mode_repair_issues_no_chown_when_the_owner_is_already_right() {
+        let fake = fake_with_user_and_ssh_dir();
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new("/home/cadu/.ssh/authorized_keys"),
+            format!("{K1}\n").as_bytes(),
+        )
+        .unwrap();
+        set_attrs(&fake, "/home/cadu/.ssh/authorized_keys", 0o644, 1000, 1001);
+        set_attrs(&fake, "/home/cadu/.ssh", 0o755, 1000, 1001);
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("both modes are wrong")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/home/cadu/.ssh".into(),
+                    mode: 0o700
+                },
+                AttrCall::Chmod {
+                    path: "/home/cadu/.ssh/authorized_keys".into(),
+                    mode: 0o600
+                },
+            ]
+        );
+    }
+
     /// The attributes are a change in their own right: the keys can be
     /// exactly as asked for while the file is still readable by everyone.
     ///
     /// The rendered diff is asserted whole because of what is *missing* from
     /// it. The file is already owned by the account, so no `owner` line is
-    /// planned — and `apply` sets only what the diff names, so no `chown`
-    /// happens. That is what keeps an unescalated run working: `chown` needs
-    /// root, and a run managing its own keys must not be asked to give away
-    /// a file it already owns just because the mode was wrong.
+    /// planned — and `apply` sets only what the intent says differs, so no
+    /// `chown` happens: one that changes the owner needs root, and one that
+    /// doesn't is a needless call that also clears setuid.
+    /// `a_mode_repair_issues_no_chown_when_the_owner_is_already_right`
+    /// asserts on the calls themselves.
     #[test]
     fn a_wrong_mode_alone_is_a_change_with_no_text_diff() {
         let fake = fake_with_user_and_ssh_dir();
@@ -1778,7 +1778,7 @@ mod tests {
             panic!("a mode sshd rejects is a change")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/home/cadu/.ssh/authorized_keys:\n  mode: 0644 -> 0600\n",
             "no text part: the keys are already right"
         );
@@ -1928,11 +1928,7 @@ mod tests {
         let Plan::Change(c) = op.check(&dry).unwrap() else {
             panic!("check mode tolerates a missing home")
         };
-        assert!(
-            planned_creation(&c.diff, Path::new("/home/cadu/.ssh")),
-            "{}",
-            c.diff.render()
-        );
+        assert!(creates_ssh_dir(&c), "{}", c.diff().render());
 
         // Handing that plan to a real `apply` must not make the home.
         let err = op.apply(&fake_sys(&fake), c).unwrap_err().chain();
@@ -2009,19 +2005,20 @@ mod tests {
         // exactly as the `file::Directory` step it replaces would have; the
         // file's is planned too, even though the file is new, so `apply`
         // never has to ask the machine whether it created it.
-        let parts = c.diff.parts();
-        assert_eq!(parts.len(), 3, "{}", c.diff.render());
+        let KeysIntent(Keys::Write(w)) = &c else {
+            panic!("expected a write: {}", c.diff().render())
+        };
         assert_eq!(
-            parts[0].render(),
+            w.dir.as_ref().and_then(DirPlan::diff).unwrap().render(),
             "/home/cadu/.ssh:\n  exists: no -> yes\n  mode: - -> 0700\n  owner: - -> 1000:1001\n"
         );
-        assert!(matches!(parts[1], Diff::Text { .. }));
+        assert!(w.planned.text.is_some());
         assert_eq!(
-            parts[2].render(),
+            Diff::attrs(w.path.display().to_string(), w.file_attrs.changes()).render(),
             "/home/cadu/.ssh/authorized_keys:\n  mode: - -> 0600\n  owner: - -> 1000:1001\n"
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes mode=0700 owner=1000:1001 +1 -0 lines mode=0600 owner=1000:1001"
         );
         assert!(
@@ -2100,11 +2097,7 @@ mod tests {
         else {
             panic!("a dry run of a first provision must not fail")
         };
-        assert!(
-            planned_creation(&c.diff, Path::new("/home/cadu/.ssh")),
-            "{}",
-            c.diff.render()
-        );
+        assert!(creates_ssh_dir(&c), "{}", c.diff().render());
         assert!(fake.file("/home/cadu").is_none());
     }
 
@@ -2126,7 +2119,7 @@ mod tests {
             panic!("would change, not ok")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/home/cadu: does not exist yet; ssh::authorized_keys would manage \
              /home/cadu/.ssh/authorized_keys once an earlier step creates it"
         );
@@ -2148,7 +2141,7 @@ mod tests {
             panic!("would change, not ok")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/etc/ssh/keys: does not exist yet; ssh::authorized_keys would manage \
              /etc/ssh/keys/root once an earlier step creates it"
         );
@@ -2201,7 +2194,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert!(!planned_creation(&c.diff, Path::new("/home/cadu/.ssh")));
+        assert!(!creates_ssh_dir(&c));
         let report = op.apply(&sys, c).unwrap();
         assert_eq!(report.created_dir, None, "the directory was already there");
         let target = fake.file("/srv/keys/cadu").unwrap();
@@ -2294,7 +2287,7 @@ mod tests {
         let Plan::Change(c) = op.check(&dry).unwrap() else {
             panic!("a dry run must not fail on a parent an earlier step creates")
         };
-        assert_eq!(c.diff.short(), "+1 -0 lines mode=0600");
+        assert_eq!(c.diff().short(), "+1 -0 lines mode=0600");
         assert!(fake.file("/etc/ssh/keys").is_none(), "nothing was created");
 
         let err = op.check(&fake_sys(&fake)).unwrap_err().chain();
@@ -2355,7 +2348,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "+0 -1 lines");
+        assert_eq!(c.diff().short(), "+0 -1 lines");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.removed, vec![key(K2)]);
         assert!(r.not_present.is_empty());
@@ -2368,8 +2361,8 @@ mod tests {
 
     /// An attributes-only plan carries no text, and `apply` writes none: its
     /// report says what `check` established (every key already there, as
-    /// requested) even when the file moved on in between, rather than
-    /// re-reading it and reporting a key it never wrote.
+    /// `check` found it in the file) even when the file moved on in between,
+    /// rather than re-reading it and reporting a key it never wrote.
     #[test]
     fn attributes_only_apply_reports_what_check_found_not_what_the_file_says_now() {
         let fake = fake_with_wrong_attributes();
@@ -2379,9 +2372,9 @@ mod tests {
             panic!("the attributes are wrong")
         };
         assert!(
-            planned_text(&c.diff).is_none(),
+            matches!(&c, KeysIntent(Keys::Write(w)) if w.planned.text.is_none()),
             "attributes only: {}",
-            c.diff.short()
+            c.diff().short()
         );
         // Someone removes K1 between check and apply.
         rustible_sdk::backend::Backend::write(
@@ -2429,7 +2422,7 @@ mod tests {
             panic!("expected change")
         };
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "mode=0700 owner=1000:1001 +0 -1 lines mode=0600 owner=1000:1001"
         );
         op.apply(&sys, c).unwrap();
@@ -2481,7 +2474,7 @@ mod tests {
             panic!("a group-writable .ssh is a change even with nothing to write")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/home/cadu/.ssh:\n  mode: 0755 -> 0700\n  owner: 0:0 -> 1000:1001\n",
             "the directory alone: no file was written and none exists"
         );
@@ -2517,7 +2510,7 @@ mod tests {
             panic!("a 0755 root-owned .ssh is a change on its own")
         };
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/home/cadu/.ssh:\n  mode: 0755 -> 0700\n  owner: 0:0 -> 1000:1001\n",
             "only the directory: the keys and the file are already right"
         );
@@ -2527,14 +2520,14 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
-    /// `apply` sets the attributes the diff names and no others. The
+    /// `apply` sets the attributes the intent plans and no others. The
     /// `in_file` form is where that is observable: it plans nothing for a
     /// file that already exists, so an `apply` that chmodded from its own
     /// desired state instead of from the plan would change this mode.
     ///
-    /// The same property is what keeps an unescalated run working — a
-    /// `check` that finds the owner already right plans no `owner` line, so
-    /// `apply` issues no `chown`, which needs root.
+    /// The same property means a `check` that finds the owner already right
+    /// plans no `owner` line, so `apply` issues no `chown`: one that changes
+    /// the owner needs root, and one that doesn't is needless.
     #[test]
     fn apply_touches_no_attribute_the_plan_did_not_name() {
         let fake = Arc::new(Fake::new().with_dir("/etc/ssh/keys").with_file_mode(
@@ -2549,7 +2542,7 @@ mod tests {
             panic!("expected change")
         };
         assert!(
-            matches!(c.diff, Diff::Text { .. }),
+            matches!(&c, KeysIntent(Keys::Write(w)) if !w.file_attrs.differs() && w.dir.is_none()),
             "in_file plans no attributes for a file that is already there"
         );
         op.apply(&sys, c).unwrap();
@@ -2627,13 +2620,14 @@ mod tests {
         assert_eq!(fake.content("/home/cadu/.ssh/authorized_keys").unwrap(), "");
     }
 
-    /// `apply` resolves the target a second time, so `check` and `apply` can
-    /// disagree about where the account lives. Acting on both answers at
-    /// once was the worst outcome available: `mkdir_all` would make the old
-    /// `~/.ssh`, the keys would land somewhere `check` never inspected, and
-    /// the attribute parts would match no subject and be skipped in silence.
+    /// The account is resolved once, by `check`, and `apply` acts on the
+    /// paths the intent holds. An account that moves house between the two
+    /// halves of the step therefore cannot split it: the keys go where the
+    /// report said, into the `~/.ssh` `check` inspected, and nothing is
+    /// made under the new home. (Before the intent, `apply` resolved the
+    /// account a second time and had to compare the two answers.)
     #[test]
-    fn a_target_that_moves_between_check_and_apply_is_refused() {
+    fn apply_acts_on_the_target_check_resolved() {
         let fake = fake_with_user_and_ssh_dir();
         let sys = fake_sys(&fake);
         let op = Present::for_user_name("cadu").keys([K1]);
@@ -2641,7 +2635,6 @@ mod tests {
             panic!("expected change")
         };
 
-        // The account moves house between the two halves of the step.
         rustible_sdk::backend::Backend::write(
             &*fake,
             Path::new("/etc/passwd"),
@@ -2649,20 +2642,18 @@ mod tests {
         )
         .unwrap();
 
-        let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("moved between check and apply"), "{err}");
-        assert!(err.contains("/home/cadu/.ssh/authorized_keys"), "{err}");
-        assert!(err.contains("/home/cadu2/.ssh/authorized_keys"), "{err}");
-        assert!(
-            fake.file("/home/cadu/.ssh/authorized_keys").is_none()
-                && fake.file("/home/cadu2/.ssh").is_none(),
-            "nothing was written to either home"
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.path, PathBuf::from("/home/cadu/.ssh/authorized_keys"));
+        assert_eq!(
+            fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
+            format!("{K1}\n")
         );
+        assert!(fake.file("/home/cadu2/.ssh").is_none());
     }
 
-    /// The same guard on `Absent`, which resolves twice for the same reason.
+    /// The same for `Absent`: the key is removed from the file `check` read.
     #[test]
-    fn absent_also_refuses_a_target_that_moved() {
+    fn absent_acts_on_the_target_check_resolved() {
         let fake = fake_with_user_and_ssh_dir();
         rustible_sdk::backend::Backend::write(
             &*fake,
@@ -2682,13 +2673,30 @@ mod tests {
             b"root:x:0:0:root:/root:/bin/bash\ncadu:x:1000:1001:Cadu:/home/cadu2:/bin/zsh\n",
         )
         .unwrap();
-        let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("moved between check and apply"), "{err}");
-        assert_eq!(
-            fake.content("/home/cadu/.ssh/authorized_keys").unwrap(),
-            format!("{K1}\n"),
-            "the key it was about to remove is still there"
-        );
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.removed, vec![key(K1)]);
+        assert_eq!(fake.content("/home/cadu/.ssh/authorized_keys").unwrap(), "");
+    }
+
+    /// The intent of a dry run that waits on a missing home is reported and
+    /// never applied; handed to a real `apply` anyway, it refuses as a real
+    /// `check` would rather than create anything.
+    #[test]
+    fn an_await_intent_is_refused_by_apply() {
+        let fake = Arc::new(Fake::new().with_file("/etc/passwd", PASSWD));
+        let op = Present::for_user_name("cadu").keys([] as [&str; 0]);
+        let dry = fake_sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = op.check(&dry).unwrap() else {
+            panic!("a dry run waits on the missing home")
+        };
+        assert!(matches!(c, KeysIntent(Keys::Await { .. })), "{c:?}");
+        let err = op.apply(&fake_sys(&fake), c).unwrap_err().chain();
+        assert!(err.contains("/home/cadu does not exist"), "{err}");
+        assert!(fake.file("/home/cadu").is_none());
+    }
+
+    fn creates_ssh_dir(intent: &KeysIntent) -> bool {
+        matches!(intent, KeysIntent(Keys::Write(w)) if w.dir.as_ref().is_some_and(|d| d.create))
     }
 
     /// `Absent` never creates the directory, and never needs to: `.ssh` is

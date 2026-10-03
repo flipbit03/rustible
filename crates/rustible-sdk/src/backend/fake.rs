@@ -35,13 +35,66 @@ pub struct Canned {
     pub stderr: String,
 }
 
+/// One `chmod` or `chown` an op asked the backend for, as [`Fake::attr_calls`]
+/// records it: the path as the op passed it (a symlink is recorded as the
+/// link, though the call changes its target), whether or not the call found
+/// anything to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttrCall {
+    /// [`Backend::set_mode`] with these permission bits.
+    Chmod {
+        /// The path passed.
+        path: PathBuf,
+        /// The mode passed.
+        mode: u32,
+    },
+    /// [`Backend::set_owner`] with these ids.
+    Chown {
+        /// The path passed.
+        path: PathBuf,
+        /// The uid passed.
+        uid: u32,
+        /// The gid passed.
+        gid: u32,
+    },
+}
+
+/// The mode a `chown(2)` by **root** (`CAP_FSETID`) leaves on an inode,
+/// measured on Linux (debian:12; `docs/plan/DECISIONS.md` `[FAKE-CHOWN]` has
+/// the table): on anything that is not a directory, every successful `chown`
+/// clears `S_ISUID`, and clears `S_ISGID` when group execute is set (setgid
+/// without group execute is mandatory locking, and stays). It does so even
+/// when the owner and group are the ones the file already has, and even for
+/// `chown(-1, -1)`. The sticky bit stays, and a directory keeps every bit.
+///
+/// The `Fake` models root, as it does elsewhere. An unprivileged owner who is
+/// not in the file's group loses setgid without group execute as well
+/// (`2745` became `0745`), which this does not model.
+pub(crate) fn mode_after_chown(kind: FileKind, mode: u32) -> u32 {
+    if kind == FileKind::Dir {
+        return mode;
+    }
+    let mut mode = mode & !0o4000;
+    if mode & 0o010 != 0 {
+        mode &= !0o2000;
+    }
+    mode
+}
+
 /// In-memory backend for unit tests. Plant files, can commands, then assert
 /// on what the op read, wrote, and ran.
+///
+/// `chown` is modelled as Linux does it, not as a plain assignment: see
+/// [`Backend::set_owner`] here, and [`Fake::attr_calls`] for the record of
+/// every `chmod` and `chown` an op made. The fake does not know which user
+/// the op runs as, so every `chown` succeeds, as it does for root.
 #[derive(Default)]
 pub struct Fake {
     files: Mutex<BTreeMap<PathBuf, FakeFile>>,
     canned: Mutex<Vec<Canned>>,
     ran: Mutex<Vec<CmdSpec>>,
+    attr_calls: Mutex<Vec<AttrCall>>,
 }
 
 impl Fake {
@@ -174,6 +227,41 @@ impl Fake {
     pub fn argvs(&self) -> Vec<Vec<String>> {
         self.commands().iter().map(|c| c.argv()).collect()
     }
+
+    /// Every [`Backend::set_mode`] and [`Backend::set_owner`] call, in the
+    /// order the op made them. The final state is in [`Fake::file`]; this is
+    /// for asserting on what was *asked*: that a step issued no `chown` when
+    /// the owner was already right (one that changes the owner needs root;
+    /// one that doesn't is a needless call that also clears setuid), or that
+    /// it set the owner before the mode. A fixture's own `Backend::set_*`
+    /// calls are recorded too; take the length first to skip past them. The `chown` a rewrite does inside
+    /// [`Backend::write`] is the backend's own, not an op's call, and is not
+    /// recorded.
+    pub fn attr_calls(&self) -> Vec<AttrCall> {
+        self.attr_calls.lock().unwrap().clone()
+    }
+
+    /// The `chown` calls alone, as `(path, uid, gid)`, in order.
+    pub fn chowns(&self) -> Vec<(PathBuf, u32, u32)> {
+        self.attr_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                AttrCall::Chown { path, uid, gid } => Some((path, uid, gid)),
+                AttrCall::Chmod { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The `chmod` calls alone, as `(path, mode)`, in order.
+    pub fn chmods(&self) -> Vec<(PathBuf, u32)> {
+        self.attr_calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                AttrCall::Chmod { path, mode } => Some((path, mode)),
+                AttrCall::Chown { .. } => None,
+            })
+            .collect()
+    }
 }
 
 fn not_found(p: &Path) -> io::Error {
@@ -201,10 +289,18 @@ impl Backend for Fake {
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
         // Mirrors `Local::write` (tempfile + rename): writing at a symlink's
         // path replaces the link itself with a regular file; the target is
-        // untouched. New files get 0644, an existing file keeps its attrs.
+        // untouched. New files get 0644. An existing file keeps its owner,
+        // and its mode as `Local::write` leaves it: that copies the mode onto
+        // the temporary file and then `chown`s it to the same owner, and the
+        // `chown` clears setuid (and setgid with group execute) as any does
+        // (`mode_after_chown`). An op that wants those bits after a rewrite
+        // has to set the mode again.
         let mut files = self.files.lock().unwrap();
         match files.get_mut(p) {
-            Some(f) if f.kind == FileKind::File => f.bytes = bytes.to_vec(),
+            Some(f) if f.kind == FileKind::File => {
+                f.bytes = bytes.to_vec();
+                f.mode = mode_after_chown(f.kind, f.mode);
+            }
             Some(f) if f.kind == FileKind::Dir => {
                 return Err(io::Error::new(
                     io::ErrorKind::IsADirectory,
@@ -309,6 +405,10 @@ impl Backend for Fake {
     // instead would let an op pass its tests here and change the wrong
     // inode on a real machine.
     fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
+        self.attr_calls.lock().unwrap().push(AttrCall::Chmod {
+            path: p.to_path_buf(),
+            mode,
+        });
         let mut files = self.files.lock().unwrap();
         let real = Self::resolve(&files, p);
         files
@@ -317,7 +417,16 @@ impl Backend for Fake {
             .ok_or_else(|| not_found(p))
     }
 
+    // `chown` clears setuid, and setgid with group execute, on anything but
+    // a directory, whether or not the ids change: `mode_after_chown` has the
+    // measured rule. Assigning the ids alone let an op that `chmod`s and then
+    // `chown`s a setuid file pass here and lose the bit on a real machine.
     fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        self.attr_calls.lock().unwrap().push(AttrCall::Chown {
+            path: p.to_path_buf(),
+            uid,
+            gid,
+        });
         let mut files = self.files.lock().unwrap();
         let real = Self::resolve(&files, p);
         files
@@ -325,11 +434,16 @@ impl Backend for Fake {
             .map(|f| {
                 f.uid = uid;
                 f.gid = gid;
+                f.mode = mode_after_chown(f.kind, f.mode);
             })
             .ok_or_else(|| not_found(p))
     }
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // The real `copy` (`std::fs::copy`) never `chown`s. Going through
+        // `write` here would clear setuid on an existing destination, which
+        // `Local` does not; harmless today, because the one caller,
+        // `System::backup`, always copies to a new path.
         let bytes = self.read(from)?;
         Backend::write(self, to, &bytes)
     }
@@ -413,6 +527,116 @@ impl Backend for Fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table measured as root on debian:12 (`[FAKE-CHOWN]`), one row per
+    /// case: the mode before a `chown` and the mode after it. The ids do not
+    /// matter, so the `Fake` takes none into account: the same-owner rows
+    /// cleared exactly like the others.
+    #[test]
+    fn chown_clears_the_bits_linux_clears() {
+        for (kind, before, after) in [
+            (FileKind::File, 0o4755, 0o755),
+            (FileKind::File, 0o2755, 0o755),
+            (FileKind::File, 0o2745, 0o2745),
+            (FileKind::File, 0o6755, 0o755),
+            (FileKind::File, 0o6745, 0o2745),
+            (FileKind::File, 0o4700, 0o700),
+            (FileKind::File, 0o1755, 0o1755),
+            (FileKind::File, 0o644, 0o644),
+            (FileKind::Dir, 0o2775, 0o2775),
+            (FileKind::Dir, 0o1777, 0o1777),
+            (FileKind::Dir, 0o6775, 0o6775),
+        ] {
+            assert_eq!(mode_after_chown(kind, before), after, "{kind:?} {before:o}");
+        }
+    }
+
+    /// Through the backend: a `chown` to the owner the file already has
+    /// still clears setuid, a `chmod` after it puts the bit back, and a
+    /// directory keeps its setgid. Both calls are recorded, in order, with
+    /// the path as passed.
+    #[test]
+    fn set_owner_clears_setuid_and_every_call_is_recorded() {
+        let fake = Fake::new()
+            .with_file_mode("/bin/x", "", 0o4755)
+            .with_dir("/srv/shared");
+        fake.set_owner(Path::new("/bin/x"), 0, 0).unwrap();
+        assert_eq!(fake.file("/bin/x").unwrap().mode, 0o755);
+        fake.set_mode(Path::new("/bin/x"), 0o4755).unwrap();
+        assert_eq!(fake.file("/bin/x").unwrap().mode, 0o4755);
+
+        fake.set_mode(Path::new("/srv/shared"), 0o2775).unwrap();
+        fake.set_owner(Path::new("/srv/shared"), 5, 6).unwrap();
+        assert_eq!(fake.file("/srv/shared").unwrap().mode, 0o2775);
+
+        assert_eq!(
+            fake.attr_calls(),
+            vec![
+                AttrCall::Chown {
+                    path: "/bin/x".into(),
+                    uid: 0,
+                    gid: 0
+                },
+                AttrCall::Chmod {
+                    path: "/bin/x".into(),
+                    mode: 0o4755
+                },
+                AttrCall::Chmod {
+                    path: "/srv/shared".into(),
+                    mode: 0o2775
+                },
+                AttrCall::Chown {
+                    path: "/srv/shared".into(),
+                    uid: 5,
+                    gid: 6
+                },
+            ]
+        );
+        assert_eq!(fake.chowns().len(), 2);
+        assert_eq!(
+            fake.chmods(),
+            vec![
+                (PathBuf::from("/bin/x"), 0o4755),
+                (PathBuf::from("/srv/shared"), 0o2775)
+            ]
+        );
+
+        // Through a symlink: the target changes, and the call is recorded
+        // with the path as passed, the link, not the target it resolved to.
+        let fake = Fake::new()
+            .with_file_mode("/opt/real", "", 0o4755)
+            .with_symlink("/opt/link", "/opt/real");
+        fake.set_owner(Path::new("/opt/link"), 7, 8).unwrap();
+        fake.set_mode(Path::new("/opt/link"), 0o4755).unwrap();
+        assert_eq!(
+            fake.attr_calls(),
+            vec![
+                AttrCall::Chown {
+                    path: "/opt/link".into(),
+                    uid: 7,
+                    gid: 8
+                },
+                AttrCall::Chmod {
+                    path: "/opt/link".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
+        let real = fake.file("/opt/real").unwrap();
+        assert_eq!((real.mode, real.uid, real.gid), (0o4755, 7, 8));
+    }
+
+    /// A rewrite of an existing file keeps its owner and loses setuid, as
+    /// `Local::write` does: it copies the mode onto the replacement and then
+    /// `chown`s it to the same owner. A new file is 0644.
+    #[test]
+    fn a_rewrite_clears_setuid_as_local_write_does() {
+        let fake = Fake::new().with_file_mode("/bin/x", "v1", 0o4755);
+        fake.write(Path::new("/bin/x"), b"v2").unwrap();
+        let f = fake.file("/bin/x").unwrap();
+        assert_eq!((f.mode, f.bytes.as_slice()), (0o755, b"v2".as_slice()));
+        assert!(fake.attr_calls().is_empty(), "the backend's own chown");
+    }
 
     /// `chmod` and `chown` follow symlinks, and `System::set_mode` and
     /// `System::set_owner` both say so. The fake operated on the link entry

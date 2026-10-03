@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use rustible_sdk::prelude::*;
 
-use super::Insert;
+use super::{Insert, TextEdit};
 
 /// Ansible's default is `# {mark} ANSIBLE MANAGED BLOCK`.
 pub const DEFAULT_MARKER: &str = "# {mark} MANAGED BY RUSTIBLE";
@@ -209,8 +209,9 @@ pub fn plan_block(
 
 impl Op for Block {
     type Output = BlockReport;
+    type Intent = TextEdit;
 
-    fn check(&self, sys: &System) -> Result<Plan<BlockReport>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. file::Block edits file text through `sys`.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -230,7 +231,10 @@ impl Op for Block {
             );
         }
         let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            return Ok(super::plan_edit_of_missing("file::Block", &self.path));
+            return Ok(Plan::Change(TextEdit::await_file(
+                "file::Block",
+                self.path.clone(),
+            )));
         };
         match plan_block(&text, &begin, &end, &self.block, &self.insert) {
             None => {
@@ -244,33 +248,23 @@ impl Op for Block {
                     backup_path: None,
                 }))
             }
-            Some((new_text, _)) => Ok(Plan::change(Diff::text(&self.path, text, new_text))),
+            Some((after, line_no)) => Ok(Plan::Change(TextEdit::rewrite(
+                self.path.clone(),
+                text,
+                after,
+                // An emptied block leaves no BEGIN marker to point at.
+                if self.block.is_empty() { 0 } else { line_no },
+            ))),
         }
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<BlockReport> {
-        // Re-plan from the current text rather than trusting the diff copy.
-        let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            bail!("{} does not exist; nothing to edit", self.path.display());
-        };
-        let (begin, end) = self.markers();
-        let Some((after, line_no)) = plan_block(&text, &begin, &end, &self.block, &self.insert)
-        else {
-            // The file changed between check and apply and already carries
-            // the block: report where it stands now.
-            let lines: Vec<String> = text.lines().map(str::to_string).collect();
-            return Ok(BlockReport {
-                path: self.path.clone(),
-                line_no: find_block(&lines, &begin, &end)
-                    .map(|(b, _)| b + 1)
-                    .unwrap_or(0),
-                backup_path: None,
-            });
-        };
-        let backup_path = super::write_with_backup(sys, &self.path, self.backup, after.as_bytes())?;
+    fn apply(&self, sys: &System, intent: TextEdit) -> Result<BlockReport> {
+        // Writes the text `check` planned, which is the text the diff
+        // showed; the file is not read and merged again here.
+        let (line_no, backup_path) = intent.write(sys, self.backup)?;
         Ok(BlockReport {
             path: self.path.clone(),
-            line_no: if self.block.is_empty() { 0 } else { line_no },
+            line_no,
             backup_path,
         })
     }
@@ -410,7 +404,7 @@ mod tests {
             .backup(true)
             .set("10.0.0.1 lab1\n10.0.0.2 lab2\n");
         let c = expect_change(&op, &sys);
-        assert_eq!(c.diff.short(), "+4 -0 lines");
+        assert_eq!(c.diff().short(), "+4 -0 lines");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.line_no, 2);
         assert!(r.backup_path.is_some());
@@ -504,7 +498,7 @@ mod tests {
         let op = Block::in_path("/etc/new.conf").set("x");
         let c = expect_change(&op, &dry);
         assert_eq!(
-            c.diff.render(),
+            c.diff().render(),
             "/etc/new.conf: does not exist yet; file::Block would edit it once an earlier \
              step creates it (or use .create(true) to create it here)"
         );
@@ -545,5 +539,43 @@ mod tests {
             .to_string();
         assert!(e.contains("is a symlink"), "{e}");
         assert_eq!(fake.content("/real").unwrap(), "a\n");
+    }
+
+    /// The intent `check` returns is the planned text, and its diff is
+    /// rendered from that same text. Pure: `plan_block` and the intent, no
+    /// `System`.
+    #[test]
+    fn what_check_planned_is_what_the_diff_shows() {
+        let (after, line_no) =
+            plan_block("a\n", "# BEGIN m", "# END m", "x\n", &Insert::Append).unwrap();
+        let intent = TextEdit::rewrite("/etc/x".into(), "a\n".into(), after, line_no);
+        assert_eq!(intent.diff().short(), "+3 -0 lines");
+        assert_eq!(intent.planned(), Some(("a\n# BEGIN m\nx\n# END m\n", 2)));
+    }
+
+    /// `apply` executes the text `check` planned instead of planning again
+    /// from the file as it is now: content that arrived in between is
+    /// overwritten with what the diff showed, not merged with the block.
+    #[test]
+    fn apply_writes_what_check_planned_even_if_the_file_moved_on() {
+        let fake = Arc::new(Fake::new().with_file("/etc/hosts", "127.0.0.1 localhost\n"));
+        let sys = fake_sys(&fake);
+        let op = Block::in_path("/etc/hosts")
+            .marker("# {mark} lab")
+            .set("10.0.0.1 lab1\n");
+        let intent = expect_change(&op, &sys);
+
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            std::path::Path::new("/etc/hosts"),
+            b"something else\n",
+        )
+        .unwrap();
+        let r = op.apply(&sys, intent).unwrap();
+        assert_eq!(r.line_no, 2);
+        assert_eq!(
+            fake.content("/etc/hosts").unwrap(),
+            "127.0.0.1 localhost\n# BEGIN lab\n10.0.0.1 lab1\n# END lab\n"
+        );
     }
 }

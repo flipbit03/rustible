@@ -547,7 +547,7 @@ type. It carries:
 | field / method | what |
 |---|---|
 | `.changed` | `bool` — did this step change anything |
-| `.diff` | `Option<Diff>` — what changed |
+| `.diff` | `Option<Diff>` — what changed, for rendering (`.render()`, `.short()`); it cannot be read field by field |
 | `.elapsed` | `Duration` |
 | `.output() -> Result<&T>` | the output, or an error if unavailable |
 | `.into_output() -> Result<T>` | the same, by value |
@@ -1301,13 +1301,18 @@ increasing order of effort:
    }
    ```
 3. **A real operation**, which is a type implementing `Op`. That is two
-   methods: `check` decides what would change and produces the diff, `apply`
-   executes that decision. Everything it does to the machine goes through the
-   `System` handle it is given, which is what makes it testable.
+   methods and an intent type: `check` decides what would change and returns
+   it as the op's own typed intent, `apply` executes that intent, and the
+   step's diff is rendered from it by the intent's `diff()`. The intent never
+   wraps a `Diff`: `apply` must not take its instruction from the report.
+   Everything it does to the machine goes through the `System` handle it is
+   given, which is what makes it testable.
 
 A collection is an ordinary crate that depends on `rustible-sdk` and exports
 operations; `cargo add` it and use it, as in "Operations from elsewhere"
-above. `rustible-github` is the worked example to copy the shape from.
+above. `rustible-github` is the worked example to copy the shape from; its
+lookup's intent is `Infallible`, so for an op with a real intent see
+`rustible_std::sysctl`.
 
 To contribute an operation to `rustible-std` itself, read
 [`CLAUDE.md`](../CLAUDE.md) — it covers the shape, where the tests go, and the

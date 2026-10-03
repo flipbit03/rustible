@@ -206,13 +206,6 @@ pub(crate) fn validate_field(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// What [`Present::check`] found: the current group, if any, and the
-/// attribute changes.
-struct Inspection {
-    current: Option<Group>,
-    changes: Vec<AttrChange>,
-}
-
 /// Ensure a group exists. `ansible.builtin.group` with `state: present`.
 ///
 /// ```no_run
@@ -268,46 +261,73 @@ impl Present {
         self.system = on;
         self
     }
+}
 
-    fn inspect(&self, sys: &System) -> Result<Inspection> {
+/// What [`Present`]'s `check` decided: create the group or renumber it,
+/// with the tool family it found to do so.
+#[derive(Debug)]
+pub struct GroupIntent {
+    name: String,
+    tools: Tools,
+    change: GroupChange,
+}
+
+#[derive(Debug)]
+enum GroupChange {
+    /// No such group: create it, with this gid or the one the tool picks.
+    Create { gid: Option<u32> },
+    /// The group exists with another gid: `groupmod -g`. Never planned on
+    /// BusyBox, which has no `groupmod`; `check` refuses that instead.
+    Renumber { from: u32, to: u32 },
+}
+
+impl Intent for GroupIntent {
+    fn diff(&self) -> Diff {
+        let changes = match self.change {
+            GroupChange::Create { gid } => {
+                let mut changes = vec![AttrChange::new("exists", "no", "yes")];
+                // Without a gid it is the tool's to pick, so the diff does
+                // not name one.
+                if let Some(gid) = gid {
+                    changes.push(AttrChange::new("gid", "-", gid.to_string()));
+                }
+                changes
+            }
+            GroupChange::Renumber { from, to } => {
+                vec![AttrChange::new("gid", from.to_string(), to.to_string())]
+            }
+        };
+        Diff::attrs(format!("group {}", self.name), changes)
+    }
+}
+
+impl Present {
+    fn plan(&self, sys: &System) -> Result<Plan<Self>> {
         validate_name("group", &self.name)?;
         let text = sys.read_to_string("/etc/group")?;
         let current = lookup_group(&text, &self.name)?;
-        let mut changes = vec![];
-        match &current {
-            None => {
-                changes.push(AttrChange {
-                    name: "exists".into(),
-                    from: "no".into(),
-                    to: "yes".into(),
-                });
-                if let Some(gid) = self.gid {
-                    if let Some(taken) = group_by_gid(&text, gid) {
-                        bail!(
-                            "gid {gid} is already used by group `{}`; group::Present does not \
-                             renumber other groups",
-                            taken.name
-                        );
-                    }
-                    changes.push(AttrChange {
-                        name: "gid".into(),
-                        from: "-".into(),
-                        to: gid.to_string(),
-                    });
-                }
+        let gid_taken = |gid: u32| -> Result<()> {
+            if let Some(taken) = group_by_gid(&text, gid) {
+                bail!(
+                    "gid {gid} is already used by group `{}`; group::Present does not \
+                     renumber other groups",
+                    taken.name
+                );
             }
-            Some(g) => {
-                if let Some(gid) = self.gid
-                    && gid != g.gid
-                {
-                    if let Some(taken) = group_by_gid(&text, gid) {
-                        bail!(
-                            "gid {gid} is already used by group `{}`; group::Present does not \
-                             renumber other groups",
-                            taken.name
-                        );
-                    }
-                    if Tools::of(sys) == Tools::BusyBox {
+            Ok(())
+        };
+        let tools = Tools::of(sys);
+        let change = match current {
+            None => {
+                if let Some(gid) = self.gid {
+                    gid_taken(gid)?;
+                }
+                GroupChange::Create { gid: self.gid }
+            }
+            Some(g) => match self.gid {
+                Some(gid) if gid != g.gid => {
+                    gid_taken(gid)?;
+                    if tools == Tools::BusyBox {
                         bail!(
                             "group `{}` has gid {} but {gid} was asked for, and BusyBox has no \
                              `groupmod` to change it; on Alpine `apk add shadow` provides groupmod, or drop `.gid()`",
@@ -315,81 +335,73 @@ impl Present {
                             g.gid
                         );
                     }
-                    changes.push(AttrChange {
-                        name: "gid".into(),
-                        from: g.gid.to_string(),
-                        to: gid.to_string(),
-                    });
+                    GroupChange::Renumber {
+                        from: g.gid,
+                        to: gid,
+                    }
                 }
-            }
-        }
-        Ok(Inspection { current, changes })
+                _ => return Ok(Plan::Satisfied(g)),
+            },
+        };
+        Ok(Plan::Change(GroupIntent {
+            name: self.name.clone(),
+            tools,
+            change,
+        }))
     }
 }
 
 impl Op for Present {
     type Output = Group;
+    type Intent = GroupIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<Group>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "group::Present")?;
         require_root(sys, "group::Present")?;
-        let Inspection { current, changes } = self.inspect(sys)?;
-        if changes.is_empty() {
-            return Ok(Plan::Satisfied(
-                current.expect("no changes means it exists"),
-            ));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("group {}", self.name),
-            changes,
-        }))
+        self.plan(sys)
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<Group> {
-        // `check` produced the diff; execute it (vision 6.2). An `exists`
-        // change means create, anything else is the gid change.
-        let Diff::Attrs { changes, .. } = &change.diff else {
-            bail!("group::Present::apply received a diff it did not produce");
-        };
-        let creating = changes.iter().any(|c| c.name == "exists");
-        let tools = Tools::of(sys);
-        match (creating, tools) {
-            (true, Tools::Shadow) => {
+    fn apply(&self, sys: &System, intent: GroupIntent) -> Result<Group> {
+        let GroupIntent {
+            name,
+            tools,
+            change,
+        } = intent;
+        match (change, tools) {
+            (GroupChange::Create { gid }, Tools::Shadow) => {
                 let mut cmd = sys.cmd("groupadd");
                 if self.system {
                     cmd = cmd.arg("-r");
                 }
-                if let Some(gid) = self.gid {
+                if let Some(gid) = gid {
                     cmd = cmd.args(["-g", &gid.to_string()]);
                 }
-                run_tool(cmd.arg(&self.name), tools, "groupadd")?;
+                run_tool(cmd.arg(&name), tools, "groupadd")?;
             }
-            (true, Tools::BusyBox) => {
+            (GroupChange::Create { gid }, Tools::BusyBox) => {
                 let mut cmd = sys.cmd("addgroup");
                 if self.system {
                     cmd = cmd.arg("-S");
                 }
-                if let Some(gid) = self.gid {
+                if let Some(gid) = gid {
                     cmd = cmd.args(["-g", &gid.to_string()]);
                 }
-                run_tool(cmd.arg(&self.name), tools, "addgroup")?;
+                run_tool(cmd.arg(&name), tools, "addgroup")?;
             }
-            (false, Tools::Shadow) => {
-                let gid = self.gid.expect("a modify plan always carries a gid");
+            (GroupChange::Renumber { to, .. }, Tools::Shadow) => {
                 run_tool(
-                    sys.cmd("groupmod")
-                        .args(["-g", &gid.to_string(), &self.name]),
+                    sys.cmd("groupmod").args(["-g", &to.to_string(), &name]),
                     tools,
                     "groupmod",
                 )?;
             }
-            (false, Tools::BusyBox) => bail!("BusyBox has no `groupmod`"),
+            (GroupChange::Renumber { .. }, Tools::BusyBox) => bail!("BusyBox has no `groupmod`"),
         }
+        // The gid a new group got is the tool's answer: read it back.
         let text = sys.read_to_string("/etc/group")?;
-        group_entry(&text, &self.name).ok_or_else(|| {
+        group_entry(&text, &name).ok_or_else(|| {
             Error::msg(format!(
-                "group `{}` is not in /etc/group after creating it",
-                self.name
+                "group `{name}` is not in /etc/group after creating it"
             ))
         })
     }
@@ -433,10 +445,30 @@ impl Absent {
     }
 }
 
+/// What [`Absent`]'s `check` decided: remove the group it found, with the
+/// tool family it found to do so.
+#[derive(Debug)]
+pub struct RemoveGroup {
+    name: String,
+    /// The gid `check` read, which the output reports: groupdel takes it.
+    gid: u32,
+    tools: Tools,
+}
+
+impl Intent for RemoveGroup {
+    fn diff(&self) -> Diff {
+        Diff::attrs(
+            format!("group {}", self.name),
+            vec![AttrChange::new("exists", "yes", "no")],
+        )
+    }
+}
+
 impl Op for Absent {
     type Output = Removed;
+    type Intent = RemoveGroup;
 
-    fn check(&self, sys: &System) -> Result<Plan<Removed>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "group::Absent")?;
         require_root(sys, "group::Absent")?;
         validate_name("group", &self.name)?;
@@ -460,28 +492,22 @@ impl Op for Absent {
                 owner.name
             );
         }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("group {}", self.name),
-            changes: vec![AttrChange {
-                name: "exists".into(),
-                from: "yes".into(),
-                to: "no".into(),
-            }],
+        Ok(Plan::Change(RemoveGroup {
+            name: self.name.clone(),
+            gid: group.gid,
+            tools: Tools::of(sys),
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<Removed> {
-        // The output names the gid that went: read it before groupdel takes it.
-        let text = sys.read_to_string("/etc/group")?;
-        let gid = lookup_group(&text, &self.name)?.map(|g| g.gid);
-        let tools = Tools::of(sys);
+    fn apply(&self, sys: &System, intent: RemoveGroup) -> Result<Removed> {
+        let RemoveGroup { name, gid, tools } = intent;
         match tools {
-            Tools::Shadow => run_tool(sys.cmd("groupdel").arg(&self.name), tools, "groupdel")?,
-            Tools::BusyBox => run_tool(sys.cmd("delgroup").arg(&self.name), tools, "delgroup")?,
+            Tools::Shadow => run_tool(sys.cmd("groupdel").arg(&name), tools, "groupdel")?,
+            Tools::BusyBox => run_tool(sys.cmd("delgroup").arg(&name), tools, "delgroup")?,
         }
         Ok(Removed {
-            name: self.name.clone(),
-            gid,
+            name,
+            gid: Some(gid),
         })
     }
 }
@@ -629,7 +655,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "exists=yes gid=1500");
+        assert_eq!(c.diff().short(), "exists=yes gid=1500");
         assert!(fake.commands().is_empty(), "check runs nothing");
 
         // The fake cannot run groupadd; stand in for its effect on the file.
@@ -654,7 +680,7 @@ mod tests {
             panic!("expected change")
         };
         // The gid is groupadd's to pick, so the diff does not name one.
-        assert_eq!(c.diff.short(), "exists=yes");
+        assert_eq!(c.diff().short(), "exists=yes");
     }
 
     #[test]
@@ -665,7 +691,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "gid=2000");
+        assert_eq!(c.diff().short(), "gid=2000");
         fake.write(
             Path::new("/etc/group"),
             GROUP.replace("docker:x:998:", "docker:x:2000:").as_bytes(),
@@ -775,7 +801,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("expected change")
         };
-        assert_eq!(c.diff.short(), "exists=no");
+        assert_eq!(c.diff().short(), "exists=no");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.gid, Some(998));
         assert_eq!(fake.argvs(), vec![vec!["groupdel", "docker"]]);

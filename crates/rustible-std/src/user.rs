@@ -229,10 +229,10 @@ impl Default for Desired {
 }
 
 /// What must change on an existing account. Output of [`plan_modify`]; each
-/// `Some` is an attribute to set, and the group lists are the delta. The
-/// `changes` are the same facts as a [`Diff::Attrs`], and
-/// [`Delta::from_changes`] reads them back: `check` produces the diff and
-/// `apply` executes it (vision 6.2) without inspecting the system again.
+/// `Some` is an attribute to set, and the group lists are the delta. It is
+/// the `Modify` half of [`Present`]'s intent: `check` produces it, `apply`
+/// executes it field by field (vision 6.2), and the report is rendered from
+/// it by [`Delta::changes`].
 #[derive(Debug, Clone, Default)]
 pub struct Delta {
     /// Uid to set (`usermod -u`). Files the old uid owns are not chowned.
@@ -252,60 +252,82 @@ pub struct Delta {
     /// with `append: false`. BusyBox runs one `delgroup` per entry; shadow's
     /// `usermod` is instead handed the whole new list as `-G`.
     pub remove_groups: Vec<String>,
-    /// The diff to report, one entry per attribute above.
-    pub changes: Vec<AttrChange>,
+    /// The account as `check` found it: the report's `from` side.
+    was: Was,
+    /// The complete, sorted supplementary list the account ends up with,
+    /// when that changes.
+    groups_after: Vec<String>,
+    /// An exact list was asked for (`append: false`): shadow's `usermod` is
+    /// handed `groups_after` whole rather than the additions.
+    exact: bool,
+}
+
+/// The attributes of an existing account as `check` read them, kept so the
+/// report can show what each change replaces.
+#[derive(Debug, Clone, Default)]
+struct Was {
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
+    shell: PathBuf,
+    comment: String,
+    groups: Vec<String>,
 }
 
 impl Delta {
     /// True when the account already matches: [`Present`] reports the step
-    /// satisfied and never runs a tool. Judged on `changes`, so a `Delta`
-    /// assembled by hand without them looks empty whatever its other fields
-    /// hold.
+    /// satisfied and never runs a tool.
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        !self.changes_attributes() && !self.changes_groups()
     }
 
-    /// Pure: the delta back from the attribute changes [`plan_modify`]
-    /// produced. Errors on changes this module did not write.
-    pub fn from_changes(changes: &[AttrChange]) -> Result<Delta> {
-        let mut delta = Delta::default();
-        let bad = |c: &AttrChange| {
-            Error::msg(format!(
-                "user::Present::apply received a diff it did not produce: {}: {} -> {}",
-                c.name, c.from, c.to
-            ))
-        };
-        let split = |s: &str| -> Vec<String> {
-            s.split(',')
-                .filter(|g| !g.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        for c in changes {
-            match c.name.as_str() {
-                "uid" => delta.uid = Some(c.to.parse().map_err(|_| bad(c))?),
-                "gid" => delta.gid = Some(c.to.parse().map_err(|_| bad(c))?),
-                "home" => delta.home = Some(PathBuf::from(&c.to)),
-                "shell" => delta.shell = Some(PathBuf::from(&c.to)),
-                "comment" => delta.comment = Some(c.to.clone()),
-                "groups" => {
-                    let (before, after) = (split(&c.from), split(&c.to));
-                    delta.add_groups = after
-                        .iter()
-                        .filter(|g| !before.contains(g))
-                        .cloned()
-                        .collect();
-                    delta.remove_groups = before
-                        .iter()
-                        .filter(|g| !after.contains(g))
-                        .cloned()
-                        .collect();
-                }
-                _ => return Err(bad(c)),
-            }
+    /// The report's rows, one per attribute that changes, in the order
+    /// `usermod` takes them.
+    pub fn changes(&self) -> Vec<AttrChange> {
+        let mut changes = vec![];
+        if let Some(uid) = self.uid {
+            changes.push(AttrChange::new(
+                "uid",
+                self.was.uid.to_string(),
+                uid.to_string(),
+            ));
         }
-        delta.changes = changes.to_vec();
-        Ok(delta)
+        if let Some(gid) = self.gid {
+            changes.push(AttrChange::new(
+                "gid",
+                self.was.gid.to_string(),
+                gid.to_string(),
+            ));
+        }
+        if let Some(home) = &self.home {
+            changes.push(AttrChange::new(
+                "home",
+                self.was.home.display().to_string(),
+                home.display().to_string(),
+            ));
+        }
+        if let Some(shell) = &self.shell {
+            changes.push(AttrChange::new(
+                "shell",
+                self.was.shell.display().to_string(),
+                shell.display().to_string(),
+            ));
+        }
+        if let Some(comment) = &self.comment {
+            changes.push(AttrChange::new(
+                "comment",
+                self.was.comment.as_str(),
+                comment.as_str(),
+            ));
+        }
+        if self.changes_groups() {
+            changes.push(AttrChange::new(
+                "groups",
+                self.was.groups.join(","),
+                self.groups_after.join(","),
+            ));
+        }
+        changes
     }
 
     /// True when something other than group membership changes; BusyBox
@@ -316,6 +338,25 @@ impl Delta {
             || self.home.is_some()
             || self.shell.is_some()
             || self.comment.is_some()
+    }
+
+    fn changes_groups(&self) -> bool {
+        !self.add_groups.is_empty() || !self.remove_groups.is_empty()
+    }
+
+    /// The names of the attributes other than membership that change, for
+    /// the BusyBox refusal.
+    fn attribute_names(&self) -> Vec<&'static str> {
+        [
+            ("uid", self.uid.is_some()),
+            ("gid", self.gid.is_some()),
+            ("home", self.home.is_some()),
+            ("shell", self.shell.is_some()),
+            ("comment", self.comment.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect()
     }
 }
 
@@ -330,59 +371,26 @@ fn sorted(mut names: Vec<String>) -> Vec<String> {
 /// `append`, groups the account already has stay; without it, the account
 /// ends up in exactly `want.groups`.
 pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desired) -> Delta {
-    let mut delta = Delta::default();
-    let mut changes = vec![];
-    let mut change = |name: &str, from: String, to: String| {
-        changes.push(AttrChange {
-            name: name.into(),
-            from,
-            to,
-        });
+    let mut delta = Delta {
+        was: Was {
+            uid: current.uid,
+            gid: current.gid,
+            home: current.home.clone(),
+            shell: current.shell.clone(),
+            comment: current.comment.clone(),
+            groups: current_groups.to_vec(),
+        },
+        ..Delta::default()
     };
-
-    if let Some(uid) = want.uid
-        && uid != current.uid
-    {
-        change("uid", current.uid.to_string(), uid.to_string());
-        delta.uid = Some(uid);
-    }
-    if let Some(gid) = want.gid
-        && gid != current.gid
-    {
-        change("gid", current.gid.to_string(), gid.to_string());
-        delta.gid = Some(gid);
-    }
-    if let Some(home) = &want.home
-        && home != &current.home
-    {
-        change(
-            "home",
-            current.home.display().to_string(),
-            home.display().to_string(),
-        );
-        delta.home = Some(home.clone());
-    }
-    if let Some(shell) = &want.shell
-        && shell != &current.shell
-    {
-        change(
-            "shell",
-            current.shell.display().to_string(),
-            shell.display().to_string(),
-        );
-        delta.shell = Some(shell.clone());
-    }
-    if let Some(comment) = &want.comment
-        && comment != &current.comment
-    {
-        change("comment", current.comment.clone(), comment.clone());
-        delta.comment = Some(comment.clone());
-    }
+    delta.uid = want.uid.filter(|uid| *uid != current.uid);
+    delta.gid = want.gid.filter(|gid| *gid != current.gid);
+    delta.home = want.home.clone().filter(|h| h != &current.home);
+    delta.shell = want.shell.clone().filter(|s| s != &current.shell);
+    delta.comment = want.comment.clone().filter(|c| c != &current.comment);
 
     // No `groups` asked for: memberships are not touched, whatever `append`
     // says (an `append(false)` alone must never strip a user's groups).
     let Some(wanted) = want.groups.clone().map(sorted) else {
-        delta.changes = changes;
         return delta;
     };
     let add: Vec<String> = wanted
@@ -400,16 +408,15 @@ pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desi
             .collect()
     };
     if !add.is_empty() || !remove.is_empty() {
-        let after = if want.append {
+        delta.groups_after = if want.append {
             sorted([current_groups.to_vec(), add.clone()].concat())
         } else {
             wanted
         };
-        change("groups", current_groups.join(","), after.join(","));
         delta.add_groups = add;
         delta.remove_groups = remove;
+        delta.exact = !want.append;
     }
-    delta.changes = changes;
     delta
 }
 
@@ -735,13 +742,7 @@ impl Present {
                 "user `{}` exists and only BusyBox account tools were found (no `usermod`) to \
                  change its {}; on Alpine `apk add shadow` provides usermod, or drop those builders",
                 self.name,
-                delta
-                    .changes
-                    .iter()
-                    .filter(|c| c.name != "groups")
-                    .map(|c| c.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                delta.attribute_names().join(", ")
             );
         }
         Ok(Inspection {
@@ -752,70 +753,36 @@ impl Present {
         })
     }
 
-    /// The plan for a missing account: the diff, field by field.
-    fn plan_create(&self, sys: &System, primary: Option<Primary>) -> Result<Plan<Account>> {
-        let tools = Tools::of(sys);
-        let mut changes = vec![AttrChange {
-            name: "exists".into(),
-            from: "no".into(),
-            to: "yes".into(),
-        }];
-        let mut change = |name: &str, to: String| {
-            changes.push(AttrChange {
-                name: name.into(),
-                from: "-".into(),
-                to,
-            });
-        };
-        if self.system {
-            change("system", "yes".into());
-        }
-        if let Some(uid) = self.uid {
-            change("uid", uid.to_string());
-        }
-        match &primary {
-            Some(Primary { gid: Some(gid), .. }) => change("gid", gid.to_string()),
-            // Under --check, a group an earlier step may create: named, gid unknown.
-            Some(Primary { name, gid: None }) => change("group", name.clone()),
-            None => {}
-        }
+    /// What creating the missing account means, every field resolved:
+    /// the primary group, and the home and shell the tool would default to.
+    fn plan_create(
+        &self,
+        sys: &System,
+        tools: Tools,
+        primary: Option<Primary>,
+    ) -> Result<Creation> {
         let defaults = useradd_defaults(sys, tools)?;
-        let home = self
-            .home
-            .clone()
-            .unwrap_or_else(|| defaults.home_base.join(&self.name));
-        change("home", home.display().to_string());
-        if !self.create_home {
-            change("create_home", "no".into());
-        }
-        // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
-        // user's passwd entry, which this op cannot see through `sys`: only
-        // an explicit shell is shown there.
-        let shell = match &self.shell {
-            Some(s) => Some(s.clone()),
-            None if tools == Tools::BusyBox => None,
-            None => Some(defaults.shell.clone()),
-        };
-        if let Some(s) = &shell {
-            change("shell", s.display().to_string());
-        }
-        if let Some(c) = &self.comment {
-            change("comment", c.clone());
-        }
-        let groups = sorted(self.groups.clone().unwrap_or_default());
-        if !groups.is_empty() {
-            change("groups", groups.join(","));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("user {}", self.name),
-            changes,
-        }))
+        Ok(Creation {
+            system: self.system,
+            uid: self.uid,
+            primary,
+            home: self.home.clone(),
+            default_home: defaults.home_base.join(&self.name),
+            create_home: self.create_home,
+            shell: self.shell.clone(),
+            // BusyBox `adduser` takes the shell from `$SHELL` or the invoking
+            // user's passwd entry, which this op cannot see through `sys`:
+            // only an explicit shell is shown there.
+            default_shell: (tools == Tools::Shadow).then_some(defaults.shell),
+            comment: self.comment.clone(),
+            groups: sorted(self.groups.clone().unwrap_or_default()),
+        })
     }
 
-    fn create(&self, sys: &System, tools: Tools, primary: Option<Primary>) -> Result<()> {
+    fn create(&self, sys: &System, tools: Tools, c: Creation) -> Result<()> {
         // A real run's `check` refused a group it could not find, so the gid
         // is known here; the check-mode tolerance never reaches `apply`.
-        let primary = match primary {
+        let primary = match c.primary {
             Some(Primary {
                 name,
                 gid: Some(gid),
@@ -829,60 +796,56 @@ impl Present {
         match tools {
             Tools::Shadow => {
                 let mut cmd = sys.cmd("useradd");
-                if self.system {
+                if c.system {
                     cmd = cmd.arg("-r");
                 }
-                if let Some(uid) = self.uid {
+                if let Some(uid) = c.uid {
                     cmd = cmd.args(["-u", &uid.to_string()]);
                 }
                 if let Some((gid, _)) = &primary {
                     cmd = cmd.args(["-g", &gid.to_string()]);
                 }
-                if let Some(groups) = self.groups.as_ref().filter(|g| !g.is_empty()) {
-                    cmd = cmd.args(["-G", &sorted(groups.clone()).join(",")]);
+                if !c.groups.is_empty() {
+                    cmd = cmd.args(["-G", &c.groups.join(",")]);
                 }
-                if let Some(home) = &self.home {
+                if let Some(home) = &c.home {
                     cmd = cmd.args(["-d", &home.display().to_string()]);
                 }
-                if let Some(shell) = &self.shell {
+                if let Some(shell) = &c.shell {
                     cmd = cmd.args(["-s", &shell.display().to_string()]);
                 }
-                if let Some(comment) = &self.comment {
+                if let Some(comment) = &c.comment {
                     cmd = cmd.args(["-c", comment]);
                 }
-                cmd = cmd.arg(if self.create_home { "-m" } else { "-M" });
+                cmd = cmd.arg(if c.create_home { "-m" } else { "-M" });
                 run_tool(cmd.arg(&self.name), tools, "useradd")
             }
             Tools::BusyBox => {
                 let mut cmd = sys.cmd("adduser").arg("-D");
-                if self.system {
+                if c.system {
                     cmd = cmd.arg("-S");
                 }
-                if let Some(uid) = self.uid {
+                if let Some(uid) = c.uid {
                     cmd = cmd.args(["-u", &uid.to_string()]);
                 }
                 if let Some((_, name)) = &primary {
                     cmd = cmd.args(["-G", name]);
                 }
-                if let Some(home) = &self.home {
+                if let Some(home) = &c.home {
                     cmd = cmd.args(["-h", &home.display().to_string()]);
                 }
-                if let Some(shell) = &self.shell {
+                if let Some(shell) = &c.shell {
                     cmd = cmd.args(["-s", &shell.display().to_string()]);
                 }
-                if let Some(comment) = &self.comment {
+                if let Some(comment) = &c.comment {
                     cmd = cmd.args(["-g", comment]);
                 }
-                if !self.create_home {
+                if !c.create_home {
                     cmd = cmd.arg("-H");
                 }
                 run_tool(cmd.arg(&self.name), tools, "adduser")?;
-                for g in sorted(self.groups.clone().unwrap_or_default()) {
-                    run_tool(
-                        sys.cmd("addgroup").args([&self.name, &g]),
-                        tools,
-                        "addgroup",
-                    )?;
+                for g in &c.groups {
+                    run_tool(sys.cmd("addgroup").args([&self.name, g]), tools, "addgroup")?;
                 }
                 Ok(())
             }
@@ -908,14 +871,13 @@ impl Present {
                 if let Some(comment) = &delta.comment {
                     cmd = cmd.args(["-c", comment]);
                 }
-                if !delta.add_groups.is_empty() || !delta.remove_groups.is_empty() {
-                    cmd = if self.append {
-                        cmd.args(["-aG", &delta.add_groups.join(",")])
+                if delta.changes_groups() {
+                    // An exact list is handed over whole; otherwise only the
+                    // additions are appended.
+                    cmd = if delta.exact {
+                        cmd.args(["-G", &delta.groups_after.join(",")])
                     } else {
-                        cmd.args([
-                            "-G",
-                            &sorted(self.groups.clone().unwrap_or_default()).join(","),
-                        ])
+                        cmd.args(["-aG", &delta.add_groups.join(",")])
                     };
                 }
                 run_tool(cmd.arg(&self.name), tools, "usermod")
@@ -933,10 +895,93 @@ impl Present {
     }
 }
 
+/// What [`Present`]'s `check` decided: create the account, or modify the
+/// one it found, with the tool family it found to do so.
+#[derive(Debug)]
+pub struct UserIntent {
+    name: String,
+    tools: Tools,
+    change: UserChange,
+}
+
+#[derive(Debug)]
+enum UserChange {
+    Create(Creation),
+    Modify(Delta),
+}
+
+/// A new account, every field resolved by `check`.
+#[derive(Debug)]
+struct Creation {
+    system: bool,
+    uid: Option<u32>,
+    /// The primary group as `check` resolved it. Under `--check` it may be
+    /// a group not on the machine yet, named and without a gid.
+    primary: Option<Primary>,
+    /// The home asked for, passed to the tool; `None` leaves it to the
+    /// tool, which picks `default_home`.
+    home: Option<PathBuf>,
+    default_home: PathBuf,
+    create_home: bool,
+    /// The shell asked for, passed to the tool.
+    shell: Option<PathBuf>,
+    /// The shell `useradd` picks when none is asked for; `None` on
+    /// BusyBox, whose choice this op cannot see.
+    default_shell: Option<PathBuf>,
+    comment: Option<String>,
+    /// Supplementary groups, sorted.
+    groups: Vec<String>,
+}
+
+impl Creation {
+    fn changes(&self) -> Vec<AttrChange> {
+        let mut changes = vec![AttrChange::new("exists", "no", "yes")];
+        let mut set = |name: &str, to: String| changes.push(AttrChange::new(name, "-", to));
+        if self.system {
+            set("system", "yes".into());
+        }
+        if let Some(uid) = self.uid {
+            set("uid", uid.to_string());
+        }
+        match &self.primary {
+            Some(Primary { gid: Some(gid), .. }) => set("gid", gid.to_string()),
+            // Under --check, a group an earlier step may create: named, gid unknown.
+            Some(Primary { name, gid: None }) => set("group", name.clone()),
+            None => {}
+        }
+        let home = self.home.as_ref().unwrap_or(&self.default_home);
+        set("home", home.display().to_string());
+        if !self.create_home {
+            set("create_home", "no".into());
+        }
+        if let Some(s) = self.shell.as_ref().or(self.default_shell.as_ref()) {
+            set("shell", s.display().to_string());
+        }
+        if let Some(c) = &self.comment {
+            set("comment", c.clone());
+        }
+        if !self.groups.is_empty() {
+            set("groups", self.groups.join(","));
+        }
+        changes
+    }
+}
+
+impl Intent for UserIntent {
+    fn diff(&self) -> Diff {
+        let changes = match &self.change {
+            UserChange::Create(c) => c.changes(),
+            UserChange::Modify(delta) => delta.changes(),
+        };
+        Diff::attrs(format!("user {}", self.name), changes)
+    }
+}
+
 impl Op for Present {
     type Output = Account;
+    type Intent = UserIntent;
 
-    fn check(&self, sys: &System) -> Result<Plan<Account>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "user::Present")?;
         require_root(sys, "user::Present")?;
         let Inspection {
@@ -945,37 +990,32 @@ impl Op for Present {
             delta,
             group_text,
         } = self.inspect(sys)?;
-        let Some(entry) = current else {
-            return self.plan_create(sys, primary);
+        let tools = Tools::of(sys);
+        let change = match current {
+            None => UserChange::Create(self.plan_create(sys, tools, primary)?),
+            Some(entry) if delta.is_empty() => {
+                return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
+            }
+            Some(_) => UserChange::Modify(delta),
         };
-        if delta.is_empty() {
-            return Ok(Plan::Satisfied(account_of(&entry, &group_text)));
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("user {}", self.name),
-            changes: delta.changes.clone(),
+        Ok(Plan::Change(UserIntent {
+            name: self.name.clone(),
+            tools,
+            change,
         }))
     }
 
-    fn apply(&self, sys: &System, change: Change) -> Result<Account> {
-        let Diff::Attrs { changes, .. } = &change.diff else {
-            bail!("user::Present::apply received a diff it did not produce");
-        };
-        let tools = Tools::of(sys);
-        if changes.iter().any(|c| c.name == "exists") {
-            let group_text = sys.read_to_string("/etc/group")?;
-            let mut primary = self.resolve_primary(sys, &group_text, true)?;
-            if primary.is_none() {
-                primary = self.same_named_group(&group_text)?;
-            }
-            self.create(sys, tools, primary)?;
-        } else {
-            self.modify(sys, tools, &Delta::from_changes(changes)?)?;
+    fn apply(&self, sys: &System, intent: UserIntent) -> Result<Account> {
+        match intent.change {
+            UserChange::Create(c) => self.create(sys, intent.tools, c)?,
+            UserChange::Modify(delta) => self.modify(sys, intent.tools, &delta)?,
         }
-        read_account(sys, &self.name)?.ok_or_else(|| {
+        // The uid and gid a new account got are the tool's answer: read
+        // them back.
+        read_account(sys, &intent.name)?.ok_or_else(|| {
             Error::msg(format!(
                 "user `{}` is not in /etc/passwd after creating it",
-                self.name
+                intent.name
             ))
         })
     }
@@ -1055,10 +1095,36 @@ impl Absent {
     }
 }
 
+/// What [`Absent`]'s `check` decided: delete the account, and its home when
+/// asked, with the tool family it found to do so.
+#[derive(Debug)]
+pub struct RemoveUser {
+    name: String,
+    /// The home `check` read from the account's entry, when it goes too
+    /// (`userdel -r`); `None` keeps it. The output reports it.
+    home: Option<PathBuf>,
+    tools: Tools,
+}
+
+impl Intent for RemoveUser {
+    fn diff(&self) -> Diff {
+        let mut changes = vec![AttrChange::new("exists", "yes", "no")];
+        if let Some(home) = &self.home {
+            changes.push(AttrChange::new(
+                "home",
+                home.display().to_string(),
+                "removed",
+            ));
+        }
+        Diff::attrs(format!("user {}", self.name), changes)
+    }
+}
+
 impl Op for Absent {
     type Output = Removed;
+    type Intent = RemoveUser;
 
-    fn check(&self, sys: &System) -> Result<Plan<Removed>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "user::Absent")?;
         require_root(sys, "user::Absent")?;
         validate_name("user", &self.name)?;
@@ -1069,54 +1135,32 @@ impl Op for Absent {
                 home: None,
             }));
         };
-        let mut changes = vec![AttrChange {
-            name: "exists".into(),
-            from: "yes".into(),
-            to: "no".into(),
-        }];
-        if self.remove_home {
-            changes.push(AttrChange {
-                name: "home".into(),
-                from: entry.home.display().to_string(),
-                to: "removed".into(),
-            });
-        }
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("user {}", self.name),
-            changes,
+        Ok(Plan::Change(RemoveUser {
+            name: self.name.clone(),
+            home: self.remove_home.then_some(entry.home),
+            tools: Tools::of(sys),
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<Removed> {
-        // The output names the home that went with the account: read it
-        // before userdel takes the entry.
-        let home = if self.remove_home {
-            let passwd = sys.read_to_string("/etc/passwd")?;
-            lookup_user(&passwd, &self.name)?.map(|e| e.home)
-        } else {
-            None
-        };
-        let tools = Tools::of(sys);
+    fn apply(&self, sys: &System, intent: RemoveUser) -> Result<Removed> {
+        let RemoveUser { name, home, tools } = intent;
         match tools {
             Tools::Shadow => {
                 let mut cmd = sys.cmd("userdel");
-                if self.remove_home {
+                if home.is_some() {
                     cmd = cmd.arg("-r");
                 }
-                run_tool(cmd.arg(&self.name), tools, "userdel")?;
+                run_tool(cmd.arg(&name), tools, "userdel")?;
             }
             Tools::BusyBox => {
                 let mut cmd = sys.cmd("deluser");
-                if self.remove_home {
+                if home.is_some() {
                     cmd = cmd.arg("--remove-home");
                 }
-                run_tool(cmd.arg(&self.name), tools, "deluser")?;
+                run_tool(cmd.arg(&name), tools, "deluser")?;
             }
         }
-        Ok(Removed {
-            name: self.name.clone(),
-            home,
-        })
+        Ok(Removed { name, home })
     }
 }
 
@@ -1151,8 +1195,9 @@ impl Existing {
 
 impl Op for Existing {
     type Output = Account;
+    type Intent = std::convert::Infallible;
 
-    fn check(&self, sys: &System) -> Result<Plan<Account>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "user::Existing")?;
         validate_name("user", &self.name)?;
         match read_account(sys, &self.name)? {
@@ -1165,8 +1210,8 @@ impl Op for Existing {
         }
     }
 
-    fn apply(&self, _: &System, _: Change) -> Result<Account> {
-        bail!("user::Existing never changes anything; apply must not be called")
+    fn apply(&self, _: &System, intent: Self::Intent) -> Result<Account> {
+        match intent {}
     }
 }
 
@@ -1250,8 +1295,9 @@ impl MembershipBuilder {
 
 impl Op for Membership {
     type Output = Member;
+    type Intent = Join;
 
-    fn check(&self, sys: &System) -> Result<Plan<Member>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_passwd_db(sys, "user::Membership")?;
         require_root(sys, "user::Membership")?;
         validate_name("user", &self.user)?;
@@ -1292,35 +1338,53 @@ impl Op for Membership {
             return Ok(Plan::Satisfied(member));
         }
         let before = groups_of(&group_text, &self.user);
-        let after = sorted([before.clone(), vec![self.group.clone()]].concat());
-        Ok(Plan::change(Diff::Attrs {
-            subject: format!("user {}", self.user),
-            changes: vec![AttrChange {
-                name: "groups".into(),
-                from: before.join(","),
-                to: after.join(","),
-            }],
+        Ok(Plan::Change(Join {
+            user: self.user.clone(),
+            group: self.group.clone(),
+            before,
+            tools: Tools::of(sys),
         }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<Member> {
-        let tools = Tools::of(sys);
+    fn apply(&self, sys: &System, intent: Join) -> Result<Member> {
+        let Join {
+            user, group, tools, ..
+        } = intent;
         match tools {
             Tools::Shadow => run_tool(
-                sys.cmd("usermod").args(["-aG", &self.group, &self.user]),
+                sys.cmd("usermod").args(["-aG", &group, &user]),
                 tools,
                 "usermod",
             )?,
-            Tools::BusyBox => run_tool(
-                sys.cmd("addgroup").args([&self.user, &self.group]),
-                tools,
-                "addgroup",
-            )?,
+            Tools::BusyBox => {
+                run_tool(sys.cmd("addgroup").args([&user, &group]), tools, "addgroup")?
+            }
         }
-        Ok(Member {
-            user: self.user.clone(),
-            group: self.group.clone(),
-        })
+        Ok(Member { user, group })
+    }
+}
+
+/// What [`Membership`]'s `check` decided: add the user to the group.
+#[derive(Debug)]
+pub struct Join {
+    user: String,
+    group: String,
+    /// The supplementary groups `check` found the user in, for the report.
+    before: Vec<String>,
+    tools: Tools,
+}
+
+impl Intent for Join {
+    fn diff(&self) -> Diff {
+        let after = sorted([self.before.clone(), vec![self.group.clone()]].concat());
+        Diff::attrs(
+            format!("user {}", self.user),
+            vec![AttrChange::new(
+                "groups",
+                self.before.join(","),
+                after.join(","),
+            )],
+        )
     }
 }
 
@@ -1431,17 +1495,9 @@ mod tests {
         assert_eq!(d.shell.as_deref(), Some(Path::new("/bin/bash")));
         assert_eq!(d.add_groups, vec!["docker"]);
         assert!(d.remove_groups.is_empty());
-        let rendered: Vec<String> = d
-            .changes
-            .iter()
-            .map(|c| format!("{}: {} -> {}", c.name, c.from, c.to))
-            .collect();
         assert_eq!(
-            rendered,
-            vec![
-                "shell: /bin/zsh -> /bin/bash",
-                "groups: adm,sudo -> adm,docker,sudo"
-            ]
+            Diff::attrs("user cadu", d.changes()).render(),
+            "user cadu:\n  shell: /bin/zsh -> /bin/bash\n  groups: adm,sudo -> adm,docker,sudo\n"
         );
     }
 
@@ -1458,7 +1514,7 @@ mod tests {
         );
         assert_eq!(d.add_groups, vec!["docker"]);
         assert_eq!(d.remove_groups, vec!["sudo"]);
-        assert_eq!(d.changes[0].to, "adm,docker");
+        assert_eq!(Diff::attrs("u", d.changes()).short(), "groups=adm,docker");
         let d = plan_modify(
             &cadu(),
             &groups_of(GROUP, "cadu"),
@@ -1469,7 +1525,7 @@ mod tests {
             },
         );
         assert_eq!(d.remove_groups, vec!["adm", "sudo"]);
-        assert_eq!(d.changes[0].to, "");
+        assert_eq!(Diff::attrs("u", d.changes()).short(), "groups=");
     }
 
     #[test]
@@ -1485,7 +1541,7 @@ mod tests {
                 },
             );
             assert!(d.add_groups.is_empty() && d.remove_groups.is_empty());
-            assert!(d.changes.is_empty(), "append={append}: {:?}", d.changes);
+            assert!(d.is_empty(), "append={append}: {d:?}");
         }
     }
 
@@ -1505,12 +1561,16 @@ mod tests {
         assert_eq!((d.uid, d.gid), (Some(1001), Some(4)));
         assert_eq!(d.home.as_deref(), Some(Path::new("/srv/cadu")));
         assert_eq!(d.comment.as_deref(), Some("Carlos"));
-        assert_eq!(d.changes.len(), 4);
+        assert_eq!(d.changes().len(), 4);
         assert!(d.changes_attributes());
     }
 
+    /// The delta is what `apply` executes and what the report is rendered
+    /// from: every field it sets is one row, with what `check` read as the
+    /// `from` side. Before the intent, `apply` parsed these rows back into a
+    /// delta, splitting the group lists on `,`.
     #[test]
-    fn delta_round_trips_through_its_changes() {
+    fn delta_renders_every_field_it_sets() {
         let want = Desired {
             uid: Some(1001),
             gid: Some(4),
@@ -1521,22 +1581,14 @@ mod tests {
             append: false,
         };
         let d = plan_modify(&cadu(), &groups_of(GROUP, "cadu"), &want);
-        let back = Delta::from_changes(&d.changes).unwrap();
-        assert_eq!((back.uid, back.gid), (d.uid, d.gid));
+        assert_eq!(d.add_groups, vec!["docker"]);
+        assert_eq!(d.remove_groups, vec!["adm", "sudo"]);
         assert_eq!(
-            (back.home, back.shell, back.comment),
-            (d.home, d.shell, d.comment)
+            Diff::attrs("user cadu", d.changes()).render(),
+            "user cadu:\n  uid: 1000 -> 1001\n  gid: 1000 -> 4\n  home: /home/cadu -> /srv/cadu\n  \
+             shell: /bin/zsh -> /bin/bash\n  comment: Cadu -> Carlos E.\n  \
+             groups: adm,sudo -> docker\n"
         );
-        assert_eq!(back.add_groups, vec!["docker"]);
-        assert_eq!(back.remove_groups, vec!["adm", "sudo"]);
-
-        let foreign = [AttrChange {
-            name: "mode".into(),
-            from: "0644".into(),
-            to: "0600".into(),
-        }];
-        let err = Delta::from_changes(&foreign).unwrap_err().to_string();
-        assert!(err.contains("did not produce"), "{err}");
     }
 
     // ---- Fake backend ----
@@ -1622,7 +1674,7 @@ mod tests {
         fake.write(Path::new(path), text.as_bytes()).unwrap();
     }
 
-    fn change<T>(plan: Plan<T>) -> Change {
+    fn change<O: Op>(plan: Plan<O>) -> O::Intent {
         match plan {
             Plan::Change(c) => c,
             Plan::Satisfied(_) => panic!("expected a change"),
@@ -1653,7 +1705,7 @@ mod tests {
             .comment("Rustible");
         let c = change(op.check(&sys).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes uid=1002 gid=4 home=/home/rustible shell=/bin/bash comment=Rustible \
              groups=docker,sudo"
         );
@@ -1713,7 +1765,7 @@ mod tests {
         // No uid and no gid in the diff: useradd allocates both, and the op
         // does not guess what it will pick.
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes home=/home/rustible shell=/bin/sh"
         );
     }
@@ -1726,13 +1778,13 @@ mod tests {
         // not model, so a uid alone puts no gid in the diff.
         let c = change(Present::new("rustible").uid(1500).check(&sys).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes uid=1500 home=/home/rustible shell=/bin/sh"
         );
         // A group named after the new user becomes its primary group (the
         // tool would refuse to create the private group), so the gid is known.
         let c = change(Present::new("docker").uid(1500).check(&sys).unwrap());
-        assert!(c.diff.short().contains("gid=998"), "{}", c.diff.short());
+        assert!(c.diff().short().contains("gid=998"), "{}", c.diff().short());
         // With an explicit primary group the gid is known.
         let c = change(
             Present::new("rustible")
@@ -1741,7 +1793,7 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert!(c.diff.short().contains("gid=4 "), "{}", c.diff.short());
+        assert!(c.diff().short().contains("gid=4 "), "{}", c.diff().short());
     }
 
     #[test]
@@ -1755,7 +1807,7 @@ mod tests {
             Present::new("svc").gid(&docker),
         ] {
             let c = change(op.check(&sys).unwrap());
-            assert!(c.diff.short().contains("gid=998"), "{}", c.diff.short());
+            assert!(c.diff().short().contains("gid=998"), "{}", c.diff().short());
         }
         let op = Present::new("svc")
             .gid("docker")
@@ -1764,7 +1816,7 @@ mod tests {
             .home("/var/lib/svc");
         let c = change(op.check(&sys).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes system=yes gid=998 home=/var/lib/svc create_home=no shell=/bin/sh"
         );
         write(
@@ -1795,7 +1847,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Present::new("cadu").shell("/bin/bash").groups(["docker"]);
         let c = change(op.check(&sys).unwrap());
-        assert_eq!(c.diff.short(), "shell=/bin/bash groups=adm,docker,sudo");
+        assert_eq!(c.diff().short(), "shell=/bin/bash groups=adm,docker,sudo");
 
         write(
             &fake,
@@ -1823,7 +1875,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Present::new("cadu").groups(["docker"]).append(false);
         let c = change(op.check(&sys).unwrap());
-        assert_eq!(c.diff.short(), "groups=docker");
+        assert_eq!(c.diff().short(), "groups=docker");
         write(
             &fake,
             "/etc/group",
@@ -1832,6 +1884,22 @@ mod tests {
         let a = op.apply(&sys, c).unwrap();
         assert_eq!(a.groups, vec!["docker"]);
         assert_eq!(fake.argvs(), vec![vec!["usermod", "-G", "docker", "cadu"]]);
+    }
+
+    /// An exact list that overlaps what the account has: `usermod -G` gets
+    /// the whole new list, kept group included, not only the additions.
+    #[test]
+    fn present_exact_groups_hands_usermod_the_whole_list() {
+        let fake = Arc::new(base().with_cmd("usermod", None, 0, ""));
+        let sys = fake_sys(&fake);
+        let op = Present::new("cadu").groups(["adm", "docker"]).append(false);
+        let c = change(op.check(&sys).unwrap());
+        assert_eq!(c.diff().short(), "groups=adm,docker");
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec!["usermod", "-G", "adm,docker", "cadu"]]
+        );
     }
 
     #[test]
@@ -1845,7 +1913,7 @@ mod tests {
             .comment("Carlos");
         let c = change(op.check(&sys).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "uid=1001 gid=4 home=/srv/cadu comment=Carlos"
         );
         write(
@@ -1927,9 +1995,9 @@ mod tests {
             .create_home(false);
         let c = change(op.check(&sys).unwrap());
         assert!(
-            c.diff.short().contains("uid=1002 gid=998"),
+            c.diff().short().contains("uid=1002 gid=998"),
             "{}",
-            c.diff.short()
+            c.diff().short()
         );
         write(
             &fake,
@@ -1973,7 +2041,7 @@ mod tests {
 
     #[test]
     fn present_on_alpine_system_user_shows_only_an_explicit_shell() {
-        let fake = Arc::new(base());
+        let fake = Arc::new(base().with_cmd("adduser", None, 0, ""));
         let sys = alpine(fake_sys(&fake));
         let c = change(
             Present::new("svc")
@@ -1982,20 +2050,39 @@ mod tests {
                 .check(&sys)
                 .unwrap(),
         );
-        assert!(!c.diff.short().contains("shell="), "{}", c.diff.short());
-        let c = change(
-            Present::new("svc")
-                .uid(100)
-                .system(true)
-                .gid("docker")
-                .shell("/sbin/nologin")
-                .check(&sys)
-                .unwrap(),
-        );
+        assert!(!c.diff().short().contains("shell="), "{}", c.diff().short());
+        let op = Present::new("svc")
+            .uid(100)
+            .system(true)
+            .gid("docker")
+            .shell("/sbin/nologin");
+        let c = change(op.check(&sys).unwrap());
         assert!(
-            c.diff.short().contains("shell=/sbin/nologin"),
+            c.diff().short().contains("shell=/sbin/nologin"),
             "{}",
-            c.diff.short()
+            c.diff().short()
+        );
+        // And the system flag the intent carries reaches `adduser` as `-S`.
+        write(
+            &fake,
+            "/etc/passwd",
+            &format!("{PASSWD}svc:x:100:998::/home/svc:/sbin/nologin\n"),
+        );
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                "adduser",
+                "-D",
+                "-S",
+                "-u",
+                "100",
+                "-G",
+                "docker",
+                "-s",
+                "/sbin/nologin",
+                "svc"
+            ]]
         );
     }
 
@@ -2014,7 +2101,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes uid=1002 gid=998 home=/home/rustible"
         );
         // An explicit shell is shown.
@@ -2027,9 +2114,9 @@ mod tests {
                 .unwrap(),
         );
         assert!(
-            c.diff.short().ends_with("shell=/bin/ash"),
+            c.diff().short().ends_with("shell=/bin/ash"),
             "{}",
-            c.diff.short()
+            c.diff().short()
         );
         // shadow-utils read the default from /etc/default/useradd.
         let c = change(
@@ -2040,9 +2127,9 @@ mod tests {
                 .unwrap(),
         );
         assert!(
-            c.diff.short().ends_with("shell=/bin/sh"),
+            c.diff().short().ends_with("shell=/bin/sh"),
             "{}",
-            c.diff.short()
+            c.diff().short()
         );
     }
 
@@ -2060,7 +2147,7 @@ mod tests {
         let op = Present::new("svc").uid(4000).shell("/bin/sh");
         let c = change(op.check(&sys).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes uid=4000 gid=4000 home=/home/svc shell=/bin/sh"
         );
         write(
@@ -2107,7 +2194,7 @@ mod tests {
                 .check(&fake_sys(&fake))
                 .unwrap(),
         );
-        assert!(c.diff.short().contains("gid=998"), "{}", c.diff.short());
+        assert!(c.diff().short().contains("gid=998"), "{}", c.diff().short());
     }
 
     // ---- check mode: a prerequisite another step could create (vision 12) ----
@@ -2157,7 +2244,7 @@ mod tests {
         let dry = fake_sys(&fake).with_check_mode(true);
         let c = change(Present::new("app").gid("app").check(&dry).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes group=app home=/home/app shell=/bin/sh"
         );
         assert!(fake.commands().is_empty(), "check mode runs nothing");
@@ -2182,7 +2269,7 @@ mod tests {
         let dry = fake_sys(&fake).with_check_mode(true);
         let c = change(Present::new("app").gid(3000).check(&dry).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes gid=3000 home=/home/app shell=/bin/sh"
         );
 
@@ -2212,7 +2299,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes home=/home/app shell=/bin/sh groups=adm,app"
         );
         // An existing one joining it is refused even here: Ansible's `user`
@@ -2253,14 +2340,14 @@ mod tests {
                 .check(&dry)
                 .unwrap(),
         );
-        assert_eq!(c.diff.short(), "groups=docker");
+        assert_eq!(c.diff().short(), "groups=docker");
         let c = change(
             Membership::of_name("ghost")
                 .in_group_named("app")
                 .check(&dry)
                 .unwrap(),
         );
-        assert_eq!(c.diff.short(), "groups=app");
+        assert_eq!(c.diff().short(), "groups=app");
         assert!(fake.commands().is_empty(), "check mode runs nothing");
 
         for sys in [dry, fake_sys(&fake)] {
@@ -2438,7 +2525,7 @@ mod tests {
         ));
         let c = change(Present::new("x").check(&fake_sys(&fake)).unwrap());
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes home=/srv/home/x shell=/bin/bash"
         );
 
@@ -2451,7 +2538,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            c.diff.short(),
+            c.diff().short(),
             "exists=yes uid=1500 gid=4 home=/srv/home/x shell=/bin/bash"
         );
 
@@ -2461,7 +2548,7 @@ mod tests {
                 .with_file("/etc/group", GROUP),
         );
         let c = change(Present::new("x").check(&fake_sys(&fake)).unwrap());
-        assert_eq!(c.diff.short(), "exists=yes home=/home/x shell=/bin/sh");
+        assert_eq!(c.diff().short(), "exists=yes home=/home/x shell=/bin/sh");
     }
 
     #[test]
@@ -2509,7 +2596,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Absent::new("cadu").remove_home(true);
         let c = change(op.check(&sys).unwrap());
-        assert_eq!(c.diff.short(), "exists=no home=removed");
+        assert_eq!(c.diff().short(), "exists=no home=removed");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.home.as_deref(), Some(Path::new("/home/cadu")));
         assert_eq!(fake.argvs(), vec![vec!["userdel", "-r", "cadu"]]);
@@ -2518,10 +2605,28 @@ mod tests {
         let sys = fake_sys(&fake);
         let op = Absent::new("cadu");
         let c = change(op.check(&sys).unwrap());
-        assert_eq!(c.diff.short(), "exists=no");
+        assert_eq!(c.diff().short(), "exists=no");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.home, None);
         assert_eq!(fake.argvs(), vec![vec!["userdel", "cadu"]]);
+    }
+
+    /// The home reported is the one `check` read, carried in the intent:
+    /// `/etc/passwd` changes between `check` and `apply` here, and an `apply`
+    /// that read it again would report the new home.
+    #[test]
+    fn absent_reports_the_home_check_read() {
+        let fake = Arc::new(base().with_cmd("userdel", None, 0, ""));
+        let sys = fake_sys(&fake);
+        let op = Absent::new("cadu").remove_home(true);
+        let c = change(op.check(&sys).unwrap());
+        write(
+            &fake,
+            "/etc/passwd",
+            &PASSWD.replace("/home/cadu", "/srv/moved"),
+        );
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.home.as_deref(), Some(Path::new("/home/cadu")));
     }
 
     #[test]
@@ -2548,9 +2653,8 @@ mod tests {
     fn existing_looks_up_without_root_and_fails_when_missing() {
         let fake = Arc::new(base());
         let sys = not_root(fake_sys(&fake));
-        let Plan::Satisfied(a) = Existing::named("cadu").check(&sys).unwrap() else {
-            panic!("expected satisfied")
-        };
+        // `Existing`'s intent is `Infallible`, so `Satisfied` is the only plan it has.
+        let Plan::Satisfied(a) = Existing::named("cadu").check(&sys).unwrap();
         assert_eq!(a.home, Path::new("/home/cadu"));
         assert_eq!(a.groups, vec!["adm", "sudo"]);
         let err = Existing::named("ghost")
@@ -2586,7 +2690,7 @@ mod tests {
         let docker = group_entry(GROUP, "docker").unwrap();
         let op = Membership::of(&account).in_group(&docker);
         let c = change(op.check(&sys).unwrap());
-        assert_eq!(c.diff.short(), "groups=adm,docker,sudo");
+        assert_eq!(c.diff().short(), "groups=adm,docker,sudo");
         let m = op.apply(&sys, c).unwrap();
         assert_eq!(
             m,

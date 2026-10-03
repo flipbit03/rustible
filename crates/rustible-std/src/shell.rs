@@ -207,19 +207,32 @@ impl Command {
         self.changed_when = Some(Arc::new(predicate));
         self
     }
+}
 
-    fn argv_str(&self) -> String {
-        std::iter::once(self.program.as_str())
+/// What [`Command`]'s `check` decided: run this argv. The environment and
+/// stdin stay on the op, unprinted; the argv is what the report shows, and
+/// it reaches the process table on every host anyway, so its `Debug` hides
+/// nothing.
+#[derive(Debug)]
+pub struct Run {
+    program: String,
+    args: Vec<String>,
+}
+
+impl Intent for Run {
+    fn diff(&self) -> Diff {
+        let argv: Vec<&str> = std::iter::once(self.program.as_str())
             .chain(self.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect();
+        Diff::summary(format!("$ {}", argv.join(" ")))
     }
 }
 
 impl Op for Command {
     type Output = CommandOutput;
+    type Intent = Run;
 
-    fn check(&self, sys: &System) -> Result<Plan<CommandOutput>> {
+    fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. shell::Command runs whatever argv it is given, so the platform is the caller's concern.
         // The supported set is written out rather than left open, so a new
         // platform is a decision made here and not an accident.
@@ -242,14 +255,14 @@ impl Op for Command {
         {
             return Ok(Plan::Satisfied(satisfied));
         }
-        Ok(Plan::change(Diff::summary(format!(
-            "$ {}",
-            self.argv_str()
-        ))))
+        Ok(Plan::Change(Run {
+            program: self.program.clone(),
+            args: self.args.clone(),
+        }))
     }
 
-    fn apply(&self, sys: &System, _: Change) -> Result<CommandOutput> {
-        let mut cmd = sys.cmd(&self.program).args(self.args.iter().cloned());
+    fn apply(&self, sys: &System, intent: Run) -> Result<CommandOutput> {
+        let mut cmd = sys.cmd(&intent.program).args(intent.args);
         for (k, v) in &self.env {
             cmd = cmd.env(k, v);
         }
@@ -347,7 +360,11 @@ mod tests {
         let op = Command::sh("echo a | tr a b");
         assert_eq!(op.program, "/bin/sh");
         assert_eq!(op.args, vec!["-c", "echo a | tr a b"]);
-        assert_eq!(op.argv_str(), "/bin/sh -c echo a | tr a b");
+        let run = Run {
+            program: op.program.clone(),
+            args: op.args.clone(),
+        };
+        assert_eq!(run.diff().render(), "$ /bin/sh -c echo a | tr a b");
     }
 
     #[test]
@@ -363,7 +380,7 @@ mod tests {
         let Plan::Change(c) = op.check(&sys).unwrap() else {
             panic!("a command always plans a change");
         };
-        assert_eq!(c.diff.short(), "$ psql -v ON_ERROR_STOP=1 app");
+        assert_eq!(c.diff().short(), "$ psql -v ON_ERROR_STOP=1 app");
         assert!(fake.commands().is_empty(), "check runs nothing");
 
         let out = op.apply(&sys, c).unwrap();
