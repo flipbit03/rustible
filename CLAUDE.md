@@ -229,9 +229,10 @@ The shape matters more than the code, and there is already a checklist for it:
 to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
-`crates/rustible-std/src/sysctl.rs`** — at ~680 lines it is short enough to
+`crates/rustible-std/src/sysctl.rs`** — at ~760 lines it is short enough to
 finish and has every part: pure planning functions over file
-text, a `check` that composes a `Diff`, an `apply`, and a test module split
+text, a `check` that returns a typed intent, an `apply` that executes it, the
+intent's `diff`, and a test module split
 into `// ---- pure ----` and `// ---- Fake ----`.
 `crates/rustible-std/src/ssh/authorized_keys.rs` is the model for anything
 that belongs to a user; `systemd.rs` and `user.rs` are the deepest but they
@@ -506,7 +507,7 @@ Each of these has already produced a test that could not fail.
   changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
   the second answer by writing into the Fake between the two checks — the
   builders consume `self`, so this goes through the `Backend` trait, as
-  `sysctl.rs:674` does:
+  `sysctl.rs:756` does:
 
   ```rust
   rustible_sdk::backend::Backend::write(&*fake, Path::new(PROC), b"1\n")?;
