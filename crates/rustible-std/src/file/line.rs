@@ -192,10 +192,10 @@ impl Op for Line {
             ref other => bail!("file::Line has no implementation for {}", other.name()),
         }
         let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            return Ok(Plan::Change(TextEdit::AwaitFile {
-                op: "file::Line",
-                path: self.path.clone(),
-            }));
+            return Ok(Plan::Change(TextEdit::await_file(
+                "file::Line",
+                self.path.clone(),
+            )));
         };
 
         match plan_line(&text, self.matching.as_ref(), &self.line, &self.insert) {
@@ -208,12 +208,12 @@ impl Op for Line {
                     backup_path: None,
                 }))
             }
-            Some((after, line_no)) => Ok(Plan::Change(TextEdit::Rewrite {
-                path: self.path.clone(),
-                before: text,
+            Some((after, line_no)) => Ok(Plan::Change(TextEdit::rewrite(
+                self.path.clone(),
+                text,
                 after,
                 line_no,
-            })),
+            ))),
         }
     }
 
@@ -380,12 +380,7 @@ mod tests {
     /// intent built by hand, no file and no `System`.
     #[test]
     fn the_diff_is_rendered_from_the_text_apply_writes() {
-        let intent = TextEdit::Rewrite {
-            path: "/etc/x".into(),
-            before: "a=1\n".into(),
-            after: "a=1\nb=2\n".into(),
-            line_no: 2,
-        };
+        let intent = TextEdit::rewrite("/etc/x".into(), "a=1\n".into(), "a=1\nb=2\n".into(), 2);
         assert_eq!(
             intent.diff().render(),
             "--- /etc/x (before)\n+++ /etc/x (after)\n@@ -1 +1,2 @@\n a=1\n+b=2\n"

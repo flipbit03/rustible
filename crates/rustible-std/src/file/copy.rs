@@ -433,6 +433,10 @@ mod tests {
         assert_eq!(c.diff().short(), "mode=0600 owner=7:8");
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.backup_path, None, "no content change, so no backup");
+        assert!(
+            !r.content_changed,
+            "attributes only: the content is not rewritten"
+        );
         let f = fake.file("/etc/x").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o600, 7, 8));
         // No backup file appeared next to it.

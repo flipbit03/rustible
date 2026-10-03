@@ -248,12 +248,16 @@ pub(crate) fn read_text_or_empty(
 /// writes exactly that text, so the diff a dry run shows is the edit a real
 /// run makes, and a file that changed between `check` and `apply` is
 /// overwritten with the planned text rather than merged again (the race is
-/// accepted, as in Ansible).
+/// accepted, as in Ansible). Its contents are private: only `check` builds
+/// one.
 #[derive(Debug)]
-pub enum TextEdit {
+pub struct TextEdit(Edit);
+
+#[derive(Debug)]
+enum Edit {
     /// Write `after` over the file.
     Rewrite {
-        /// The file, for the diff header.
+        /// The file, for the diff header and the write.
         path: PathBuf,
         /// The text `check` read; empty when `.create(true)` met no file.
         before: String,
@@ -276,15 +280,15 @@ pub enum TextEdit {
 
 impl Intent for TextEdit {
     fn diff(&self) -> Diff {
-        match self {
-            TextEdit::Rewrite {
+        match &self.0 {
+            Edit::Rewrite {
                 path,
                 before,
                 after,
                 ..
             } => Diff::text(path, before.as_str(), after.as_str()),
             // Worded so the reader knows why no text diff is shown.
-            TextEdit::AwaitFile { op, path } => Diff::summary(format!(
+            Edit::AwaitFile { op, path } => Diff::summary(format!(
                 "{}: does not exist yet; {op} would edit it once an earlier step creates it \
                  (or use .create(true) to create it here)",
                 path.display()
@@ -294,11 +298,35 @@ impl Intent for TextEdit {
 }
 
 impl TextEdit {
+    /// Write `after` over `path`, which `check` read as `before`.
+    fn rewrite(path: PathBuf, before: String, after: String, line_no: usize) -> Self {
+        TextEdit(Edit::Rewrite {
+            path,
+            before,
+            after,
+            line_no,
+        })
+    }
+
+    /// Under `--check` only: `path` is not there yet.
+    fn await_file(op: &'static str, path: PathBuf) -> Self {
+        TextEdit(Edit::AwaitFile { op, path })
+    }
+
+    /// The text to write and where the edit sits, for a test to look at.
+    #[cfg(test)]
+    fn planned(&self) -> Option<(&str, usize)> {
+        match &self.0 {
+            Edit::Rewrite { after, line_no, .. } => Some((after.as_str(), *line_no)),
+            Edit::AwaitFile { .. } => None,
+        }
+    }
+
     /// Execute the edit: back up when asked, then write the planned text.
     /// Returns the line the edit sits on and the backup path.
-    pub(crate) fn write(self, sys: &System, backup: bool) -> Result<(usize, Option<PathBuf>)> {
-        match self {
-            TextEdit::Rewrite {
+    fn write(self, sys: &System, backup: bool) -> Result<(usize, Option<PathBuf>)> {
+        match self.0 {
+            Edit::Rewrite {
                 path,
                 after,
                 line_no,
@@ -308,7 +336,7 @@ impl TextEdit {
                 Ok((line_no, backup_path))
             }
             // The same refusal a real run's `check` gives.
-            TextEdit::AwaitFile { path, .. } => bail!(
+            Edit::AwaitFile { path, .. } => bail!(
                 "{} does not exist (use .create(true) to create it)",
                 path.display()
             ),
@@ -425,9 +453,9 @@ mod tests {
     }
 
     /// Only the differing attributes are rows in the report, but every
-    /// attribute the op was given is set when the step applies: `chown`
-    /// clears setuid, so a mode that already matched is set again after an
-    /// owner change.
+    /// attribute the op was given is set when the step applies. Why that
+    /// matters (a rewrite clearing setuid) cannot show here, since the `Fake`
+    /// does not model it; `tests/it_file_ops.rs` holds that half.
     #[test]
     fn attr_plan_reports_what_differs_and_sets_everything_wanted() {
         let s = stat(0o4755, 0, 0);

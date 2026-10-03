@@ -573,7 +573,7 @@ impl Intent for std::convert::Infallible {
 pub struct Applied<T> {
     value: Option<T>,        // None only in check mode, when the step would change (section 12)
     pub changed: bool,
-    pub diff: Option<Diff>,  // for rendering: a `Diff` is opaque and cannot be read back
+    pub diff: Option<Diff>,  // for rendering: a `Diff` is opaque, with no field to read
     pub elapsed: Duration,
 }
 // Applied<T> derefs to T, so `account.home` works and `account.changed` is there too.

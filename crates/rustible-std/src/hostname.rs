@@ -386,6 +386,42 @@ mod tests {
         assert_eq!(fake.argvs(), vec![vec!["hostname", "HOME-GAMES"]]);
     }
 
+    /// Without systemd the two halves are separate commands, and `apply`
+    /// runs only the one the intent says differs. Here only the kernel's
+    /// name is wrong: `hostname` runs and the file is not rewritten (its
+    /// second line would not survive a rewrite).
+    #[test]
+    fn without_systemd_only_the_kernel_half_runs_when_only_it_differs() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file(ETC_HOSTNAME, "HOME-GAMES\n# kept\n")
+                .with_file(KERNEL_HOSTNAME, "old\n")
+                .with_cmd("hostname", None, 0, ""),
+        );
+        let s = openrc(&fake);
+        let op = Is::new("HOME-GAMES");
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("the kernel differs")
+        };
+        op.apply(&s, c).unwrap();
+        assert_eq!(fake.argvs(), vec![vec!["hostname", "HOME-GAMES"]]);
+        assert_eq!(fake.content(ETC_HOSTNAME).unwrap(), "HOME-GAMES\n# kept\n");
+    }
+
+    /// And when only `/etc/hostname` is wrong, no command runs at all.
+    #[test]
+    fn without_systemd_only_the_file_half_runs_when_only_it_differs() {
+        let fake = Arc::new(box_named("old", "HOME-GAMES").with_cmd("hostname", None, 0, ""));
+        let s = openrc(&fake);
+        let op = Is::new("HOME-GAMES");
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("the file differs")
+        };
+        op.apply(&s, c).unwrap();
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+        assert_eq!(fake.content(ETC_HOSTNAME).unwrap(), "HOME-GAMES\n");
+    }
+
     #[test]
     fn apply_creates_etc_hostname_when_missing() {
         let fake = Arc::new(

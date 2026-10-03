@@ -231,10 +231,10 @@ impl Op for Block {
             );
         }
         let Some(text) = super::read_text_or_empty(sys, &self.path, self.create)? else {
-            return Ok(Plan::Change(TextEdit::AwaitFile {
-                op: "file::Block",
-                path: self.path.clone(),
-            }));
+            return Ok(Plan::Change(TextEdit::await_file(
+                "file::Block",
+                self.path.clone(),
+            )));
         };
         match plan_block(&text, &begin, &end, &self.block, &self.insert) {
             None => {
@@ -248,13 +248,13 @@ impl Op for Block {
                     backup_path: None,
                 }))
             }
-            Some((after, line_no)) => Ok(Plan::Change(TextEdit::Rewrite {
-                path: self.path.clone(),
-                before: text,
+            Some((after, line_no)) => Ok(Plan::Change(TextEdit::rewrite(
+                self.path.clone(),
+                text,
                 after,
                 // An emptied block leaves no BEGIN marker to point at.
-                line_no: if self.block.is_empty() { 0 } else { line_no },
-            })),
+                if self.block.is_empty() { 0 } else { line_no },
+            ))),
         }
     }
 
@@ -548,17 +548,9 @@ mod tests {
     fn what_check_planned_is_what_the_diff_shows() {
         let (after, line_no) =
             plan_block("a\n", "# BEGIN m", "# END m", "x\n", &Insert::Append).unwrap();
-        let intent = TextEdit::Rewrite {
-            path: "/etc/x".into(),
-            before: "a\n".into(),
-            after,
-            line_no,
-        };
+        let intent = TextEdit::rewrite("/etc/x".into(), "a\n".into(), after, line_no);
         assert_eq!(intent.diff().short(), "+3 -0 lines");
-        let TextEdit::Rewrite { after, line_no, .. } = intent else {
-            unreachable!()
-        };
-        assert_eq!((after.as_str(), line_no), ("a\n# BEGIN m\nx\n# END m\n", 2));
+        assert_eq!(intent.planned(), Some(("a\n# BEGIN m\nx\n# END m\n", 2)));
     }
 
     /// `apply` executes the text `check` planned instead of planning again

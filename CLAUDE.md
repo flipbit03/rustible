@@ -230,14 +230,13 @@ to the harness test. Read that first.
 
 Then read one existing op end to end. **Start with
 `crates/rustible-std/src/sysctl.rs`** — at ~760 lines it is short enough to
-finish and has every part: pure planning functions over file
-text, a `check` that returns a typed intent, an `apply` that executes it, the
-intent's `diff`, and a test module split
-into `// ---- pure ----` and `// ---- Fake ----`.
-`crates/rustible-std/src/ssh/authorized_keys.rs` is the model for anything
-that belongs to a user; `systemd.rs` and `user.rs` are the deepest but they
-are 2,000 and 2,600 lines, so read them for a specific question rather than
-for orientation.
+finish and has every part: pure planning functions over file text, a `check`
+that returns a typed intent, an `apply` that executes it, the intent's
+`diff`, and a test module split into `// ---- pure ----` and
+`// ---- Fake ----`. `crates/rustible-std/src/ssh/authorized_keys.rs` is the
+model for anything that belongs to a user; `systemd.rs` and `user.rs` are the
+deepest but they are 2,300 and 2,750 lines, so read them for a specific
+question rather than for orientation.
 
 A new op is a module in `crates/rustible-std/src/`, declared with `pub mod
 <name>;` in that crate's `lib.rs` — a file for a small op, a directory with a
@@ -257,6 +256,7 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
   genuinely actions get verbs and always report changed: `systemd::Restart`,
+  `shell::Command`.
 - **`check` does all the thinking** and produces the op's **intent**: a type
   of its own (`type Intent` on the `Op`) whose typed fields say what `check`
   observed and decided. **`apply` executes that intent**, rather than
@@ -271,9 +271,9 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   `struct ThingIntent(Diff)` compiles, passes every test, and restores the
   seam the intent exists to close: an `apply` deciding from display strings,
   where rewording a report changes what runs. `Diff` is opaque outside the
-  SDK for this reason — it can be built and rendered, never matched or read —
-  so parsing `render()` is the only way left to cheat, and that is caught in
-  review. The one structural exception is a composite op, whose intent holds
+  SDK for this reason — it can be built and rendered, never matched or read
+  field by field — so the only way left to cheat is parsing one of its string
+  forms (`render()`, `{:?}` or its JSON), and that is caught in review. The one structural exception is a composite op, whose intent holds
   its children's *intents*, never their diffs.
 - **A step that would change has no output in check mode.** The intent
   carries what `check` observed and decided and nothing `apply` will
@@ -281,7 +281,6 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
   whatever its output needs beyond the intent (a gid to report, a digest).
   A later step that reads a would-change step's output under `--check` fails
   with a clear message (vision 12).
-  output under `--check` fails with a clear message (vision 12).
 - **Refuse, do not invent — in a real run.** An operation that manages a user
   does not create the group it references, and `authorized_keys` does not
   create the home. Fail naming the operation the author wanted. Under

@@ -2312,8 +2312,8 @@ mod tests {
 
     /// An attributes-only plan carries no text, and `apply` writes none: its
     /// report says what `check` established (every key already there, as
-    /// requested) even when the file moved on in between, rather than
-    /// re-reading it and reporting a key it never wrote.
+    /// `check` found it in the file) even when the file moved on in between,
+    /// rather than re-reading it and reporting a key it never wrote.
     #[test]
     fn attributes_only_apply_reports_what_check_found_not_what_the_file_says_now() {
         let fake = fake_with_wrong_attributes();

@@ -75,8 +75,12 @@ impl SymlinkBuilder {
 }
 
 /// What [`Symlink`]'s `check` decided, by what it found at the link's path.
+/// Its contents are private: only `check` builds one.
 #[derive(Debug)]
-pub enum SymlinkIntent {
+pub struct SymlinkIntent(Link);
+
+#[derive(Debug)]
+enum Link {
     /// Nothing is there: create the link.
     Create {
         /// The link's own path.
@@ -107,12 +111,12 @@ pub enum SymlinkIntent {
 
 impl Intent for SymlinkIntent {
     fn diff(&self) -> Diff {
-        let (link, changes) = match self {
-            SymlinkIntent::Create { link, target } => (
+        let (link, changes) = match &self.0 {
+            Link::Create { link, target } => (
                 link,
                 vec![AttrChange::new("target", "-", target.display().to_string())],
             ),
-            SymlinkIntent::Retarget { link, from, target } => (
+            Link::Retarget { link, from, target } => (
                 link,
                 vec![AttrChange::new(
                     "target",
@@ -120,7 +124,7 @@ impl Intent for SymlinkIntent {
                     target.display().to_string(),
                 )],
             ),
-            SymlinkIntent::Replace { link, kind, target } => (
+            Link::Replace { link, kind, target } => (
                 link,
                 vec![
                     AttrChange::new("kind", format!("{kind:?}").to_lowercase(), "symlink"),
@@ -147,13 +151,13 @@ impl Op for Symlink {
         let link = self.link.clone();
         let target = self.target.clone();
         let intent = match sys.stat(&self.link)? {
-            None => SymlinkIntent::Create { link, target },
+            None => Link::Create { link, target },
             Some(s) if s.kind == FileKind::Symlink => {
                 let current = sys.read_link(&self.link)?;
                 if current == self.target {
                     return Ok(Plan::Satisfied(self.report()));
                 }
-                SymlinkIntent::Retarget {
+                Link::Retarget {
                     link,
                     from: current,
                     target,
@@ -168,20 +172,19 @@ impl Op for Symlink {
                 self.link.display(),
                 s.kind
             ),
-            Some(s) => SymlinkIntent::Replace {
+            Some(s) => Link::Replace {
                 link,
                 kind: s.kind,
                 target,
             },
         };
-        Ok(Plan::Change(intent))
+        Ok(Plan::Change(SymlinkIntent(intent)))
     }
 
     fn apply(&self, sys: &System, intent: SymlinkIntent) -> Result<SymlinkReport> {
-        match intent {
-            SymlinkIntent::Create { link, target } => sys.symlink(&target, &link)?,
-            SymlinkIntent::Retarget { link, target, .. }
-            | SymlinkIntent::Replace { link, target, .. } => {
+        match intent.0 {
+            Link::Create { link, target } => sys.symlink(&target, &link)?,
+            Link::Retarget { link, target, .. } | Link::Replace { link, target, .. } => {
                 // Replace atomically: a reader never sees the path missing.
                 let mut tmp = link.clone().into_os_string();
                 tmp.push(format!(".rustible-tmp-{}", std::process::id()));

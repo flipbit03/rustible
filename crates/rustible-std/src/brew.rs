@@ -580,7 +580,12 @@ mod tests {
 
     #[test]
     fn absent_diff_names_the_version_and_apply_reports_what_went() {
-        let s = mac_sys("nethack 3.6.7\n");
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/opt/homebrew/bin/brew", "")
+                .with_cmd("/opt/homebrew/bin/brew", None, 0, "nethack 3.6.7\n"),
+        );
+        let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_facts(mac_facts());
         let op = Absent::new(["nethack", "agg"]);
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
@@ -595,6 +600,11 @@ mod tests {
         assert_eq!(r.removed[0].name, "nethack");
         assert_eq!(r.removed[0].version, "3.6.7");
         assert_eq!(r.already_absent, vec!["agg".to_string()]);
+        // Only what `check` planned is uninstalled, never the absent `agg`.
+        assert_eq!(
+            fake.argvs().last().unwrap(),
+            &vec!["/opt/homebrew/bin/brew", "uninstall", "nethack"]
+        );
     }
 
     #[test]

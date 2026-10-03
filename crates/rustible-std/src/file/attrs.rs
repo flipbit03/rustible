@@ -71,18 +71,23 @@ impl Attrs {
 }
 
 /// What [`Attrs`]'s `check` decided: the attributes to set on the path, with
-/// what it found there.
+/// what it found there, or, under `--check` only, that the path is not there
+/// yet.
 #[derive(Debug)]
 pub struct AttrsIntent {
     path: PathBuf,
     attrs: AttrPlan,
+    /// The path does not exist yet and an earlier step may create it. Only
+    /// `check` under `--check` plans this, so it is reported and never
+    /// applied; a real run's `check` refuses the missing path instead, and
+    /// `apply` refuses it too rather than set attributes on nothing.
+    awaits_path: bool,
 }
 
 impl Intent for AttrsIntent {
     fn diff(&self) -> Diff {
-        if !self.attrs.differs() {
-            // Only reachable under --check, for a path not there yet with
-            // nothing to set: the step still has the path to wait for.
+        if self.awaits_path && !self.attrs.differs() {
+            // Nothing to set, but the step still has the path to wait for.
             return Diff::summary(format!(
                 "{}: does not exist yet; file::Attrs would check it once an earlier \
                  step creates it",
@@ -114,12 +119,10 @@ impl Op for Attrs {
                 return Ok(Plan::Change(AttrsIntent {
                     path: self.path.clone(),
                     attrs: plan_attrs(None, self.mode, self.owner),
+                    awaits_path: true,
                 }));
             }
-            bail!(
-                "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",
-                self.path.display()
-            );
+            return Err(missing(&self.path));
         };
         if stat.kind == FileKind::Symlink {
             bail!(
@@ -134,13 +137,26 @@ impl Op for Attrs {
         Ok(Plan::Change(AttrsIntent {
             path: self.path.clone(),
             attrs,
+            awaits_path: false,
         }))
     }
 
     fn apply(&self, sys: &System, intent: AttrsIntent) -> Result<AttrsReport> {
+        if intent.awaits_path {
+            // The refusal a real run's `check` gives for the same machine.
+            return Err(missing(&intent.path));
+        }
         intent.attrs.apply(sys, &intent.path)?;
         Ok(self.report())
     }
+}
+
+/// The refusal for a path that is not there: this op never creates one.
+fn missing(path: &std::path::Path) -> Error {
+    Error::msg(format!(
+        "{} does not exist; file::Attrs only sets attributes (create it with file::Copy or file::Directory)",
+        path.display()
+    ))
 }
 
 #[cfg(test)]
@@ -289,5 +305,14 @@ mod tests {
             err.contains("/missing does not exist; file::Attrs only sets attributes"),
             "{err}"
         );
+
+        // A dry run's intent never reaches `apply`; handed to one anyway, it
+        // refuses as a real `check` does rather than succeed on nothing.
+        let waiting = expect_change(&Attrs::at("/missing"), &dry);
+        let err = Attrs::at("/missing")
+            .apply(&real, waiting)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("/missing does not exist"), "{err}");
     }
 }

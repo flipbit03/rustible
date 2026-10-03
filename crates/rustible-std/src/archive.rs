@@ -1388,6 +1388,48 @@ mod tests {
         assert!(err.contains("EOF"), "{err}");
     }
 
+    /// `apply` writes the members `check` walked and reads only their data
+    /// from the archive. An archive swapped in between, with a member under
+    /// another name, is refused at that member: its data never lands under
+    /// a name `check` did not validate.
+    #[test]
+    fn apply_refuses_an_archive_whose_member_changed_since_check() {
+        let (fake, sys) = sys_with(&raw_tar(&[
+            ("a", b'0', b"one", ""),
+            ("b", b'0', b"two", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let intent = expect_change(&op, &sys);
+        sys.write_atomic(
+            "/tmp/a.tar",
+            &raw_tar(&[("a", b'0', b"one", ""), ("evil", b'0', b"two", "")]),
+        )
+        .unwrap();
+        let err = op.apply(&sys, intent).unwrap_err().chain();
+        assert!(err.contains("not the member `check` walked"), "{err}");
+        assert!(
+            fake.file("/opt/evil").is_none(),
+            "nothing under the new name"
+        );
+        assert!(fake.file("/opt/b").is_none());
+    }
+
+    /// The same for an archive that lost members: `apply` refuses rather
+    /// than report an extraction it did not finish.
+    #[test]
+    fn apply_refuses_an_archive_that_ends_early() {
+        let (_, sys) = sys_with(&raw_tar(&[
+            ("a", b'0', b"one", ""),
+            ("b", b'0', b"two", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let intent = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &raw_tar(&[("a", b'0', b"one", "")]))
+            .unwrap();
+        let err = op.apply(&sys, intent).unwrap_err().chain();
+        assert!(err.contains("ended before"), "{err}");
+    }
+
     #[test]
     fn an_absurd_header_size_does_not_abort_apply_either() {
         // `apply` walks the archive again, and `write_member` reserves from

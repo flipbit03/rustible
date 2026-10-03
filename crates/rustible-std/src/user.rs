@@ -419,6 +419,7 @@ pub fn plan_modify(current: &PasswdEntry, current_groups: &[String], want: &Desi
     }
     delta
 }
+
 /// What a new account gets when nothing is asked for: shadow-utils read
 /// `SHELL=` and `HOME=` (the base directory) from `/etc/default/useradd`
 /// (Debian and Ubuntu ship `/bin/sh` and `/home`, Fedora `/bin/bash`) and
@@ -1885,6 +1886,22 @@ mod tests {
         assert_eq!(fake.argvs(), vec![vec!["usermod", "-G", "docker", "cadu"]]);
     }
 
+    /// An exact list that overlaps what the account has: `usermod -G` gets
+    /// the whole new list, kept group included, not only the additions.
+    #[test]
+    fn present_exact_groups_hands_usermod_the_whole_list() {
+        let fake = Arc::new(base().with_cmd("usermod", None, 0, ""));
+        let sys = fake_sys(&fake);
+        let op = Present::new("cadu").groups(["adm", "docker"]).append(false);
+        let c = change(op.check(&sys).unwrap());
+        assert_eq!(c.diff().short(), "groups=adm,docker");
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec!["usermod", "-G", "adm,docker", "cadu"]]
+        );
+    }
+
     #[test]
     fn present_modifies_ids_home_and_comment_in_one_usermod() {
         let fake = Arc::new(base().with_cmd("usermod", None, 0, ""));
@@ -2024,7 +2041,7 @@ mod tests {
 
     #[test]
     fn present_on_alpine_system_user_shows_only_an_explicit_shell() {
-        let fake = Arc::new(base());
+        let fake = Arc::new(base().with_cmd("adduser", None, 0, ""));
         let sys = alpine(fake_sys(&fake));
         let c = change(
             Present::new("svc")
@@ -2034,19 +2051,38 @@ mod tests {
                 .unwrap(),
         );
         assert!(!c.diff().short().contains("shell="), "{}", c.diff().short());
-        let c = change(
-            Present::new("svc")
-                .uid(100)
-                .system(true)
-                .gid("docker")
-                .shell("/sbin/nologin")
-                .check(&sys)
-                .unwrap(),
-        );
+        let op = Present::new("svc")
+            .uid(100)
+            .system(true)
+            .gid("docker")
+            .shell("/sbin/nologin");
+        let c = change(op.check(&sys).unwrap());
         assert!(
             c.diff().short().contains("shell=/sbin/nologin"),
             "{}",
             c.diff().short()
+        );
+        // And the system flag the intent carries reaches `adduser` as `-S`.
+        write(
+            &fake,
+            "/etc/passwd",
+            &format!("{PASSWD}svc:x:100:998::/home/svc:/sbin/nologin\n"),
+        );
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                "adduser",
+                "-D",
+                "-S",
+                "-u",
+                "100",
+                "-G",
+                "docker",
+                "-s",
+                "/sbin/nologin",
+                "svc"
+            ]]
         );
     }
 

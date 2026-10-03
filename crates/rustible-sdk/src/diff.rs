@@ -19,13 +19,15 @@ use serde::{Deserialize, Serialize};
 /// orchestrator.
 ///
 /// Write-only outside the SDK: an op builds one with [`Diff::text`],
-/// [`Diff::attrs`], [`Diff::summary`] or [`Diff::many`], and the only things
-/// that can be done with it afterwards are [`Diff::render`] and
-/// [`Diff::short`]. There is no variant to match and no field to read,
-/// because a `Diff` is the report rendered from an op's
-/// [`Intent`](crate::op::Intent) and never the instruction `apply` follows.
-/// An `apply` that decided what to do from display strings would let
-/// rewording a report change what runs.
+/// [`Diff::attrs`], [`Diff::summary`] or [`Diff::many`], and what it does
+/// with it afterwards is [`Diff::render`] and [`Diff::short`]. There is no
+/// variant to match and no field to read, because a `Diff` is the report
+/// rendered from an op's [`Intent`](crate::op::Intent) and never the
+/// instruction `apply` follows. An `apply` that decided what to do from
+/// display strings would let rewording a report change what runs. Reading one
+/// back now means parsing one of its string forms (`render()`, `{:?}` or its
+/// JSON), which is plainly wrong and caught in review; the type cannot stop
+/// it, only make it conspicuous.
 ///
 /// The JSON is the private enum's, unchanged by the wrapper
 /// (`#[serde(transparent)]`), so the wire format does not depend on this

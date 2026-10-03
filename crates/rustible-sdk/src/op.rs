@@ -43,7 +43,9 @@ use crate::system::System;
 ///
 /// It restores the seam this type exists to close: rewording a report would
 /// change what runs. [`Diff`] is opaque outside the SDK for the same reason,
-/// so such an `apply` has no variant to match and no field to read. The one
+/// so such an `apply` has no variant to match and no field to read; all it
+/// could do is parse a string form (`render()`, `{:?}`, the JSON), which
+/// review catches. The one
 /// structural exception is a composite op, whose intent holds its children's
 /// *intents*, never their diffs.
 ///
