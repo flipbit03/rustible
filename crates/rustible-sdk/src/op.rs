@@ -269,7 +269,10 @@ impl<T> Deref for Applied<T> {
     /// it unwinds with a typed [`OutputUnavailable`] payload rather than
     /// panicking: nothing is printed, and the innermost enclosing
     /// [`Ctx::block`](crate::ctx::Ctx::block), or the runtime outside any
-    /// block, ends that part of the dry run with a warning.
+    /// block, ends that part of the dry run with a warning. That is for a
+    /// read in playbook code between steps: read inside an operation's own
+    /// `check`, it is that step's failure instead, counted, and nothing is
+    /// absorbed.
     ///
     /// [`OutputUnavailable`]: crate::error::OutputUnavailable
     fn deref(&self) -> &T {

@@ -1627,8 +1627,8 @@ later step that chains from it has no value.
 Options considered:
 1. Stop the host at the first would-change step. Honest but shows only the
    first change; useless for "what would this playbook do". Rejected.
-2. Continue; the output is unavailable; when a later step reads it, end the
-   enclosing block there with a warning.
+2. Continue; the output is unavailable; when playbook code later reads it,
+   end the enclosing block there with a warning.
 3. Let ops predict their output. Most fidelity, more work per op, and a wrong
    prediction is a lie in a dry run.
 

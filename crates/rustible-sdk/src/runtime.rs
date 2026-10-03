@@ -434,6 +434,17 @@ fn print_usage(playbooks: &[Named]) {
     }
 }
 
+/// The warning a dry run gives when this binary cannot unwind: under
+/// `panic = "abort"`, a read of a would-change step's output kills the host
+/// instead of ending the enclosing `ctx.block`.
+fn abort_notice(abort: bool, check_mode: bool) -> Option<&'static str> {
+    (abort && check_mode).then_some(
+        "this playbook binary was built with panic = \"abort\", so under --check a read of a \
+         would-change step's output ends this host's run instead of the enclosing ctx.block; \
+         set panic = \"unwind\" in [profile.dist]",
+    )
+}
+
 /// Gather facts, build the context, run the entry, report, and map the
 /// outcome to an exit code. Shared by every mode.
 #[allow(clippy::too_many_arguments)]
@@ -461,6 +472,12 @@ fn execute(
         sink.emit(Event::Log {
             level: crate::event::Level::Warn,
             msg: w,
+        });
+    }
+    if let Some(w) = abort_notice(cfg!(panic = "abort"), check_mode) {
+        sink.emit(Event::Log {
+            level: crate::event::Level::Warn,
+            msg: w.into(),
         });
     }
     let mut ctx = Ctx::for_run(sys, host, channel, run_id);
@@ -1049,5 +1066,14 @@ mod tests {
             ]
         );
         assert!(warnings_in(&events).is_empty(), "{events:#?}");
+    }
+
+    /// Only a dry run of a binary that cannot unwind is warned.
+    #[test]
+    fn only_a_dry_run_built_to_abort_is_warned() {
+        assert!(abort_notice(true, true).is_some_and(|w| w.contains("panic = \"unwind\"")));
+        assert!(abort_notice(true, false).is_none());
+        assert!(abort_notice(false, true).is_none());
+        assert!(abort_notice(false, false).is_none());
     }
 }

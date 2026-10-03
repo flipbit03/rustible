@@ -503,6 +503,11 @@ impl Ctx {
     /// the error it is. A read made inside an op's own `check` is not a gap
     /// in the dry run but that step's failure, and is never absorbed.
     ///
+    /// Absorbing unwinds through the closure's frames, as a panic would. A
+    /// `std::sync::Mutex` guard held across the read is poisoned by it, so a
+    /// dry run can then fail with a `PoisonError` where the real run is
+    /// fine: drop such a guard before reading a step's output.
+    ///
     /// ```no_run
     /// use rustible_sdk::prelude::*;
     ///
@@ -2114,15 +2119,12 @@ mod tests {
         );
     }
 
-    const PROBE_VAR: &str = "RUSTIBLE_PROBE_SILENT_UNWIND";
-
-    /// Not a test on its own: the body of the subprocess run below. Without
-    /// the variable it does nothing.
+    /// Not a test on its own: the body of the subprocess run below, which
+    /// reads its stderr. Ignored, so a normal run does not report it as a
+    /// pass that checked nothing.
     #[test]
+    #[ignore = "run by an_absorbed_read_does_not_run_the_panic_hook in a child process"]
     fn probe_absorbed_reads_print_nothing() {
-        if std::env::var_os(PROBE_VAR).is_none() {
-            return;
-        }
         let (mut ctx, _sink) = ctx_in(true);
         let b = ctx
             .block("b", |ctx| {
@@ -2145,12 +2147,12 @@ mod tests {
     fn an_absorbed_read_does_not_run_the_panic_hook() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
                 "ctx::tests::probe_absorbed_reads_print_nothing",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(PROBE_VAR, "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);

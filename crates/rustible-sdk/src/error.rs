@@ -158,9 +158,12 @@ pub struct MutationDuringCheck {
 ///
 /// It arrives two ways: as an error, from [`Applied::output`] and its
 /// friends, and as an unwind payload, from `Applied`'s and `Block`'s `Deref`,
-/// which have no `Result` to return. Under `--check` either one ends the
-/// innermost enclosing [`Ctx::block`] with a warning, or the playbook body
-/// for that host when there is no block; nothing fails.
+/// which have no `Result` to return. Under `--check`, read in playbook code
+/// between steps, either one ends the innermost enclosing [`Ctx::block`]
+/// with a warning, or the playbook body for that host when there is no
+/// block; nothing fails. Read inside an operation's own `check` (or its
+/// intent's `diff`), it is that step's failure instead: the step fails and
+/// is counted, and nothing is absorbed.
 ///
 /// [`Applied::output`]: crate::op::Applied::output
 /// [`Ctx::block`]: crate::ctx::Ctx::block
@@ -181,17 +184,27 @@ impl OutputUnavailable {
     /// does not run, so nothing is printed, and the catcher tells it from a
     /// real bug by its type. With no catcher (a unit test driving a dry
     /// `Ctx` by hand, another thread), nobody would report it, so it is an
-    /// ordinary `panic!` carrying the message, and the hook prints it.
+    /// ordinary `panic!` carrying the message, and the hook prints it. The
+    /// same holds in a binary built with `panic = "abort"`, where nothing is
+    /// caught at all: the process dies, and the hook's message is the only
+    /// reason anyone gets.
     pub(crate) fn throw(step: &str) -> ! {
         let unavailable = OutputUnavailable {
             step: step.to_string(),
         };
-        if CATCHERS.with(Cell::get) > 0 {
+        if unwinds_silently(cfg!(panic = "unwind"), CATCHERS.with(Cell::get)) {
             std::panic::resume_unwind(Box::new(unavailable))
         } else {
             panic!("{unavailable}")
         }
     }
+}
+
+/// Whether [`OutputUnavailable::throw`] may skip the panic hook: only when
+/// panics unwind, so a catcher can receive the payload, and one is on the
+/// stack to do so.
+fn unwinds_silently(unwind: bool, catchers: u32) -> bool {
+    unwind && catchers > 0
 }
 
 thread_local! {
@@ -321,6 +334,19 @@ macro_rules! ensure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The typed, hook-free unwind only when something can receive it: a
+    /// catcher on the stack, and panics that unwind at all. Otherwise the
+    /// read is a panic with its message, which the hook prints, so a
+    /// `panic = "abort"` binary still says why it died.
+    #[test]
+    fn a_missing_output_unwinds_silently_only_to_a_catcher_that_can_catch() {
+        assert!(unwinds_silently(true, 1));
+        assert!(unwinds_silently(true, 3));
+        assert!(!unwinds_silently(true, 0), "no catcher on the stack");
+        assert!(!unwinds_silently(false, 1), "built with panic = \"abort\"");
+        assert!(!unwinds_silently(false, 0));
+    }
 
     #[test]
     fn foreign_errors_convert_with_question_mark() {
