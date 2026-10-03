@@ -382,9 +382,10 @@ pub struct Compact<W: Write + Send> {
 
 impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
-    /// per step and warning, a step inside a block prefixed with its path. At 1 it adds `debug` logs, the full
-    /// diff under a changed step, and the failing command's stderr. At 2 it
-    /// adds a `$` line per [`Event::CmdRan`]. Higher values behave like 2.
+    /// per step and warning, a step inside a block prefixed with its path.
+    /// At 1 it adds `debug` logs, the full diff under a changed step, and
+    /// the failing command's stderr. At 2 it adds a `$` line per
+    /// [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
             w: Mutex::new(w),

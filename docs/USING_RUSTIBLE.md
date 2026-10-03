@@ -583,7 +583,7 @@ if deploy.changed { /* ... */ }
 ```
 
 ```
-[web1]  [deploy account] user ............... would change   ...
+[web1]  [deploy account] user ................................... would change    exists=yes home=/home/deploy shell=/bin/sh
 [web1]    WARNING: [deploy account] not evaluated further under --check: needs the output of step `user`, which would change and so has none
 ```
 
@@ -972,8 +972,11 @@ directory's parent, or a destination directory as a side effect. Sequence them:
 
 ```rust
 ctx.step("docker group", group::Present::new("docker"))?;
-let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
-ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
+ctx.block("app account", |ctx| {
+    let app = ctx.step("app user", user::Present::new("app").groups(["docker"]))?;
+    ctx.step("keys", authorized_keys::Present::for_user(&app).keys([KEY]))?;
+    Ok(())
+})?;
 ```
 
 In a real run most of these refuse in `check`, before anything is touched,
@@ -1276,7 +1279,7 @@ the whole shape of the real run, conditionals included.
 |---|---|
 | ``no host or group named `all` `` | there is no implicit `all` group (§6); exits 3 |
 | `cannot find module or crate 'apt' in this scope` | missing `use rustible_std::apt;` (§7) |
-| `not evaluated further under --check` | a read of a would-change step's output; the dry run skipped the rest of that block (§9, §15) |
+| `not evaluated further under --check` | a read of a would-change step's output; the dry run did not evaluate the rest of that block (§9, §15) |
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
 | ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
 | `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |

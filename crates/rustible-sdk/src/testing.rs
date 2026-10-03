@@ -42,7 +42,6 @@
 //! label `rustible.integration=1`, so a run killed half way leaves something
 //! `docker ps -q --filter label=rustible.integration` can find.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -354,7 +353,7 @@ fn inside(spec: &Spec, image: &str, body: Body) {
     // libtest prints `test <name> ... ` without a newline before the body runs.
     println!();
     let t0 = Instant::now();
-    let outcome = catch_unwind(AssertUnwindSafe(|| body(&mut ctx)));
+    let outcome = crate::error::catching(|| body(&mut ctx));
     let error = match outcome {
         Ok(Ok(())) => None,
         Ok(Err(e)) => Some(e.chain()),
@@ -853,7 +852,7 @@ mod tests {
     #[test]
     fn panic_message_reads_the_output_unavailable_payload() {
         let payload =
-            std::panic::catch_unwind(|| -> () { crate::error::OutputUnavailable::throw("read") })
+            crate::error::catching(|| -> () { crate::error::OutputUnavailable::throw("read") })
                 .unwrap_err();
         assert_eq!(
             panic_message(&payload),

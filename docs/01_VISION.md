@@ -1476,7 +1476,7 @@ pub struct Ctx {
     host: HostInfo,         // from the Start frame
     channel: Channel,       // framed up/down link to the orchestrator
     step_counter: u32,
-    blocks: Rc<[Rc<BlockFrame>]>,   // the enclosing ctx.block path; each frame records whether a step inside changed
+    blocks: Vec<BlockFrame>,   // the ctx.block stack open right now, shared by every Ctx of the run
 }
 
 impl Ctx {
@@ -1521,9 +1521,11 @@ impl Ctx {
   counter and has no line of its own; every step inside is printed with a
   `[outer][inner] ` prefix, so a line stands on its own however hosts
   interleave. It returns `Block<T>`: the closure's value, and `.changed`,
-  derived from the steps inside (nested blocks and `as_user` children
-  included) rather than declared. Under `--check` it is where a read of a
-  missing output ends (section 12). Blocks nest.
+  derived from the steps run while it is open (nested blocks included,
+  through any `Ctx` value, an `as_root()` bound earlier among them) rather
+  than declared. Under `--check` it is where a read of a missing output in
+  playbook code ends (section 12); a read inside an op's `check` fails that
+  step instead. Blocks nest.
 - **`bail!`** (re-exported) is Ansible's `fail` module.
 - **Tier 3 calls are blocking calls over the channel** (remote-brain): `barrier`
   sends a frame up and waits for `BarrierRelease`; `run_once` is a barrier plus
@@ -1616,7 +1618,7 @@ Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 
-## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
+## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02, 2026-10-02 for #47)
 
 Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change(intent)` does
 not, so in a dry run a step that *would* change has nothing to return, and a
@@ -1625,8 +1627,8 @@ later step that chains from it has no value.
 Options considered:
 1. Stop the host at the first would-change step. Honest but shows only the
    first change; useless for "what would this playbook do". Rejected.
-2. Continue; the output is unavailable; fail loudly only when a later step
-   actually reads it.
+2. Continue; the output is unavailable; when a later step reads it, end the
+   enclosing block there with a warning.
 3. Let ops predict their output. Most fidelity, more work per op, and a wrong
    prediction is a lie in a dry run.
 

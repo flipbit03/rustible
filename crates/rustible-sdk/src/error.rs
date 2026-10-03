@@ -5,6 +5,7 @@
 //! never map errors by hand. A handful of SDK signals stay as concrete types
 //! inside the chain so the orchestrator can render them specially.
 
+use std::cell::Cell;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -13,8 +14,10 @@ pub struct Error {
     inner: anyhow::Error,
     /// Set once a [`Ctx::block`](crate::ctx::Ctx::block) has printed this
     /// error's `block ended with an error` line, so the blocks enclosing it
-    /// pass it on without printing it a second time. Kept through
-    /// [`Error::context`]; nothing outside the SDK sees it.
+    /// pass it on without printing it a second time. It sticks to the error
+    /// for good: [`Error::context`] keeps it, and nothing clears it, so an
+    /// error a playbook catches and returns later is not announced again.
+    /// Nothing outside the SDK sees it.
     pub(crate) shown_by_block: bool,
 }
 
@@ -170,15 +173,40 @@ pub struct OutputUnavailable {
 }
 
 impl OutputUnavailable {
-    /// Unwind with this as a typed payload, for a `Deref` that has no
-    /// `Result` to return. `resume_unwind` rather than `panic!`: the panic
-    /// hook does not run, so nothing is printed on stderr, and the catcher
-    /// (`Ctx::block`, the runtime) tells it from a real bug by its type.
+    /// Unwind for a `Deref` that has no `Result` to return.
+    ///
+    /// When one of the SDK's catchers is on this thread's stack
+    /// ([`catching`]: `Ctx::block`, `Ctx::step`, the runtime, the container
+    /// harness), this is `resume_unwind` with a typed payload: the panic hook
+    /// does not run, so nothing is printed, and the catcher tells it from a
+    /// real bug by its type. With no catcher (a unit test driving a dry
+    /// `Ctx` by hand, another thread), nobody would report it, so it is an
+    /// ordinary `panic!` carrying the message, and the hook prints it.
     pub(crate) fn throw(step: &str) -> ! {
-        std::panic::resume_unwind(Box::new(OutputUnavailable {
+        let unavailable = OutputUnavailable {
             step: step.to_string(),
-        }))
+        };
+        if CATCHERS.with(Cell::get) > 0 {
+            std::panic::resume_unwind(Box::new(unavailable))
+        } else {
+            panic!("{unavailable}")
+        }
     }
+}
+
+thread_local! {
+    /// How many [`catching`] frames are on this thread's stack.
+    static CATCHERS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// `catch_unwind`, counted, so [`OutputUnavailable::throw`] knows whether
+/// anything will receive its typed payload. Every SDK site that catches a
+/// panic goes through here.
+pub(crate) fn catching<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    CATCHERS.with(|c| c.set(c.get() + 1));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    CATCHERS.with(|c| c.set(c.get() - 1));
+    caught
 }
 
 /// The step a failure happened in, as [`Ctx::step`](crate::ctx::Ctx::step)

@@ -225,8 +225,9 @@ pub(crate) fn validate_field(what: &str, value: &str) -> Result<()> {
 /// creation and is ignored for an existing group, as in Ansible.
 ///
 /// Check mode (vision 12): a step that would change has no output, so a
-/// dry run that chains from this step — `.gid(&grp)` on the next one —
-/// stops there with a clear message rather than carrying a made-up gid.
+/// dry run that chains from this step — `.gid(&grp)` on the next one — ends
+/// the enclosing `ctx.block` there with a warning, rather than carrying a
+/// made-up gid; the run goes on after the block.
 #[derive(Debug, Clone)]
 pub struct Present {
     name: String,

@@ -15,8 +15,14 @@ use std::io::Write;
 
 use rustible_sdk::event::{Event, Level, Status, Summary, block_prefix};
 
-/// Column the status starts in on a step line.
-const NAME_WIDTH: usize = 44;
+/// Column the status starts in on a step line, counted from the start of the
+/// label. 57 is where the mock-ups in issue #47 put it: a block prefix plus
+/// a step name, `[DCIM folder is receive-only] Read folder config `, is 49
+/// characters, and still gets a dot leader. With a host label of a dozen
+/// characters and `would change`, a status-only line ends near column 85,
+/// inside a 100-column terminal. A longer label still pushes the status
+/// right rather than being cut.
+const NAME_WIDTH: usize = 57;
 
 #[derive(Default)]
 struct HostState {
@@ -504,11 +510,11 @@ mod tests {
             assert!(!r.finish());
         });
         let expected = "\
-[local]  mc present ................................. ok
+[local]  mc present .............................................. ok
 [local]    $ dpkg-query -W mc (as self, exit 0, 12ms)
 [local]    debug: already there
 [local]    done
-[arm  ]  mc present ................................. changed
+[arm  ]  mc present .............................................. changed
 [arm  ]    $ apt-get (as self, exit 0, 4500ms)
 
 host    ok  changed  would change  skipped  failed  warnings
@@ -674,7 +680,7 @@ arm      0        1             0        0       0         0
         assert_eq!(reported.matches("boom: deeper").count(), 1, "{reported}");
         assert!(
             reported.contains(
-                "[local]  x .......................................... FAILED
+                "[local]  x ....................................................... FAILED
 "
             ),
             "{reported}"
@@ -873,11 +879,11 @@ arm      0        1             0        0       0         0
             );
         });
         let expected = "\
-[arm  ]  [DCIM] Read folder config .................. would change    GET http://x (not sent under --check)
+[arm  ]  [DCIM] Read folder config ............................... would change    GET http://x (not sent under --check)
 [arm  ]    WARNING: [DCIM] not evaluated further under --check: needs the output of step `Read folder config`, which would change and so has none
-[local]  [DCIM] Read folder config .................. ok
-[local]  [DCIM][inner] Set type ..................... changed
-[arm  ]  Restart syncthing .......................... would change
+[local]  [DCIM] Read folder config ............................... ok
+[local]  [DCIM][inner] Set type .................................. changed
+[arm  ]  Restart syncthing ....................................... would change
 ";
         assert_eq!(out, expected);
     }
@@ -886,18 +892,18 @@ arm      0        1             0        0       0         0
     /// long name does; it is never cut.
     #[test]
     fn a_long_prefix_counts_toward_the_name_column() {
-        let path = ["a block with a rather long name", "and another"];
+        let path = ["a block with a rather long name", "and another one, longer"];
         assert_eq!(
             step_line(&path.map(String::from), "step", "ok", ""),
-            "[a block with a rather long name][and another] step  ok"
+            "[a block with a rather long name][and another one, longer] step  ok"
         );
         assert_eq!(
             step_line(&["b".to_string()], "step", "ok", ""),
-            "[b] step ................................... ok"
+            "[b] step ................................................ ok"
         );
         assert_eq!(
             step_line(&[], "step", "skipped", "   why"),
-            "step ....................................... skipped         why"
+            "step .................................................... skipped         why"
         );
     }
 
@@ -936,7 +942,7 @@ arm      0        1             0        0       0         0
         });
         assert_eq!(
             out,
-            "[local]  [a] restart ................................ skipped         config unchanged\n"
+            "[local]  [a] restart ............................................. skipped         config unchanged\n"
         );
     }
 

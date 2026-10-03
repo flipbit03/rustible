@@ -397,8 +397,9 @@ impl Target {
     /// user must exist or you must provide full path to key file in check
     /// mode"), and Ansible's behaviour is authoritative here (vision 12). A
     /// dry run of a first provision therefore stops at the keys step; chain
-    /// from `user::Present` with `for_user(&account)` behind
-    /// `is_available()`, or dry-run once the account exists.
+    /// from `user::Present` with `for_user(&account)` inside a `ctx.block`,
+    /// which under `--check` ends there with a warning, or dry-run once the
+    /// account exists.
     fn resolve(&self, sys: &System) -> Result<Resolved> {
         match self {
             Target::File(path) => Ok(Resolved {
@@ -1960,7 +1961,8 @@ mod tests {
     /// check-mode run for a missing user too, and Ansible's behaviour is
     /// authoritative here (vision 12). The dry run of a first provision
     /// therefore stops at the keys step unless it chains from the user step
-    /// behind `is_available()`.
+    /// with `for_user(&account)`, inside a `ctx.block` that ends there under
+    /// `--check`.
     #[test]
     fn a_missing_user_is_refused_in_both_modes_as_ansible_does() {
         let fake = fake_with_user();

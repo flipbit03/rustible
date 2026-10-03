@@ -29,7 +29,7 @@ use serde_json::Value;
 use crate::backend::serve_helper;
 use crate::channel::{Channel, Feeder};
 use crate::ctx::{Ctx, HostInfo, not_evaluated_further};
-use crate::error::OutputUnavailable;
+use crate::error::{OutputUnavailable, catching};
 use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink, WarnCounter};
 use crate::protocol::{self, Down, FrameSink, Up};
 use crate::registry::{Named, describe_all};
@@ -466,17 +466,19 @@ fn execute(
     let mut ctx = Ctx::for_run(sys, host, channel, run_id);
     let entry = named.playbook.entry;
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry(&mut ctx, vars)));
+    let outcome = catching(|| entry(&mut ctx, vars));
     // The playbook body is the outermost block (vision doc 12): under
     // `--check`, a read of a would-change step's output that no `ctx.block`
     // absorbed ends this host's dry run here, with the same warning a block
     // gives and no prefix. Nothing failed, so the host is not counted as
-    // failed. Outside check mode it is an error like any other.
+    // failed. Outside check mode it is an error like any other, and so is
+    // one that carries `StepFailed`: a step read the missing output inside
+    // its op, failed, and was counted, and that stays a failure.
     let check_mode = ctx.check_mode();
     let failed = match outcome {
         Ok(Ok(())) => false,
         Ok(Err(e)) => match e.downcast_ref::<OutputUnavailable>() {
-            Some(u) if check_mode => {
+            Some(u) if check_mode && e.step_failed().is_none() => {
                 ctx.warn(not_evaluated_further("", &u.step));
                 false
             }
@@ -1003,5 +1005,49 @@ mod tests {
             failed_in(&events),
             ["step `by hand` would have changed; its output is unavailable in check mode"]
         );
+    }
+
+    /// An op that reads another step's output inside `check`.
+    struct ReadsInCheck(crate::op::Applied<u32>);
+
+    impl crate::op::Op for ReadsInCheck {
+        type Output = u32;
+        type Intent = Go;
+        fn check(&self, _: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            Ok(crate::op::Plan::Satisfied(*self.0))
+        }
+        fn apply(&self, _: &crate::system::System, Go: Go) -> crate::Result<u32> {
+            Ok(1)
+        }
+    }
+
+    static READS_INSIDE_AN_OP: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        schema: vars::no_schema,
+        entry: |ctx, _| {
+            let got = ctx.step("read", WouldChange)?;
+            ctx.step("uses it", ReadsInCheck(got))?;
+            Ok(())
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// A read inside an op is that step's failure, counted, and the runtime
+    /// does not relabel it as a gap in the dry run: the host fails, with
+    /// the step and the reason, and there is no "not evaluated" warning.
+    #[test]
+    fn under_check_a_read_inside_an_op_fails_the_host() {
+        let (code, events) = run(&READS_INSIDE_AN_OP, true);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_eq!(summary_of(&events).failed, 1);
+        assert_eq!(
+            failed_in(&events),
+            [
+                "step `uses it`: step `read` would have changed; its output is unavailable in \
+              check mode"
+            ]
+        );
+        assert!(warnings_in(&events).is_empty(), "{events:#?}");
     }
 }

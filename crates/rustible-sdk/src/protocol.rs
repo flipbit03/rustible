@@ -356,6 +356,54 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        // The block events and the step events that carry the block path
+        // come back through a frame exactly as they went in.
+        let path = vec!["outer".to_string(), "inner".to_string()];
+        let events = [
+            Event::BlockStarted {
+                blocks: path.clone(),
+            },
+            Event::StepStarted {
+                id: 1,
+                blocks: path.clone(),
+                name: "s".into(),
+                identity: "self".into(),
+            },
+            Event::StepFinished {
+                id: 1,
+                blocks: path.clone(),
+                name: "s".into(),
+                identity: "self".into(),
+                status: crate::event::Status::WouldChange,
+                diff: None,
+                note: None,
+                elapsed_ms: 2,
+            },
+            Event::StepSkipped {
+                id: 2,
+                blocks: vec![],
+                name: "k".into(),
+                reason: "r".into(),
+            },
+            Event::BlockFinished {
+                blocks: path.clone(),
+            },
+        ];
+        let mut buf = Vec::new();
+        for e in &events {
+            write_frame(&mut buf, &Up::Event(e.clone())).unwrap();
+        }
+        let mut rd = buf.as_slice();
+        for e in &events {
+            let Up::Event(back) = read_frame::<_, Up>(&mut rd).unwrap().unwrap() else {
+                panic!("not an event frame")
+            };
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(e).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -443,6 +491,33 @@ mod tests {
             serde_json::to_string(&skipped).unwrap(),
             r#"{"StepSkipped":{"id":3,"blocks":["a"],"name":"n","reason":"r"}}"#
         );
+        // And the same JSON reads back into the same shapes.
+        let Event::BlockFinished { blocks } =
+            serde_json::from_str(r#"{"BlockFinished":{"blocks":["a","b"]}}"#).unwrap()
+        else {
+            panic!("not BlockFinished")
+        };
+        assert_eq!(blocks, ["a", "b"]);
+        let Event::BlockStarted { blocks } =
+            serde_json::from_str(r#"{"BlockStarted":{"blocks":["a"]}}"#).unwrap()
+        else {
+            panic!("not BlockStarted")
+        };
+        assert_eq!(blocks, ["a"]);
+        let Event::StepStarted { blocks, .. } = serde_json::from_str(
+            r#"{"StepStarted":{"id":1,"blocks":["a"],"name":"n","identity":"self"}}"#,
+        )
+        .unwrap() else {
+            panic!("not StepStarted")
+        };
+        assert_eq!(blocks, ["a"]);
+        let Event::StepSkipped { blocks, .. } = serde_json::from_str(
+            r#"{"StepSkipped":{"id":3,"blocks":["a"],"name":"n","reason":"r"}}"#,
+        )
+        .unwrap() else {
+            panic!("not StepSkipped")
+        };
+        assert_eq!(blocks, ["a"]);
         // A version-4 frame, with `depth` and no `blocks`, does not read.
         let old = r#"{"StepSkipped":{"id":3,"depth":1,"name":"n","reason":"r"}}"#;
         assert!(serde_json::from_str::<Event>(old).is_err());

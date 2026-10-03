@@ -3,7 +3,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::io::Write;
 use std::ops::Deref;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::channel::Channel;
-use crate::error::{Context as _, Error, OutputUnavailable, Result, StepFailed};
+use crate::error::{Context as _, Error, OutputUnavailable, Result, StepFailed, catching};
 use crate::event::{Event, Level, Status, Summary, block_prefix};
 use crate::facts::Facts;
 use crate::op::{Applied, Intent, Op, Plan};
@@ -79,11 +79,19 @@ impl HostInfo {
 }
 
 /// State every `Ctx` of a run shares: one step sequence and summary across
-/// `block` and `as_user` clones (vision doc 11.1), the channel, and the
-/// directory streamed files land in, removed when the run's last `Ctx` drops.
+/// `as_user` clones (vision doc 11.1), the blocks open right now, the
+/// channel, and the directory streamed files land in, removed when the run's
+/// last `Ctx` drops.
 pub(crate) struct Shared {
     pub(crate) step_counter: Cell<u32>,
     pub(crate) summary: RefCell<Summary>,
+    /// The [`Ctx::block`]s running right now, outermost first. A step
+    /// belongs to the blocks open while it runs, whichever `Ctx` value it
+    /// went through: a `ctx.as_root()` bound before a block and used inside
+    /// it counts toward the block, and one that outlives a block does not
+    /// keep its prefix. A `Ctx` never leaves its thread (it holds `Rc`s), so
+    /// blocks nest strictly and a stack is exact.
+    blocks: RefCell<Vec<Rc<BlockFrame>>>,
     channel: Arc<Channel>,
     run_id: String,
     tempdir: OnceCell<RunDir>,
@@ -137,16 +145,13 @@ impl Shared {
 /// `Ctx` values, and every one of them shares a single step counter and a
 /// single summary with this one (vision doc 11.1). However deeply a playbook
 /// nests, the report stays one numbered sequence and the counts at the end
-/// add up. Each also carries the path of blocks it is inside, so a step
-/// reports its `[outer][inner]` prefix and marks every one of them changed.
+/// add up. They also share the stack of blocks open right now, so a step
+/// reports the `[outer][inner]` prefix of the blocks it runs inside and marks
+/// every one of them changed, through whichever of these values it went.
 pub struct Ctx {
     sys: System,
     host: HostInfo,
     shared: Rc<Shared>,
-    /// The enclosing blocks, outermost first. Shared with the `Ctx` that
-    /// made each one, which reads its frame's `changed` when the closure
-    /// returns.
-    blocks: Rc<[Rc<BlockFrame>]>,
 }
 
 /// One enclosing [`Ctx::block`], as the steps inside it see it.
@@ -188,8 +193,8 @@ impl Ctx {
                 channel,
                 run_id: run_id.into(),
                 tempdir: OnceCell::new(),
+                blocks: RefCell::new(Vec::new()),
             }),
-            blocks: Rc::new([]),
         }
     }
 
@@ -257,9 +262,15 @@ impl Ctx {
             });
         };
 
-        self.sys.set_phase(Phase::Checking);
-        let plan = op.check(&self.sys);
-        self.sys.set_phase(Phase::Idle);
+        // A missing output read inside the op itself (an op holding another
+        // step's `Applied`) is this step's failure, not a gap in the dry run:
+        // `in_op` turns the typed payload into an error, which takes the
+        // check-failed path below and carries `StepFailed`, so no block
+        // absorbs it (vision doc 12).
+        let plan = {
+            let _phase = PhaseGuard::enter(&self.sys, Phase::Checking);
+            in_op(|| op.check(&self.sys))
+        };
 
         let result = match plan {
             Err(e) => {
@@ -273,7 +284,13 @@ impl Ctx {
             Ok(Plan::Change(intent)) if self.sys.check_mode() => {
                 // The one place a step's diff is made: rendered from the
                 // intent, so what the report shows is what `apply` would run.
-                let diff = intent.diff();
+                let diff = match in_op(|| Ok(intent.diff())) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        finish(Status::Failed, None, Some(e.chain()));
+                        return Err(e.context(StepFailed::at(&name)));
+                    }
+                };
                 let note = if op.always_changes() {
                     Some("action".into())
                 } else {
@@ -286,14 +303,21 @@ impl Ctx {
                 Applied::new(name, None, true, Some(diff), t0.elapsed())
             }
             Ok(Plan::Change(intent)) => {
-                let diff = intent.diff();
+                let diff = match in_op(|| Ok(intent.diff())) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        finish(Status::Failed, None, Some(e.chain()));
+                        return Err(e.context(StepFailed::at(&name)));
+                    }
+                };
                 if let Err(e) = self.shared.channel.check_cancelled() {
                     finish(Status::Failed, Some(diff), Some(e.chain()));
                     return Err(e.context(StepFailed::cancelled(&name, "not applied")));
                 }
-                self.sys.set_phase(Phase::Applying);
-                let applied = op.apply(&self.sys, intent);
-                self.sys.set_phase(Phase::Idle);
+                let applied = {
+                    let _phase = PhaseGuard::enter(&self.sys, Phase::Applying);
+                    op.apply(&self.sys, intent)
+                };
                 match applied {
                     Err(e) => {
                         finish(Status::Failed, Some(diff), Some(e.chain()));
@@ -459,17 +483,44 @@ impl Ctx {
     /// every way out.
     ///
     /// The returned [`Block`] holds the closure's value and `.changed`, true
-    /// when any step inside finished `changed` or `would change`, nested
-    /// blocks and [`Ctx::as_user`] children included.
+    /// when any step run inside it finished `changed` or `would change`.
+    /// "Inside" means while the closure runs, through any `Ctx` value: nested
+    /// blocks count, and so does a `ctx.as_root()` bound before the block and
+    /// used in it.
     ///
-    /// Under `--check`, reading the output of a would-change step inside the
+    /// Under `--check`, reading the output of a would-change step in the
     /// closure, through `?` on [`Applied::output`] or through `Deref`, ends
     /// the block there: a warning names the block and the step, the block
     /// has no value, and the playbook carries on after it. The innermost
     /// block absorbs. That is the only thing a block absorbs, and only in
     /// check mode: in a real run every step has applied, so the read cannot
     /// fail, and an `OutputUnavailable` that turns up anyway is returned as
-    /// the error it is.
+    /// the error it is. A read made inside an op's own `check` is not a gap
+    /// in the dry run but that step's failure, and is never absorbed.
+    ///
+    /// ```no_run
+    /// use rustible_sdk::prelude::*;
+    ///
+    /// fn converge(
+    ///     ctx: &mut Ctx,
+    ///     read: impl Op<Output = String>,
+    ///     patch: impl Op,
+    ///     restart: impl Op,
+    /// ) -> Result<()> {
+    ///     let folder = ctx.block("folder is receive-only", |ctx| {
+    ///         let kind = ctx.step("Read folder config", read)?;
+    ///         if *kind != "receiveonly" {
+    ///             // Under --check, the read above ends the block here.
+    ///             ctx.step("Set type", patch)?;
+    ///         }
+    ///         kind.into_output()
+    ///     })?;
+    ///     if folder.changed {
+    ///         ctx.step("Restart syncthing", restart)?;
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// Any other error is returned unchanged. When it did not come from a
     /// failed step, whose own line already carries the block's prefix, a
@@ -485,19 +536,16 @@ impl Ctx {
             name: name.into(),
             changed: Cell::new(false),
         });
-        let mut inner = Ctx {
-            sys: self.sys.clone(),
-            host: self.host.clone(),
-            shared: self.shared.clone(),
-            blocks: self.blocks.iter().cloned().chain([frame.clone()]).collect(),
-        };
-        let path = inner.block_path();
+        // Open while the closure runs, and closed on every way out: the
+        // closure runs under `catching`, so the pop below is always reached.
+        self.shared.blocks.borrow_mut().push(frame.clone());
+        let path = self.block_path();
         let sink = self.sys.sink().clone();
         sink.emit(Event::BlockStarted {
             blocks: path.clone(),
         });
-        let outcome = catch_unwind(AssertUnwindSafe(|| f(&mut inner)));
-        drop(inner);
+        let outcome = catching(|| f(self));
+        self.shared.blocks.borrow_mut().pop();
         let finished = || {
             sink.emit(Event::BlockFinished {
                 blocks: path.clone(),
@@ -517,8 +565,10 @@ impl Ctx {
                     changed: frame.changed.get(),
                 });
             }
+            // A step that failed is counted and stays a failure, even when
+            // what failed was a read of a missing output inside its op.
             Ok(Err(e)) => match e.downcast_ref::<OutputUnavailable>() {
-                Some(u) if check_mode => u.step.clone(),
+                Some(u) if check_mode && e.step_failed().is_none() => u.step.clone(),
                 _ => {
                     let mut e = e;
                     if e.step_failed().is_none() && !e.shown_by_block {
@@ -560,7 +610,6 @@ impl Ctx {
             sys: self.sys.as_user(name),
             host: self.host.clone(),
             shared: self.shared.clone(),
-            blocks: self.blocks.clone(),
         }
     }
 
@@ -652,14 +701,19 @@ impl Ctx {
             Status::Failed => s.failed += 1,
         });
         if matches!(status, Status::Changed | Status::WouldChange) {
-            for frame in self.blocks.iter() {
+            for frame in self.shared.blocks.borrow().iter() {
                 frame.changed.set(true);
             }
         }
     }
 
     fn block_path(&self) -> Vec<String> {
-        self.blocks.iter().map(|f| f.name.clone()).collect()
+        self.shared
+            .blocks
+            .borrow()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
     }
 
     pub(crate) fn summary(&self) -> Summary {
@@ -672,14 +726,29 @@ impl Ctx {
 ///
 /// It reads like [`Applied`], but is not one: a block has no diff, no
 /// elapsed time and no status, and never stands for a step.
+///
+/// ```no_run
+/// use rustible_sdk::prelude::*;
+///
+/// fn next(ctx: &mut Ctx, read: impl Op<Output = u32>) -> Result<u32> {
+///     let n = ctx.block("count", |ctx| Ok(*ctx.step("read", read)? + 1))?;
+///     if n.changed {
+///         ctx.log("the read changed something");
+///     }
+///     // The value, or under --check, if the block was ended early, an
+///     // `OutputUnavailable` naming the `read` step.
+///     Ok(*n.output()?)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Block<T> {
     value: Option<T>,
     /// The step whose missing output ended the block under `--check`, so
     /// reading the block's own missing value names it.
     missing: Option<String>,
-    /// True when any step inside, nested blocks and `as_user` children
-    /// included, finished `changed` or, under `--check`, `would change`.
+    /// True when any step run inside the block (nested blocks included,
+    /// through whichever `Ctx` value) finished `changed` or, under
+    /// `--check`, `would change`.
     /// `ok` (including `ran, unchanged`), failed and skipped steps leave it
     /// false. Derived, never declared, so a forgotten `|=` cannot hide a
     /// change from the step that reacts to it.
@@ -749,6 +818,37 @@ pub(crate) fn not_evaluated_further(prefix: &str, step: &str) -> String {
     }
 }
 
+/// Sets the `System`'s phase and puts it back to idle when dropped, so a
+/// panic out of `check` or `apply` cannot leave it `Checking`, where every
+/// later write would be refused as a mutation during check.
+struct PhaseGuard<'a>(&'a System);
+
+impl<'a> PhaseGuard<'a> {
+    fn enter(sys: &'a System, phase: Phase) -> Self {
+        sys.set_phase(phase);
+        PhaseGuard(sys)
+    }
+}
+
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_phase(Phase::Idle);
+    }
+}
+
+/// Run part of an op (`check`, `Intent::diff`) and turn a missing output
+/// read inside it into this step's error. Any other panic is resumed as it
+/// came.
+fn in_op<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
+    match catching(f) {
+        Ok(r) => r,
+        Err(payload) => match payload.downcast::<OutputUnavailable>() {
+            Ok(u) => Err((*u).into()),
+            Err(other) => resume_unwind(other),
+        },
+    }
+}
+
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -759,6 +859,7 @@ mod tests {
     use crate::backend::Fake;
     use crate::event::Collect;
     use crate::protocol::{Down, Up, UpLink};
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct NoUp;
@@ -1464,7 +1565,7 @@ mod tests {
     #[test]
     fn a_foreign_panic_is_resumed_after_block_finished() {
         let (mut ctx, sink) = ctx_in(true);
-        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let payload = catching(AssertUnwindSafe(|| {
             let _ = ctx.block("a", |ctx| {
                 ctx.block("b", |_| -> Result<()> { std::panic::panic_any(42u8) })?;
                 Ok(())
@@ -1545,7 +1646,7 @@ mod tests {
             err.downcast_ref::<OutputUnavailable>().unwrap().step,
             "read"
         );
-        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| *b)).unwrap_err();
+        let payload = catching(AssertUnwindSafe(|| *b)).unwrap_err();
         assert_eq!(
             payload.downcast::<OutputUnavailable>().unwrap().step,
             "read"
@@ -1674,7 +1775,7 @@ mod tests {
             None,
             std::time::Duration::ZERO,
         );
-        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let payload = catching(AssertUnwindSafe(|| {
             let _ = ctx.block("b", |_| Ok(*missing));
         }))
         .unwrap_err();
@@ -1741,10 +1842,298 @@ mod tests {
     fn applied_deref_unwinds_with_a_typed_payload() {
         let missing: Applied<u32> =
             Applied::new("read".into(), None, true, None, std::time::Duration::ZERO);
-        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| *missing)).unwrap_err();
+        let payload = catching(AssertUnwindSafe(|| *missing)).unwrap_err();
         let u = payload
             .downcast::<OutputUnavailable>()
             .expect("an OutputUnavailable payload, not a string");
         assert_eq!(u.step, "read");
+    }
+
+    // ---- review: which blocks a step belongs to ----
+
+    /// `let mut root = ctx.as_root();` before a block is the documented
+    /// binding. A step through it inside the block runs inside the block, so
+    /// it marks the block changed and carries its prefix.
+    #[test]
+    fn a_child_made_before_a_block_counts_toward_it() {
+        let (mut ctx, sink) = ctx_in(false);
+        let mut root = ctx.as_root();
+        let b = ctx
+            .block("b", |_| {
+                root.step("x", change(1))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(b.changed);
+        assert_eq!(finished_steps(&sink), [("x".into(), path(&["b"]))]);
+    }
+
+    /// The converse: a `Ctx` handed out inside a block and used after it is
+    /// outside the block, and neither carries its prefix nor marks it.
+    #[test]
+    fn a_child_that_outlives_a_block_is_outside_it() {
+        let (mut ctx, sink) = ctx_in(false);
+        let b = ctx.block("b", |ctx| Ok(ctx.as_root())).unwrap();
+        let mut escaped = b.into_output().unwrap();
+        escaped.step("after", change(1)).unwrap();
+        assert_eq!(finished_steps(&sink), [("after".into(), path(&[]))]);
+        let outer = ctx.block("outer", |_| Ok(())).unwrap();
+        assert!(!outer.changed);
+    }
+
+    // ---- review: a missing output read inside an op ----
+
+    /// An op holding another step's output, which it reads in `check`.
+    struct ReadsInCheck {
+        got: Applied<u32>,
+        through_deref: bool,
+    }
+
+    impl Op for ReadsInCheck {
+        type Output = u32;
+        type Intent = DoIt;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            let n = if self.through_deref {
+                *self.got
+            } else {
+                *self.got.output()?
+            };
+            Ok(Plan::Satisfied(n))
+        }
+        fn apply(&self, _: &System, DoIt: DoIt) -> Result<u32> {
+            Ok(0)
+        }
+    }
+
+    /// An intent whose diff reads another step's output.
+    #[derive(Debug)]
+    struct DiffReads(Applied<u32>);
+
+    impl crate::op::Intent for DiffReads {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::summary(format!("{}", *self.0))
+        }
+    }
+
+    struct ReadsInDiff(std::cell::RefCell<Option<Applied<u32>>>);
+
+    impl Op for ReadsInDiff {
+        type Output = ();
+        type Intent = DiffReads;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            Ok(Plan::Change(DiffReads(self.0.borrow_mut().take().unwrap())))
+        }
+        fn apply(&self, _: &System, _: DiffReads) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Decision (b) of the review: absorption is for reads in playbook code
+    /// between steps. A read inside an op's `check` fails that step, which
+    /// is finished, counted, and not absorbed by the block around it; the
+    /// phase is back to idle, so the next write is not refused as a
+    /// mutation during check.
+    #[test]
+    fn a_missing_output_read_inside_check_fails_that_step() {
+        for through_deref in [true, false] {
+            let (mut ctx, sink) = ctx_in(true);
+            let err = ctx
+                .block("b", |ctx| {
+                    let got = ctx.step("read", change(1))?;
+                    ctx.step("uses it", ReadsInCheck { got, through_deref })?;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert_eq!(err.step_failed().unwrap().step, "uses it");
+            assert_eq!(
+                err.chain(),
+                "step `uses it`: step `read` would have changed; its output is unavailable \
+                 in check mode"
+            );
+            let statuses: Vec<(String, Status)> = sink
+                .events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::StepFinished { name, status, .. } => Some((name, status)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                [
+                    ("read".into(), Status::WouldChange),
+                    ("uses it".into(), Status::Failed)
+                ]
+            );
+            let s = ctx.summary();
+            assert_eq!((s.would_change, s.failed), (1, 1));
+            assert!(warnings(&sink).is_empty(), "{:?}", warnings(&sink));
+            ctx.sys()
+                .write_atomic("/after", b"x")
+                .expect("the phase is idle again");
+        }
+    }
+
+    #[test]
+    fn a_missing_output_read_inside_an_intents_diff_fails_that_step() {
+        let (mut ctx, sink) = ctx_in(true);
+        let got = ctx.step("read", change(1)).unwrap();
+        let err = ctx
+            .step(
+                "renders it",
+                ReadsInDiff(std::cell::RefCell::new(Some(got))),
+            )
+            .unwrap_err();
+        assert_eq!(err.step_failed().unwrap().step, "renders it");
+        assert!(err.chain().contains("step `read` would have changed"));
+        assert_eq!(ctx.summary().failed, 1);
+        assert!(sink.events().iter().any(|e| matches!(
+            e,
+            Event::StepFinished { name, status: Status::Failed, .. } if name == "renders it"
+        )));
+    }
+
+    /// A panic out of `check` that is not a missing output is resumed, and
+    /// the phase is put back first.
+    #[test]
+    fn a_foreign_panic_in_check_leaves_the_phase_idle() {
+        struct Boom;
+        impl Op for Boom {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, _: &System) -> Result<Plan<Self>> {
+                std::panic::panic_any(7u8)
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
+            }
+        }
+        let (mut ctx, _sink) = ctx_in(false);
+        let payload = catching(AssertUnwindSafe(|| {
+            let _ = ctx.step("boom", Boom);
+        }))
+        .unwrap_err();
+        assert_eq!(payload.downcast_ref::<u8>(), Some(&7));
+        ctx.sys()
+            .write_atomic("/after", b"x")
+            .expect("the phase is idle again");
+    }
+
+    // ---- review: the error line and the event order ----
+
+    /// The flag that keeps the error line to one survives a `.context(..)`
+    /// added between two blocks.
+    #[test]
+    fn the_error_line_is_printed_once_through_a_context_layer() {
+        let (mut ctx, sink) = ctx_in(false);
+        let err = ctx
+            .block("outer", |ctx| {
+                ctx.block("inner", |_| -> Result<()> { crate::bail!("boom") })
+                    .context("while doing the inner thing")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(err.chain(), "while doing the inner thing: boom");
+        assert_eq!(
+            warnings(&sink),
+            ["[outer][inner] block ended with an error: boom"]
+        );
+    }
+
+    /// The whole sequence of an absorption: the warning belongs to the block
+    /// and comes before its `BlockFinished`.
+    #[test]
+    fn an_absorption_warns_inside_the_block() {
+        let (mut ctx, sink) = ctx_in(true);
+        ctx.block("a", |ctx| {
+            let r = ctx.step("read", change(1))?;
+            ctx.block("b", |_| Ok(*r))?;
+            Ok(())
+        })
+        .unwrap();
+        let seq: Vec<String> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::BlockStarted { blocks } => Some(format!("+{}", blocks.join("/"))),
+                Event::BlockFinished { blocks } => Some(format!("-{}", blocks.join("/"))),
+                Event::StepFinished { name, .. } => Some(format!("step {name}")),
+                Event::Log {
+                    level: Level::Warn,
+                    msg,
+                } => Some(format!("warn {}", &msg[..msg.find(' ').unwrap()])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seq,
+            ["+a", "step read", "+a/b", "warn [a][b]", "-a/b", "-a"]
+        );
+    }
+
+    // ---- review: whether the panic hook runs ----
+
+    /// With no SDK catcher on the stack nobody would report the typed
+    /// payload, so the read is an ordinary panic carrying the message, which
+    /// the hook prints, rather than a silent unwind.
+    #[test]
+    fn with_no_catcher_a_missing_output_panics_with_its_message() {
+        let missing: Applied<u32> =
+            Applied::new("read".into(), None, true, None, std::time::Duration::ZERO);
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| *missing)).unwrap_err();
+        let msg = payload
+            .downcast_ref::<String>()
+            .expect("a message, not a typed payload");
+        assert_eq!(
+            msg,
+            "step `read` would have changed; its output is unavailable in check mode"
+        );
+    }
+
+    const PROBE_VAR: &str = "RUSTIBLE_PROBE_SILENT_UNWIND";
+
+    /// Not a test on its own: the body of the subprocess run below. Without
+    /// the variable it does nothing.
+    #[test]
+    fn probe_absorbed_reads_print_nothing() {
+        if std::env::var_os(PROBE_VAR).is_none() {
+            return;
+        }
+        let (mut ctx, _sink) = ctx_in(true);
+        let b = ctx
+            .block("b", |ctx| {
+                let got = ctx.step("read", change(1))?;
+                Ok(*got)
+            })
+            .unwrap();
+        assert!(!b.is_available());
+        let missing: Applied<u32> =
+            Applied::new("read".into(), None, true, None, std::time::Duration::ZERO);
+        assert!(catching(AssertUnwindSafe(|| *missing)).is_err());
+    }
+
+    /// Under a catcher the typed payload goes through `resume_unwind`, which
+    /// does not run the panic hook, so an absorbed read prints nothing. The
+    /// hook is process-wide and tests run in parallel, so this re-runs one
+    /// probe test in a child process and reads its stderr instead of
+    /// installing a hook.
+    #[test]
+    fn an_absorbed_read_does_not_run_the_panic_hook() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ctx::tests::probe_absorbed_reads_print_nothing",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PROBE_VAR, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "the probe ran: {stdout}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(!stdout.contains("panicked"), "{stdout}");
     }
 }
