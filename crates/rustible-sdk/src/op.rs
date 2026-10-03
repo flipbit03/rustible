@@ -106,8 +106,8 @@ pub trait Op {
     /// not root, a malformed input — stands in both modes.
     ///
     /// An op must not depend on another step's output under check mode: a
-    /// would-change step has none. If `check` (or the intent's `diff`) reads
-    /// one anyway, through `Deref` or `.output()?`, this step fails with
+    /// would-change step has none. If `check` (or [`Op::always_changes`], or
+    /// the intent's `diff`) reads one anyway, through `Deref` or `.output()?`, this step fails with
     /// [`OutputUnavailable`](crate::error::OutputUnavailable) and is counted
     /// failed. Only a read in playbook code, between steps, ends the
     /// enclosing `ctx.block` without failing anything.

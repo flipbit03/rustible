@@ -590,7 +590,9 @@ if keys.changed { /* ... */ }    // the `keys` step's field, through the block
 
 `.is_available()` is for branching inside a block instead of ending it.
 Reading through a block that was ended this way (`keys.changed` above) is cut
-short the same way, so the `if` neither runs nor skips on a guess.
+short the same way, so the `if` neither runs nor skips on a guess. At the top
+level, as here, that ends the host's dry run with the warning; to keep the
+rest visible, put the dependent `if` inside a block of its own.
 
 ## 10. Facts
 

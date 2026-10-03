@@ -1533,9 +1533,10 @@ impl Ctx {
 - **`HostInfo`** (from the `Start` frame) carries `name`, `groups`, and the
   parameters that matter on the target: `escalate_user` (for `as_escalated`)
   and `connection`. Never `addr` or `port`; those are the orchestrator's.
-- **`step` numbering and the summary are shared** across `block` and
-  `as_user` contexts (they clone a shared counter), so a run has one step
-  sequence regardless of how many `Ctx` values exist.
+- **`step` numbering and the summary are shared** across `as_user`
+  contexts (they clone a shared counter) and inside blocks (which pass the
+  same `Ctx`), so a run has one step sequence regardless of how many `Ctx`
+  values exist.
 - **In check mode `changed` means "would change".** A playbook that logs after
   a changed step should branch on `ctx.check_mode()` to word it honestly
   (spike 2 caught the `mc` playbook logging "installed mc" in a dry run).

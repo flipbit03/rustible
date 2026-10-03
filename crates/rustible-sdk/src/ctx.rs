@@ -141,13 +141,14 @@ impl Shared {
 /// the orchestrator's workspace and this host ([`Ctx::local_file`],
 /// [`Ctx::local_secret`], [`Ctx::fetch`]).
 ///
-/// [`Ctx::block`], [`Ctx::as_user`] and their friends hand out further
-/// `Ctx` values, and every one of them shares a single step counter and a
-/// single summary with this one (vision doc 11.1). However deeply a playbook
-/// nests, the report stays one numbered sequence and the counts at the end
-/// add up. They also share the stack of blocks open right now, so a step
-/// reports the `[outer][inner]` prefix of the blocks it runs inside, through
-/// whichever of these values it went.
+/// [`Ctx::as_user`] and its friends hand out further `Ctx` values, and every
+/// one of them shares a single step counter and a single summary with this
+/// one (vision doc 11.1); [`Ctx::block`] passes this same `Ctx` to its
+/// closure. However deeply a playbook nests, the report stays one numbered
+/// sequence and the counts at the end add up. All of them also share the
+/// stack of blocks open right now, so a step reports the `[outer][inner]`
+/// prefix of the blocks it runs inside, through whichever of these values it
+/// went.
 pub struct Ctx {
     sys: System,
     host: HostInfo,
@@ -749,6 +750,18 @@ impl Ctx {
 ///     Ok(())
 /// }
 /// ```
+///
+/// Read at the top level of the playbook, as above, a block that was cut
+/// short ends that host's dry run with the warning. To keep the rest of the
+/// dry run visible, put the dependent `if` inside a block of its own:
+/// `ctx.block("restart", |ctx| { if cfg.changed { .. } Ok(()) })?`.
+///
+/// `Block`'s own [`Block::is_available`], [`Block::output`] and
+/// [`Block::into_output`] are about the block's value, and shadow the
+/// methods of the same names on an [`Applied`] it holds: with the pattern
+/// above, `cfg.is_available()` says whether the block was cut short, not
+/// whether the step has an output. Fields still reach the `Applied` through
+/// `Deref`; for the inner check write `cfg.output()?.is_available()`.
 #[derive(Debug)]
 pub struct Block<T> {
     value: Option<T>,
