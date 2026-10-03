@@ -1674,19 +1674,20 @@ where the dry run stopped seeing.
 - In check mode, a would-change step reports `WouldChange` with its diff and
   the run continues. Nothing is applied and nothing is predicted: the intent
   carries what `check` observed and decided, and no post-apply output.
-- A would-change step's output does not exist. `Applied<T>` holds
-  `Option<T>`; reading it, through `.output()` or through `Deref`, raises
-  `OutputUnavailable` naming the step. `.changed` and `.diff` remain
-  readable. Under `--check` that read ends the innermost enclosing
-  `ctx.block` — or, outside any block, the playbook body for that host —
-  with a warning naming the block and the step whose output was read. The
-  block yields no value and the run continues after it. This is not a
-  failure: nothing failed, the dry run could not see further. Playbooks are
-  written as if every output exists, without guards; `.is_available()`
-  remains for a playbook that wants to branch inside a block rather than end
-  it. In a real run every step has applied and the read cannot fail. Ansible
-  carries on with silent garbage; Rustible says where the dry run stopped
-  seeing.
+- A would-change step's output does not exist. `Applied<T>` holds `Option<T>`;
+  reading it, through `.output()` or through `Deref`, raises
+  `OutputUnavailable` naming the step. `.changed` and `.diff` remain readable.
+  Under `--check` that read ends the innermost enclosing `ctx.block` — or,
+  outside any block, the playbook body for that host — with a warning naming
+  the block and the step whose output was read. (Read inside an operation's
+  own `check`, the missing output is that step's failure instead: the step
+  fails and is counted, and nothing is absorbed.) The block yields no value
+  and the run continues after it. This is not a failure: nothing failed, the
+  dry run could not see further. Playbooks are written as if every output
+  exists, without guards; `.is_available()` remains for a playbook that wants
+  to branch inside a block rather than end it. In a real run every step has
+  applied and the read cannot fail. Ansible carries on with silent garbage;
+  Rustible says where the dry run stopped seeing.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group for an account not there yet, that account, its
