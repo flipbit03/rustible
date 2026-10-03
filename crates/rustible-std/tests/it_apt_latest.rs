@@ -39,17 +39,14 @@ fn latest_refreshes_the_cache_in_check(ctx: &mut Ctx) -> Result<()> {
     };
     // The diff is the dry run's whole answer (vision 12): one package, from
     // absent to the candidate the refreshed lists name.
-    let Diff::Attrs { changes, .. } = &change.diff else {
-        panic!("expected an attribute diff, got {:?}", change.diff);
-    };
-    assert_eq!(changes.len(), 1);
-    assert_eq!(
-        (changes[0].name.as_str(), changes[0].from.as_str()),
-        ("sl", "absent")
-    );
+    let rendered = change.diff().render();
+    let candidate = rendered
+        .strip_prefix("apt packages:\n  sl: absent -> ")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("expected one package from absent, got {rendered:?}"));
     assert!(
-        !changes[0].to.is_empty(),
-        "the refreshed lists name a candidate version"
+        !candidate.is_empty() && !candidate.contains('\n'),
+        "the refreshed lists name a candidate version: {rendered:?}"
     );
 
     // The refresh really happened on the target, which is the honest cost of
