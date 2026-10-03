@@ -62,7 +62,8 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     // planned the second write, but replacing the file chowns its new inode,
     // which clears setuid on a real kernel: every wanted attribute has to be
     // set again after a rewrite, not only those that differed. The `Fake`
-    // does not model the clearing, so this tier is where it is held.
+    // models the clearing too (`copy_rewrite_of_a_setuid_file_keeps_the_bit`);
+    // this is the same property on a real kernel.
     let suid = "/etc/rustible-test/files/suid";
     changed_then_ok(ctx, "suid v1", || {
         file::Copy::from_str("v1\n")

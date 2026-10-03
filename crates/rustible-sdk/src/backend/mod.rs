@@ -13,7 +13,7 @@ mod local;
 pub use elevated::{
     Elevated, HelperOp, HelperRequest, HelperResponse, Spawner, helper_argv, serve_helper,
 };
-pub use fake::{Fake, FakeFile};
+pub use fake::{AttrCall, Fake, FakeFile};
 pub use local::Local;
 
 /// What one path looks like on the target: the part of `stat(2)` the ops

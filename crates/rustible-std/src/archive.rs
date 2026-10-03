@@ -1388,6 +1388,29 @@ mod tests {
         assert!(err.contains("EOF"), "{err}");
     }
 
+    /// A setuid member extracted with `.owner(..)` keeps the bit: the owner
+    /// is set before the mode, because `chown` clears setuid (the `Fake`
+    /// models it). The other order leaves 0755.
+    #[test]
+    fn a_setuid_member_keeps_the_bit_under_owner() {
+        let mut h = tar::Header::new_gnu();
+        h.set_path("tool").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o4755);
+        h.set_size(2);
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend_from_slice(b"#!");
+        archive.resize(1024, 0);
+        archive.extend_from_slice(&[0u8; 1024]);
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
+        let intent = expect_change(&op, &sys);
+        op.apply(&sys, intent).unwrap();
+        let f = fake.file("/opt/tool").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+    }
+
     /// `apply` writes the members `check` walked and reads only their data
     /// from the archive. An archive swapped in between, with a member under
     /// another name, is refused at that member: its data never lands under

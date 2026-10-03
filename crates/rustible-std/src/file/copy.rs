@@ -401,6 +401,28 @@ mod tests {
         assert_eq!(d.short(), "+1 -0 lines");
     }
 
+    /// A rewrite of a setuid file keeps the bit. The mode and owner already
+    /// matched when `check` planned the write, but the rewrite `chown`s the
+    /// replacement file, which clears setuid on Linux (and in the `Fake`,
+    /// which models it), so `apply` sets every wanted attribute again after
+    /// writing. An `apply` that set only the attributes that differed would
+    /// leave 0755.
+    #[test]
+    fn copy_rewrite_of_a_setuid_file_keeps_the_bit() {
+        let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
+        let sys = fake_sys(&fake);
+        let op = Copy::from_str("v2\n")
+            .to("/usr/local/bin/x")
+            .mode(0o4755)
+            .owner(0, 0);
+        let c = expect_change(&op, &sys);
+        assert_eq!(c.diff().short(), "+1 -1 lines");
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/usr/local/bin/x").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 0, 0));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
     #[test]
     fn copy_rewrite_preserves_existing_mode_when_none_given() {
         let fake = Arc::new(Fake::new().with_file_mode("/etc/shadowish", "old\n", 0o600));

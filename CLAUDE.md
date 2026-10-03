@@ -515,6 +515,19 @@ Each of these has already produced a test that could not fail.
   There is no equivalent for a command. If you hit that, it is a design
   signal: reading state through a file that `sys` can serve is more testable
   than shelling out for it.
+- **A file's final mode does not say what was asked.** The `Fake` models
+  `chown` as Linux does — it clears setuid, and setgid with group execute, on
+  anything but a directory, even to the owner the file already has, and a
+  rewrite through `write` loses them the same way `Local::write` does — so an
+  op that sets the mode before the owner, or not at all after a rewrite, now
+  fails at tier 2. What it cannot show in the final state is a call that
+  changed nothing: a `chown` to the owner a file already has needs root and
+  leaves no trace. Assert on the calls for that: `fake.attr_calls()` records
+  every `set_mode` and `set_owner` in order (`fake.chowns()` and
+  `fake.chmods()` filter it), as `authorized_keys`'s
+  `a_mode_repair_issues_no_chown_when_the_owner_is_already_right` does. The
+  `Fake` does not know which user runs the op, so a `chown` never fails with
+  `EPERM` there; only a real run shows that.
 - **`Fake::argvs()` drops stdin.** An op that pipes a payload into a tool must
   assert with `fake.commands()` and read `CmdSpec.stdin`, or the test silently
   ignores the entire payload.

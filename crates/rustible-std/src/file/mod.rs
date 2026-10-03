@@ -384,7 +384,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use rustible_sdk::backend::FileKind;
+    use rustible_sdk::backend::{AttrCall, FileKind};
 
     use super::*;
 
@@ -453,9 +453,12 @@ mod tests {
     }
 
     /// Only the differing attributes are rows in the report, but every
-    /// attribute the op was given is set when the step applies. Why that
-    /// matters (a rewrite clearing setuid) cannot show here, since the `Fake`
-    /// does not model it; `tests/it_file_ops.rs` holds that half.
+    /// attribute the op was given is set when the step applies, owner first:
+    /// `chown` clears setuid, so a mode that already matched is set again
+    /// after an owner change. The `Fake` models that clearing (measured on
+    /// Linux; `[FAKE-CHOWN]` in `DECISIONS.md`), so an `apply` that set only
+    /// what differed leaves 0755 here, and one that set the mode first does
+    /// too; `tests/it_file_ops.rs` holds the same on a real kernel.
     #[test]
     fn attr_plan_reports_what_differs_and_sets_everything_wanted() {
         let s = stat(0o4755, 0, 0);
@@ -469,6 +472,35 @@ mod tests {
         plan.apply(&sys, Path::new("/f")).unwrap();
         let f = fake.file("/f").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+        assert_eq!(
+            fake.attr_calls(),
+            vec![
+                AttrCall::Chown {
+                    path: "/f".into(),
+                    uid: 5,
+                    gid: 6
+                },
+                AttrCall::Chmod {
+                    path: "/f".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
+    }
+
+    /// `apply_differing` sets only what `check` found wrong: with the owner
+    /// already right, no `chown` is issued at all (it needs root), only the
+    /// `chmod`.
+    #[test]
+    fn apply_differing_issues_no_chown_for_an_owner_already_right() {
+        let s = stat(0o644, 5, 6);
+        let plan = plan_attrs(Some(&s), Some(0o600), Some(Owner { uid: 5, gid: 6 }));
+        let fake =
+            std::sync::Arc::new(rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o644));
+        let sys = testing::fake_sys(&fake);
+        plan.apply_differing(&sys, Path::new("/f")).unwrap();
+        assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
+        assert_eq!(fake.chmods(), vec![(PathBuf::from("/f"), 0o600)]);
     }
 
     #[test]

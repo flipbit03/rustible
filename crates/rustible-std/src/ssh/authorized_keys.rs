@@ -1215,7 +1215,7 @@ impl Op for Absent {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{AttrCall, Fake};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -1712,6 +1712,45 @@ mod tests {
     /// happens. That is what keeps an unescalated run working: `chown` needs
     /// root, and a run managing its own keys must not be asked to give away
     /// a file it already owns just because the mode was wrong.
+    /// What keeps an unescalated run managing its own keys working, pinned:
+    /// with the account already owning `~/.ssh` and the file, a repair of
+    /// their modes issues two `chmod`s and no `chown` (which needs root),
+    /// for the directory and for the file alike. Setting every wanted
+    /// attribute instead, as `file::Copy` does after a rewrite, would `chown`
+    /// both.
+    #[test]
+    fn a_mode_repair_issues_no_chown_when_the_owner_is_already_right() {
+        let fake = fake_with_user_and_ssh_dir();
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new("/home/cadu/.ssh/authorized_keys"),
+            format!("{K1}\n").as_bytes(),
+        )
+        .unwrap();
+        set_attrs(&fake, "/home/cadu/.ssh/authorized_keys", 0o644, 1000, 1001);
+        set_attrs(&fake, "/home/cadu/.ssh", 0o755, 1000, 1001);
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("both modes are wrong")
+        };
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/home/cadu/.ssh".into(),
+                    mode: 0o700
+                },
+                AttrCall::Chmod {
+                    path: "/home/cadu/.ssh/authorized_keys".into(),
+                    mode: 0o600
+                },
+            ]
+        );
+    }
+
     #[test]
     fn a_wrong_mode_alone_is_a_change_with_no_text_diff() {
         let fake = fake_with_user_and_ssh_dir();
