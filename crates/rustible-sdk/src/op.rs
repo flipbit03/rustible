@@ -114,8 +114,20 @@ pub trait Op {
     /// read is not a decision. The race between `check` and `apply` is
     /// accepted, as in Ansible.
     ///
-    /// The intent never wraps a [`Diff`], and `apply` never reads one: see
-    /// [`Intent`] for the shape that compiles and is forbidden.
+    /// The intent never wraps a [`Diff`], and `apply` never reads one. This
+    /// compiles, passes every test, and is forbidden, because rewording the
+    /// report would change what runs:
+    ///
+    /// ```ignore
+    /// struct SysctlIntent(Diff);                                // DO NOT
+    ///
+    /// fn apply(&self, sys: &System, i: SysctlIntent) -> Result<SysctlReport> {
+    ///     // ... deciding what to do from the report's display strings
+    /// }
+    /// ```
+    ///
+    /// Hold typed fields instead (the text to write, whether to create,
+    /// which packages to install), and `match` on them here.
     fn apply(&self, sys: &System, intent: Self::Intent) -> Result<Self::Output>;
 
     /// True for actions whose `check` always returns `Change` (restart, command).

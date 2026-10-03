@@ -256,14 +256,30 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
   genuinely actions get verbs and always report changed: `systemd::Restart`,
-  `shell::Command`.
-- **`check` does all the thinking** and produces the diff. **`apply` executes
-  that diff**, rather than inspecting the system again. That is what lets the
-  `Fake` tests plant a tool's effect and check the result.
-- **A step that would change has no output in check mode.** `Change` carries
-  the diff and nothing else; there is no prediction to fill in, and `apply`
-  reads for itself whatever its output needs that the diff does not carry (a
-  gid to report, a digest). A later step that reads a would-change step's
+- **`check` does all the thinking** and produces the op's **intent**: a type
+  of its own (`type Intent` on the `Op`) whose typed fields say what `check`
+  observed and decided. **`apply` executes that intent**, rather than
+  inspecting the system again or planning again, and `ctx.step` renders the
+  step's `Diff` from the same value with `Intent::diff`, so what is reported
+  is what runs. That is what lets the `Fake` tests plant a tool's effect and
+  check the result. Prefer an enum when `apply` has distinct branches, and
+  hold decisions, not payloads the op already has: `apply` still gets
+  `&self`. A read-only op uses `type Intent = Infallible` and its `apply` is
+  `match intent {}`.
+- **An intent never contains a `Diff`, and `apply` never reads one.**
+  `struct ThingIntent(Diff)` compiles, passes every test, and restores the
+  seam the intent exists to close: an `apply` deciding from display strings,
+  where rewording a report changes what runs. `Diff` is opaque outside the
+  SDK for this reason — it can be built and rendered, never matched or read —
+  so parsing `render()` is the only way left to cheat, and that is caught in
+  review. The one structural exception is a composite op, whose intent holds
+  its children's *intents*, never their diffs.
+- **A step that would change has no output in check mode.** The intent
+  carries what `check` observed and decided and nothing `apply` will
+  produce; there is no prediction to fill in, and `apply` reads for itself
+  whatever its output needs beyond the intent (a gid to report, a digest).
+  A later step that reads a would-change step's output under `--check` fails
+  with a clear message (vision 12).
   output under `--check` fails with a clear message (vision 12).
 - **Refuse, do not invent — in a real run.** An operation that manages a user
   does not create the group it references, and `authorized_keys` does not
@@ -384,14 +400,14 @@ mod tests {
         let s = sys(&fake);
         let op = Present::new("thing", "after");
 
-        let Plan::Change(c) = op.check(&s).unwrap() else {
+        let Plan::Change(intent) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
         // Assert the rendered diff verbatim: it is what a user reads.
-        assert_eq!(c.diff.render(), "thing:\n  /etc/thing: before -> after\n");
+        assert_eq!(intent.diff().render(), "thing:\n  /etc/thing: before -> after\n");
 
-        // `apply` takes the change `check` produced.
-        op.apply(&s, c).unwrap();
+        // `apply` takes the intent `check` produced.
+        op.apply(&s, intent).unwrap();
 
         // Read the box back: `.content(path)`, `.argvs()`, `.commands()`.
         assert_eq!(fake.content("/etc/thing").unwrap(), "after\n");

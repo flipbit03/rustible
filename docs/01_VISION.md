@@ -32,7 +32,7 @@ vetting), with one brief per milestone under `docs/plan/`.
 
 **What is in the tree today** (`crates/`), classified honestly:
 
-- **Keepers**, written to this design and tested: `Op`, `Plan`, `Change`,
+- **Keepers**, written to this design and tested: `Op`, `Plan`, `Intent`,
   `Applied`, `System` over `Backend` with `Local` and `Fake`, `Facts` with real
   probes, `Diff`, the event model, the protocol codec, and the ops `file::Line`,
   `file::Directory`, `apt::Present`, `shell::Command`. 14 unit tests, clippy
@@ -531,33 +531,49 @@ built conditionally, stored in a `Vec`, or returned from helper functions in
 third-party crates.
 
 ```rust
+/// What `check` decided, and what `apply` executes. The step's `Diff` is
+/// rendered from it by `Ctx::step`, so what is reported is what runs.
+///
+/// An intent holds typed fields: the state `check` observed and the change
+/// it decided on. It never holds what `apply` will produce (section 12), and
+/// it never holds a `Diff`: an `apply` that read its instruction out of the
+/// report would let rewording a report change what runs.
+pub trait Intent: std::fmt::Debug {
+    /// This intent as the report shows it. Called by `Ctx::step`, never by `apply`.
+    fn diff(&self) -> Diff;
+}
+
 pub trait Op {
     type Output;
+    type Intent: Intent;
     /// Inspect the system. Never mutates. Returns what would need to happen.
-    fn check(&self, sys: &System) -> Result<Plan<Self::Output>>;
-    /// Perform the change described by the plan. Only called when `check`
+    fn check(&self, sys: &System) -> Result<Plan<Self>>;
+    /// Execute the intent `check` produced. Only called when `check`
     /// returned `Change` and we are not in check mode.
-    fn apply(&self, sys: &System, change: Change) -> Result<Self::Output>;
+    fn apply(&self, sys: &System, intent: Self::Intent) -> Result<Self::Output>;
 }
 
-pub enum Plan<T> {
+pub enum Plan<O: Op + ?Sized> {
     /// Already in desired state. Carries the output so `step` can return it without applying.
-    Satisfied(T),
-    /// Something must change.
-    Change(Change),
+    Satisfied(O::Output),
+    /// Something must change: what `check` decided, and nothing else. A
+    /// would-change step has no output until `apply` has run (section 12).
+    Change(O::Intent),
 }
 
-/// `diff` is what the report shows and what `apply` executes. Nothing else
-/// rides along: a would-change step has no output until `apply` has run
-/// (section 12, revised 2026-09-24).
-pub struct Change { pub diff: Diff }
+/// For read-only ops, whose `check` never returns `Change`: their `apply` is
+/// `match intent {}`, and the compiler proves it unreachable.
+impl Intent for std::convert::Infallible {
+    fn diff(&self) -> Diff { match *self {} }
+}
 // (Spike 3 finding: `apply` takes the change rather than `Plan<T>`; see docs/02_SPIKE_SDK_CORE.md.
-//  `Change` lost its type parameter together with the prediction slot, 2026-09-24.)
+//  `Change` lost its type parameter together with the prediction slot, 2026-09-24, and was
+//  replaced by the op's own intent on 2026-09-25.)
 
 pub struct Applied<T> {
     value: Option<T>,        // None only in check mode, when the step would change (section 12)
     pub changed: bool,
-    pub diff: Option<Diff>,
+    pub diff: Option<Diff>,  // for rendering: a `Diff` is opaque and cannot be read back
     pub elapsed: Duration,
 }
 // Applied<T> derefs to T, so `account.home` works and `account.changed` is there too.
@@ -575,12 +591,14 @@ pub fn step<O: Op>(&mut self, name, op: O) -> Result<Applied<O::Output>> {
     sys.set_phase(Checking);   let plan = op.check(&sys);   sys.set_phase(Idle);
     match plan? {
         Plan::Satisfied(out) => { emit(StepFinished { status: Ok }); Applied { value: Some(out), changed: false, .. } }
-        Plan::Change(c) if sys.check_mode() => {
-            emit(StepFinished { status: WouldChange, diff: c.diff });
+        Plan::Change(intent) if sys.check_mode() => {
+            let diff = intent.diff();   // the intent is dropped unexecuted
+            emit(StepFinished { status: WouldChange, diff });
             Applied { value: None, changed: true, .. }   // no apply, so no output (section 12)
         }
-        Plan::Change(c) => {
-            sys.set_phase(Applying);   let out = op.apply(&sys, c)?;   sys.set_phase(Idle);
+        Plan::Change(intent) => {
+            let diff = intent.diff();
+            sys.set_phase(Applying);   let out = op.apply(&sys, intent)?;   sys.set_phase(Idle);
             emit(StepFinished { status: Changed, diff });
             Applied { value: Some(out), changed: true, .. }
         }
@@ -588,10 +606,12 @@ pub fn step<O: Op>(&mut self, name, op: O) -> Result<Applied<O::Output>> {
 }
 ```
 
-`check` does all the thinking and produces the `Diff`; `apply` executes that
-diff. This makes dry-run trustworthy: the diff shown in check mode is exactly the
-change that would be applied. The phase markers are what lets `System` refuse
-file mutations during `check` (section 7.3).
+`check` does all the thinking and produces the op's intent; `apply` executes
+that intent, and the `Diff` the report shows is rendered from it by
+`ctx.step`, so what is shown is what runs. This makes dry-run trustworthy: the
+diff shown in check mode is exactly the change that would be applied. The
+phase markers are what lets `System` refuse file mutations during `check`
+(section 7.3).
 
 **Policies learned in spike 3, now rules for the stdlib:**
 - **No predictions** (reversed 2026-09-24; the original rule is kept here for
@@ -605,15 +625,17 @@ file mutations during `check` (section 7.3).
   has not resolved), each ruling needed its own decision-log entry, and the
   report never distinguished a prediction from a fact. A would-change step
   now has no output in check mode; section 12 has the rule. `apply` executes
-  the `Diff` that `check` produced and reads for itself whatever the diff
-  does not carry (a gid to report, a digest for the output): a read is not a
-  decision, and the change carries no private payload from `check` to
-  `apply`.
+  the intent that `check` produced and reads for itself whatever its output
+  needs beyond it (a gid to report, a digest for the output): a read is not
+  a decision. The intent carries what `check` observed and decided, never
+  what `apply` will produce, so a would-change step still has no output.
 - **Builders end in a finishing call for the one mandatory piece of desired
   state.** `Line::in_path(p).matching(re).backup(true).set(line)`: `set` returns
   the `Op`, so a `Line` without a line cannot be constructed.
-- **`apply` receives `Change<T>`, not `Plan<T>`.** Only the change branch is
-  meaningful there; passing `Plan` forced a pointless match.
+- **`apply` receives the intent, not `Plan`.** Only the change branch is
+  meaningful there; passing `Plan` forced a pointless match. The intent
+  replaced `Change { diff }` on 2026-09-25, when string-typed diffs had
+  become the instruction channel.
 
 ### 6.3 Ops are named after desired state (DECIDED)
 
@@ -1185,7 +1207,7 @@ Networking and anything async are also off `System` for now.
     `cargo install rustible-cli`, binary named `rustible`. Never a dependency of
     a workspace: it would drag tokio and openssh into every cross-compiled
     playbook. The `Pretty` renderer belongs here, not in the SDK.
-  - `rustible-sdk`: `Op`, `Plan`, `Change`, `Applied`, `System`, `Backend`,
+  - `rustible-sdk`: `Op`, `Plan`, `Intent`, `Applied`, `System`, `Backend`,
     `Local`, `Fake`, `Facts`, `Diff`, `Ctx`, the event and protocol types, the
     runtime that the macro expands into, the test harness. Everything a
     collection author needs. Collections depend on this directly.
@@ -1591,7 +1613,7 @@ and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
 
 ## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
 
-Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change { diff }` does
+Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change(intent)` does
 not, so in a dry run a step that *would* change has nothing to return, and a
 later step that chains from it has no value.
 
@@ -1642,8 +1664,8 @@ Ansible lacks when a later step reads what a dry run could not produce.
 
 **The rules:**
 - In check mode, a would-change step reports `WouldChange` with its diff and
-  the run continues. Nothing is applied and nothing is predicted: `Change`
-  carries the diff and no post-apply output.
+  the run continues. Nothing is applied and nothing is predicted: the intent
+  carries what `check` observed and decided, and no post-apply output.
 - A would-change step's output does not exist. `Applied<T>` holds
   `Option<T>`; reading the output of a would-change step (via `Deref`) fails
   with "step `<name>` would have changed; its output is unavailable in check
@@ -1802,7 +1824,9 @@ Rendered example:
 - **Op**: a struct implementing `Op`, describing a desired state (or an action),
   with `check`/`apply`.
 - **Step**: one `ctx.step(name, op)` call; the unit of reporting.
-- **Plan**: the result of `check`: `Satisfied` or `Change { diff }`.
+- **Plan**: the result of `check`: `Satisfied(output)` or `Change(intent)`.
+- **Intent**: what `check` decided, specific to the op and never sent over
+  the wire; `apply` executes it and the step's `Diff` is rendered from it.
 - **Applied**: what `step` returns: the op's typed output plus `changed` and `diff`.
 - **System**: the op's handle to the machine, over a `Backend`.
 - **Facts**: typed data about the target gathered at startup.

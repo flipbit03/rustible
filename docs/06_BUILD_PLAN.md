@@ -121,8 +121,9 @@ Each op is one task. The brief is the template above with these fixed parts:
   resource per op), 7.3 (all I/O through `sys`), 8 (test tiers), 12 (check
   mode: a would-change step has no output; a prerequisite another step could
   create is tolerated under `--check`).
-- Scope: the op struct(s) and builder, the `Op` impl with `check` producing a
-  `Diff` and `apply` executing it, an `Output` struct,
+- Scope: the op struct(s) and builder, the `Op` impl, with `check` producing a
+  typed intent and `apply` executing it; the intent never wraps a `Diff`; an
+  `Output` struct,
   rustdoc with the Ansible equivalent named, pure-function tests for the
   planning logic, `Fake`-backend tests for satisfied / change / apply /
   failure / wrong-distro, and a Docker harness test doing changed-then-ok.

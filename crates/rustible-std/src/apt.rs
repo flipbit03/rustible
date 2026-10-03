@@ -969,7 +969,7 @@ mod tests {
         };
         // Only the missing one is planned, and only it is installed.
         assert_eq!(c.diff().short(), "mc=installed");
-        // Apply works from the diff alone.
+        // Apply works from the intent alone.
         let report = op.apply(&s, c).unwrap();
         let argvs = fake.argvs();
         let install = argv_starting(&argvs, &["apt-get", "install"]).unwrap();
@@ -1323,7 +1323,7 @@ mod tests {
             "apt packages:\n  openssl: 3.0.15-1 -> 3.0.16-1\n"
         );
         let r = op.apply(&s, c).unwrap();
-        // The version left behind comes from the diff; the one reported is
+        // The version left behind comes from the intent; the one reported is
         // what dpkg says now, and the fake still answers 3.0.15-1.
         assert_eq!(r.upgraded[0].0.name, "openssl");
         assert_eq!(r.upgraded[0].0.version, "3.0.15-1");
@@ -1352,7 +1352,7 @@ mod tests {
         };
         assert_eq!(c.diff().short(), "sl=5.02-1");
         let r = op.apply(&s, c).unwrap();
-        // Installed per the diff; the fake dpkg never learns of it, so the
+        // Installed per the intent; the fake dpkg never learns of it, so the
         // version read back is empty rather than the candidate.
         assert_eq!(r.installed[0].name, "sl");
         assert_eq!(r.installed[0].version, "");

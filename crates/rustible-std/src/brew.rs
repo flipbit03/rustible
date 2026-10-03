@@ -1,7 +1,7 @@
 //! Homebrew formulae. Ansible's `community.general.homebrew`.
 //!
 //! Shaped like [`crate::apt`]: one type per desired state, `check` decides
-//! from `brew list` and encodes the decision in the diff, `apply` executes
+//! from `brew list` and returns the decision as a typed intent, `apply` executes
 //! exactly that.
 //!
 //! Two things are different from every other package op here, and both are
