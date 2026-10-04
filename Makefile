@@ -67,10 +67,10 @@ vm-up-arm:
 	cd $(VAGRANT_DIR) && $(VAGRANT) up arm
 
 # Destroys and recreates the guests, then runs each playbook twice (vagrant,
-# then vagrant_login, which logs in as an account the first creates): the first
-# run must change something (otherwise the test is vacuous) and the second must
-# change nothing. Pass HOSTS=vagrant-arm to limit it, QUICK=1 to skip the
-# recreate while iterating.
+# then vagrant_login and vagrant_escalate_user, which log in as and escalate
+# to accounts the first creates): the first run must change something
+# (otherwise the test is vacuous) and the second must change nothing. Pass
+# HOSTS=vagrant-arm to limit it, QUICK=1 to skip the recreate while iterating.
 vm-test: example
 	$(CARGO) build --release -p rustible-cli
 	$(VAGRANT_DIR)/vm-test.sh $(HOSTS)

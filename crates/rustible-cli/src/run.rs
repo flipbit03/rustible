@@ -24,6 +24,7 @@ use rustible_cli::inventory::{
     bag_to_json, format_vars_report,
 };
 use rustible_sdk::event::Event;
+use rustible_sdk::launch::{self, Answer, Launch, Mode, Next, Place, Spawn};
 use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use rustible_sdk::secret::Secret;
@@ -181,10 +182,32 @@ fn new_run_id() -> String {
 /// step 7; absolute, so no shell expands anything later).
 pub fn remote_path(home: &str, playbook: &str, hash: &str) -> String {
     format!(
-        "{}/.cache/rustible/bin/{}-{hash}",
+        "{}/.cache/rustible/bin/{}",
         home.trim_end_matches('/'),
-        playbook.replace('/', "_")
+        binary_name(playbook, hash)
     )
+}
+
+/// The binary's file name in any account's cache: `<playbook with / as
+/// _>-<sha256>`. A streamed copy is found by it, so it must change with the
+/// contents.
+pub fn binary_name(playbook: &str, hash: &str) -> String {
+    format!("{}-{hash}", playbook.replace('/', "_"))
+}
+
+/// Whether the binary is streamed to `escalate_user` rather than run from
+/// the login user's cache: when the playbook escalates to an account that is
+/// neither root, which reads anything, nor the login user, whose cache it
+/// is (vision 11.3, #62).
+///
+/// A login with no name (`id -un` failed: a uid without a passwd entry) is
+/// not streamed to anyone; the launch is the one it always was.
+pub fn streams_launch(escalate: bool, method: Escalate, escalate_user: &str, login: &str) -> bool {
+    escalate
+        && method != Escalate::None
+        && !login.is_empty()
+        && escalate_user != "root"
+        && escalate_user != login
 }
 
 /// The transport target for a resolved host. Parameters the inventory left
@@ -797,21 +820,8 @@ async fn drive(
     let name = plan.name.as_str();
     let (bytes, hash) = artifact;
     let path = remote_path(&probe.home, name, hash);
-
-    let t0 = Instant::now();
-    let cached = tr.exists(&path).await?;
-    if !cached {
-        tr.upload(bytes, &path).await?;
-    }
-    out.lock().unwrap().note(
-        host,
-        &format!(
-            "binary {} ({} bytes) in {:.2?}",
-            if cached { "already cached" } else { "uploaded" },
-            bytes.len(),
-            t0.elapsed()
-        ),
-    );
+    let login = login_override(r, plan.ssh_user.as_deref());
+    let run_id = new_run_id();
 
     if plan.escalate && r.params.escalate == Escalate::None {
         out.lock().unwrap().note(
@@ -819,25 +829,74 @@ async fn drive(
             "playbook says escalate, host has escalate=\"none\": running unescalated",
         );
     }
-    let argv = exec_argv(
-        &path,
+    let t0 = Instant::now();
+    let (mut proc, prefix) = if streams_launch(
         plan.escalate,
         r.params.escalate,
         &r.params.escalate_user,
-    );
-    let prefix = escalate_prefix(plan.escalate, r.params.escalate, &r.params.escalate_user);
-    let login = login_override(r, plan.ssh_user.as_deref());
-    let run_id = new_run_id();
-    let mut proc = tr
-        .spawn(
-            &argv,
-            Some(KillTarget {
-                binary: path.clone(),
-                run_dir: run_dir_name(&run_id),
-                escalate: prefix.clone(),
-            }),
+        &probe.user,
+    ) {
+        // The login user's cache is no use to this account, so nothing is
+        // uploaded there: the bytes go to the account from memory.
+        let user = &r.params.escalate_user;
+        let streamed = launch_streamed(
+            tr,
+            r,
+            &binary_name(name, hash),
+            bytes,
+            &run_id,
+            login.as_ref(),
         )
         .await?;
+        let how = match streamed.installed {
+            None => format!("already cached for `{user}`"),
+            Some(Place::Home) => format!("streamed to `{user}`"),
+            Some(Place::Temp) => format!("streamed to a private temp directory for `{user}`"),
+        };
+        out.lock().unwrap().note(
+            host,
+            &format!(
+                "binary {how} ({} bytes) in {:.2?}",
+                bytes.len(),
+                t0.elapsed()
+            ),
+        );
+        (streamed.proc, streamed.prefix)
+    } else {
+        let cached = tr.exists(&path).await?;
+        if !cached {
+            tr.upload(bytes, &path).await?;
+        }
+        out.lock().unwrap().note(
+            host,
+            &format!(
+                "binary {} ({} bytes) in {:.2?}",
+                if cached { "already cached" } else { "uploaded" },
+                bytes.len(),
+                t0.elapsed()
+            ),
+        );
+        let argv = exec_argv(
+            &path,
+            plan.escalate,
+            r.params.escalate,
+            &r.params.escalate_user,
+        );
+        let prefix = escalate_prefix(plan.escalate, r.params.escalate, &r.params.escalate_user);
+        let proc = tr
+            .spawn(
+                &argv,
+                Some(KillTarget {
+                    binary: path.clone(),
+                    by_name: false,
+                    run_dir: run_dir_name(&run_id),
+                    escalate: prefix.clone(),
+                    ephemeral: None,
+                }),
+            )
+            .await?;
+        (proc, prefix)
+    };
     // From here on the child owns the failure story: `sudo -n` refusing, a
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
@@ -917,6 +976,159 @@ async fn drive(
     }
     out.lock().unwrap().exited(host, exit);
     Ok(())
+}
+
+/// A binary started by [`launch_streamed`]: the process, the escalation
+/// words it runs behind, and where it had to be installed, if anywhere.
+struct Streamed {
+    proc: crate::transport::Proc,
+    prefix: Vec<String>,
+    installed: Option<Place>,
+}
+
+/// Start the binary as an `escalate_user` that cannot read the login
+/// user's cache: stream it to that account's own cache, or to a private
+/// per-run temp directory, through the spawns `rustible_sdk::launch`
+/// describes, and run it from there (vision 11.3, #62). The SDK's helper
+/// spawner drives the same plan with local processes.
+///
+/// Every spawn runs from `/` (the login's home may be unreadable to the
+/// account, and macOS's `/bin/sh` says so on stderr), behind `sudo -n -H`
+/// or `doas -n`: the launch never sends a password, so nothing here can
+/// wait on one, and the first-byte deadline is only a backstop.
+async fn launch_streamed(
+    tr: &Transport,
+    r: &Resolved,
+    name: &str,
+    bytes: &[u8],
+    run_id: &str,
+    login: Option<&LoginOverride>,
+) -> Result<Streamed> {
+    let user = r.params.escalate_user.as_str();
+    let words = launch::escalation(r.params.escalate.as_str(), user, false, true)?;
+    let mut plan = Launch::new(
+        name,
+        bytes.len() as u64,
+        Mode::Remote,
+        user,
+        format!("escalating to `{user}`"),
+    );
+    loop {
+        let spawn = plan.spawn();
+        let mut argv: Vec<String> = ["sh", "-c", "cd / && exec \"$@\"", "rustible"]
+            .map(String::from)
+            .to_vec();
+        argv.extend(words.iter().cloned());
+        argv.extend(plan.argv(spawn));
+        let next = match spawn {
+            Spawn::Try(place) => {
+                let kill = KillTarget {
+                    binary: name.to_string(),
+                    by_name: true,
+                    run_dir: run_dir_name(run_id),
+                    escalate: words.clone(),
+                    ephemeral: (place == Place::Temp).then(|| plan.suffix().to_string()),
+                };
+                let mut proc = tr.spawn(&argv, Some(kill)).await?;
+                let byte = first_byte(tr, &mut proc, user).await?;
+                let Some(answer) = byte.and_then(Answer::from_byte) else {
+                    return Err(launch_died(tr, &mut proc, byte, &words, user, login).await);
+                };
+                let next = plan.after_try(answer);
+                if next == Next::Ready {
+                    return Ok(Streamed {
+                        proc,
+                        prefix: words,
+                        installed: plan.installed(),
+                    });
+                }
+                proc.wait().await?;
+                next
+            }
+            Spawn::Install(_) => {
+                let mut proc = tr.spawn(&argv, None).await?;
+                let byte = first_byte(tr, &mut proc, user).await?;
+                if byte != Some(launch::INSTALL_READY) {
+                    return Err(launch_died(tr, &mut proc, byte, &words, user, login).await);
+                }
+                // A write the script stopped reading fails; its exit status
+                // and stderr say why, so that is what is reported.
+                let _ = proc.stdin.write_all(bytes).await;
+                let _ = proc.stdin.shutdown().await;
+                proc.stdin = Box::pin(tokio::io::sink());
+                let code = proc.wait().await?;
+                let stderr = proc.stderr_text().await;
+                plan.after_install(code, &stderr)
+            }
+        };
+        match next {
+            Next::Spawn(_) => continue,
+            Next::Refuse(msg) => bail!(msg),
+            Next::Ready => unreachable!("only a try answers Ready"),
+        }
+    }
+}
+
+/// A launch spawn's first byte, `None` at EOF. Nothing past
+/// [`launch::FIRST_BYTE_DEADLINE`]: the process is killed and the launch
+/// refused.
+async fn first_byte(
+    tr: &Transport,
+    proc: &mut crate::transport::Proc,
+    user: &str,
+) -> Result<Option<u8>> {
+    let mut b = [0u8];
+    match tokio::time::timeout(launch::FIRST_BYTE_DEADLINE, proc.stdout.read(&mut b)).await {
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(_)) => Ok(Some(b[0])),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            let _ = tr.kill(proc).await;
+            bail!(launch::deadline_message(
+                user,
+                launch::FIRST_BYTE_DEADLINE,
+                ""
+            ))
+        }
+    }
+}
+
+/// A launch spawn that exited before it answered, or answered something no
+/// script writes: the escalation tool's own refusal, with the playbook's
+/// `ssh_user` named when it chose the account that escalated.
+///
+/// Its stdin is closed first, and one that answered nonsense is killed
+/// before it is waited for: it is still running, and may be reading.
+async fn launch_died(
+    tr: &Transport,
+    proc: &mut crate::transport::Proc,
+    byte: Option<u8>,
+    words: &[String],
+    user: &str,
+    login: Option<&LoginOverride>,
+) -> anyhow::Error {
+    proc.stdin = Box::pin(tokio::io::sink());
+    if byte.is_some() {
+        let _ = tr.kill(proc).await;
+    }
+    let code = proc.wait().await.unwrap_or(-1);
+    let stderr = proc.stderr_text().await;
+    let said = match stderr.trim() {
+        "" => String::new(),
+        s => format!(": {}", s.replace('\n', " / ")),
+    };
+    let what = match byte {
+        Some(b) => format!(" after answering {:?}", b as char),
+        None => String::new(),
+    };
+    let e = anyhow::anyhow!(
+        "escalating to `{user}` with `{}` exited {code}{what} before the playbook started{said}",
+        words.join(" ")
+    );
+    match launch_escalation_failure(false, words, user, &stderr, login) {
+        Some(line) => e.context(line),
+        None => e,
+    }
 }
 
 /// `Start` down, every `Up` frame to the renderer, until the binary closes
@@ -1676,6 +1888,7 @@ host "laptop" connection="local"
         let probe = Probe {
             triple: "x86_64-unknown-linux-musl".into(),
             home: dir.path().display().to_string(),
+            user: "cadu".into(),
         };
         let r = by_defaults();
         for ssh_user in [Some("minecraft"), None] {
@@ -1771,6 +1984,7 @@ host "laptop" connection="local"
         let probe = Probe {
             triple: "x86_64-unknown-linux-musl".into(),
             home: dir.path().display().to_string(),
+            user: "cadu".into(),
         };
         let mut plan = plan(dir.path(), Some("minecraft"));
         plan.escalate = true;
@@ -1811,6 +2025,219 @@ host "laptop" connection="local"
             }
             _ => result.unwrap(),
         }
+    }
+
+    // ---- the streamed launch (#62), behind a stand-in `sudo` ----
+
+    /// Drops sudo's options, logs which script it was asked to run, and runs
+    /// it as the test's own user with the `HOME` and `TMPDIR` the outer test
+    /// chose.
+    const STAND_IN_SUDO: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$RUSTIBLE_TEST_SUDO_LOG"
+case "$RUSTIBLE_TEST_NO_READY $*" in
+  1*"printf I"*) ( sleep 1; kill $$ ) & exec cat > "$RUSTIBLE_TEST_DIR/early" ;;
+esac
+while [ $# -gt 0 ]; do
+  case $1 in -n|-H) shift ;; -u) shift 2 ;; *) break ;; esac
+done
+exec "$@"
+"#;
+
+    fn streamed_behind_stand_in_sudo(case: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("sudo"), STAND_IN_SUDO).unwrap();
+        std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for d in ["home", "tmp"] {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "run::tests::drive_streams_behind_a_stand_in_sudo",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PATH", path)
+            .env("HOME", dir.path().join("home"))
+            .env("TMPDIR", dir.path().join("tmp"))
+            .env("RUSTIBLE_TEST_SUDO_LOG", dir.path().join("sudo.log"))
+            .env("RUSTIBLE_TEST_STREAMED", case)
+            .env("RUSTIBLE_TEST_DIR", dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{case}:\n{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{case}: did not run\n{stdout}");
+    }
+
+    #[test]
+    fn an_unprivileged_escalate_user_runs_its_own_copy() {
+        streamed_behind_stand_in_sudo("home");
+    }
+
+    #[test]
+    fn an_escalate_user_without_a_home_runs_a_temp_copy() {
+        streamed_behind_stand_in_sudo("no-home");
+    }
+
+    #[test]
+    fn an_escalate_user_with_nowhere_to_run_is_refused() {
+        streamed_behind_stand_in_sudo("nowhere");
+    }
+
+    #[test]
+    fn no_byte_of_the_binary_is_streamed_before_the_install_answers() {
+        streamed_behind_stand_in_sudo("no-ready");
+    }
+
+    /// The inner half of the three tests above: the real `drive`, through
+    /// `Transport::Local`, with `escalate = true` and `escalate_user="svc"`.
+    #[tokio::test]
+    #[ignore = "run by streamed_behind_stand_in_sudo"]
+    async fn drive_streams_behind_a_stand_in_sudo() {
+        let Ok(case) = std::env::var("RUSTIBLE_TEST_STREAMED") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(std::env::var("RUSTIBLE_TEST_DIR").unwrap());
+        let (home, tmp) = (dir.join("home"), dir.join("tmp"));
+        let start = dir.join("start");
+        let hash = "0123456789abcdef".repeat(4);
+        let name = "games/minecraft";
+        let artifact = (stand_in(&start, name, true, "").into_bytes(), hash.clone());
+        // The login user's home, which nothing may touch.
+        let login_home = dir.join("login");
+        let probe = Probe {
+            triple: "x86_64-unknown-linux-musl".into(),
+            home: login_home.display().to_string(),
+            user: "cadu".into(),
+        };
+        let mut plan = plan(&dir, None);
+        plan.escalate = true;
+        let r = Inventory::parse(
+            r#"host "svc-host" addr="10.0.4.5" escalate_user="svc""#,
+            "hosts.kdl",
+        )
+        .unwrap()
+        .resolve("svc-host")
+        .unwrap();
+        let run = || async {
+            let (_tx, rx) = tokio::sync::watch::channel(false);
+            drive(
+                &plan,
+                &r,
+                &Transport::Local,
+                &probe,
+                &artifact,
+                Value::Null,
+                &quiet(&r.host),
+                rx,
+            )
+            .await
+        };
+        let log = || std::fs::read_to_string(dir.join("sudo.log")).unwrap_or_default();
+        let spawns = || {
+            log()
+                .lines()
+                .map(|l| {
+                    assert!(l.starts_with("-n -H -u svc /bin/sh -c "), "{l}");
+                    if l.contains("printf I") {
+                        "install"
+                    } else {
+                        "try"
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let started = || {
+            let frame = std::fs::read(&start).unwrap();
+            let Down::Start { host, .. } = serde_json::from_slice(&frame).unwrap() else {
+                panic!("not Start")
+            };
+            assert_eq!(host.name, "svc-host");
+            std::fs::remove_file(&start).unwrap();
+        };
+        let cached = home
+            .join(".cache/rustible/bin")
+            .join(binary_name(name, &hash));
+        match case.as_str() {
+            "home" => {
+                run().await.unwrap();
+                started();
+                assert_eq!(spawns(), ["try", "install", "try"]);
+                assert_eq!(std::fs::read(&cached).unwrap(), artifact.0);
+                // Nothing went to the login user's cache.
+                assert!(!login_home.exists());
+                std::fs::remove_file(dir.join("sudo.log")).unwrap();
+                run().await.unwrap();
+                started();
+                assert_eq!(spawns(), ["try"]);
+            }
+            "no-home" => {
+                std::fs::remove_dir(&home).unwrap();
+                run().await.unwrap();
+                started();
+                assert_eq!(spawns(), ["try", "install", "install", "try"]);
+                let dirs: Vec<_> = std::fs::read_dir(&tmp)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                assert_eq!(dirs.len(), 1, "{dirs:?}");
+                assert!(
+                    dirs[0].to_string_lossy().starts_with("rustible-"),
+                    "{dirs:?}"
+                );
+            }
+            "nowhere" => {
+                std::fs::remove_dir(&home).unwrap();
+                std::fs::remove_dir(&tmp).unwrap();
+                let e = format!("{:#}", run().await.unwrap_err());
+                assert!(
+                    e.starts_with(&format!(
+                        "escalating to `svc`: no usable home ({} does not exist) and cannot create {}/rustible-",
+                        home.display(),
+                        tmp.display()
+                    )),
+                    "{e}"
+                );
+                assert!(
+                    e.ends_with("so svc cannot run its copy of the playbook binary"),
+                    "{e}"
+                );
+                assert!(!start.exists());
+            }
+            "no-ready" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_NO_READY", "1") };
+                // The stand-in's install never answers `I`: it reads what it
+                // is sent for a second, then dies.
+                let e = format!("{:#}", run().await.unwrap_err());
+                assert!(e.contains("before the playbook started"), "{e}");
+                let early = std::fs::read(dir.join("early")).unwrap();
+                assert!(early.is_empty(), "{} bytes sent before `I`", early.len());
+            }
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    #[test]
+    fn only_an_unprivileged_other_account_is_streamed() {
+        assert!(streams_launch(true, Escalate::Sudo, "svc", "cadu"));
+        assert!(streams_launch(true, Escalate::Doas, "svc", "cadu"));
+        assert!(!streams_launch(true, Escalate::Sudo, "root", "cadu"));
+        assert!(!streams_launch(true, Escalate::Sudo, "cadu", "cadu"));
+        assert!(!streams_launch(true, Escalate::None, "svc", "cadu"));
+        assert!(!streams_launch(false, Escalate::Sudo, "svc", "cadu"));
+        // The probe found no name for the login.
+        assert!(!streams_launch(true, Escalate::Sudo, "svc", ""));
     }
 
     #[test]

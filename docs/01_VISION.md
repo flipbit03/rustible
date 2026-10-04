@@ -275,6 +275,10 @@ Consequences accepted with remote-brain:
    `escalate = true`, using the host's escalation method), write the `Start`
    frame (section 5.5) to its stdin, read frames from its stdout until EOF,
    capture stderr separately (panics land there), wait for the exit code.
+   When `escalate_user` is neither root nor the login user, the binary is not
+   run from the login user's cache: it is copied to that account (or a private
+   per-run directory) and launched from there, as an `as_user` helper is
+   (11.3).
 9. **Render** the per-host, per-step view from the event stream as it arrives.
    Facts gathering is the first thing the binary does and is reported as a
    frame. Sub-events between `StepStarted` and `StepFinished` (`CmdRan`, debug
@@ -1611,18 +1615,34 @@ from the binary's own (`as root`, `as postgres`).
 `sys.write_atomic("/etc/...")` from an unprivileged process gets EACCES.
 Ansible's answer is shell tricks (`sudo tee`, chmod dances). Ours: `as_user`
 creates a `System` whose backend is `Elevated { user }`. On first use it spawns
-**the same binary** under sudo in helper mode:
+**the same binary** under sudo in helper mode. For root that is the binary
+already running
+(`sudo -n -u root <login home>/.cache/rustible/bin/<playbook>-<sha256> --helper`).
+Any other account usually cannot reach that file (homes are 0750 or 0700 by
+default on Ubuntu and Debian, and `~/.cache` is 0700 on macOS), so the binary
+copies itself to the account first: `/bin/sh`, run as the account, writes the
+bytes streamed on its stdin into the account's own
+`~/.cache/rustible/bin/<playbook>-<sha256>` (0700, temp name then rename, size
+checked), and the helper is exec'd from there; one byte on stdout before any
+frame says whether a copy was found. The copy is a cache, so a later run of the
+same build spawns once, as for root. An account with no usable home (none, not
+writable, or `noexec`) gets a private per-run directory instead,
+`${TMPDIR:-/tmp}/rustible-<random>` made with `mkdir -m 700`, which is not
+cached: the helper deletes its copy and the directory as it starts. A step is
+refused only when both are unusable, naming both causes. `escalate = true` with
+an `escalate_user` other than root or the login launches the binary the same
+way (5.2 step 8), except that its per-run temp copy is removed when the run
+ends rather than as it starts, because the run's own helpers are started from
+it.
 
-```
-sudo -n -u <user> /tmp/.rustible/<hash> --helper
-```
+It speaks the `Backend` primitives (`read`, `write`, `stat`, `spawn`) to it
+over its stdin/stdout, framed like the main channel. The helper is `Local`
+wrapped in a request loop. One helper per identity, spawned lazily, kept alive
+for the run, killed at exit. Properties:
 
-and speaks the `Backend` primitives (`read`, `write`, `stat`, `spawn`) to it over
-its stdin/stdout, framed like the main channel. The helper is `Local` wrapped in
-a request loop. One helper per identity, spawned lazily, kept alive for the run,
-killed at exit. Properties:
-
-- No extra upload: the helper is the binary already on the target.
+- No extra upload from the controller: the helper is the binary already on the
+  target, copied over a local pipe into an unprivileged account's own cache
+  once per build.
 - Ops know nothing: this is the payoff of routing all I/O through `sys`.
 - Stepping down (`as_user("postgres")`) is the same mechanism.
 - The check-mode mutation guard holds in the helper (same code).
@@ -1633,6 +1653,9 @@ killed at exit. Properties:
 Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
 needs a password, the orchestrator sends it in the `Start` frame as a secret
 and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
+A rejected password is refused as soon as sudo says so, and a spawn that has
+not answered within 60 seconds is killed, so a wrong password cannot hang a
+run.
 
 ## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
 

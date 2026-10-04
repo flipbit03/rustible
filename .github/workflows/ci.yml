@@ -357,7 +357,7 @@ jobs:
           virsh -c qemu:///system dumpxml vagrant_${{ matrix.machine }} \
             | grep -E "<domain type" || true
 
-      # Runs each playbook (vagrant, then vagrant_login) twice and fails
+      # Runs each playbook (vagrant, vagrant_login, vagrant_escalate_user) twice and fails
       # unless every second run changes nothing. The second run is the test.
       - name: make vm-test
         run: make vm-test

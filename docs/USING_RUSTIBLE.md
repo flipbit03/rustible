@@ -746,6 +746,10 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 }
 ```
 
+⚠️ An account other than root that a step runs as can read this playbook's
+whole binary, including anything `include_str!`'d into it, so keep secrets in
+`ctx.local_secret`.
+
 ⚠️ A host with `escalate="none"` under a playbook with `escalate = true` runs
 **unescalated**. It does not refuse and it does not fail, so a host you
 deliberately exempted stays exempt — but you are only told if you ask. The
