@@ -67,6 +67,7 @@
 
 use std::time::{Duration, Instant};
 
+use rustible_sdk::IoAt;
 use rustible_sdk::prelude::*;
 use rustible_sdk::system::{Cmd, Identity};
 
@@ -368,7 +369,7 @@ impl Runtime {
         };
         let dir = format!("/run/user/{uid}");
         let socket = format!("{dir}/systemd/private");
-        let ready = sys.exists(&socket)?
+        let ready = socket_up(sys, &socket)?
             || (!sys.check_mode() && wait(sys, &account, uid, &socket, op, timeout)?);
         if !ready && !sys.check_mode() {
             if sys.is_root() {
@@ -441,10 +442,28 @@ fn wait(
             );
         }
         std::thread::sleep(MANAGER_POLL.min(left));
-        if sys.exists(socket)? {
+        if socket_up(sys, socket)? {
             return Ok(true);
         }
     }
+}
+
+/// Whether the manager's socket exists yet. A stat refused with `EACCES`
+/// counts as "not yet": `user-runtime-dir@.service` creates `/run/user/<uid>`
+/// as root, mode 0700, before it mounts the account's tmpfs there, and a
+/// stat made as the account in between is denied rather than answered.
+fn socket_up(sys: &System, socket: &str) -> Result<bool> {
+    match sys.exists(socket) {
+        Err(e) if denied(&e) => Ok(false),
+        r => r,
+    }
+}
+
+/// Whether `e` is a path refused with `EACCES`, which [`socket_up`] reads
+/// as a runtime directory not yet handed to its account.
+fn denied(e: &Error) -> bool {
+    e.downcast_ref::<IoAt>()
+        .is_some_and(|io| io.source.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// A timeout as a reader wrote it: `30s`, `250ms`.
@@ -1534,10 +1553,12 @@ impl Op for DaemonReload {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
     use rustible_sdk::{Ctx, HostInfo};
 
@@ -1705,6 +1726,25 @@ mod tests {
         for bad in ["", "a b", "-x", "a\nb", "\tnginx"] {
             assert!(validate_unit(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Only a stat refused with `EACCES` is "not yet"; any other failure,
+    /// or a message that merely reads like one, is still an error.
+    #[test]
+    fn denied_is_an_eacces_on_a_path_and_nothing_else() {
+        let at = |kind| {
+            Error::from(IoAt {
+                path: SOCKET.into(),
+                source: io::Error::from(kind),
+            })
+        };
+        assert!(denied(&at(io::ErrorKind::PermissionDenied)));
+        assert!(denied(
+            &at(io::ErrorKind::PermissionDenied).context("looking for the manager")
+        ));
+        assert!(!denied(&at(io::ErrorKind::NotFound)));
+        assert!(!denied(&at(io::ErrorKind::Other)));
+        assert!(!denied(&Error::msg("Permission denied (os error 13)")));
     }
 
     // ---- fake helpers ----
@@ -3088,6 +3128,97 @@ mod tests {
             )
     }
 
+    /// A `Fake` that counts the stats of [`SOCKET`] and refuses the first
+    /// `denied` of them with `EACCES`, as a stat as the account does between
+    /// `user-runtime-dir` creating `/run/user/<uid>` (root, 0700) and mounting
+    /// the account's tmpfs there. The `Fake` itself cannot fail a stat, so
+    /// this wraps it through [`System::new`]; everything else passes through.
+    struct Watched {
+        fake: Arc<Fake>,
+        denied: AtomicUsize,
+        looks: AtomicUsize,
+    }
+
+    impl Watched {
+        fn new(fake: &Arc<Fake>, denied: usize) -> Arc<Self> {
+            Arc::new(Watched {
+                fake: fake.clone(),
+                denied: AtomicUsize::new(denied),
+                looks: AtomicUsize::new(0),
+            })
+        }
+
+        /// A `System` over this backend with `sys(..)`'s facts, as `minecraft`.
+        fn sys(self: &Arc<Self>) -> System {
+            let facts = sys(&self.fake).facts().clone();
+            System::new(self.clone(), facts, false, Arc::new(Collect::default()))
+                .as_user("minecraft")
+        }
+
+        /// How many times the socket was looked at.
+        fn looks(&self) -> usize {
+            self.looks.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Backend for Watched {
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.fake.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
+            self.fake.write(p, bytes)
+        }
+        fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
+            if p == Path::new(SOCKET) {
+                self.looks.fetch_add(1, Ordering::SeqCst);
+                let denying = self
+                    .denied
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if denying {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+            }
+            self.fake.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.fake.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+            self.fake.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fake.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
+            self.fake.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+            self.fake.set_owner(p, uid, gid)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fake.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+            self.fake.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+            self.fake.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+            self.fake.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
+            self.fake.spawn(spec)
+        }
+    }
+
     /// The manager's socket appears while `check` waits, written into the
     /// box from another thread as logind would; `check` then probes it.
     #[test]
@@ -3196,6 +3327,47 @@ mod tests {
             change(plan).diff().render(),
             "nginx:\n  active: inactive -> active\n"
         );
+    }
+
+    /// A stat refused with `EACCES` while `user-runtime-dir` has made
+    /// `/run/user/<uid>` but not yet mounted the account's tmpfs on it is
+    /// "not yet", in the first look and while waiting: the step waits
+    /// through it instead of failing with "Permission denied".
+    #[test]
+    fn user_mode_waits_through_a_runtime_dir_not_yet_handed_to_the_account() {
+        let fake = Arc::new(linger_starting().with_file(SOCKET, ""));
+        let watched = Watched::new(&fake, 3);
+        let plan = Enabled::new("nginx")
+            .user(true)
+            .check(&watched.sys())
+            .unwrap();
+        // The first look and two polls were denied; the third poll found it.
+        assert_eq!(watched.looks(), 4);
+        assert_eq!(
+            change(plan).diff().render(),
+            "nginx:\n  enabled: disabled -> enabled\n"
+        );
+    }
+
+    /// A denial that never ends is still a manager that did not come up, and
+    /// refuses as one once the timeout has passed.
+    #[test]
+    fn user_mode_refuses_a_runtime_dir_that_stays_denied_as_a_timeout() {
+        let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, usize::MAX);
+        let err = Enabled::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::from_millis(300))
+            .check(&watched.sys())
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.starts_with(
+                "systemd::Enabled: the user manager of `minecraft` (uid 1002) did not come up"
+            ),
+            "{err}"
+        );
+        assert!(watched.looks() > 1, "{}", watched.looks());
     }
 
     /// Every op takes the knob, and it reaches the wait.
