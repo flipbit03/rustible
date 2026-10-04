@@ -411,7 +411,7 @@ module by module. Forgetting the second line is the most common first error.
 | `hosts` | string, **required** | a host name or a group name from the inventory |
 | `vars` | a type | the `#[rustible::vars]` struct this playbook needs (§11) |
 | `escalate` | bool | run every step escalated (§12) |
-| `ssh_user` | string | log in as this account instead of the host's `ssh_user`, whichever level of `hosts.kdl` set it; a run reaching a `connection="local"` host is refused (§12) |
+| `ssh_user` | string | log in as this account instead of the host's `ssh_user`; refused on a `connection="local"` host |
 
 The function signature is fixed:
 
@@ -756,10 +756,6 @@ output for it.
 **`escalate = true` needs passwordless `sudo`.** The orchestrator launches the
 whole binary behind `sudo -n`, which fails outright if a password is wanted,
 before the playbook starts.
-
-Escalation of every kind runs from the account that logged in: under a
-playbook's `ssh_user = "minecraft"`, it is `minecraft` that runs `sudo -n`,
-and a failure says the login came from the attribute.
 
 `--escalate-password-env` does **not** change that. It supplies a password to
 the per-step helper — `ctx.as_root()` and `ctx.as_user()` — inside an
