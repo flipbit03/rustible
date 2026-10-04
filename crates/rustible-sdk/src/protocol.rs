@@ -34,7 +34,9 @@ use crate::secret::Secret;
 /// is gone, and `Os`, `Distro`, `Pm`, `Init` gain the macOS variants.
 /// 5: `Ctx::block` — `BlockStarted`/`BlockFinished` replace
 /// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// 6: the playbook's `ssh_user` — `--describe` entries carry `ssh_user`, and
+/// `Start.host` carries `login_override`.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -470,10 +472,9 @@ mod tests {
 
     /// Version 5 is `Ctx::block`: the block events replace the section
     /// events, and every step event carries the block path instead of a
-    /// depth. Pinned here so the shape and the number move together.
+    /// depth. The number itself is pinned by the newest version's test.
     #[test]
     fn protocol_5_carries_block_paths() {
-        assert_eq!(PROTOCOL_VERSION, 5);
         let started = Event::BlockStarted {
             blocks: vec!["a".into(), "b".into()],
         };
@@ -521,5 +522,44 @@ mod tests {
         // A version-4 frame, with `depth` and no `blocks`, does not read.
         let old = r#"{"StepSkipped":{"id":3,"depth":1,"name":"n","reason":"r"}}"#;
         assert!(serde_json::from_str::<Event>(old).is_err());
+    }
+
+    /// Version 6 is the playbook's `ssh_user`: `Start.host` says, when the
+    /// attribute chose the login, what the inventory would have used, so the
+    /// binary's escalation failures can say so. An orchestrator that sets
+    /// nothing sends the same bytes as before, and a `Start` without the
+    /// field reads as "the inventory chose".
+    #[test]
+    fn protocol_6_carries_the_login_override() {
+        use crate::ctx::{InventoryLogin, LoginOverride};
+
+        assert_eq!(PROTOCOL_VERSION, 6);
+        let mut host = HostInfo::local();
+        let plain = serde_json::to_value(&host).unwrap();
+        assert!(plain.get("login_override").is_none(), "{plain}");
+
+        host.login_override = Some(Box::new(LoginOverride {
+            ssh_user: "minecraft".into(),
+            inventory: Some(InventoryLogin {
+                ssh_user: "cadu".into(),
+                source: "defaults".into(),
+            }),
+        }));
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json["login_override"],
+            serde_json::json!({
+                "ssh_user": "minecraft",
+                "inventory": { "ssh_user": "cadu", "source": "defaults" },
+            })
+        );
+        let back: HostInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.login_override, host.login_override);
+
+        let json = r#"{"Start":{"run_id":"r","host":{"name":"h","groups":[]},"vars":{},"check_mode":false,"verbosity":0}}"#;
+        let Down::Start { host, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not Start")
+        };
+        assert!(host.login_override.is_none());
     }
 }

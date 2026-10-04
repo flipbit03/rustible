@@ -108,27 +108,34 @@ impl Proc {
 
 /// The `ssh` command that opens the ControlMaster for `target`: forks after
 /// authentication (`-f -N`), keeps the socket alive between commands, and
-/// never prompts (`BatchMode`). Inventory `ssh_args` go in verbatim, after
-/// ours so they can override them.
+/// never prompts (`BatchMode`).
+///
+/// Inventory `ssh_args` go first: ssh keeps the first value it sees for an
+/// option, so they beat our defaults (`StrictHostKeyChecking`). What the
+/// master depends on, and the login and port, which have their own
+/// parameters, are refused in `ssh_args` at load
+/// (`inventory::ssh_args_problems`), so nothing below is overridden silently.
 pub fn master_argv(ctl: &Path, log: &Path, target: &SshTarget) -> Vec<String> {
-    let mut argv: Vec<String> = [
-        "-E",
-        &log.display().to_string(),
-        "-S",
-        &ctl.display().to_string(),
-        "-M",
-        "-f",
-        "-N",
-        "-o",
-        "ControlPersist=300",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let mut argv = target.args.clone();
+    argv.extend(
+        [
+            "-E",
+            &log.display().to_string(),
+            "-S",
+            &ctl.display().to_string(),
+            "-M",
+            "-f",
+            "-N",
+            "-o",
+            "ControlPersist=300",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
     if let Some(p) = target.port {
         argv.push("-p".into());
         argv.push(p.to_string());
@@ -137,7 +144,6 @@ pub fn master_argv(ctl: &Path, log: &Path, target: &SshTarget) -> Vec<String> {
         argv.push("-l".into());
         argv.push(u.clone());
     }
-    argv.extend(target.args.iter().cloned());
     argv.push("--".into());
     argv.push(target.addr.clone());
     argv
@@ -614,10 +620,132 @@ mod tests {
         let argv = master_argv(ctl, log, &full);
         assert!(argv.windows(2).any(|w| w == ["-p", "2222"]));
         assert!(argv.windows(2).any(|w| w == ["-l", "deploy"]));
-        assert_eq!(
-            &argv[argv.len() - 5..],
-            ["-4", "-o", "ConnectTimeout=5", "--", "10.0.0.1"]
+        assert_eq!(&argv[argv.len() - 2..], ["--", "10.0.0.1"]);
+    }
+
+    /// ssh keeps the first value it sees, so `ssh_args` come before every
+    /// option of ours, or a default like `StrictHostKeyChecking` beats them.
+    #[test]
+    fn master_argv_puts_the_inventorys_ssh_args_first() {
+        let args: Vec<String> = ["-i", "/k", "-o", "StrictHostKeyChecking=no", "-4"]
+            .map(String::from)
+            .into();
+        let target = SshTarget {
+            addr: "192.0.2.1".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            args: args.clone(),
+        };
+        let argv = master_argv(Path::new("/tmp/x/master"), Path::new("/tmp/x/log"), &target);
+        assert_eq!(argv[..args.len()], args[..]);
+        assert_eq!(argv[args.len()], "-E", "ours start right after: {argv:?}");
+        assert_eq!(&argv[argv.len() - 2..], ["--", "192.0.2.1"]);
+    }
+
+    /// Every option `master_argv` passes is either refused in `ssh_args` or
+    /// a default they override; one added without deciding which fails here.
+    #[test]
+    fn every_option_master_argv_passes_is_classified() {
+        use rustible_cli::inventory::{SshOption, ssh_options};
+        let target = SshTarget {
+            addr: "192.0.2.1".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            args: vec![],
+        };
+        let argv = master_argv(Path::new("/tmp/x/master"), Path::new("/tmp/x/log"), &target);
+        let options = ssh_options(&argv);
+        assert_eq!(options.len(), 10, "{options:?}");
+        for (spelling, class) in &options {
+            match class {
+                SshOption::Owned { .. } | SshOption::Param { .. } => {}
+                SshOption::Default => {
+                    assert_eq!(spelling, "-o StrictHostKeyChecking=accept-new")
+                }
+                SshOption::Free => panic!("`{spelling}` is passed but not classified"),
+            }
+        }
+    }
+
+    /// What ssh itself makes of the command line. `ssh -G` only parses its
+    /// configuration and prints it, so no server is needed, and `-F
+    /// /dev/null` keeps the developer's own config out of it.
+    fn ssh_g(argv: &[String]) -> std::collections::HashMap<String, String> {
+        let out = std::process::Command::new("ssh")
+            .args(["-G", "-F", "/dev/null"])
+            .args(argv)
+            .output()
+            .expect("`ssh` must be on PATH: the transport runs it");
+        assert!(
+            out.status.success(),
+            "ssh -G {argv:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn ssh_reads_the_inventorys_ssh_args_over_our_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = dir.path().join("master");
+        let log = dir.path().join("log");
+        let target = |args: &[&str]| SshTarget {
+            addr: "192.0.2.1".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        };
+
+        let ours = ssh_g(&master_argv(&ctl, &log, &target(&[])));
+        assert_eq!(ours["stricthostkeychecking"], "accept-new");
+
+        let config = ssh_g(&master_argv(
+            &ctl,
+            &log,
+            &target(&["-o", "StrictHostKeyChecking=no"]),
+        ));
+        assert_eq!(config["stricthostkeychecking"], "false");
+        // What the inventory cannot touch is still ours.
+        assert_eq!(config["batchmode"], "yes");
+        assert_eq!(config["controlmaster"], "true");
+        assert_eq!(config["controlpath"], ctl.display().to_string());
+        assert_eq!(config["controlpersist"], "300");
+        assert_eq!(config["user"], "deploy");
+        assert_eq!(config["port"], "2222");
+    }
+
+    /// Spellings `ssh` honours in `ssh_args`, over Rustible's own values,
+    /// that a scanner reading `-o` more strictly than ssh would let through.
+    /// Each one is shown to take effect, then shown to be refused at load.
+    #[test]
+    fn what_would_beat_ours_in_ssh_is_refused_at_load() {
+        use rustible_cli::inventory::ssh_args_problems;
+        let dir = tempfile::tempdir().unwrap();
+        let (ctl, log) = (dir.path().join("master"), dir.path().join("log"));
+        for (args, key, value) in [
+            (&["-o=User=evil"][..], "user", "evil"),
+            (&["-o", "U\"ser\" evil"], "user", "evil"),
+            (&["-o", "Host\"Name\" 192.0.2.9"], "hostname", "192.0.2.9"),
+            (&["-o", " =Port=1"], "port", "1"),
+            (&["-o", "\"BatchMode\" no"], "batchmode", "no"),
+            (&["-o", "HostName=192.0.2.9"], "hostname", "192.0.2.9"),
+            (&["stray"], "hostname", "stray"),
+        ] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let target = SshTarget {
+                addr: "192.0.2.1".into(),
+                user: Some("deploy".into()),
+                port: Some(2222),
+                args: args.clone(),
+            };
+            let config = ssh_g(&master_argv(&ctl, &log, &target));
+            assert_eq!(config[key], value, "ssh ignores {args:?}");
+            assert!(!ssh_args_problems(&args).is_empty(), "{args:?} loads");
+        }
     }
 
     #[test]

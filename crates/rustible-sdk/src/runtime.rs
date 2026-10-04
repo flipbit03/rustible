@@ -422,13 +422,17 @@ fn print_usage(playbooks: &[Named]) {
     eprintln!("playbooks in this binary:");
     for p in playbooks {
         eprintln!(
-            "  {}  (hosts = {:?}{})",
+            "  {}  (hosts = {:?}{}{})",
             p.name,
             p.playbook.hosts,
             if p.playbook.escalate {
                 ", escalate"
             } else {
                 ""
+            },
+            match p.playbook.ssh_user {
+                Some(u) => format!(", ssh_user = {u:?}"),
+                None => String::new(),
             }
         );
     }
@@ -443,6 +447,20 @@ fn abort_notice(abort: bool, check_mode: bool) -> Option<&'static str> {
          would-change step's output ends this host's run instead of the enclosing ctx.block; \
          set panic = \"unwind\" in [profile.dist]",
     )
+}
+
+/// The real system a run works through: facts gathered, other identities
+/// reached by the host's escalation method, and every escalation failure
+/// saying where the login came from when the playbook's `ssh_user` chose it.
+fn system(
+    host: &HostInfo,
+    check_mode: bool,
+    sink: SharedSink,
+    escalate_password: Option<Secret>,
+) -> System {
+    System::local(check_mode, sink)
+        .with_escalation(&host.escalate_method, escalate_password)
+        .with_escalation_note(host.login_override.as_ref().map(|o| o.note()))
 }
 
 /// Gather facts, build the context, run the entry, report, and map the
@@ -462,8 +480,7 @@ fn execute(
     // rather than by each of the three places that write one.
     let counter = Arc::new(WarnCounter::new(sink));
     let sink: SharedSink = counter.clone();
-    let sys = System::local(check_mode, sink.clone())
-        .with_escalation(&host.escalate_method, escalate_password);
+    let sys = system(&host, check_mode, sink.clone(), escalate_password);
     sink.emit(Event::Facts(sys.facts().clone()));
     // A host's var bag is shared by every playbook that targets it, so keys
     // this playbook does not declare are legitimate; still, a near-miss of a
@@ -570,6 +587,7 @@ mod tests {
     static WITH_VARS: Playbook = Playbook {
         hosts: "lab",
         escalate: false,
+        ssh_user: None,
         schema: vars::schema_for::<Vars>,
         entry: |_, _| Ok(()),
         check_vars: |raw| vars::from_value::<Vars>(raw).map(|_| ()),
@@ -578,6 +596,7 @@ mod tests {
     static NO_VARS: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| Ok(()),
         check_vars: |_| Ok(()),
@@ -685,6 +704,7 @@ mod tests {
         static WARNS: Playbook = Playbook {
             hosts: "local",
             escalate: false,
+            ssh_user: None,
             schema: vars::schema_for::<Vars>,
             entry: |ctx, _| {
                 ctx.warn("the playbook has an opinion");
@@ -764,6 +784,7 @@ mod tests {
         static FAILS: Playbook = Playbook {
             hosts: "local",
             escalate: false,
+            ssh_user: None,
             schema: vars::no_schema,
             entry: |ctx, _| {
                 ctx.step("odd `: name", Boom)?;
@@ -905,6 +926,7 @@ mod tests {
     static DEREF_AT_TOP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -919,6 +941,7 @@ mod tests {
     static QUESTION_MARK_AT_TOP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -948,6 +971,7 @@ mod tests {
     static RETURNS_UNAVAILABLE: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| {
             Err(crate::error::OutputUnavailable {
@@ -975,6 +999,7 @@ mod tests {
     static PANICS_IN_A_BLOCK: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             ctx.block("b", |_| -> crate::Result<()> { panic!("boom") })?;
@@ -1003,6 +1028,7 @@ mod tests {
     static DEREF_IN_A_REAL_RUN: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| {
             // A real run cannot produce this; the payload is thrown directly
@@ -1041,6 +1067,7 @@ mod tests {
     static READS_INSIDE_AN_OP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -1080,6 +1107,7 @@ mod tests {
     static RESTART_GUARDED_BY_AN_ABSORBED_BLOCK: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -1116,5 +1144,37 @@ mod tests {
             e,
             Event::StepStarted { name, .. } if name == "restart"
         )));
+    }
+
+    /// The run's system carries the login's origin into every escalation
+    /// failure when the orchestrator says the playbook's `ssh_user` chose
+    /// it, and nothing when the inventory did.
+    #[test]
+    fn the_runs_system_carries_the_login_override_note() {
+        use crate::ctx::{InventoryLogin, LoginOverride};
+        use crate::event::Collect;
+
+        let login = LoginOverride {
+            ssh_user: "minecraft".into(),
+            inventory: Some(InventoryLogin {
+                ssh_user: "cadu".into(),
+                source: "defaults".into(),
+            }),
+        };
+        let host = HostInfo {
+            escalate_method: "doas".into(),
+            login_override: Some(Box::new(login.clone())),
+            ..HostInfo::local()
+        };
+        let sys = system(&host, false, Arc::new(Collect::default()), None);
+        assert_eq!(sys.escalation_note(), Some(login.note().as_str()));
+
+        let sys = system(
+            &HostInfo::local(),
+            false,
+            Arc::new(Collect::default()),
+            None,
+        );
+        assert_eq!(sys.escalation_note(), None);
     }
 }

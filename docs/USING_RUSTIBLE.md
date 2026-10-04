@@ -404,13 +404,14 @@ so the import is `use rustible_std::ssh::authorized_keys;`.
 **not** give you any operations — those come from `rustible_std`, named
 module by module. Forgetting the second line is the most common first error.
 
-`#[rustible::playbook]` takes exactly three options:
+`#[rustible::playbook]` takes exactly four options:
 
 | option | type | meaning |
 |---|---|---|
 | `hosts` | string, **required** | a host name or a group name from the inventory |
 | `vars` | a type | the `#[rustible::vars]` struct this playbook needs (§11) |
 | `escalate` | bool | run every step escalated (§12) |
+| `ssh_user` | string | log in as this account instead of the host's `ssh_user`; refused on a `connection="local"` host |
 
 The function signature is fixed:
 

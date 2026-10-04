@@ -32,7 +32,7 @@ pub mod __private {
     pub use serde_json;
 }
 
-pub use ctx::{Block, Ctx, HostInfo};
+pub use ctx::{Block, Ctx, HostInfo, InventoryLogin, LoginOverride};
 pub use diff::{AttrChange, Diff};
 pub use error::{
     CmdFailed, Context, Error, IoAt, MutationDuringCheck, OutputUnavailable, Result, SpawnFailed,

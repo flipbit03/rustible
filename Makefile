@@ -66,7 +66,8 @@ vm-up-x86:
 vm-up-arm:
 	cd $(VAGRANT_DIR) && $(VAGRANT) up arm
 
-# Destroys and recreates the guests, then runs the playbook twice: the first
+# Destroys and recreates the guests, then runs each playbook twice (vagrant,
+# then vagrant_login, which logs in as an account the first creates): the first
 # run must change something (otherwise the test is vacuous) and the second must
 # change nothing. Pass HOSTS=vagrant-arm to limit it, QUICK=1 to skip the
 # recreate while iterating.
