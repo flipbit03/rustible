@@ -39,10 +39,12 @@ struct HostState {
     /// first (the playbook caught the error: the step is `recovered`), the
     /// chain prints from here, before it.
     pending_fail: Option<PendingFail>,
-    /// The failed steps whose chain was printed from `pending_fail`, so a
-    /// `Failed` frame that names one later (an error the playbook kept and
-    /// returned after other steps) closes it without printing it twice.
-    shown: Vec<FailKey>,
+    /// The failed steps whose chain was printed from `pending_fail`, with
+    /// the chain as printed, so a `Failed` frame that names one later (an
+    /// error the playbook kept and returned after other steps) closes it
+    /// without printing it twice. Only when the frame's chain is that one:
+    /// a `.context(..)` the playbook added on the way out was not printed.
+    shown: Vec<(FailKey, String)>,
 }
 
 /// Which failed step a chain or a `Failed` frame belongs to: its id, block
@@ -132,7 +134,7 @@ impl<W: Write> Renderer<W> {
             for l in p.after {
                 self.line(host, &l);
             }
-            self.state(host).shown.push(p.key);
+            self.state(host).shown.push((p.key, p.chain));
         }
     }
 
@@ -291,17 +293,18 @@ impl<W: Write> Renderer<W> {
                 // Anything else held back is a different failure, which the
                 // playbook caught: its reason prints first, in order.
                 self.flush(host);
-                // Its reason was printed already, and no other failed step of
-                // the same name and blocks was, so "above" can only mean it.
-                // With such a twin the reason is printed again: repeated, but
-                // never ambiguous.
+                // Its reason was printed already, word for word, and no other
+                // failed step of the same name and blocks was, so "above" can
+                // only mean it. With such a twin the reason is printed again:
+                // repeated, but never ambiguous. So is a reason the playbook
+                // added words to with `.context(..)`, which were not above.
                 let st = self.state(host);
                 let shown = key.as_ref().is_some_and(|k| {
-                    st.shown.contains(k)
+                    st.shown.iter().any(|(o, chain)| o == k && *chain == *error)
                         && !st
                             .shown
                             .iter()
-                            .any(|o| o.step == k.step && o.blocks == k.blocks && o.id != k.id)
+                            .any(|(o, _)| o.step == k.step && o.blocks == k.blocks && o.id != k.id)
                 });
                 let text = match (step, shown) {
                     // Printed already, when a later step began; this line
@@ -1125,6 +1128,40 @@ web1    4        1             0        0       0          2         0
 "
         );
         assert_eq!(out.matches("exited 3").count(), 1, "{out}");
+    }
+
+    /// An error kept, then returned with words the playbook added by
+    /// `.context(..)`: what printed above was the step's own chain, without
+    /// them, so the frame's line prints its chain in full rather than
+    /// pointing above and losing the words.
+    #[test]
+    fn a_reason_given_context_after_it_printed_is_printed_again_with_it() {
+        let out = render(0, |r| {
+            r.event("local", &step_started(1, "deploy"));
+            r.event(
+                "local",
+                &failing(1, "deploy", "`/bin/sh -c exit 5` exited 5"),
+            );
+            r.event("local", &step_started(2, "report"));
+            r.event("local", &step_finished(2, "report", Status::Changed));
+            r.event(
+                "local",
+                &failed_frame(
+                    Some("deploy"),
+                    Some(1),
+                    "deploying the app: step `deploy`: `/bin/sh -c exit 5` exited 5",
+                ),
+            );
+        });
+        assert!(
+            out.ends_with(
+                "[local]  FAILED at `deploy`: `/bin/sh -c exit 5` exited 5\n\
+                 [local]  report .................................................. changed\n\
+                 [local]  FAILED at `deploy`: deploying the app: `/bin/sh -c exit 5` exited 5\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("reason above"), "{out}");
     }
 
     /// The manual's idiom for adding words, `.context(..)`, puts the step's
