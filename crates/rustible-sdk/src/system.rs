@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::backend::{Backend, CmdSpec, Elevated, Fake, Local, Output, Spawner, Stat};
+use crate::backend::{Backend, CmdSpec, Elevated, Fake, HelperGone, Local, Output, Spawner, Stat};
 use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
@@ -81,6 +81,19 @@ impl Escalation {
             .entry(user.to_string())
             .or_insert_with(|| Arc::new(Elevated::new(user, self.spawner.clone(), phase.clone())))
             .clone()
+    }
+}
+
+/// A command that could not be spawned, or a dead helper's report printed
+/// once, as in `System::io`.
+fn spawn_failed(program: &str, source: std::io::Error) -> Error {
+    match HelperGone::inside(&source) {
+        Some(gone) => Error::msg(format!("could not spawn `{program}`: {gone}")),
+        None => SpawnFailed {
+            program: program.to_string(),
+            source,
+        }
+        .into(),
     }
 }
 
@@ -174,6 +187,13 @@ impl System {
             }));
         }
         self
+    }
+
+    /// The sentence [`System::with_escalation_note`] set, for the runtime's
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn escalation_note(&self) -> Option<&str> {
+        self.escalation.as_ref()?.spawner.note.as_deref()
     }
 
     /// A sentence appended to every escalation failure (a helper that
@@ -316,6 +336,11 @@ impl System {
 
     fn io(p: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
         move |source| {
+            // A dead helper's report is already whole; as an `IoAt` source it
+            // would print twice (see `HelperGone`).
+            if let Some(gone) = HelperGone::inside(&source) {
+                return Error::msg(format!("{}: {gone}", p.display()));
+            }
             IoAt {
                 path: p.to_path_buf(),
                 source,
@@ -617,10 +642,7 @@ impl Cmd {
             .sys
             .backend
             .spawn(&self.spec)
-            .map_err(|source| SpawnFailed {
-                program: self.spec.program.clone(),
-                source,
-            })?;
+            .map_err(|source| spawn_failed(&self.spec.program, source))?;
         self.sys.sink.emit(Event::CmdRan {
             identity: self.sys.identity.label(),
             argv: self.spec.argv(),

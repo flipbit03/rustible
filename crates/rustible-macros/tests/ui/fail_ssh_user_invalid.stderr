@@ -15,3 +15,21 @@ error: playbook option `ssh_user` is empty
    |
 26 |     #[rustible::playbook(hosts = "local", ssh_user = "")]
    |                                                      ^^
+
+error: playbook option `ssh_user` is `mine,craft`, which contains `,`; an account name cannot contain `:`, `,`, whitespace or control characters
+  --> tests/ui/fail_ssh_user_invalid.rs:36:54
+   |
+36 |     #[rustible::playbook(hosts = "local", ssh_user = "mine,craft")]
+   |                                                      ^^^^^^^^^^^^
+
+error: playbook option `ssh_user` is `mine craft`, which contains ` `; an account name cannot contain `:`, `,`, whitespace or control characters
+  --> tests/ui/fail_ssh_user_invalid.rs:46:54
+   |
+46 |     #[rustible::playbook(hosts = "local", ssh_user = "mine craft")]
+   |                                                      ^^^^^^^^^^^^
+
+error: playbook option `ssh_user` is `mine\u{7}craft`, which contains `\u{7}`; an account name cannot contain `:`, `,`, whitespace or control characters
+  --> tests/ui/fail_ssh_user_invalid.rs:56:54
+   |
+56 |     #[rustible::playbook(hosts = "local", ssh_user = "mine\u{7}craft")]
+   |                                                      ^^^^^^^^^^^^^^^^

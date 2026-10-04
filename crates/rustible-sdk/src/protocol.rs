@@ -42,9 +42,6 @@ pub const PROTOCOL_VERSION: u32 = 6;
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Orchestrator -> binary.
-// `Start` is the large variant and is sent once per run; boxing it would
-// save nothing worth a less direct frame type.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Down {
     /// Always the first frame, and the only one the binary reads
@@ -534,25 +531,26 @@ mod tests {
     /// field reads as "the inventory chose".
     #[test]
     fn protocol_6_carries_the_login_override() {
-        use crate::ctx::LoginOverride;
+        use crate::ctx::{InventoryLogin, LoginOverride};
 
         assert_eq!(PROTOCOL_VERSION, 6);
         let mut host = HostInfo::local();
         let plain = serde_json::to_value(&host).unwrap();
         assert!(plain.get("login_override").is_none(), "{plain}");
 
-        host.login_override = Some(LoginOverride {
+        host.login_override = Some(Box::new(LoginOverride {
             ssh_user: "minecraft".into(),
-            inventory_ssh_user: "cadu".into(),
-            inventory_source: "defaults".into(),
-        });
+            inventory: Some(InventoryLogin {
+                ssh_user: "cadu".into(),
+                source: "defaults".into(),
+            }),
+        }));
         let json = serde_json::to_value(&host).unwrap();
         assert_eq!(
             json["login_override"],
             serde_json::json!({
                 "ssh_user": "minecraft",
-                "inventory_ssh_user": "cadu",
-                "inventory_source": "defaults",
+                "inventory": { "ssh_user": "cadu", "source": "defaults" },
             })
         );
         let back: HostInfo = serde_json::from_value(json).unwrap();

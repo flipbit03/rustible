@@ -30,6 +30,34 @@ pub struct Describe {
     pub vars_schema: Value,
 }
 
+/// One describe cache file: the entry and the protocol of the binary that
+/// wrote it. A CLI of another protocol reads the playbook's metadata
+/// differently (a field it does not know, such as `ssh_user`, would be
+/// dropped and the run would log in as the wrong account), so it builds
+/// afresh instead of trusting the file.
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheEntry {
+    protocol: u32,
+    #[serde(flatten)]
+    describe: Describe,
+}
+
+/// The cache file's text for `d`, under this CLI's protocol.
+fn cache_text(d: &Describe) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&CacheEntry {
+        protocol: PROTOCOL_VERSION,
+        describe: d.clone(),
+    })?)
+}
+
+/// The cached entry for `name`, or `None` when the file is unreadable, is
+/// for another playbook, or was written under another protocol (or before
+/// the cache recorded one).
+fn from_cache(text: &str, name: &str) -> Option<Describe> {
+    let entry: CacheEntry = serde_json::from_str(text).ok()?;
+    (entry.protocol == PROTOCOL_VERSION && entry.describe.name == name).then_some(entry.describe)
+}
+
 #[derive(Debug, Deserialize)]
 struct DescribeDoc {
     protocol: u32,
@@ -328,8 +356,7 @@ pub async fn describe_playbook(ws: &Workspace, cargo: &Cargo, name: &str) -> Res
     let key = read_key(ws, name)?;
     let cached = cache_path(&ws.cache_dir(), name, &key);
     if let Ok(text) = std::fs::read_to_string(&cached)
-        && let Ok(d) = serde_json::from_str::<Describe>(&text)
-        && d.name == name
+        && let Some(d) = from_cache(&text, name)
     {
         return Ok(d);
     }
@@ -343,7 +370,7 @@ pub async fn describe_playbook(ws: &Workspace, cargo: &Cargo, name: &str) -> Res
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&cached, serde_json::to_string_pretty(&d)?)
+    std::fs::write(&cached, cache_text(&d)?)
         .with_context(|| format!("writing {}", cached.display()))?;
     Ok(d)
 }
@@ -500,9 +527,37 @@ mod tests {
         assert_eq!(doc.playbooks[0].ssh_user.as_deref(), Some("minecraft"));
         assert_eq!(doc.playbooks[1].ssh_user, None);
         // The cache stores `Describe` itself, so it must survive the trip.
-        let text = serde_json::to_string(&doc.playbooks[0]).unwrap();
-        let back: Describe = serde_json::from_str(&text).unwrap();
-        assert_eq!(back, doc.playbooks[0]);
+        let text = cache_text(&doc.playbooks[0]).unwrap();
+        assert_eq!(
+            from_cache(&text, "games/minecraft"),
+            Some(doc.playbooks[0].clone())
+        );
+    }
+
+    /// A cache file from a CLI of another protocol is not trusted: a newer
+    /// one's `ssh_user` read by an older CLI would vanish, and the run would
+    /// log in as the inventory's account until the binary's `Hello`.
+    #[test]
+    fn a_cache_entry_from_another_protocol_is_rebuilt() {
+        let d = Describe {
+            name: "games/minecraft".into(),
+            hosts: "games".into(),
+            escalate: false,
+            ssh_user: Some("minecraft".into()),
+            vars_schema: Value::Null,
+        };
+        let text = cache_text(&d).unwrap();
+        let mut entry: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(entry["protocol"], PROTOCOL_VERSION);
+        assert_eq!(entry["ssh_user"], "minecraft");
+
+        entry["protocol"] = Value::from(PROTOCOL_VERSION + 1);
+        assert_eq!(from_cache(&entry.to_string(), "games/minecraft"), None);
+        // Written before the cache recorded a protocol.
+        let old = serde_json::to_string(&d).unwrap();
+        assert_eq!(from_cache(&old, "games/minecraft"), None);
+        // Another playbook's file.
+        assert_eq!(from_cache(&text, "hello"), None);
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub struct HostInfo {
     /// account, so a failed escalation quotes [`LoginOverride::note`].
     /// `None` when the inventory chose the login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login_override: Option<LoginOverride>,
+    pub login_override: Option<Box<LoginOverride>>,
 }
 
 /// Where the login user came from, when the playbook's `ssh_user`
@@ -62,13 +62,19 @@ pub struct HostInfo {
 pub struct LoginOverride {
     /// The account the attribute named, which ssh logged in as.
     pub ssh_user: String,
-    /// What the inventory resolves `ssh_user` to for this host, which the
-    /// attribute replaced.
-    pub inventory_ssh_user: String,
-    /// The inventory level that set [`LoginOverride::inventory_ssh_user`]:
-    /// `host`, `group <name>`, `defaults`, or `built-in` when nothing in the
-    /// file set it.
-    pub inventory_source: String,
+    /// What the inventory sets `ssh_user` to for this host, which the
+    /// attribute replaced. `None` when nothing in the inventory sets it, so
+    /// without the attribute ssh's own default would decide.
+    pub inventory: Option<InventoryLogin>,
+}
+
+/// The inventory's `ssh_user` for a host, and the level that set it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryLogin {
+    /// The account.
+    pub ssh_user: String,
+    /// The level that set it: `host`, `group <name>` or `defaults`.
+    pub source: String,
 }
 
 impl LoginOverride {
@@ -76,26 +82,20 @@ impl LoginOverride {
     /// the escalation failures on both sides of the wire, the orchestrator's
     /// `-v` note, and a failed ssh connection.
     pub fn note(&self) -> String {
-        let inventory = if self.inventory_source == "built-in" {
-            format!(
-                "the inventory sets no `ssh_user` for this host, so it would have used `{}`",
-                self.inventory_ssh_user
-            )
-        } else {
-            format!(
-                "which overrides the inventory's `{}` (from {})",
-                self.inventory_ssh_user, self.inventory_source
-            )
-        };
-        let sep = if self.inventory_source == "built-in" {
-            ";"
-        } else {
-            ","
-        };
-        format!(
-            "the login user `{}` comes from the playbook's `ssh_user` attribute{sep} {inventory}",
+        let attribute = format!(
+            "the login user `{}` comes from the playbook's `ssh_user` attribute",
             self.ssh_user
-        )
+        );
+        match &self.inventory {
+            Some(inv) => format!(
+                "{attribute}, which overrides the inventory's `{}` (from {})",
+                inv.ssh_user, inv.source
+            ),
+            None => format!(
+                "{attribute}; the inventory sets no `ssh_user` for this host, so without it \
+                 ssh's own default would apply"
+            ),
+        }
     }
 }
 
@@ -928,22 +928,25 @@ mod tests {
     fn the_login_override_note_names_both_accounts_and_the_inventory_level() {
         let o = LoginOverride {
             ssh_user: "minecraft".into(),
-            inventory_ssh_user: "cadu".into(),
-            inventory_source: "group games".into(),
+            inventory: Some(InventoryLogin {
+                ssh_user: "cadu".into(),
+                source: "group games".into(),
+            }),
         };
         assert_eq!(
             o.note(),
             "the login user `minecraft` comes from the playbook's `ssh_user` attribute, \
              which overrides the inventory's `cadu` (from group games)"
         );
-        let built_in = LoginOverride {
-            inventory_source: "built-in".into(),
+        let unset = LoginOverride {
+            inventory: None,
             ..o
         };
         assert_eq!(
-            built_in.note(),
+            unset.note(),
             "the login user `minecraft` comes from the playbook's `ssh_user` attribute; \
-             the inventory sets no `ssh_user` for this host, so it would have used `cadu`"
+             the inventory sets no `ssh_user` for this host, so without it ssh's own \
+             default would apply"
         );
     }
     use crate::backend::Fake;
