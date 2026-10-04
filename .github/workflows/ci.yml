@@ -359,6 +359,7 @@ jobs:
 
       # Runs each playbook (vagrant, vagrant_login, vagrant_escalate_user) twice and fails
       # unless every second run changes nothing. The second run is the test.
+      # Then vagrant_login_escalate once, which must be refused at launch.
       - name: make vm-test
         run: make vm-test
 
