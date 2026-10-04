@@ -354,6 +354,13 @@ impl Runtime {
                      `systemctl start user@{uid}.service` waits for it"
                 );
             }
+            if sys.is_root() {
+                bail!(
+                    "systemd::{op}: no user manager for `root`: {dir} does not exist. \
+                     `.user(true)` as root targets root's own user manager; to manage another \
+                     account's user units, step into it with `ctx.as_user(\"<account>\")`"
+                );
+            }
             bail!(
                 "systemd::{op}: no user manager for `{account}`: {dir} does not exist, so \
                  `{account}` has neither a login session nor linger. Enable linger as root \
@@ -399,6 +406,16 @@ impl Unit {
             Some(r) => cmd.env("XDG_RUNTIME_DIR", &r.dir),
             None => cmd,
         }
+    }
+
+    /// Whose manager answered, for messages about the unit: empty for the
+    /// system manager, and for a user one a phrase naming the account, so an
+    /// operator under `as_user` does not go and look in their own.
+    fn whose(&self) -> String {
+        self.runtime
+            .as_ref()
+            .map(|r| format!(" in the user manager of `{}`", r.account))
+            .unwrap_or_default()
     }
 
     /// Under `--check` with no user manager yet, what the step waits for.
@@ -535,9 +552,10 @@ impl Unit {
         let p = self.probe(sys)?;
         if p.enabled == EnabledState::NotFound && !sys.check_mode() {
             bail!(
-                "systemd::{op}: unit `{}` not found by `{} is-enabled`",
+                "systemd::{op}: unit `{}` not found by `{} is-enabled`{}",
                 self.name,
-                self.prefix()
+                self.prefix(),
+                self.whose()
             );
         }
         Ok(p)
@@ -789,9 +807,10 @@ impl Op for Enabled {
         let p = unit.probe_existing(sys, "Enabled")?;
         if p.enabled.is_masked() {
             bail!(
-                "systemd::Enabled: unit `{}` is {}; unmask it first (`{} unmask {}`)",
+                "systemd::Enabled: unit `{}` is {}{}; unmask it first (`{} unmask {}`)",
                 unit.name,
                 p.enabled.as_str(),
+                unit.whose(),
                 unit.prefix(),
                 unit.name
             );
@@ -896,10 +915,11 @@ impl Op for Disabled {
         let p = unit.probe_existing(sys, "Disabled")?;
         if p.enabled.cannot_be_disabled() {
             bail!(
-                "systemd::Disabled: unit `{}` is {}: it has no [Install] section, so it cannot be \
-                 disabled; mask it (`{} mask {}`) or stop it instead",
+                "systemd::Disabled: unit `{}` is {}{}: it has no [Install] section, so it cannot \
+                 be disabled; mask it (`{} mask {}`) or stop it instead",
                 unit.name,
                 p.enabled.as_str(),
+                unit.whose(),
                 unit.prefix(),
                 unit.name
             );
@@ -1006,9 +1026,10 @@ impl Op for Running {
         let p = unit.probe_existing(sys, "Running")?;
         if p.enabled.is_masked() {
             bail!(
-                "systemd::Running: unit `{}` is {} and cannot be started; unmask it first",
+                "systemd::Running: unit `{}` is {}{} and cannot be started; unmask it first",
                 unit.name,
-                p.enabled.as_str()
+                p.enabled.as_str(),
+                unit.whose()
             );
         }
         if p.active.is_running() {
@@ -2760,6 +2781,137 @@ mod tests {
             fake.argvs().iter().all(|a| a[4..] == ["id", "-u"]),
             "{:?}",
             fake.argvs()
+        );
+    }
+
+    /// A `daemon-reload` that `Restart` or `Reload` run first talks to the
+    /// same user manager as the verb after it.
+    #[test]
+    fn user_mode_daemon_reload_before_a_bounce_carries_the_runtime_dir() {
+        for (op, verb) in [("Restart", "restart"), ("Reload", "reload-or-restart")] {
+            let fake = Arc::new(with_ok(
+                with_ok(
+                    user_manager(Fake::new(), 1002)
+                        .with_cmd(
+                            "systemctl",
+                            Some(&["--user", "is-enabled", "nginx"]),
+                            0,
+                            "enabled\n",
+                        )
+                        .with_cmd(
+                            "systemctl",
+                            Some(&["--user", "is-active", "nginx"]),
+                            0,
+                            "active\n",
+                        ),
+                    &["--user", "daemon-reload"],
+                ),
+                &["--user", verb, "nginx"],
+            ));
+            let s = sys(&fake).as_user("minecraft");
+            if op == "Restart" {
+                let op = Restart::new("nginx").user(true).daemon_reload(true);
+                op.apply(&s, change(op.check(&s).unwrap())).unwrap();
+            } else {
+                let op = Reload::new("nginx")
+                    .user(true)
+                    .or_restart(true)
+                    .daemon_reload(true);
+                op.apply(&s, change(op.check(&s).unwrap())).unwrap();
+            }
+            let ran: Vec<_> = fake.argvs().iter().map(|a| a[4..].to_vec()).collect();
+            assert_eq!(
+                ran,
+                vec![
+                    argv(&["id", "-u"]),
+                    argv(&["systemctl", "--user", "daemon-reload"]),
+                    argv(&["systemctl", "--user", verb, "nginx"]),
+                    argv(&["systemctl", "--user", "is-enabled", "nginx"]),
+                    argv(&["systemctl", "--user", "is-active", "nginx"]),
+                ],
+                "{op}"
+            );
+            let rt = Some("/run/user/1002".to_string());
+            assert_eq!(
+                runtime_dirs(&fake)[1..],
+                [rt.clone(), rt.clone(), rt.clone(), rt],
+                "{op}"
+            );
+        }
+    }
+
+    /// A refusal about the unit names whose user manager answered, so an
+    /// operator stepping into another account checks that account's units.
+    #[test]
+    fn user_mode_refusals_about_the_unit_name_the_account() {
+        let fake = Arc::new(
+            user_manager(Fake::new(), 1002)
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-enabled", "nginx"]),
+                    1,
+                    "not-found\n",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-active", "nginx"]),
+                    3,
+                    "inactive\n",
+                ),
+        );
+        let s = sys(&fake).as_user("minecraft");
+        assert_eq!(
+            Enabled::new("nginx")
+                .user(true)
+                .check(&s)
+                .unwrap_err()
+                .chain(),
+            "systemd::Enabled: unit `nginx` not found by `systemctl --user is-enabled` in the \
+             user manager of `minecraft`"
+        );
+        let fake = Arc::new(
+            user_manager(Fake::new(), 1002)
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-enabled", "nginx"]),
+                    1,
+                    "masked\n",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-active", "nginx"]),
+                    3,
+                    "inactive\n",
+                ),
+        );
+        let s = sys(&fake).as_user("minecraft");
+        assert_eq!(
+            Enabled::new("nginx")
+                .user(true)
+                .check(&s)
+                .unwrap_err()
+                .chain(),
+            "systemd::Enabled: unit `nginx` is masked in the user manager of `minecraft`; \
+             unmask it first (`systemctl --user unmask nginx`)"
+        );
+    }
+
+    /// As root without `as_user`, `.user(true)` means root's own user
+    /// manager, which is rarely what was meant: the refusal says so rather
+    /// than suggesting linger for root.
+    #[test]
+    fn user_mode_as_root_without_a_manager_points_at_as_user() {
+        let fake = Arc::new(with_id(Fake::new(), 0));
+        let err = Enabled::new("nginx")
+            .user(true)
+            .check(&sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert_eq!(
+            err,
+            "systemd::Enabled: no user manager for `root`: /run/user/0 does not exist. \
+             `.user(true)` as root targets root's own user manager; to manage another \
+             account's user units, step into it with `ctx.as_user(\"<account>\")`"
         );
     }
 
