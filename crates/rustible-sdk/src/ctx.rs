@@ -7,6 +7,7 @@ use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,10 @@ pub(crate) struct Shared {
     /// Every step that finished `Failed`, in order, for the runtime to
     /// classify as `failed` or `recovered` (vision doc 14).
     failures: RefCell<Vec<FailedStep>>,
+    /// Unique in this process, and put on every `StepFailed` layer this
+    /// family of `Ctx` values attaches: step ids restart at 1 in every
+    /// `Ctx::new`, so only the pair says which run's step an error is from.
+    token: u64,
     /// The [`Ctx::block`]s running right now, outermost first. A step
     /// belongs to the blocks open while it runs, whichever `Ctx` value it
     /// went through: a `ctx.as_root()` bound before a block and used inside
@@ -161,6 +166,10 @@ pub struct Ctx {
     shared: Rc<Shared>,
 }
 
+/// Where each [`Shared`]'s token comes from. Starts at 1 so no run's token
+/// is the 0 a hand-built `StepFailed` carries.
+static NEXT_RUN_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// One enclosing [`Ctx::block`], as the steps inside it see it.
 struct BlockFrame {
     name: String,
@@ -209,6 +218,7 @@ impl Ctx {
                 step_counter: Cell::new(0),
                 summary: RefCell::new(Summary::default()),
                 failures: RefCell::new(Vec::new()),
+                token: NEXT_RUN_TOKEN.fetch_add(1, Ordering::Relaxed),
                 channel,
                 run_id: run_id.into(),
                 tempdir: OnceCell::new(),
@@ -292,7 +302,7 @@ impl Ctx {
         // left the playbook.
         let failed = |e: Error, diff: Option<crate::Diff>, layer: StepFailed| -> Error {
             finish(Status::Failed, diff, Some(e.chain()));
-            e.context(layer.of_step(id, blocks.clone()))
+            e.context(layer.of_step(self.shared.token, id, blocks.clone()))
         };
 
         // A missing output read inside the op itself (an op holding another
@@ -752,6 +762,15 @@ impl Ctx {
     /// the runtime's to fill from [`Ctx::failures`].
     pub(crate) fn summary(&self) -> Summary {
         self.shared.summary.borrow().clone()
+    }
+
+    /// The id of this run's failed step that `layer` was attached to, or
+    /// `None` when another `Ctx` family, or nobody, attached it.
+    pub(crate) fn claims(&self, layer: &StepFailed) -> Option<u32> {
+        match layer.origin() {
+            Some((run, id)) if run == self.shared.token => Some(id),
+            _ => None,
+        }
     }
 
     /// Every step that finished `Failed` so far, in order.
@@ -1860,12 +1879,37 @@ mod tests {
         );
         let s = ctx.summary();
         assert_eq!((s.ok, s.failed, s.recovered), (1, 0, 0));
-        // `Event::failed` reads the same layer.
-        let Event::Failed { step, blocks, .. } = Event::failed(&err) else {
+        // This run claims the layer by its token and id, and `Event::failed`
+        // reads the same layer.
+        assert_eq!(ctx.claims(layer), Some(2));
+        let Event::Failed {
+            step, id, blocks, ..
+        } = Event::failed(&err, ctx.claims(layer))
+        else {
             unreachable!()
         };
-        assert_eq!(step.as_deref(), Some("fails"));
+        assert_eq!((step.as_deref(), id), (Some("fails"), Some(2)));
         assert_eq!(blocks, ["outer", "inner"]);
+    }
+
+    /// Step ids restart at 1 in every `Ctx`, so a second context's step 1
+    /// is not this run's step 1: only the context that attached a layer
+    /// claims it.
+    #[test]
+    fn a_layer_is_claimed_only_by_the_ctx_that_attached_it() {
+        let (mut first, _) = ctx_in(false);
+        let (mut second, _) = ctx_in(false);
+        let a = first.step("a", FailsInCheck).unwrap_err();
+        let b = second.step("b", FailsInCheck).unwrap_err();
+        let (la, lb) = (a.step_failed().unwrap(), b.step_failed().unwrap());
+        assert_eq!((la.id(), lb.id()), (Some(1), Some(1)));
+        assert_eq!(first.claims(la), Some(1));
+        assert_eq!(first.claims(lb), None);
+        assert_eq!(second.claims(lb), Some(1));
+        // A clone through `as_user` is the same run.
+        assert_eq!(first.as_root().claims(la), Some(1));
+        // And a layer built by hand is nobody's.
+        assert_eq!(first.claims(&StepFailed::at("a")), None);
     }
 
     struct FailsInCheck;

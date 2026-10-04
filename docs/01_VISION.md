@@ -373,7 +373,7 @@ enum Event {
     StepSkipped  { id, blocks, name, reason },
     Log { level: Debug | Info | Warn, msg },
     CmdRan { identity, argv: Vec<String>, status: i32, elapsed_ms },   // rendered at -vv
-    Failed { step: Option<String>, blocks, error: String },   // the host failed (14)
+    Failed { step: Option<String>, id: Option<u32>, blocks, error: String },   // the host failed (14)
     Finished(Summary),   // ok, changed, would_change, skipped, failed, recovered, warnings
 }
 
@@ -494,7 +494,8 @@ PLAYBOOK ensure_rustible_user   hosts: local   (x86_64-unknown-linux-musl, cache
 [local]  Ensure rustible user exists ............................. changed         uid=1002
 [local]  Install authorized keys ................................. changed         +2 keys
 
-local    ok=2  changed=2  skipped=0  failed=0     1.2s
+host    ok  changed  would change  skipped  failed  recovered  warnings
+local    0        2             0        0       0          0         0
 ```
 
 - The `#[rustible::playbook(...)]` attribute carries metadata: target hosts (a host
@@ -1683,14 +1684,14 @@ where the dry run stopped seeing.
   the block and the step whose output was read. (Read inside an operation's
   own `check`, the missing output is that step's failure instead: the step
   fails like any other, `failed` when its error leaves the playbook and
-  `recovered` when the playbook catches it (14), and nothing is absorbed.) The block yields no value
-  and the run continues after it. This is not a failure: nothing failed, the
-  dry run could not see further, and it is counted neither `failed` nor
-  `recovered`. Playbooks are written as if every output
-  exists, without guards; `.is_available()` remains for a playbook that wants
-  to branch inside a block rather than end it. In a real run every step has
-  applied and the read cannot fail. Ansible carries on with silent garbage;
-  Rustible says where the dry run stopped seeing.
+  `recovered` when the playbook catches it (14), and nothing is absorbed.)
+  The block yields no value and the run continues after it. This is not a
+  failure: nothing failed, the dry run could not see further, and it is
+  counted neither `failed` nor `recovered`. Playbooks are written as if
+  every output exists, without guards; `.is_available()` remains for a
+  playbook that wants to branch inside a block rather than end it. In a real
+  run every step has applied and the read cannot fail. Ansible carries on
+  with silent garbage; Rustible says where the dry run stopped seeing.
 - **Prerequisites are verified when the run is about to act.** An op whose
   `check` would refuse for want of a resource another op in the same run
   could create — a group for an account not there yet, that account, its
@@ -1825,10 +1826,11 @@ types that the orchestrator can `downcast_ref` for rendering:
 `MutationDuringCheck { path }`, `OutputUnavailable { step }`,
 `CmdFailed { argv, status, stderr }`. Playbooks never need them.
 
-**On the wire.** `Failed { step, blocks, error }` carries the rendered chain
-as text, the failed step's block path, plus the structured fields of a
-`CmdFailed` when present, so `-v` can show the command and its stderr
-separately.
+**On the wire.** `Failed { step, id, blocks, error }` carries the rendered
+chain as text, the failed step's id and block path, plus the structured
+fields of a `CmdFailed` when present, so `-v` can show the command and its
+stderr separately. Step names repeat, so the id is what ties the frame to the
+step line it closes.
 
 Rendered example:
 
@@ -1843,6 +1845,7 @@ Inside a block, the closing line names the block path as the step line does:
 [web1]  [outer][inner] boom ..................................... FAILED
 [web1]  FAILED at [outer][inner] `boom`: `/bin/sh -c exit 3` exited 3
 ```
+
 ## 15. Glossary
 
 - **Orchestrator**: the `rustible` CLI process on the developer's machine that

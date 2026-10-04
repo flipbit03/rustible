@@ -184,23 +184,33 @@ pub enum Event {
         elapsed_ms: u64,
     },
     /// The host failed: the playbook returned an error to the runtime or
-    /// panicked, or it returned `Ok` from a run that was cancelled. At most
-    /// one per run, emitted after the body returns and before `Finished`.
-    /// The failing step already reported `Status::Failed` with the same
-    /// chain in its `note`; `rustible` prefers this frame and prints the
-    /// chain once.
+    /// panicked, or the run was cancelled and the playbook returned `Ok`
+    /// (or an error absorbed under `--check`), in which case `error` is the
+    /// cancellation. At most one per run, emitted after the body returns
+    /// and before `Finished`. When there is a failing step, it already
+    /// reported `Status::Failed` with the same chain in its `note`;
+    /// `rustible` prefers this frame and prints the chain once.
     Failed {
         /// The step the failure belongs to. The runtime reads it off the
         /// [`StepFailed`](crate::error::StepFailed) layer `Ctx::step`
         /// attaches, so it is filled for anything that failed inside a step
-        /// and `None` for a panic or an error the playbook raised on its
-        /// own. `error` still opens with that layer's text; a reporter that
-        /// prints the name separately drops it.
+        /// and `None` for a panic, an error the playbook raised on its own,
+        /// and a cancellation the playbook swallowed. `error` still opens
+        /// with that layer's text; a reporter that prints the name
+        /// separately drops it.
         step: Option<String>,
-        /// The block path of `step`, outermost first, as its `StepStarted`
-        /// reported it; empty at the top level and when `step` is `None`.
-        /// Step names repeat, and blocks make repeats likelier, so a
-        /// reporter prints it before the name as the step line does.
+        /// The `id` of the failed step's `StepStarted` and `StepFinished`,
+        /// when the error is one this run's `Ctx::step` returned; `None`
+        /// otherwise, including for a step refused before it started, which
+        /// drew no id. Step names repeat, so this is what pairs the frame
+        /// with the step line it closes.
+        id: Option<u32>,
+        /// The block path of `step`, outermost first: the blocks open when
+        /// it ran (what its `StepStarted` reported) or, for a step refused
+        /// before it started, when it was refused. Empty at the top level
+        /// and when `step` is `None`. Step names repeat, and blocks make
+        /// repeats likelier, so a reporter prints it before the name as the
+        /// step line does.
         blocks: Vec<String>,
         /// The rendered context chain, outermost first.
         error: String,
@@ -228,11 +238,15 @@ impl Event {
     /// Build a `Failed` event from the error that failed the host: the step
     /// and its block path from the error's
     /// [`StepFailed`](crate::error::StepFailed) layer when it has one, and
-    /// the command if one is in the chain.
-    pub fn failed(e: &crate::Error) -> Event {
+    /// the command if one is in the chain. `id` is the failed step's id when
+    /// the caller has matched the error to one of this run's steps; the
+    /// layer's own id is not trusted for that, since another `Ctx` may have
+    /// drawn it.
+    pub fn failed(e: &crate::Error, id: Option<u32>) -> Event {
         let step = e.step_failed();
         Event::Failed {
             step: step.map(|s| s.step.clone()),
+            id,
             blocks: step.map(|s| s.blocks.clone()).unwrap_or_default(),
             error: e.chain(),
             cmd: e.cmd_failed().cloned(),
@@ -498,6 +512,7 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 blocks,
                 error,
                 cmd,
+                ..
             } => {
                 let r = match step {
                     Some(s) => writeln!(w, "FAILED at {}`{s}`: {error}", step_prefix(&blocks)),
@@ -618,6 +633,7 @@ mod tests {
         let printer = Compact::new(Vec::new(), 0);
         printer.emit(Event::Failed {
             step: Some("boom".into()),
+            id: Some(4),
             blocks: vec!["outer".into(), "inner".into()],
             error: "step `boom`: nope".into(),
             cmd: None,

@@ -1167,9 +1167,9 @@ Each step is a line:
 Every run ends with one row per host:
 
 ```
-host    ok  changed  would change  skipped  failed  recovered  warnings
-web1     3        2             0        0       0          0         0
-web2     3        2             0        0       0          0         0
+host   ok  changed  would change  skipped  failed  recovered  warnings
+web1    3        2             0        0       0          0         0
+web2    3        2             0        0       0          0         0
 ```
 
 A host that never got as far as running gets a `failed: <reason>` row instead
@@ -1203,7 +1203,7 @@ carried on.
 ```rust
 // Optional: carry on without it.
 if let Err(e) = ctx.step("optional thing", op) {
-    ctx.warn(format!("skipping: {e}"));
+    ctx.warn(format!("skipping: {e:#}")); // {e:#}: the whole chain; {e} names only the step
 }
 
 // Retry: a loop. Failed attempts print FAILED; the attempt that succeeds
@@ -1211,7 +1211,7 @@ if let Err(e) = ctx.step("optional thing", op) {
 let mut attempts = 0;
 while let Err(e) = ctx.step(
     "wait for the api",
-    shell::Command::new("curl").args(["-fsS", "http://127.0.0.1:8080/health"]),
+    shell::Command::new("curl").args(["-fsS", "--max-time", "5", "http://127.0.0.1:8080/health"]),
 ) {
     attempts += 1;
     if attempts == 5 {
@@ -1223,6 +1223,10 @@ while let Err(e) = ctx.step(
 
 ⚠️ A cancelled run (ctrl-c) and a panic always fail the host, even when the
 playbook catches the error.
+
+⚠️ To add words to a step's error, wrap it: `.context("…")`. `bail!("…{e}")`
+or `Error::msg(..)` makes a new error, so the step it came from counts as
+`recovered` while the host still fails.
 
 **Hosts run in parallel, and one failing does not stop the others.** Every
 host runs to completion; the summary says which failed, and the process exits

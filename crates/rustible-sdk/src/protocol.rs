@@ -36,7 +36,7 @@ use crate::secret::Secret;
 /// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
 /// 6: the host's verdict is what the playbook returns — `Summary.recovered`
 /// counts the failed steps the playbook caught, `Summary.failed` only those
-/// that failed the host, and `Failed` carries the step's `blocks`.
+/// that failed the host, and `Failed` carries the step's `id` and `blocks`.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Bytes per streamed chunk (vision doc 5.6).
@@ -527,7 +527,8 @@ mod tests {
 
     /// Version 6 is the host's verdict as the playbook returns it (#44):
     /// `Summary` gains `recovered` beside a `failed` that no longer counts
-    /// every failed step, and `Failed` names the failed step's block path.
+    /// every failed step, and `Failed` names the failed step's id and block
+    /// path.
     /// The meaning of `failed` moved with it, so a version-5 peer would
     /// disagree about a host without failing to parse anything: the number
     /// is what stops a mixed pair. Pinned here so the shape and the number
@@ -548,11 +549,12 @@ mod tests {
         );
         let failed = Event::Failed {
             step: Some("boom".into()),
+            id: Some(7),
             blocks: vec!["outer".into(), "inner".into()],
             error: "step `boom`: nope".into(),
             cmd: None,
         };
-        let json = r#"{"Failed":{"step":"boom","blocks":["outer","inner"],"error":"step `boom`: nope","cmd":null}}"#;
+        let json = r#"{"Failed":{"step":"boom","id":7,"blocks":["outer","inner"],"error":"step `boom`: nope","cmd":null}}"#;
         assert_eq!(serde_json::to_string(&failed).unwrap(), json);
         let Event::Failed { blocks, .. } = serde_json::from_str(json).unwrap() else {
             panic!("not Failed")

@@ -535,8 +535,12 @@ fn execute(
                 (false, None)
             }
             _ => {
-                sink.emit(Event::failed(&e));
-                (true, e.step_failed().and_then(|s| s.id()))
+                // Matched on the run's token and the step id, never on the
+                // name, which repeats, nor on the id alone, which a second
+                // `Ctx` draws again from 1.
+                let escaped = e.step_failed().and_then(|s| ctx.claims(s));
+                sink.emit(Event::failed(&e, escaped));
+                (true, escaped)
             }
         },
         Err(payload) => match payload.downcast::<OutputUnavailable>() {
@@ -549,6 +553,7 @@ fn execute(
                 // error it stands for rather than as `panic: panic`.
                 sink.emit(Event::Failed {
                     step: None,
+                    id: None,
                     blocks: vec![],
                     error: u.to_string(),
                     cmd: None,
@@ -563,6 +568,7 @@ fn execute(
                     .unwrap_or_else(|| "panic".into());
                 sink.emit(Event::Failed {
                     step: None,
+                    id: None,
                     blocks: vec![],
                     error: format!("panic: {msg}"),
                     cmd: None,
@@ -576,7 +582,7 @@ fn execute(
     // Said here, since nothing else would say why the host failed.
     let failed = match ctx.check_cancelled() {
         Err(cancelled) if !failed => {
-            sink.emit(Event::failed(&cancelled));
+            sink.emit(Event::failed(&cancelled, None));
             true
         }
         Err(_) => true,
@@ -1302,6 +1308,7 @@ mod tests {
         let (code, events) = run(&ESCAPES, false);
         assert_eq!(verdict(&events), (1, 0));
         assert_eq!(failed_frames(&events), [(Some("boom".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [Some(1)]);
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
     }
 
@@ -1337,6 +1344,7 @@ mod tests {
     fn retries_exhausted_count_the_last_failed_and_the_rest_recovered() {
         let (code, events) = run(&RETRIES_EXHAUSTED, false);
         assert_eq!(verdict(&events), (1, 4));
+        assert_eq!(failed_ids(&events), [Some(5)]);
         assert_eq!(
             failed_frames(&events),
             [(Some("wait for the api".into()), vec![])]
@@ -1689,6 +1697,76 @@ mod tests {
         let (code, events) = run_on(&CANCELLED_AND_ESCAPED, false, cancellable());
         assert_eq!(verdict(&events), (1, 0));
         assert_eq!(failed_frames(&events), [(Some("b".into()), vec![])]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    /// The `Failed` frames' step ids, in order.
+    fn failed_ids(events: &[Event]) -> Vec<Option<u32>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Failed { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    static RETURNS_AN_EARLIER_ERROR: Playbook = playbook!(|ctx, _| {
+        let a = ctx.step("a", Attempt(false)).map(drop);
+        let _ = ctx.step("b", Attempt(false)).ok();
+        a
+    });
+
+    /// The escaping error is matched to its own step, not to the last one
+    /// that failed: `a`'s error is returned after `b` failed and was caught,
+    /// so `a` is failed and `b` recovered, and the frame names `a`.
+    #[test]
+    fn an_earlier_steps_error_returned_later_fails_that_step() {
+        let (code, events) = run(&RETURNS_AN_EARLIER_ERROR, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("a".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [Some(1)]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static A_SECOND_CTX_CLAIMS_NOTHING: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("main1", Attempt(false)).ok();
+        // Ids restart at 1 in a new context: its step 1 is not this run's.
+        let mut other = Ctx::new(ctx.sys().clone(), HostInfo::local());
+        other.step("other", Attempt(false))?;
+        Ok(())
+    });
+
+    /// An error from a second `Ctx` carries an id this run also drew, and
+    /// must not claim it: `main1` stays recovered, and the host fails by the
+    /// floor of one, with a frame that names `other` and no id.
+    #[test]
+    fn an_error_from_a_second_ctx_does_not_claim_this_runs_step() {
+        let (code, events) = run(&A_SECOND_CTX_CLAIMS_NOTHING, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("other".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [None]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static UNDER_CHECK_CANCELLED_THEN_ABSORBED: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("optional", Attempt(false)).ok();
+        let got = ctx.step("read", CancelledMidStep)?;
+        let _ = *got;
+        ctx.step("never reached", WouldChange)?;
+        Ok(())
+    });
+
+    /// Under `--check` too, a cancelled run fails the host: the read that
+    /// ends the dry run is absorbed as usual, with its warning, and the
+    /// cancellation is what fails the host, said by its own frame.
+    #[test]
+    fn under_check_a_cancelled_run_fails_the_host_even_when_the_rest_is_absorbed() {
+        let (code, events) = run_on(&UNDER_CHECK_CANCELLED_THEN_ABSORBED, true, cancellable());
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(warnings_in(&events), [TOP_LEVEL]);
+        assert_eq!(failed_in(&events), ["cancelled: cancelled by the test"]);
+        assert_eq!(failed_ids(&events), [None]);
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
     }
 
