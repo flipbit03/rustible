@@ -234,15 +234,16 @@ Consequences accepted with remote-brain:
    This yields the target hosts, `escalate`, an optional `ssh_user`, and a JSON
    schema of the typed vars struct (section 10.3). **Accepted trade-off
    (final, 2026-09-06):** the pre-check costs a cold build the first time
-   (about a minute) and seconds afterwards. In exchange the schema comes from the real compiled types, so
-   there is no source parser of our own to maintain and no restriction on var
-   field types. (Alternative considered twice: parse the source with `syn`. It is
-   instant but only sound for a closed set of canonically spelled types, cannot
-   see through aliases or imports, and needs a second parser kept in sync with
-   the proc macro. Rejected.) Mitigations: cache describe output by hash of the
-   playbook source plus `Cargo.lock`; dev profile with a shared target dir; the
-   describe build shares dependency compilation with the target build for
-   same-arch hosts; `rustible inventory check` runs only this step.
+   (about a minute) and seconds afterwards. In exchange the schema comes from
+   the real compiled types, so there is no source parser of our own to maintain
+   and no restriction on var field types. (Alternative considered twice: parse
+   the source with `syn`. It is instant but only sound for a closed set of
+   canonically spelled types, cannot see through aliases or imports, and needs a
+   second parser kept in sync with the proc macro. Rejected.) Mitigations: cache
+   describe output by hash of the playbook source plus `Cargo.lock`; dev profile
+   with a shared target dir; the describe build shares dependency compilation
+   with the target build for same-arch hosts; `rustible inventory check` runs
+   only this step.
 3. **Resolve hosts and validate vars.** For every resolved host, merge its vars
    (section 10.3) and check them against the schema. Any failure aborts the
    whole run before anything is compiled or uploaded, naming each host and each
