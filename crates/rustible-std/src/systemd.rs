@@ -1755,7 +1755,9 @@ mod tests {
     }
 
     /// Only a stat refused with `EACCES` is "not yet"; any other failure,
-    /// or a message that merely reads like one, is still an error.
+    /// or a message that merely reads like one, is still an error. That last
+    /// is also what `System` makes of an `as_user` helper that died: its
+    /// report becomes a message, never an `IoAt`, so it fails the step.
     #[test]
     fn denied_is_an_eacces_on_a_path_and_nothing_else() {
         let at = |kind| {
@@ -3202,7 +3204,12 @@ mod tests {
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok();
                 if denying {
-                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    // The shape a stat refused inside the `as_user` helper
+                    // arrives in: the errno's kind around its message.
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ));
                 }
             }
             self.fake.stat(p)
