@@ -1084,6 +1084,28 @@ mod tests {
         assert!(text.ends_with("1048576\n"), "{}", &text[text.len() - 40..]);
     }
 
+    /// A command's variables cross to the helper and reach the child. The
+    /// helper is started by `sudo`, whose reset environment is what its
+    /// children inherit, so a variable an op needs there has to ride in the
+    /// `CmdSpec`: `systemd`'s `.user(true)` sets `XDG_RUNTIME_DIR` this way
+    /// for an `as_user` target (#55).
+    #[test]
+    fn a_commands_env_reaches_the_child_through_the_helper() {
+        let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
+        let e = in_process(phase);
+        let out = e
+            .spawn(&CmdSpec {
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf %s \"$XDG_RUNTIME_DIR\"".into()],
+                env: BTreeMap::from([("XDG_RUNTIME_DIR".into(), "/run/user/1002".into())]),
+                cwd: None,
+                stdin: None,
+                prefix: vec![],
+            })
+            .unwrap();
+        assert_eq!((out.status, out.stdout_str()), (0, "/run/user/1002".into()));
+    }
+
     #[test]
     fn an_oversized_write_is_refused_before_it_reaches_the_wire() {
         let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
