@@ -148,6 +148,16 @@ run() {
         playbook run ${limit[@]+"${limit[@]}"} "$1"
 }
 
+# `run`'s stdout, both shown on stderr as it arrives and returned for the
+# assertions. Not `tee /dev/stderr`: on Linux that opens /proc/self/fd/2
+# afresh, which truncates a log file stderr is redirected to
+# (`make vm-test > log 2>&1`), so everything before it was lost. fd 3 is the
+# command substitution's pipe; tee writes there and its own stdout goes to
+# the stderr already open. Under pipefail, `run`'s status is the function's.
+capture() {
+    { run "$1" | tee /dev/fd/3 >&2; } 3>&1
+}
+
 # The summary table has more than one row shape (render.rs). A host that ran
 # gets eight columns,
 # `host ok changed would-change skipped failed recovered warnings`,
@@ -224,9 +234,12 @@ assert_recovered() {
 # with counts means the binary ran, which is what must not happen.
 assert_refused_at_launch() {
     awk -v want="$1" '
+        BEGIN { s = "]  FAILED: " want }
         /^host  *ok  *changed/ { in_table = 1; next }
-        !in_table && /^\[/ && index($0, "]  FAILED: " want) {
-            # `[<host, padded to the widest>]  FAILED: <reason>`
+        # `[<host, padded to the widest>]  FAILED: <reason>`, the reason
+        # starting right after the first `]`: anywhere later in the line, it
+        # could be the text of a stderr line (`[h]    stderr: [x]  FAILED: ...`).
+        !in_table && /^\[/ && substr($0, index($0, "]"), length(s)) == s {
             h = substr($0, 2, index($0, "]") - 2)
             sub(/ +$/, "", h)
             refused[h] = 1
@@ -277,7 +290,7 @@ for playbook in "${playbooks[@]}"; do
     want=$(recovered_per_run "$playbook")
 
     echo "==> $playbook, first run: converging"
-    first=$(run "$playbook" | tee /dev/stderr)
+    first=$(capture "$playbook")
 
     if [ "$quick" != 1 ] && ! printf '%s\n' "$first" | assert_changed_something; then
         echo >&2
@@ -300,7 +313,7 @@ MSG
 
     echo
     echo "==> $playbook, second run: must change nothing"
-    second=$(run "$playbook" | tee /dev/stderr)
+    second=$(capture "$playbook")
 
     if ! printf '%s\n' "$second" | assert_no_change; then
         echo >&2
@@ -318,7 +331,7 @@ done
 # Once: it converges nothing, so there is no second run. An `if` rather than
 # `set -e`, because the run failing is the pass.
 echo "==> $refused_playbook: the launch must be refused"
-if refused=$(run "$refused_playbook" | tee /dev/stderr); then
+if refused=$(capture "$refused_playbook"); then
     echo >&2
     echo "vm-test failed: $refused_playbook succeeded; its launch should have been refused." >&2
     exit 1
@@ -330,4 +343,5 @@ if ! printf '%s\n' "$refused" | assert_refused_at_launch "$refused_line"; then
 fi
 echo
 
-echo "vm-test passed: converged, every second run changed nothing, and the refused launch said why."
+echo "vm-test passed: every second run changed nothing, every run recovered exactly the"
+echo "failures its playbook catches, and the refused launch said why."

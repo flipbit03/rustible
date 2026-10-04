@@ -204,11 +204,15 @@ rustible --workspace examples/workspace \
          playbook run vagrant --check -v
 ```
 
-`make vm-test` **destroys and recreates the guests**, then runs the playbook
-twice and fails unless the first run changed something and the second changed
-nothing. That second run is the test. A first run that reports `changed`
-proves only that the operation did something; an operation that rewrites a
-correct file every time also reports `changed`.
+`make vm-test` **destroys and recreates the guests**, then runs `vagrant`,
+`vagrant_login` and `vagrant_escalate_user` twice each, and fails unless each
+first run changed something, each second run changed nothing and failed
+nothing, and every run recovered exactly the failures its playbook catches on
+purpose (`recovered_per_run` in `dev/vagrant/vm-test.sh`). The second run is
+the test. A first run that reports `changed` proves only that the operation
+did something; an operation that rewrites a correct file every time also
+reports `changed`. Last, `vagrant_login_escalate` runs once and must be
+refused at launch with the line naming its `ssh_user`.
 
 The recreate is there because the alternative is a false green. CI always
 starts from a freshly created machine; a checkout does not, and a local run

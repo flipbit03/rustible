@@ -358,8 +358,10 @@ jobs:
             | grep -E "<domain type" || true
 
       # Runs each playbook (vagrant, vagrant_login, vagrant_escalate_user) twice and fails
-      # unless every second run changes nothing. The second run is the test.
-      # Then vagrant_login_escalate once, which must be refused at launch.
+      # unless every second run changes nothing and every run recovers exactly the
+      # failures its playbook catches (vagrant_login: 1). The second run is the test.
+      # Then vagrant_login_escalate once, which must be refused at launch naming its
+      # ssh_user.
       - name: make vm-test
         run: make vm-test
 
