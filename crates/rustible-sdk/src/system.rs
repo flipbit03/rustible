@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::backend::{Backend, CmdSpec, Elevated, Fake, Local, Output, Spawner, Stat};
+use crate::backend::{Backend, CmdSpec, Elevated, Fake, HelperGone, Local, Output, Spawner, Stat};
 use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
@@ -84,6 +84,19 @@ impl Escalation {
     }
 }
 
+/// A command that could not be spawned, or a dead helper's report printed
+/// once, as in `System::io`.
+fn spawn_failed(program: &str, source: std::io::Error) -> Error {
+    match HelperGone::inside(&source) {
+        Some(gone) => Error::msg(format!("could not spawn `{program}`: {gone}")),
+        None => SpawnFailed {
+            program: program.to_string(),
+            source,
+        }
+        .into(),
+    }
+}
+
 /// The op's handle to one machine, at one identity.
 ///
 /// Everything an op is allowed to do to the world goes through this: the
@@ -149,6 +162,7 @@ impl System {
                 method: "sudo".into(),
                 exe: std::env::current_exe().unwrap_or_default(),
                 password: None,
+                note: None,
             },
             helpers: Mutex::new(BTreeMap::new()),
         }));
@@ -167,7 +181,34 @@ impl System {
                     method: method.to_string(),
                     exe: esc.spawner.exe.clone(),
                     password,
+                    note: esc.spawner.note.clone(),
                 },
+                helpers: Mutex::new(BTreeMap::new()),
+            }));
+        }
+        self
+    }
+
+    /// The sentence [`System::with_escalation_note`] set, for the runtime's
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn escalation_note(&self) -> Option<&str> {
+        self.escalation.as_ref()?.spawner.note.as_deref()
+    }
+
+    /// A sentence appended to every escalation failure (a helper that
+    /// died, which is how a refused `sudo` shows). The runtime sets
+    /// [`LoginOverride::note`](crate::ctx::LoginOverride::note) here when the
+    /// playbook's `ssh_user` chose the account escalating. No effect on a
+    /// `Fake` system.
+    pub fn with_escalation_note(mut self, note: Option<String>) -> Self {
+        if let Some(esc) = &self.escalation {
+            let mut spawner = esc.spawner.clone();
+            spawner.note = note;
+            self.escalation = Some(Arc::new(Escalation {
+                own_user: esc.own_user.clone(),
+                local: esc.local.clone(),
+                spawner,
                 helpers: Mutex::new(BTreeMap::new()),
             }));
         }
@@ -295,6 +336,11 @@ impl System {
 
     fn io(p: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
         move |source| {
+            // A dead helper's report is already whole; as an `IoAt` source it
+            // would print twice (see `HelperGone`).
+            if let Some(gone) = HelperGone::inside(&source) {
+                return Error::msg(format!("{}: {gone}", p.display()));
+            }
             IoAt {
                 path: p.to_path_buf(),
                 source,
@@ -596,10 +642,7 @@ impl Cmd {
             .sys
             .backend
             .spawn(&self.spec)
-            .map_err(|source| SpawnFailed {
-                program: self.spec.program.clone(),
-                source,
-            })?;
+            .map_err(|source| spawn_failed(&self.spec.program, source))?;
         self.sys.sink.emit(Event::CmdRan {
             identity: self.sys.identity.label(),
             argv: self.spec.argv(),
@@ -643,5 +686,19 @@ mod tests {
         sys.symlink("/target", "/link").unwrap();
         assert_eq!(sys.read_link("/link").unwrap(), PathBuf::from("/target"));
         assert!(sys.read_dir("/").is_err(), "no such dir in the fake");
+    }
+
+    /// The runtime calls `with_escalation` and then `with_escalation_note`;
+    /// each rebuilds the escalation, so neither may drop what the other set.
+    #[test]
+    fn the_escalation_note_and_method_survive_each_other() {
+        let spawner = |s: &System| s.escalation.as_ref().unwrap().spawner.clone();
+        let sys = System::local(false, Arc::new(Collect::default()))
+            .with_escalation("doas", None)
+            .with_escalation_note(Some("the login user `x`".into()));
+        assert_eq!(spawner(&sys).method, "doas");
+        assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
+        let sys = sys.with_escalation("sudo", None);
+        assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
     }
 }

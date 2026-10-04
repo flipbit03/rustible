@@ -457,6 +457,11 @@ pub struct Spawner {
     /// present it reaches `sudo -S` on the helper's stdin and never argv,
     /// and only after `sudo -n` has been seen to fail.
     pub password: Option<Secret>,
+    /// Appended to every report of a helper that died, which is how a
+    /// refused `sudo` reaches the step. Set when the playbook's `ssh_user`
+    /// chose the account escalating, so the failure says where that account
+    /// came from ([`LoginOverride::note`](crate::ctx::LoginOverride::note)).
+    pub note: Option<String>,
 }
 
 impl Spawner {
@@ -479,14 +484,27 @@ impl Spawner {
     fn spawn(&self, user: &str) -> io::Result<Connection> {
         let with_password = self.needs_password(user);
         let argv = helper_argv(&self.method, user, &self.exe, with_password)?;
-        let mut child = Command::new(&argv[0])
+        let child = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| io::Error::new(e.kind(), format!("spawning `{}`: {e}", argv.join(" "))))?;
-        let mut tx: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
+        let mut conn = self.connection(user, child);
+        if with_password && let Some(pw) = &self.password {
+            conn.tx.write_all(pw.as_bytes())?;
+            conn.tx.write_all(b"\n")?;
+            conn.tx.flush()?;
+        }
+        Ok(conn)
+    }
+
+    /// A [`Connection`] over a started helper's pipes, with its stderr
+    /// echoed and its tail kept for the failure report, and this spawner's
+    /// `note` attached.
+    fn connection(&self, user: &str, mut child: Child) -> Connection {
+        let tx: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
         let rx: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped"));
         let stderr = child.stderr.take().expect("piped");
         let tail: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -502,17 +520,45 @@ impl Spawner {
                 t.push(line);
             }
         });
-        if with_password && let Some(pw) = &self.password {
-            tx.write_all(pw.as_bytes())?;
-            tx.write_all(b"\n")?;
-            tx.flush()?;
-        }
-        Ok(Connection {
+        Connection {
             tx,
             rx,
             child: Some(child),
             stderr_tail: tail,
-        })
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// Why a helper is gone, and the spawner's note. It travels as the inner
+/// error of an `io::Error` so [`System`](crate::system::System) can tell it
+/// from an ordinary I/O failure: the report already says everything, and
+/// wrapping it in `IoAt`, which prints its source and also chains it, would
+/// print it, note included, twice.
+#[derive(Debug, Clone)]
+pub(crate) struct HelperGone {
+    /// How it went: the exit status and the tail of its stderr.
+    pub(crate) what: String,
+    /// [`Spawner::note`], printed once after `what`.
+    pub(crate) note: Option<String>,
+}
+
+impl std::fmt::Display for HelperGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.note {
+            Some(note) => write!(f, "{}; {note}", self.what),
+            None => f.write_str(&self.what),
+        }
+    }
+}
+
+impl std::error::Error for HelperGone {}
+
+impl HelperGone {
+    /// The report inside `e`, when `e` carries one.
+    pub(crate) fn inside(e: &io::Error) -> Option<&HelperGone> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<HelperGone>())
     }
 }
 
@@ -521,6 +567,8 @@ struct Connection {
     rx: Box<dyn Read + Send>,
     child: Option<Child>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    /// [`Spawner::note`], carried to where the failure is described.
+    note: Option<String>,
 }
 
 impl Connection {
@@ -531,23 +579,23 @@ impl Connection {
             Ok(Some(resp)) => Ok(resp),
             // EOF or a broken pipe: the helper is gone (sudo refused, it
             // crashed, or it was killed); say how it went.
-            Ok(None) => Err(io::Error::other(self.exit_description())),
+            Ok(None) => Err(io::Error::other(self.gone(None))),
             Err(e)
                 if matches!(
                     e.kind(),
                     io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
                 ) =>
             {
-                Err(io::Error::other(format!(
-                    "{} ({e})",
-                    self.exit_description()
-                )))
+                Err(io::Error::other(self.gone(Some(&e))))
             }
             Err(e) => Err(e),
         }
     }
 
-    fn exit_description(&mut self) -> String {
+    /// The helper's death as a [`HelperGone`]: exit status, the tail of its
+    /// stderr, `cause` when a broken pipe or EOF is how it showed, and the
+    /// spawner's note.
+    fn gone(&mut self, cause: Option<&io::Error>) -> HelperGone {
         let status = match &mut self.child {
             Some(c) => match c.wait() {
                 Ok(s) => format!("exited {}", s.code().unwrap_or(-1)),
@@ -556,10 +604,17 @@ impl Connection {
             None => "closed the connection".to_string(),
         };
         let tail = self.stderr_tail.lock().unwrap().join(" / ");
-        if tail.is_empty() {
+        let mut what = if tail.is_empty() {
             format!("helper {status}")
         } else {
             format!("helper {status}: {tail}")
+        };
+        if let Some(cause) = cause {
+            what = format!("{what} ({cause})");
+        }
+        HelperGone {
+            what,
+            note: self.note.clone(),
         }
     }
 
@@ -605,7 +660,7 @@ pub struct Elevated {
     /// password would otherwise mean one `sudo` authentication attempt per
     /// file operation, which is a syslog line and mail to root each time
     /// and `pam_faillock` locking the account out after a handful.
-    failed: Mutex<Option<String>>,
+    failed: Mutex<Option<HelperGone>>,
 }
 
 impl Elevated {
@@ -646,6 +701,7 @@ impl Elevated {
                 rx,
                 child: None,
                 stderr_tail: Arc::default(),
+                note: None,
             })),
             failed: Mutex::new(None),
         }
@@ -661,11 +717,14 @@ impl Elevated {
 
     fn call(&self, op: HelperOp) -> io::Result<HelperResponse> {
         let checking = self.phase.load(Ordering::SeqCst) == crate::system::Phase::Checking as u8;
-        if let Some(why) = self.failed.lock().unwrap().as_ref() {
-            return Err(io::Error::other(format!(
-                "the helper running as `{}` failed earlier and is not retried: {why}",
-                self.user
-            )));
+        if let Some(first) = self.failed.lock().unwrap().as_ref() {
+            return Err(io::Error::other(HelperGone {
+                what: format!(
+                    "the helper running as `{}` failed earlier and is not retried: {}",
+                    self.user, first.what
+                ),
+                note: first.note.clone(),
+            }));
         }
         if let Some((path, len)) = op.payload()
             && len > MAX_FRAME_PAYLOAD
@@ -725,7 +784,14 @@ impl Elevated {
         if let Err(e) = &r {
             let mut f = self.failed.lock().unwrap();
             if f.is_none() {
-                *f = Some(e.to_string());
+                *f = Some(
+                    HelperGone::inside(e)
+                        .cloned()
+                        .unwrap_or_else(|| HelperGone {
+                            what: e.to_string(),
+                            note: None,
+                        }),
+                );
             }
         }
         r
@@ -1088,44 +1154,48 @@ mod tests {
         assert!(!err.contains("exceeds limit"), "raw framing error: {err}");
     }
 
-    #[test]
-    fn dead_helper_reports_exit_and_stderr() {
-        // A "helper" that prints to stderr and exits without answering.
+    /// An `Elevated` whose "helper" printed to stderr and exited without
+    /// answering, which is what a refused `sudo -n` looks like from here.
+    /// The connection comes from [`Spawner::connection`], the same call
+    /// `Spawner::spawn` makes once `sudo` has started, so only the `sudo`
+    /// itself is bypassed.
+    fn dead_helper(note: Option<String>) -> Elevated {
         let spawner = Spawner {
             method: "sudo".into(),
             exe: PathBuf::from("/nonexistent/rustible-bin"),
             password: None,
+            note,
         };
-        // Bypass `sudo` by connecting to a shell that quits immediately.
-        let mut child = Command::new("sh")
+        let child = Command::new("sh")
             .args(["-c", "echo boom >&2; exit 7"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let tail: Arc<Mutex<Vec<String>>> = Arc::default();
-        let stderr = child.stderr.take().unwrap();
-        let tail_w = tail.clone();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                tail_w.lock().unwrap().push(line);
-            }
-        });
-        let conn = Connection {
-            tx: Box::new(child.stdin.take().unwrap()),
-            rx: Box::new(child.stdout.take().unwrap()),
-            child: Some(child),
-            stderr_tail: tail,
-        };
-        let e = Elevated {
+        let conn = spawner.connection("root", child);
+        // The stderr reader is a thread of its own; let it finish the one
+        // line before the report reads the tail.
+        let t0 = Instant::now();
+        while conn.stderr_tail.lock().unwrap().is_empty() {
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "no stderr from the helper"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Elevated {
             user: "root".into(),
             spawner: Some(spawner),
             phase: Arc::new(AtomicU8::new(0)),
             conn: Mutex::new(Some(conn)),
             failed: Mutex::new(None),
-        };
-        reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn dead_helper_reports_exit_and_stderr() {
+        let e = dead_helper(None);
         let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
         assert!(err.contains("exited 7") && err.contains("boom"), "{err}");
 
@@ -1139,5 +1209,49 @@ mod tests {
         );
         assert!(again.contains("exited 7"), "{again}");
         assert!(!again.contains("/nonexistent/rustible-bin"), "{again}");
+    }
+
+    /// A playbook whose `ssh_user` attribute chose the login has the
+    /// escalating account's origin on every report of a dead helper,
+    /// including the latched one later primitives return.
+    #[test]
+    fn a_dead_helper_carries_the_spawners_note() {
+        let note = "the login user `minecraft` comes from the playbook's `ssh_user` attribute";
+        let e = dead_helper(Some(note.into()));
+        let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
+        // A broken pipe may or may not come between, depending on whether
+        // the helper had exited before the request was written.
+        assert!(err.starts_with("helper exited 7: boom"), "{err}");
+        assert!(err.ends_with(&format!("; {note}")), "{err}");
+        let again = e.stat(Path::new("/etc/hostname")).unwrap_err().to_string();
+        assert!(again.contains(note), "{again}");
+    }
+
+    /// Through `System`, as a step sees it: the report, note included, is
+    /// printed once, for a file primitive and for a command alike. As the
+    /// source of an `IoAt` it printed twice.
+    #[test]
+    fn a_dead_helpers_report_reaches_a_step_once() {
+        use crate::event::Collect;
+        use crate::system::System;
+
+        let note = "the login user `minecraft` comes from the playbook's `ssh_user` attribute";
+        let sink = Arc::new(Collect::default());
+        let facts = System::fake(Arc::new(crate::backend::Fake::new()), sink.clone())
+            .facts()
+            .clone();
+        let sys = System::new(Arc::new(dead_helper(Some(note.into()))), facts, false, sink);
+
+        let read = sys.read("/etc/hostname").unwrap_err().chain();
+        assert_eq!(read.matches(note).count(), 1, "{read}");
+        assert_eq!(read.matches("exited 7").count(), 1, "{read}");
+        assert!(
+            read.starts_with("/etc/hostname: helper exited 7: boom"),
+            "{read}"
+        );
+
+        let cmd = sys.cmd("true").run().unwrap_err().chain();
+        assert_eq!(cmd.matches(note).count(), 1, "{cmd}");
+        assert!(cmd.contains("failed earlier and is not retried"), "{cmd}");
     }
 }

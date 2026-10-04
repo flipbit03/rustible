@@ -406,7 +406,8 @@ async fn inventory(
 
 /// Vars of every playbook against every host it targets (vision 3, 10.3),
 /// through one host-native build of the whole workspace and its
-/// `--check-vars` mode.
+/// `--check-vars` mode; and a playbook's `ssh_user` against hosts that have
+/// no ssh login, which `playbook run` would refuse.
 async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result<u8> {
     let cargo = Cargo::load(ws).await?;
     cargo
@@ -433,36 +434,88 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result
         for h in &hosts {
             resolved.push(inv.resolve(&h.name).map_err(|e| anyhow::anyhow!("{e}"))?);
         }
-        if d.vars_schema.is_null() {
-            println!("{src}: ok ({}, no vars)", count(hosts.len(), "host"));
-            continue;
-        }
-        let input: Vec<HostVars> = resolved
-            .iter()
-            .map(|r| HostVars {
-                host: r.host.clone(),
-                vars: rustible_cli::inventory::bag_to_json(&r.vars),
-            })
-            .collect();
-        let (results, warnings) =
-            run::split_checks(describe::check_vars(&bin, &d.name, &input).await?);
-        for (host, message) in warnings {
-            eprintln!("warning: {src} on host `{host}`: {message}");
-        }
+        let checks = if d.vars_schema.is_null() {
+            None
+        } else {
+            let input: Vec<HostVars> = resolved
+                .iter()
+                .map(|r| HostVars {
+                    host: r.host.clone(),
+                    vars: rustible_cli::inventory::bag_to_json(&r.vars),
+                })
+                .collect();
+            Some(describe::check_vars(&bin, &d.name, &input).await?)
+        };
         let is_group = inv.groups.contains_key(&d.hosts);
-        match format_vars_report(&d.hosts, is_group, &src, &inventory_file, &results) {
-            Some(report) => {
-                eprint!("{report}");
-                errors += 1;
-            }
-            None => println!("{src}: ok ({})", count(hosts.len(), "host")),
+        let verdict = judge(d, &resolved, is_group, &src, &inventory_file, checks);
+        for w in &verdict.warnings {
+            eprintln!("{w}");
+        }
+        for p in &verdict.problems {
+            eprint!("{p}");
+        }
+        match &verdict.ok {
+            Some(line) => println!("{line}"),
+            None => errors += 1,
         }
     }
     if errors > 0 {
-        eprintln!("{shown}: {} with vars errors", count(errors, "playbook"));
+        eprintln!("{shown}: {} with errors", count(errors, "playbook"));
         return Ok(EXIT_ERROR);
     }
     Ok(0)
+}
+
+/// What `inventory check` says about one playbook whose hosts resolved.
+#[derive(Debug, Default)]
+struct Verdict {
+    /// The `ok` line for stdout, when there is no problem.
+    ok: Option<String>,
+    /// Each a complete stderr report ending in a newline; any one fails
+    /// the check. All of them are reported, so fixing one does not reveal
+    /// the next on the following run.
+    problems: Vec<String>,
+    /// Lines for stderr that fail nothing (undeclared vars).
+    warnings: Vec<String>,
+}
+
+/// Judge one playbook against every host it targets, as `playbook run`
+/// would without `--limit`: a `ssh_user` on a host reached without ssh, and
+/// the vars, where `checks` is the binary's `--check-vars` answer (`None`
+/// when the playbook takes no vars).
+fn judge(
+    d: &describe::Describe,
+    resolved: &[rustible_cli::inventory::Resolved],
+    is_group: bool,
+    src: &str,
+    inventory_file: &str,
+    checks: Option<Vec<rustible_sdk::runtime::HostCheck>>,
+) -> Verdict {
+    let mut v = Verdict::default();
+    if let Some(refusal) = run::local_login_refusal(d, resolved) {
+        v.problems.push(format!(
+            "{src}: {refusal}; remove the attribute, or point `hosts` at hosts reached over ssh\n"
+        ));
+    }
+    let hosts = count(resolved.len(), "host");
+    let Some(checks) = checks else {
+        if v.problems.is_empty() {
+            v.ok = Some(format!("{src}: ok ({hosts}, no vars)"));
+        }
+        return v;
+    };
+    let (results, warnings) = run::split_checks(checks);
+    for (host, message) in warnings {
+        v.warnings
+            .push(format!("warning: {src} on host `{host}`: {message}"));
+    }
+    if let Some(report) = format_vars_report(&d.hosts, is_group, src, inventory_file, &results) {
+        v.problems.push(report);
+    }
+    if v.problems.is_empty() {
+        v.ok = Some(format!("{src}: ok ({hosts})"));
+    }
+    v
 }
 
 fn count(n: usize, noun: &str) -> String {
@@ -490,6 +543,74 @@ fn load_or_exit(file: &Path) -> Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn judged(
+        ssh_user: Option<&str>,
+        checks: Option<Vec<rustible_sdk::runtime::HostCheck>>,
+    ) -> Verdict {
+        let inv = Inventory::parse(
+            "group \"games\" {\n    host \"laptop\" connection=\"local\"\n    host \"box\" addr=\"10.0.4.5\"\n}\n",
+            "hosts.kdl",
+        )
+        .unwrap();
+        let resolved: Vec<_> = ["laptop", "box"]
+            .iter()
+            .map(|h| inv.resolve(h).unwrap())
+            .collect();
+        let d = describe::Describe {
+            name: "games/minecraft".into(),
+            hosts: "games".into(),
+            escalate: false,
+            ssh_user: ssh_user.map(Into::into),
+            vars_schema: serde_json::Value::Null,
+        };
+        judge(
+            &d,
+            &resolved,
+            true,
+            "playbooks/games/minecraft.rs",
+            "hosts.kdl",
+            checks,
+        )
+    }
+
+    fn missing_var(host: &str) -> rustible_sdk::runtime::HostCheck {
+        rustible_sdk::runtime::HostCheck {
+            host: host.into(),
+            problems: vec![rustible_sdk::runtime::VarProblem {
+                var: "world".into(),
+                severity: rustible_sdk::runtime::Severity::Error,
+                message: "missing required var `world`".into(),
+            }],
+        }
+    }
+
+    /// `inventory check` fails a playbook whose `ssh_user` reaches a host
+    /// with no ssh login, judged against all its hosts as vars are, and
+    /// still reports its vars errors beside the refusal.
+    #[test]
+    fn inventory_check_fails_a_playbook_login_on_a_local_host() {
+        let v = judged(Some("minecraft"), None);
+        assert_eq!(v.ok, None);
+        assert_eq!(v.problems.len(), 1, "{v:?}");
+        assert!(v.problems[0].starts_with("playbooks/games/minecraft.rs: playbook `games/minecraft` sets `ssh_user = \"minecraft\"`"), "{v:?}");
+        assert!(v.problems[0].contains("`laptop`"), "{v:?}");
+
+        let v = judged(
+            Some("minecraft"),
+            Some(vec![missing_var("laptop"), missing_var("box")]),
+        );
+        assert_eq!(v.ok, None);
+        assert_eq!(v.problems.len(), 2, "both the refusal and the vars: {v:?}");
+        assert!(v.problems[1].contains("world"), "{v:?}");
+
+        let v = judged(None, None);
+        assert_eq!(
+            v.ok.as_deref(),
+            Some("playbooks/games/minecraft.rs: ok (2 hosts, no vars)")
+        );
+        assert!(v.problems.is_empty());
+    }
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("rustible").chain(args.iter().copied())).unwrap()

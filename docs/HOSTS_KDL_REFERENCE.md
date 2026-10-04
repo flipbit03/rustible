@@ -63,7 +63,9 @@ group "production" {
 
 Seven, and no others. Set them on a `host`, on a `group`, or on `defaults`;
 the nearest one wins, and `rustible inventory show` prints where each came
-from.
+from. One thing outranks them all: a playbook's `ssh_user` attribute replaces
+the host's `ssh_user` for that playbook, whichever level set it.
+`inventory show` describes this file and does not apply it.
 
 | parameter | meaning | default |
 |---|---|---|
@@ -75,7 +77,7 @@ from.
 | `escalate_user` | account to escalate to | `root` |
 | `ssh_args` | extra arguments for `ssh` | none |
 
-Three rules worth knowing:
+Four rules worth knowing:
 
 - **`addr` is host-only.** An address names one machine, so it cannot be
   inherited; setting it on a group or on `defaults` is a load error. Every
@@ -84,6 +86,16 @@ Three rules worth knowing:
   rejected at load — naming the node — if they are empty, start with `-`, or
   contain `:`, `,`, whitespace or control characters, so a typo is one error
   here rather than a `sudo -u` failure on every host mid-run.
+- **`ssh_args` beats Rustible's own ssh defaults, and cannot touch what it
+  depends on.** They come first on the `ssh` command line, so
+  `"-o" "StrictHostKeyChecking=no"` replaces Rustible's `accept-new`. The
+  login, port and address have their own parameters, so `-l`, `-o User=`,
+  `-p`, `-o Port=` and `-o HostName=` in `ssh_args` are a load error that
+  names `ssh_user`, `port` or `addr`; so are the options the connection runs
+  on: `-M`, `-S`, `-E`, `-f`, `-N`, and `ControlMaster`, `ControlPath`,
+  `ControlPersist`, `BatchMode`, `ForkAfterAuthentication` and `SessionType`
+  as `-o` options. Every word must be an option or an option's value: a bare
+  word or a `--` would change the machine ssh connects to.
 - **`ssh_args` does not merge.** The nearest level that sets it wins whole.
   Write one argument as a property, several as a child node:
 

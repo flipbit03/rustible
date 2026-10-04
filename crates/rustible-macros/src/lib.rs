@@ -27,9 +27,10 @@ use syn::{Error, FnArg, ItemFn, ItemStruct, LitBool, LitStr, Type};
 ///
 /// `hosts` is required. `vars` names a `#[rustible::vars]` struct and adds a
 /// second parameter to `main`. `escalate` (Ansible's `become`) defaults to
-/// false. Expands to a private renamed `main`, a `__rustible_entry` that
-/// deserializes the vars, and a `__RUSTIBLE_PLAYBOOK` static the build
-/// script's registry points at.
+/// false. `ssh_user = "<account>"` logs in as that account instead of the
+/// host's `ssh_user` from the inventory. Expands to a private renamed
+/// `main`, a `__rustible_entry` that deserializes the vars, and a
+/// `__RUSTIBLE_PLAYBOOK` static the build script's registry points at.
 #[proc_macro_attribute]
 pub fn playbook(attr: TokenStream, item: TokenStream) -> TokenStream {
     match playbook_impl(attr.into(), item.into()) {
@@ -42,6 +43,37 @@ struct PlaybookArgs {
     hosts: Option<LitStr>,
     vars: Option<Type>,
     escalate: Option<LitBool>,
+    ssh_user: Option<LitStr>,
+}
+
+/// Reject a `ssh_user` that cannot name an account, at compile time and on
+/// the literal.
+///
+/// The same rule as `rustible-cli`'s `validate_account_name` (which checks
+/// the inventory's `ssh_user`) and `rustible_std::group::validate_name`. The
+/// three crates cannot share one function, so they are kept in step by these
+/// notes: a stricter rule here would refuse an account the inventory accepts.
+fn validate_ssh_user(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("is empty".to_string());
+    }
+    if name.starts_with('-') {
+        return Err(format!(
+            "is `{}`, which starts with `-` and would be read as a flag",
+            name.escape_default()
+        ));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| *c == ':' || *c == ',' || c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "is `{}`, which contains `{}`; an account name cannot contain `:`, `,`, whitespace or control characters",
+            name.escape_default(),
+            bad.escape_default()
+        ));
+    }
+    Ok(())
 }
 
 fn playbook_impl(
@@ -52,6 +84,7 @@ fn playbook_impl(
         hosts: None,
         vars: None,
         escalate: None,
+        ssh_user: None,
     };
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("hosts") {
@@ -63,6 +96,16 @@ fn playbook_impl(
         } else if meta.path.is_ident("escalate") {
             args.escalate = Some(meta.value()?.parse()?);
             Ok(())
+        } else if meta.path.is_ident("ssh_user") {
+            let lit: LitStr = meta.value()?.parse()?;
+            if let Err(why) = validate_ssh_user(&lit.value()) {
+                return Err(Error::new_spanned(
+                    &lit,
+                    format!("playbook option `ssh_user` {why}"),
+                ));
+            }
+            args.ssh_user = Some(lit);
+            Ok(())
         } else {
             let key = meta
                 .path
@@ -70,7 +113,7 @@ fn playbook_impl(
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "?".into());
             Err(meta.error(format!(
-                "unknown playbook option `{key}`; expected `hosts`, `vars`, or `escalate`"
+                "unknown playbook option `{key}`; expected `hosts`, `vars`, `escalate`, or `ssh_user`"
             )))
         }
     });
@@ -83,6 +126,10 @@ fn playbook_impl(
         )
     })?;
     let escalate = args.escalate.map(|b| b.value).unwrap_or(false);
+    let ssh_user = match &args.ssh_user {
+        Some(u) => quote! { ::core::option::Option::Some(#u) },
+        None => quote! { ::core::option::Option::None },
+    };
 
     let mut f: ItemFn = syn::parse2(item)?;
     if f.sig.ident != "main" {
@@ -165,6 +212,7 @@ fn playbook_impl(
         pub static __RUSTIBLE_PLAYBOOK: ::rustible::sdk::registry::Playbook = ::rustible::sdk::registry::Playbook {
             hosts: #hosts,
             escalate: #escalate,
+            ssh_user: #ssh_user,
             schema: #schema_fn,
             entry: __rustible_entry,
             check_vars: __rustible_check_vars,

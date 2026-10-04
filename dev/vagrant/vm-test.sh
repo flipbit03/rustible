@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Run examples/workspace/playbooks/vagrant.rs against whichever Vagrant
-# machines are up, and prove it is idempotent.
+# Run examples/workspace/playbooks/vagrant.rs, then vagrant_login.rs, against
+# whichever Vagrant machines are up, and prove both are idempotent.
+# vagrant_login.rs logs in as an account vagrant.rs creates, so the order is
+# fixed.
 #
 # A playbook run that reports `changed` proves the operation did something. It
 # does not prove the operation was right: an op that rewrites a correct file
@@ -22,7 +24,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 inventory="$root/dev/vagrant/hosts.vagrant.kdl"
-playbook="vagrant"     # the name form; a path would resolve against the cwd
+# The name form; a path would resolve against the cwd. In order: the second
+# logs in as the account the first creates.
+playbooks=(vagrant vagrant_login)
 
 
 limit=()
@@ -105,7 +109,7 @@ run() {
     "$root/target/release/rustible" \
         --workspace "$root/examples/workspace" \
         --inventory "$inventory" \
-        playbook run ${limit[@]+"${limit[@]}"} "$playbook"
+        playbook run ${limit[@]+"${limit[@]}"} "$1"
 }
 
 # The summary table has more than one row shape (render.rs). A host that ran
@@ -170,31 +174,34 @@ assert_changed_something() {
     '
 }
 
-echo "==> first run: converging"
-first=$(run | tee /dev/stderr)
+for playbook in "${playbooks[@]}"; do
+    echo "==> $playbook, first run: converging"
+    first=$(run "$playbook" | tee /dev/stderr)
 
-if [ "$quick" != 1 ] && ! printf '%s\n' "$first" | assert_changed_something; then
-    echo >&2
-    cat >&2 <<'MSG'
-vm-test failed: the first run changed nothing, so this proved nothing.
+    if [ "$quick" != 1 ] && ! printf '%s\n' "$first" | assert_changed_something; then
+        echo >&2
+        cat >&2 <<MSG
+vm-test failed: the first run of $playbook changed nothing, so this proved
+nothing.
 
 The guests were supposed to be recreated before it. A converged guest makes
-both runs report `ok` and the second-run assertion hold vacuously, which is
+both runs report \`ok\` and the second-run assertion hold vacuously, which is
 exactly the false green this check exists to stop. Either the recreate did
 not take, or the playbook has a step that is satisfied on a fresh guest.
 MSG
-    exit 1
-fi
+        exit 1
+    fi
 
-echo
-echo "==> second run: must change nothing"
-second=$(run | tee /dev/stderr)
+    echo
+    echo "==> $playbook, second run: must change nothing"
+    second=$(run "$playbook" | tee /dev/stderr)
 
-if ! printf '%s\n' "$second" | assert_no_change; then
-    echo >&2
-    echo "vm-test failed: the playbook is not idempotent on these machines." >&2
-    exit 1
-fi
+    if ! printf '%s\n' "$second" | assert_no_change; then
+        echo >&2
+        echo "vm-test failed: $playbook is not idempotent on these machines." >&2
+        exit 1
+    fi
+    echo
+done
 
-echo
-echo "vm-test passed: converged, and the second run changed nothing."
+echo "vm-test passed: converged, and every second run changed nothing."

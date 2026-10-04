@@ -183,6 +183,11 @@ pub(crate) fn run_tool(cmd: rustible_sdk::Cmd, tools: Tools, program: &str) -> R
 /// Reject names that would break the passwd/group format or the tools:
 /// empty, a leading `-` (read as a flag), or any of `:`, `,`, whitespace
 /// and control characters.
+///
+/// `rustible-cli` checks the inventory's `ssh_user` and `escalate_user` with
+/// the same rule (`validate_account_name`), and `rustible-macros` the
+/// playbook attribute's `ssh_user` (`validate_ssh_user`); none of the three
+/// crates can call another's, so a change here is a change there too.
 pub(crate) fn validate_name(what: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("{what} name is empty");
