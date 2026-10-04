@@ -41,8 +41,10 @@ pub enum Status {
     WouldChange,
     /// `check` or `apply` returned an error, or the run was cancelled between
     /// the two. The rendered context chain travels in the `note` field, and
-    /// an [`Event::Failed`] normally follows once the error reaches the top
-    /// of the playbook.
+    /// an [`Event::Failed`] follows if the error reaches the top of the
+    /// playbook. Whether the step failed the host is not known yet: the
+    /// summary counts it under [`Summary::failed`] or [`Summary::recovered`]
+    /// once the playbook has returned.
     Failed,
 }
 
@@ -129,9 +131,13 @@ pub enum Event {
         /// `action` for an op whose
         /// [`always_changes`](crate::op::Op::always_changes) is true, and
         /// `ran, unchanged` for an apply that reported no change. `rustible`
-        /// holds a failed step's chain back and prints it only if no
-        /// [`Failed`](Event::Failed) frame follows, so a playbook that
-        /// swallowed the error still shows why.
+        /// holds a failed step's chain back: a [`Failed`](Event::Failed)
+        /// frame for the same step (the same id, name and blocks) prints it
+        /// instead. The next step starting or being skipped, a `Failed`
+        /// frame for another failure, `Finished` or the end of the host
+        /// prints it first, so a failure the playbook caught (`recovered`)
+        /// still shows why. Logs and commands from outside a step that
+        /// arrive meanwhile print after it, and block events print nothing.
         note: Option<String>,
         /// Wall clock across both phases, from just before `check` to the
         /// moment the status was decided. The integration harness records it
@@ -181,19 +187,35 @@ pub enum Event {
         /// Wall clock around the spawn, including reading stdout and stderr.
         elapsed_ms: u64,
     },
-    /// The playbook returned an error to the runtime or panicked. At most
-    /// one per run, emitted after the body returns and before `Finished`.
-    /// The failing step already reported `Status::Failed` with the same
-    /// chain in its `note`; `rustible` prefers this frame and prints the
-    /// chain once.
+    /// The host failed: the playbook returned an error to the runtime or
+    /// panicked, or the run was cancelled and the playbook returned `Ok`
+    /// (or an error absorbed under `--check`), in which case `error` is the
+    /// cancellation. At most one per run, emitted after the body returns
+    /// and before `Finished`. When there is a failing step, it already
+    /// reported `Status::Failed` with the same chain in its `note`;
+    /// `rustible` prefers this frame and prints the chain once.
     Failed {
         /// The step the failure belongs to. The runtime reads it off the
         /// [`StepFailed`](crate::error::StepFailed) layer `Ctx::step`
         /// attaches, so it is filled for anything that failed inside a step
-        /// and `None` for a panic or an error the playbook raised on its
-        /// own. `error` still opens with that layer's text; a reporter that
-        /// prints the name separately drops it.
+        /// and `None` for a panic, an error the playbook raised on its own,
+        /// and a cancellation the playbook swallowed. `error` still opens
+        /// with that layer's text; a reporter that prints the name
+        /// separately drops it.
         step: Option<String>,
+        /// The `id` of the failed step's `StepStarted` and `StepFinished`,
+        /// when the error is one this run's `Ctx::step` returned; `None`
+        /// otherwise, including for a step refused before it started, which
+        /// drew no id. Step names repeat, so this is what pairs the frame
+        /// with the step line it closes.
+        id: Option<u32>,
+        /// The block path of `step`, outermost first: the blocks open when
+        /// it ran (what its `StepStarted` reported) or, for a step refused
+        /// before it started, when it was refused. Empty at the top level
+        /// and when `step` is `None`. Step names repeat, and blocks make
+        /// repeats likelier, so a reporter prints it before the name as the
+        /// step line does.
+        blocks: Vec<String>,
         /// The rendered context chain, outermost first.
         error: String,
         /// Present when a command failure is in the chain (rendered at -v).
@@ -217,10 +239,19 @@ pub fn block_prefix(blocks: &[String]) -> String {
 }
 
 impl Event {
-    /// Build a `Failed` event from an error, extracting the command if any.
-    pub fn failed(step: Option<String>, e: &crate::Error) -> Event {
+    /// Build a `Failed` event from the error that failed the host: the step
+    /// and its block path from the error's
+    /// [`StepFailed`](crate::error::StepFailed) layer when it has one, and
+    /// the command if one is in the chain. `id` is the failed step's id when
+    /// the caller has matched the error to one of this run's steps; the
+    /// layer's own id is not trusted for that, since another `Ctx` may have
+    /// drawn it.
+    pub(crate) fn failed(e: &crate::Error, id: Option<u32>) -> Event {
+        let step = e.step_failed();
         Event::Failed {
-            step,
+            step: step.map(|s| s.step.clone()),
+            id,
+            blocks: step.map(|s| s.blocks.clone()).unwrap_or_default(),
             error: e.chain(),
             cmd: e.cmd_failed().cloned(),
         }
@@ -248,8 +279,15 @@ pub enum Level {
 
 /// The per-host tally `Ctx` keeps as steps finish, sent once in
 /// [`Event::Finished`] and rendered as one row of `rustible`'s closing
-/// table. Each finished or skipped step adds to exactly one of the first
-/// five counters, so they sum to the number of steps the playbook reached.
+/// table. Each finished or skipped step adds to exactly one of the six step
+/// counters, `ok`, `changed`, `would_change`, `skipped`, `failed` and
+/// `recovered`, so they sum to the number of steps the playbook reached;
+/// the one exception is the `failed` of 1 the runtime forces for a host that
+/// failed with no failed step to count.
+///
+/// The host's verdict is what the playbook returned (vision doc 14): it
+/// failed exactly when `failed > 0`, which is what the binary's exit code
+/// and `rustible`'s verdict read. `recovered` never fails a host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Summary {
     /// Steps that needed no change, plus actions that ran and reported
@@ -264,17 +302,25 @@ pub struct Summary {
     /// Steps `Ctx::skip` recorded. These never ran a check, so they carry
     /// no [`Status`]; they arrive as [`Event::StepSkipped`].
     pub skipped: u32,
-    /// Steps whose check or apply failed. The runtime forces this to at
-    /// least 1 when the playbook returned an error or panicked without any
-    /// step having failed: the process exit code and `rustible`'s per-host
+    /// Failed steps that failed the host: the one whose error left the
+    /// playbook, and any a cancellation stopped. The runtime forces this to
+    /// at least 1 when the host failed with no such step (the playbook
+    /// `bail!`ed on its own, panicked, or the run was cancelled before a
+    /// step started): the process exit code and `rustible`'s per-host
     /// verdict are both read off this field, so a zero here would report a
-    /// crashed run as a success.
+    /// failed host as a success.
     pub failed: u32,
+    /// Failed steps the playbook recovered from: a step failed, and the
+    /// playbook caught the error and carried on (a retry, a fallback, or an
+    /// optional step). Each still printed `FAILED` with its error when it
+    /// happened; none of them fails the host. Ansible's `ignored` and
+    /// `rescued` in one column.
+    pub recovered: u32,
     /// How many `Log { level: Warn }` frames the run emitted, from any of
     /// `Ctx::warn`, `System::warn` inside an op, and the runtime's
     /// undeclared-var notice. Counted at the sink rather than by each
     /// producer, so this is exactly the number of `WARNING:` lines the
-    /// operator saw. Unlike the five above it does not belong to a step and
+    /// operator saw. Unlike the six above it does not belong to a step and
     /// is not part of their sum.
     pub warnings: u32,
 }
@@ -465,9 +511,15 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 argv.join(" ")
             ),
             Event::CmdRan { .. } => Ok(()),
-            Event::Failed { step, error, cmd } => {
+            Event::Failed {
+                step,
+                blocks,
+                error,
+                cmd,
+                ..
+            } => {
                 let r = match step {
-                    Some(s) => writeln!(w, "FAILED at `{s}`: {error}"),
+                    Some(s) => writeln!(w, "FAILED at {}`{s}`: {error}", step_prefix(&blocks)),
                     None => writeln!(w, "FAILED: {error}"),
                 };
                 if self.verbosity >= 1
@@ -482,8 +534,8 @@ impl<W: Write + Send> EventSink for Compact<W> {
             }
             Event::Finished(s) => writeln!(
                 w,
-                "ok={} changed={} would_change={} skipped={} failed={} warnings={}",
-                s.ok, s.changed, s.would_change, s.skipped, s.failed, s.warnings
+                "ok={} changed={} would_change={} skipped={} failed={} recovered={} warnings={}",
+                s.ok, s.changed, s.would_change, s.skipped, s.failed, s.recovered, s.warnings
             ),
         };
     }
@@ -575,6 +627,32 @@ mod tests {
         assert_eq!(
             out,
             "changed: [a][b] inner\nskipped: [a] skipped  why\nok: top\n"
+        );
+    }
+
+    /// A binary run by hand prints the failed step's block path on its
+    /// `FAILED at` line and the `recovered` count in its closing line.
+    #[test]
+    fn compact_names_the_failed_steps_blocks_and_counts_recovered() {
+        let printer = Compact::new(Vec::new(), 0);
+        printer.emit(Event::Failed {
+            step: Some("boom".into()),
+            id: Some(4),
+            blocks: vec!["outer".into(), "inner".into()],
+            error: "step `boom`: nope".into(),
+            cmd: None,
+        });
+        printer.emit(Event::Finished(Summary {
+            ok: 2,
+            failed: 1,
+            recovered: 3,
+            ..Default::default()
+        }));
+        let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "FAILED at [outer][inner] `boom`: step `boom`: nope\n\
+             ok=2 changed=0 would_change=0 skipped=0 failed=1 recovered=3 warnings=0\n"
         );
     }
 

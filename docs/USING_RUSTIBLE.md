@@ -66,7 +66,8 @@ The concepts carry over. The syntax does not.
 | handlers and `notify:` | `if step.changed { ... }` |
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
-| `ignore_errors` / `failed_when` | match on the `Result` — see §14 |
+| `ignore_errors` / `rescue:` / `until:` | catch the `Result` (`.ok()`, `if let Err`, a loop); counted `recovered` — see §14 |
+| `failed_when` | match on the `Result` — see §14 |
 | a `roles/` entry, reused | a function in `src/lib.rs` — see §7 |
 | `include_tasks:`, used once | statements in the playbook — see §7 |
 | `--tags` / `--skip-tags` | separate playbooks, or an `if` on a var |
@@ -275,7 +276,7 @@ Exit codes, which matter if you script this:
 |---|---|
 | `0` | success |
 | `1` | refused before touching anything — a bad inventory, a missing var, a build failure |
-| `2` | a host or step failed — **something may have been changed** |
+| `2` | a host failed — **something may have been changed** |
 | `3` | the command line, the playbook name, or the hosts it names could not be resolved |
 
 ⚠️ `1` and `2` are the important distinction: `1` means the fleet was not
@@ -1171,13 +1172,14 @@ Each step is a line:
 Every run ends with one row per host:
 
 ```
-host    ok  changed  would change  skipped  failed  warnings
-web1     3        2             0        0       0         0
-web2     3        2             0        0       0         0
+host   ok  changed  would change  skipped  failed  recovered  warnings
+web1    3        2             0        0       0          0         0
+web2    3        2             0        0       0          0         0
 ```
 
 A host that never got as far as running gets a `failed: <reason>` row instead
-— a connect error, a build failure.
+— a connect error, a build failure. `recovered` counts failures the playbook
+caught; see "When a step fails" below.
 
 **Read the `changed` column on a second run.** An operation that reports
 `changed` every time is not idempotent, and that is a bug worth reporting.
@@ -1197,19 +1199,43 @@ here, since the build is your controller's CPU and nobody else's.
 
 ### When a step fails
 
-`ctx.step(...)?` propagates, so by default the first failure stops that host.
-To carry on regardless, handle the `Result` like any other:
+`ctx.step(...)?` propagates, so by default the first failure stops that host
+and the host is `failed`. A failure the playbook catches does not fail the
+host: the step still prints `FAILED` with its error, and the summary counts it
+under `recovered` — a step failed, and the playbook caught the error and
+carried on.
 
 ```rust
+// Optional: carry on without it.
 if let Err(e) = ctx.step("optional thing", op) {
-    ctx.warn(format!("skipping: {e}"));
+    ctx.warn(format!("skipping: {e:#}")); // {e:#}: the whole chain; {e} names only the step
+}
+
+// Retry: a loop. Failed attempts print FAILED; the attempt that succeeds
+// prints its status, and the recap shows the failures as recovered.
+let mut attempts = 0;
+while let Err(e) = ctx.step(
+    "wait for the api",
+    shell::Command::new("curl").args(["-fsS", "--max-time", "5", "http://127.0.0.1:8080/health"]),
+) {
+    attempts += 1;
+    if attempts == 5 {
+        return Err(e); // gives up: this attempt is `failed`, the four before it `recovered`
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
 }
 ```
 
-⚠️ **That continues the playbook, but the step is still counted as failed**,
-the host still reports `failed` in the summary, and the run still exits `2`.
-There is no `ignore_errors` that makes a failure invisible — you can decide
-what to do next, not whether it happened.
+⚠️ A cancelled run (ctrl-c) and a panic always fail the host, even when the
+playbook catches the error.
+
+⚠️ To add words to a step's error, wrap it: `.context("…")`. `bail!("…{e}")`
+or `Error::msg(..)` makes a new error, so the step it came from counts as
+`recovered` while the host still fails.
+
+⚠️ `.unwrap()` or `.expect(..)` on a step's error panics, and the step then
+counts as `recovered` while the host fails. Use `?`, which names the step as
+the failure.
 
 **Hosts run in parallel, and one failing does not stop the others.** Every
 host runs to completion; the summary says which failed, and the process exits
@@ -1292,6 +1318,7 @@ the whole shape of the real run, conditionals included.
 | ``no host or group named `all` `` | there is no implicit `all` group (§6); exits 3 |
 | `cannot find module or crate 'apt' in this scope` | missing `use rustible_std::apt;` (§7) |
 | `not evaluated further under --check` | a read of a would-change step's output; the dry run did not evaluate the rest of that block (§9, §15) |
+| a step printed `FAILED`, yet the host is not failed | the playbook caught the error; the summary counts it under `recovered` (§14) |
 | `var X is not declared by this playbook` | the inventory sets a var the playbook's `Vars` does not declare; harmless, but usually a typo |
 | ``missing required var `x` `` | a `Vars` field with no `#[default]` and no value in the inventory |
 | `sudo: a password is required` | `escalate = true` needs passwordless sudo; the flag does not help there (§12) |

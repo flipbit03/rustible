@@ -553,6 +553,8 @@ mod tests {
 
         entry["protocol"] = Value::from(PROTOCOL_VERSION + 1);
         assert_eq!(from_cache(&entry.to_string(), "games/minecraft"), None);
+        entry["protocol"] = Value::from(PROTOCOL_VERSION - 1);
+        assert_eq!(from_cache(&entry.to_string(), "games/minecraft"), None);
         // Written before the cache recorded a protocol.
         let old = serde_json::to_string(&d).unwrap();
         assert_eq!(from_cache(&old, "games/minecraft"), None);

@@ -1583,6 +1583,63 @@ mod tests {
         assert!(cmd.contains("failed earlier and is not retried"), "{cmd}");
     }
 
+    /// A step whose escalation died, as a refused `sudo` shows inside the
+    /// binary: one recorded failure, claimed by the run when its error
+    /// escapes, and one `Failed` frame naming the step, with the report and
+    /// its note printed once. The verdict is then `classify`'s like any other
+    /// step's (#44): failed when the error leaves the playbook, recovered
+    /// when it is caught.
+    #[test]
+    fn a_dead_helper_fails_its_step_like_any_other_failure() {
+        use crate::ctx::Ctx;
+        use crate::event::{Collect, Event};
+        use crate::op::{Op, Plan};
+        use crate::system::System;
+
+        struct ReadsHostname;
+        impl Op for ReadsHostname {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> crate::Result<Plan<Self>> {
+                sys.read("/etc/hostname")?;
+                Ok(Plan::Satisfied(()))
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> crate::Result<()> {
+                match intent {}
+            }
+        }
+
+        let note = "the login user `minecraft` comes from the playbook's `ssh_user` attribute";
+        let sink = Arc::new(Collect::default());
+        let facts = System::fake(Arc::new(crate::backend::Fake::new()), sink.clone())
+            .facts()
+            .clone();
+        let sys = System::new(Arc::new(dead_helper(Some(note.into()))), facts, false, sink);
+        let mut ctx = Ctx::new(sys, crate::ctx::HostInfo::local());
+
+        let e = ctx.step("read the hostname", ReadsHostname).unwrap_err();
+        let failures = ctx.failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(!failures[0].cancelled);
+        let escaped = e.step_failed().and_then(|s| ctx.claims(s));
+        assert_eq!(escaped, Some(failures[0].id));
+
+        let Event::Failed {
+            step, id, error, ..
+        } = Event::failed(&e, escaped)
+        else {
+            panic!("not Failed")
+        };
+        assert_eq!(step.as_deref(), Some("read the hostname"));
+        assert_eq!(id, escaped);
+        assert_eq!(error.matches(note).count(), 1, "{error}");
+        assert_eq!(error.matches("exited 7").count(), 1, "{error}");
+        assert!(
+            error.starts_with("step `read the hostname`: /etc/hostname: helper exited 7"),
+            "{error}"
+        );
+    }
+
     // ---- streaming, behind a stand-in `sudo` ----
     //
     // `sudo` is resolved through `PATH`, and changing `PATH` in this process

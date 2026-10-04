@@ -399,11 +399,7 @@ impl Output {
                 }
             }
             Output::Json { failed, .. } => {
-                if let Up::Event(Event::Finished(s)) = up
-                    && s.failed > 0
-                {
-                    *failed = true;
-                }
+                *failed |= reports_a_failed_host(up);
                 self.json(
                     host,
                     "frame",
@@ -470,6 +466,13 @@ impl Output {
             Output::Json { failed, .. } => *failed,
         }
     }
+}
+
+/// Whether a frame says its host failed: a summary counting a `failed`
+/// step. `recovered` is a failure the playbook caught and never fails a
+/// host, so it is not read here; the frame carries it to `--json` as is.
+fn reports_a_failed_host(up: &Up) -> bool {
+    matches!(up, Up::Event(Event::Finished(s)) if s.failed > 0)
 }
 
 type Shared = Arc<Mutex<Output>>;
@@ -1501,6 +1504,27 @@ host "solo" addr="10.0.0.9"
         assert_eq!(solo.user.as_deref(), Some("cadu"), "from defaults");
     }
 
+    /// `--json`'s verdict reads `failed` and nothing else: a host that only
+    /// recovered from failures did not fail, and the frame carries
+    /// `recovered` to the script as it is.
+    #[test]
+    fn json_fails_a_host_on_failed_and_never_on_recovered() {
+        use rustible_sdk::event::Summary;
+        let finished = |failed, recovered| {
+            Up::Event(Event::Finished(Summary {
+                failed,
+                recovered,
+                ..Default::default()
+            }))
+        };
+        assert!(!reports_a_failed_host(&finished(0, 0)));
+        assert!(!reports_a_failed_host(&finished(0, 3)));
+        assert!(reports_a_failed_host(&finished(1, 0)));
+        assert!(reports_a_failed_host(&finished(1, 4)));
+        let json = serde_json::to_value(finished(0, 3)).unwrap();
+        assert_eq!(json["Event"]["Finished"]["recovered"], 3, "{json}");
+    }
+
     /// Every inventory level a playbook's `ssh_user` has to beat, and the
     /// built-in default.
     const LOGINS: &str = r#"
@@ -1698,6 +1722,12 @@ host "laptop" connection="local"
     /// the frame off the pipe), then says `Hello` or not, prints `stderr`,
     /// and exits 3.
     fn stand_in(start: &Path, name: &str, hello: bool, stderr: &str) -> String {
+        stand_in_speaking(start, name, hello.then_some(PROTOCOL_VERSION), stderr)
+    }
+
+    /// [`stand_in`], saying `Hello` with this protocol version when there is
+    /// one.
+    fn stand_in_speaking(start: &Path, name: &str, hello: Option<u32>, stderr: &str) -> String {
         let mut script = format!(
             "#!/bin/sh\nset -e\n\
              set -- $(dd bs=1 count=4 2>/dev/null | od -An -tu1)\n\
@@ -1705,9 +1735,9 @@ host "laptop" connection="local"
              dd bs=1 count=$n of='{}' 2>/dev/null\n",
             start.display()
         );
-        if hello {
+        if let Some(protocol) = hello {
             let json = serde_json::to_string(&Up::Hello {
-                protocol: PROTOCOL_VERSION,
+                protocol,
                 playbook: name.into(),
             })
             .unwrap();
@@ -1793,6 +1823,58 @@ host "laptop" connection="local"
             assert_eq!(hello, said_hello);
             assert_eq!(proc.wait().await.unwrap(), 3);
         }
+    }
+
+    /// A binary of the previous protocol is refused at its `Hello`, before
+    /// any event of it is read: version 6's `Summary` counts every failed
+    /// step as `failed`, and would be read as this version's verdict.
+    #[tokio::test]
+    async fn the_frame_loop_refuses_a_binary_of_the_previous_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bin");
+        std::fs::write(
+            &script,
+            stand_in_speaking(
+                &dir.path().join("start"),
+                "games/minecraft",
+                Some(PROTOCOL_VERSION - 1),
+                "",
+            ),
+        )
+        .unwrap();
+        let tr = Transport::Local;
+        let mut proc = tr
+            .spawn(&["sh".into(), script.display().to_string()], None)
+            .await
+            .unwrap();
+        let r = by_defaults();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut hello = false;
+        let e = drive_frames(
+            &tr,
+            &mut proc,
+            &plan(dir.path(), None),
+            &r,
+            None,
+            Value::Null,
+            &quiet(&r.host),
+            &r.host,
+            "games/minecraft",
+            rx,
+            "run",
+            &mut hello,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with(&format!(
+                "protocol mismatch: rustible speaks {PROTOCOL_VERSION}, the binary speaks {}",
+                PROTOCOL_VERSION - 1
+            )),
+            "{e}"
+        );
+        let _ = proc.wait().await;
     }
 
     /// The binary is told where its login came from, so its own escalation

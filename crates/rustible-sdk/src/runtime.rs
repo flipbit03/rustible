@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use crate::backend::serve_helper;
 use crate::channel::{Channel, Feeder};
-use crate::ctx::{Ctx, HostInfo, not_evaluated_further};
+use crate::ctx::{Ctx, FailedStep, HostInfo, not_evaluated_further};
 use crate::error::{OutputUnavailable, catching};
 use crate::event::{Compact, Event, EventSink, JsonLines, SharedSink, WarnCounter};
 use crate::protocol::{self, Down, FrameSink, Up};
@@ -43,8 +43,10 @@ use crate::stream::WorkspaceFiles;
 use crate::system::System;
 use crate::vars;
 
-/// Exit codes: 0 ok, 2 a step or the playbook failed, 3 the binary was
-/// misused (bad flags, unknown playbook, bad `Start` frame).
+/// Exit codes: 0 ok, 2 the host failed, 3 the binary was misused (bad
+/// flags, unknown playbook, bad `Start` frame). The host failed when the
+/// playbook returned an error or panicked, or the run was cancelled; a step
+/// failure the playbook caught does not fail it (vision doc 14).
 const EXIT_FAILED: u8 = 2;
 const EXIT_USAGE: u8 = 3;
 
@@ -482,6 +484,35 @@ fn print_usage(playbooks: &[Named]) {
     }
 }
 
+/// The `failed` and `recovered` counts for a host, once its playbook has
+/// returned (vision doc 14).
+///
+/// A failed step is `failed` when its error is the one that left the
+/// playbook (`escaped`, read off the error's `StepFailed` layer) or when the
+/// run was cancelled as it failed; every other failed step was caught by the
+/// playbook, which carried on, and is `recovered`. A host that failed
+/// (`host_failed`) with no failed step to show for it, because the playbook
+/// `bail!`ed on its own, panicked, or was cancelled before a step started,
+/// still counts one, so `failed > 0` is exactly "the host failed".
+///
+/// Identification is by step id, never by name, which repeats in a retry
+/// loop. An `escaped` id that names no recorded failure (a layer built by
+/// hand) matches nothing and falls back to the floor of one.
+fn classify(failures: &[FailedStep], escaped: Option<u32>, host_failed: bool) -> (u32, u32) {
+    let (mut failed, mut recovered) = (0u32, 0u32);
+    for f in failures {
+        if f.cancelled || escaped == Some(f.id) {
+            failed = failed.saturating_add(1);
+        } else {
+            recovered = recovered.saturating_add(1);
+        }
+    }
+    if host_failed && failed == 0 {
+        failed = 1;
+    }
+    (failed, recovered)
+}
+
 /// The warning a dry run gives when this binary cannot unwind: under
 /// `panic = "abort"`, a read of a would-change step's output kills the host
 /// instead of ending the enclosing `ctx.block`.
@@ -551,34 +582,44 @@ fn execute(
     // gives and no prefix. Nothing failed, so the host is not counted as
     // failed. Outside check mode it is an error like any other, and so is
     // one that carries `StepFailed`: a step read the missing output inside
-    // its op, failed, and was counted, and that stays a failure.
+    // its op, failed, and that stays a failure.
+    //
+    // `escaped` is the id of the failed step whose error left the playbook,
+    // when the error came from one: that step is `failed`, and every other
+    // failed step the playbook caught is `recovered` (vision doc 14).
     let check_mode = ctx.check_mode();
-    let failed = match outcome {
-        Ok(Ok(())) => false,
+    let (failed, escaped) = match outcome {
+        Ok(Ok(())) => (false, None),
         Ok(Err(e)) => match e.downcast_ref::<OutputUnavailable>() {
             Some(u) if check_mode && e.step_failed().is_none() => {
                 ctx.warn(not_evaluated_further("", &u.step));
-                false
+                (false, None)
             }
             _ => {
-                sink.emit(Event::failed(e.step_failed().map(|s| s.step.clone()), &e));
-                true
+                // Matched on the run's token and the step id, never on the
+                // name, which repeats, nor on the id alone, which a second
+                // `Ctx` draws again from 1.
+                let escaped = e.step_failed().and_then(|s| ctx.claims(s));
+                sink.emit(Event::failed(&e, escaped));
+                (true, escaped)
             }
         },
         Err(payload) => match payload.downcast::<OutputUnavailable>() {
             Ok(u) if check_mode => {
                 ctx.warn(not_evaluated_further("", &u.step));
-                false
+                (false, None)
             }
             Ok(u) => {
                 // `Deref` unwinds with this typed payload; reported as the
                 // error it stands for rather than as `panic: panic`.
                 sink.emit(Event::Failed {
                     step: None,
+                    id: None,
+                    blocks: vec![],
                     error: u.to_string(),
                     cmd: None,
                 });
-                true
+                (true, None)
             }
             Err(payload) => {
                 let msg = payload
@@ -588,19 +629,30 @@ fn execute(
                     .unwrap_or_else(|| "panic".into());
                 sink.emit(Event::Failed {
                     step: None,
+                    id: None,
+                    blocks: vec![],
                     error: format!("panic: {msg}"),
                     cmd: None,
                 });
-                true
+                (true, None)
             }
         },
+    };
+    // A run the operator stopped never reports success, even when the
+    // playbook swallowed every cancelled step's error and returned `Ok`.
+    // Said here, since nothing else would say why the host failed.
+    let failed = match ctx.check_cancelled() {
+        Err(cancelled) if !failed => {
+            sink.emit(Event::failed(&cancelled, None));
+            true
+        }
+        Err(_) => true,
+        Ok(()) => failed,
     };
 
     let mut summary = ctx.summary();
     summary.warnings = counter.count();
-    if failed && summary.failed == 0 {
-        summary.failed += 1;
-    }
+    (summary.failed, summary.recovered) = classify(&ctx.failures(), escaped, failed);
     // Dropping the last `Ctx` removes streamed files and closes the helpers
     // (their `CmdRan` events are already in the sink).
     drop(ctx);
@@ -1038,7 +1090,10 @@ mod tests {
             let (code, events) = run(playbook, true);
             assert_eq!(code, ExitCode::SUCCESS);
             let s = summary_of(&events);
-            assert_eq!((s.failed, s.would_change, s.warnings), (0, 1, 1));
+            assert_eq!(
+                (s.failed, s.recovered, s.would_change, s.warnings),
+                (0, 0, 1, 1)
+            );
             assert_eq!(warnings_in(&events), [TOP_LEVEL]);
             assert!(failed_in(&events).is_empty(), "{events:#?}");
         }
@@ -1160,7 +1215,7 @@ mod tests {
     fn under_check_a_read_inside_an_op_fails_the_host() {
         let (code, events) = run(&READS_INSIDE_AN_OP, true);
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
-        assert_eq!(summary_of(&events).failed, 1);
+        assert_eq!(verdict(&events), (1, 0));
         assert_eq!(
             failed_in(&events),
             [
@@ -1209,7 +1264,10 @@ mod tests {
         let (code, events) = run(&RESTART_GUARDED_BY_AN_ABSORBED_BLOCK, true);
         assert_eq!(code, ExitCode::SUCCESS);
         let s = summary_of(&events);
-        assert_eq!((s.failed, s.would_change, s.warnings), (0, 1, 2));
+        assert_eq!(
+            (s.failed, s.recovered, s.would_change, s.warnings),
+            (0, 0, 1, 2)
+        );
         let missing = "not evaluated further under --check: needs the output of step `read`, \
                        which would change and so has none";
         assert_eq!(
@@ -1220,6 +1278,635 @@ mod tests {
             e,
             Event::StepStarted { name, .. } if name == "restart"
         )));
+    }
+
+    // ---- the host's verdict is what the playbook returns (#44) ----
+
+    /// A step that succeeds or fails as it is told, so a playbook can play
+    /// out a retry.
+    struct Attempt(bool);
+
+    impl crate::op::Op for Attempt {
+        type Output = ();
+        type Intent = std::convert::Infallible;
+        fn check(&self, _: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            if self.0 {
+                Ok(crate::op::Plan::Satisfied(()))
+            } else {
+                Err(crate::Error::msg("not yet"))
+            }
+        }
+        fn apply(&self, _: &crate::system::System, intent: Self::Intent) -> crate::Result<()> {
+            match intent {}
+        }
+    }
+
+    macro_rules! playbook {
+        ($entry:expr) => {
+            Playbook {
+                hosts: "local",
+                escalate: false,
+                ssh_user: None,
+                schema: vars::no_schema,
+                entry: $entry,
+                check_vars: |_| Ok(()),
+            }
+        };
+    }
+
+    /// `run`, on a channel the test holds, so it can cancel the run.
+    fn run_on(
+        playbook: &'static Playbook,
+        check_mode: bool,
+        channel: Arc<Channel>,
+    ) -> (ExitCode, Vec<Event>) {
+        let sink = Arc::new(crate::event::Collect::default());
+        let named = Named {
+            name: "under-test",
+            playbook,
+        };
+        let code = execute(
+            &named,
+            HostInfo::local(),
+            Value::Null,
+            check_mode,
+            sink.clone(),
+            channel,
+            None,
+            "test".into(),
+        );
+        (code, sink.events())
+    }
+
+    /// `(failed, recovered)` from the run's `Finished` frame.
+    fn verdict(events: &[Event]) -> (u32, u32) {
+        let s = summary_of(events);
+        (s.failed, s.recovered)
+    }
+
+    /// Every `Failed` frame as `(step, blocks)`.
+    fn failed_frames(events: &[Event]) -> Vec<(Option<String>, Vec<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Failed { step, blocks, .. } => Some((step.clone(), blocks.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The process-level mapping every case below relies on: exit 2 exactly
+    /// when the summary counts a failed step, whatever it recovered from.
+    fn assert_exit_matches(code: ExitCode, events: &[Event]) {
+        let expected = if summary_of(events).failed > 0 {
+            ExitCode::from(EXIT_FAILED)
+        } else {
+            ExitCode::SUCCESS
+        };
+        assert_eq!(code, expected, "{events:#?}");
+    }
+
+    static RETRY_HEALS: Playbook = playbook!(|ctx, _| {
+        let mut attempt = 0;
+        while let Err(e) = ctx.step("wait for the api", Attempt(attempt == 2)) {
+            attempt += 1;
+            if attempt == 5 {
+                return Err(e);
+            }
+        }
+        Ok(())
+    });
+
+    /// The issue's first scenario: a retry that succeeds on its third
+    /// attempt. Two failed attempts, both caught by the loop: the host did
+    /// not fail.
+    #[test]
+    fn a_retry_that_heals_recovers_and_does_not_fail_the_host() {
+        let (code, events) = run(&RETRY_HEALS, false);
+        assert_eq!(verdict(&events), (0, 2));
+        assert_eq!(summary_of(&events).ok, 1);
+        assert!(failed_frames(&events).is_empty(), "{events:#?}");
+        assert_eq!(code, ExitCode::SUCCESS);
+        // Both failed attempts were still reported failed, live.
+        let failed_lines = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::StepFinished {
+                        status: crate::event::Status::Failed,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(failed_lines, 2);
+    }
+
+    static ESCAPES: Playbook = playbook!(|ctx, _| {
+        ctx.step("boom", Attempt(false))?;
+        Ok(())
+    });
+
+    #[test]
+    fn a_step_error_returned_with_question_mark_fails_the_host() {
+        let (code, events) = run(&ESCAPES, false);
+        assert_eq!(verdict(&events), (1, 0));
+        assert_eq!(failed_frames(&events), [(Some("boom".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [Some(1)]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static RECOVER_THEN_ESCAPE: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("a", Attempt(false)).ok();
+        ctx.step("b", Attempt(false))?;
+        Ok(())
+    });
+
+    #[test]
+    fn a_caught_failure_then_an_escaping_one_is_one_of_each() {
+        let (code, events) = run(&RECOVER_THEN_ESCAPE, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("b".into()), vec![])]);
+        assert_exit_matches(code, &events);
+    }
+
+    static RETRIES_EXHAUSTED: Playbook = playbook!(|ctx, _| {
+        let mut attempt = 0;
+        while let Err(e) = ctx.step("wait for the api", Attempt(false)) {
+            attempt += 1;
+            if attempt == 5 {
+                return Err(e);
+            }
+        }
+        Ok(())
+    });
+
+    /// Five failures of one step name, the last returned: the literal rule.
+    /// The loop caught four, and the fifth left the playbook. Telling them
+    /// apart takes the step id; the name is the same all five times.
+    #[test]
+    fn retries_exhausted_count_the_last_failed_and_the_rest_recovered() {
+        let (code, events) = run(&RETRIES_EXHAUSTED, false);
+        assert_eq!(verdict(&events), (1, 4));
+        assert_eq!(failed_ids(&events), [Some(5)]);
+        assert_eq!(
+            failed_frames(&events),
+            [(Some("wait for the api".into()), vec![])]
+        );
+        assert_exit_matches(code, &events);
+    }
+
+    static CONTEXT_PRESERVED: Playbook = playbook!(|ctx, _| {
+        use crate::error::Context as _;
+        ctx.step("boom", Attempt(false))
+            .context("while bringing the api up")?;
+        Ok(())
+    });
+
+    /// A layer the playbook adds on the way out does not hide which step
+    /// failed.
+    #[test]
+    fn a_context_layer_added_by_the_playbook_keeps_the_step_identified() {
+        let (code, events) = run(&CONTEXT_PRESERVED, false);
+        assert_eq!(verdict(&events), (1, 0));
+        assert_eq!(failed_frames(&events), [(Some("boom".into()), vec![])]);
+        assert_exit_matches(code, &events);
+    }
+
+    static BAILS_AFTER_A_CAUGHT_FAILURE: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("a", Attempt(false)).ok();
+        crate::bail!("gave up on my own")
+    });
+
+    #[test]
+    fn a_bail_without_a_step_fails_the_host_and_the_caught_step_stays_recovered() {
+        let (code, events) = run(&BAILS_AFTER_A_CAUGHT_FAILURE, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(None, vec![])]);
+        assert_eq!(failed_in(&events), ["gave up on my own"]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static PANICS_AFTER_A_CAUGHT_FAILURE: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("a", Attempt(false)).ok();
+        panic!("boom")
+    });
+
+    #[test]
+    fn a_panic_fails_the_host_whatever_was_caught_before_it() {
+        let (code, events) = run(&PANICS_AFTER_A_CAUGHT_FAILURE, false);
+        let (failed, recovered) = verdict(&events);
+        assert!(failed >= 1, "{events:#?}");
+        assert_eq!(recovered, 1);
+        assert_eq!(failed_in(&events), ["panic: boom"]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static HAND_BUILT_STEP_FAILED: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("boom", Attempt(false)).ok();
+        Err(crate::Error::msg("made up").context(crate::error::StepFailed::at("boom")))
+    });
+
+    /// A `StepFailed` the playbook built itself names a step but no step
+    /// id, so it claims none of the recorded failures: the caught one stays
+    /// recovered and the host still fails, by the floor of one.
+    #[test]
+    fn a_hand_built_step_failed_layer_claims_no_recorded_failure() {
+        let (code, events) = run(&HAND_BUILT_STEP_FAILED, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_exit_matches(code, &events);
+    }
+
+    static OPTIONAL_STEP: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("optional thing", Attempt(false)).ok();
+        ctx.step("the rest", Attempt(true))?;
+        Ok(())
+    });
+
+    /// The issue's third scenario: `.ok()` on an optional step.
+    #[test]
+    fn an_optional_step_wrapped_in_ok_does_not_fail_the_host() {
+        let (code, events) = run(&OPTIONAL_STEP, false);
+        assert_eq!(verdict(&events), (0, 1));
+        assert!(failed_frames(&events).is_empty(), "{events:#?}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    /// `grep -q <pattern> <file>`, run for real: it exits 1 when nothing
+    /// matches, which `Cmd::run` turns into a `CmdFailed`.
+    struct GrepQ(&'static str, &'static str);
+
+    impl crate::op::Op for GrepQ {
+        type Output = ();
+        type Intent = std::convert::Infallible;
+        fn check(&self, sys: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            sys.cmd("grep").args(["-q", self.0, self.1]).run()?;
+            Ok(crate::op::Plan::Satisfied(()))
+        }
+        fn apply(&self, _: &crate::system::System, intent: Self::Intent) -> crate::Result<()> {
+            match intent {}
+        }
+    }
+
+    static GREP_NOT_FOUND: Playbook = playbook!(|ctx, _| {
+        // `grep -q` exits 1 for "no match"; the playbook reads that as an
+        // answer rather than as a failure.
+        let found = ctx
+            .step("is the line there", GrepQ("^nope$", "/dev/null"))
+            .is_ok();
+        if !found {
+            ctx.step("add the line", Attempt(true))?;
+        }
+        Ok(())
+    });
+
+    /// The issue's second scenario: a real `grep -q` that finds nothing,
+    /// caught as "not found".
+    #[test]
+    fn grep_caught_as_not_found_does_not_fail_the_host() {
+        let (code, events) = run(&GREP_NOT_FOUND, false);
+        assert_eq!(verdict(&events), (0, 1));
+        assert_eq!(summary_of(&events).ok, 1);
+        assert!(failed_frames(&events).is_empty(), "{events:#?}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    static ACROSS_BLOCKS_AND_IDENTITIES: Playbook = playbook!(|ctx, _| {
+        let _ = ctx
+            .block("outer", |ctx| {
+                let _ = ctx.as_root().step("as root", Attempt(false)).ok();
+                ctx.block("inner", |ctx| {
+                    ctx.step("deep", Attempt(false))?;
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .ok();
+        ctx.as_user("nobody").step("as nobody", Attempt(false))?;
+        Ok(())
+    });
+
+    /// Failures through `as_user` clones and inside blocks land in the one
+    /// shared record and are classified like any other: the two caught ones
+    /// recovered (one by the playbook, one by `.ok()` on the outer block
+    /// after `?` carried it out of the inner one), the escaping one failed.
+    #[test]
+    fn failures_in_blocks_and_as_user_share_one_classification() {
+        let (code, events) = run(&ACROSS_BLOCKS_AND_IDENTITIES, false);
+        assert_eq!(verdict(&events), (1, 2));
+        assert_eq!(failed_frames(&events), [(Some("as nobody".into()), vec![])]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static ESCAPES_FROM_NESTED_BLOCKS: Playbook = playbook!(|ctx, _| {
+        ctx.block("outer", |ctx| {
+            ctx.step("before", Attempt(true))?;
+            ctx.block("inner", |ctx| ctx.step("boom", Attempt(false)).map(drop))?;
+            Ok(())
+        })?;
+        Ok(())
+    });
+
+    /// `?` across two block boundaries and out of the playbook: failed, and
+    /// the `Failed` frame names where, so the closing line can print
+    /// `FAILED at [outer][inner] `boom``.
+    #[test]
+    fn a_failure_escaping_nested_blocks_fails_the_host_and_names_its_blocks() {
+        let (code, events) = run(&ESCAPES_FROM_NESTED_BLOCKS, false);
+        assert_eq!(verdict(&events), (1, 0));
+        assert_eq!(
+            failed_frames(&events),
+            [(Some("boom".into()), vec!["outer".into(), "inner".into()])]
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static CAUGHT_BY_THE_BLOCK_BODY: Playbook = playbook!(|ctx, _| {
+        ctx.block("outer", |ctx| {
+            if ctx
+                .block("inner", |ctx| ctx.step("boom", Attempt(false)).map(drop))
+                .is_err()
+            {
+                ctx.step("fallback", Attempt(true))?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    });
+
+    /// A block whose `Err` its enclosing block catches: recovered, and the
+    /// host succeeds.
+    #[test]
+    fn a_failure_caught_by_an_enclosing_block_is_recovered() {
+        let (code, events) = run(&CAUGHT_BY_THE_BLOCK_BODY, false);
+        assert_eq!(verdict(&events), (0, 1));
+        assert!(failed_frames(&events).is_empty(), "{events:#?}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    static READ_INSIDE_AN_OP_CAUGHT: Playbook = playbook!(|ctx, _| {
+        let got = ctx.step("read", WouldChange)?;
+        let _ = ctx.step("uses it", ReadsInCheck(got)).ok();
+        ctx.step("after", WouldChange)?;
+        Ok(())
+    });
+
+    /// Decision (b)'s step failure follows the same rule: caught, it is
+    /// recovered, and the host succeeds.
+    #[test]
+    fn under_check_a_caught_read_inside_an_op_is_recovered() {
+        let (code, events) = run(&READ_INSIDE_AN_OP_CAUGHT, true);
+        assert_eq!(verdict(&events), (0, 1));
+        assert_eq!(summary_of(&events).would_change, 2);
+        assert!(failed_frames(&events).is_empty(), "{events:#?}");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    static CAUGHT_THEN_ABSORBED: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("optional", Attempt(false)).ok();
+        let got = ctx.step("read", WouldChange)?;
+        let _ = *got;
+        ctx.step("never reached", WouldChange)?;
+        Ok(())
+    });
+
+    /// Absorption is neither failed nor recovered: the caught step is the
+    /// only one counted, and the dry run's early end fails nothing.
+    #[test]
+    fn under_check_an_absorbed_read_is_neither_failed_nor_recovered() {
+        let (code, events) = run(&CAUGHT_THEN_ABSORBED, true);
+        assert_eq!(verdict(&events), (0, 1));
+        assert_eq!(warnings_in(&events), [TOP_LEVEL]);
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    thread_local! {
+        /// The channel the cancelling ops below cancel: `execute` runs the
+        /// playbook on the test's own thread.
+        static CHANNEL: std::cell::RefCell<Option<Arc<Channel>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn cancel_this_run() {
+        CHANNEL.with(|c| {
+            c.borrow()
+                .as_ref()
+                .expect("the test set the channel")
+                .cancel("cancelled by the test")
+        });
+    }
+
+    /// Cancels the run from inside `check`, as a `Cancel` frame arriving
+    /// mid-step does, then plans a change: the step is stopped before
+    /// `apply`, "not applied".
+    struct CancelledMidStep;
+
+    impl crate::op::Op for CancelledMidStep {
+        type Output = u32;
+        type Intent = Go;
+        fn check(&self, _: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            cancel_this_run();
+            Ok(crate::op::Plan::Change(Go))
+        }
+        fn apply(&self, _: &crate::system::System, Go: Go) -> crate::Result<u32> {
+            Ok(1)
+        }
+    }
+
+    /// An op that gives up because the run was cancelled under it.
+    struct GivesUpOnCancel;
+
+    impl crate::op::Op for GivesUpOnCancel {
+        type Output = ();
+        type Intent = std::convert::Infallible;
+        fn check(&self, _: &crate::system::System) -> crate::Result<crate::op::Plan<Self>> {
+            cancel_this_run();
+            Err(crate::Error::msg("stopped waiting: the run was cancelled"))
+        }
+        fn apply(&self, _: &crate::system::System, intent: Self::Intent) -> crate::Result<()> {
+            match intent {}
+        }
+    }
+
+    fn cancellable() -> Arc<Channel> {
+        let channel = Channel::detached();
+        CHANNEL.with(|c| *c.borrow_mut() = Some(channel.clone()));
+        channel
+    }
+
+    static SWALLOWS_EVERYTHING: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("a", Attempt(false)).ok();
+        let _ = ctx.step("b", CancelledMidStep).ok();
+        let _ = ctx.step("c", Attempt(true)).ok();
+        Ok(())
+    });
+
+    /// A cancelled run fails the host even when the playbook swallows every
+    /// error and returns `Ok`: the step the cancellation stopped is failed,
+    /// never recovered, and the one caught before it stays recovered. The
+    /// `Failed` frame says why, since no error left the playbook to say it.
+    #[test]
+    fn a_cancelled_run_fails_the_host_even_when_every_error_is_swallowed() {
+        let (code, events) = run_on(&SWALLOWS_EVERYTHING, false, cancellable());
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_in(&events), ["cancelled: cancelled by the test"]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        // `c` was refused before it started: no step events, no count.
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::StepStarted { name, .. } if name == "c"
+        )));
+    }
+
+    static SWALLOWS_AN_OP_THAT_GAVE_UP: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("waits", GivesUpOnCancel).ok();
+        Ok(())
+    });
+
+    /// A step whose own op gave up because of the cancellation failed
+    /// because the run was cancelled, and is never recovered.
+    #[test]
+    fn a_step_that_failed_once_the_run_was_cancelled_is_failed_even_when_caught() {
+        let (code, events) = run_on(&SWALLOWS_AN_OP_THAT_GAVE_UP, false, cancellable());
+        assert_eq!(verdict(&events), (1, 0));
+        assert_exit_matches(code, &events);
+    }
+
+    static ONLY_REFUSED_STEPS: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("a", Attempt(true)).ok();
+        Ok(())
+    });
+
+    /// Cancelled before any step started: nothing is recorded, and the host
+    /// fails by the floor of one.
+    #[test]
+    fn a_run_cancelled_before_any_step_still_fails_the_host() {
+        let channel = cancellable();
+        channel.cancel("cancelled by the test");
+        let (code, events) = run_on(&ONLY_REFUSED_STEPS, false, channel);
+        assert_eq!(verdict(&events), (1, 0));
+        assert_eq!(failed_in(&events), ["cancelled: cancelled by the test"]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static CANCELLED_AND_ESCAPED: Playbook = playbook!(|ctx, _| {
+        ctx.step("b", CancelledMidStep)?;
+        Ok(())
+    });
+
+    /// A cancelled step whose error leaves the playbook is reported once:
+    /// the frame for the escaped error, no second one for the cancellation.
+    #[test]
+    fn a_cancelled_step_that_escapes_is_reported_once() {
+        let (code, events) = run_on(&CANCELLED_AND_ESCAPED, false, cancellable());
+        assert_eq!(verdict(&events), (1, 0));
+        assert_eq!(failed_frames(&events), [(Some("b".into()), vec![])]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    /// The `Failed` frames' step ids, in order.
+    fn failed_ids(events: &[Event]) -> Vec<Option<u32>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Failed { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    static RETURNS_AN_EARLIER_ERROR: Playbook = playbook!(|ctx, _| {
+        let a = ctx.step("a", Attempt(false)).map(drop);
+        let _ = ctx.step("b", Attempt(false)).ok();
+        a
+    });
+
+    /// The escaping error is matched to its own step, not to the last one
+    /// that failed: `a`'s error is returned after `b` failed and was caught,
+    /// so `a` is failed and `b` recovered, and the frame names `a`.
+    #[test]
+    fn an_earlier_steps_error_returned_later_fails_that_step() {
+        let (code, events) = run(&RETURNS_AN_EARLIER_ERROR, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("a".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [Some(1)]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static A_SECOND_CTX_CLAIMS_NOTHING: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("main1", Attempt(false)).ok();
+        // Ids restart at 1 in a new context: its step 1 is not this run's.
+        let mut other = Ctx::new(ctx.sys().clone(), HostInfo::local());
+        other.step("other", Attempt(false))?;
+        Ok(())
+    });
+
+    /// An error from a second `Ctx` carries an id this run also drew, and
+    /// must not claim it: `main1` stays recovered, and the host fails by the
+    /// floor of one, with a frame that names `other` and no id.
+    #[test]
+    fn an_error_from_a_second_ctx_does_not_claim_this_runs_step() {
+        let (code, events) = run(&A_SECOND_CTX_CLAIMS_NOTHING, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("other".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [None]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static UNDER_CHECK_CANCELLED_THEN_ABSORBED: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("optional", Attempt(false)).ok();
+        let got = ctx.step("read", CancelledMidStep)?;
+        let _ = *got;
+        ctx.step("never reached", WouldChange)?;
+        Ok(())
+    });
+
+    /// Under `--check` too, a cancelled run fails the host: the read that
+    /// ends the dry run is absorbed as usual, with its warning, and the
+    /// cancellation is what fails the host, said by its own frame.
+    #[test]
+    fn under_check_a_cancelled_run_fails_the_host_even_when_the_rest_is_absorbed() {
+        let (code, events) = run_on(&UNDER_CHECK_CANCELLED_THEN_ABSORBED, true, cancellable());
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(warnings_in(&events), [TOP_LEVEL]);
+        assert_eq!(failed_in(&events), ["cancelled: cancelled by the test"]);
+        assert_eq!(failed_ids(&events), [None]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    // ---- classify: tier 1 ----
+
+    fn step(id: u32) -> FailedStep {
+        FailedStep {
+            id,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn classify_is_by_id_and_floors_a_failed_host_at_one() {
+        let five = [step(1), step(2), step(3), step(4), step(5)];
+        assert_eq!(classify(&five, Some(5), true), (1, 4));
+        assert_eq!(classify(&five, None, false), (0, 5));
+        assert_eq!(classify(&five, None, true), (1, 5), "bail! after catching");
+        assert_eq!(
+            classify(&five, Some(99), true),
+            (1, 5),
+            "an id no step drew"
+        );
+        assert_eq!(classify(&[], None, true), (1, 0), "a panic with no step");
+        assert_eq!(classify(&[], None, false), (0, 0));
+        let cancelled = [
+            step(1),
+            FailedStep {
+                id: 2,
+                cancelled: true,
+            },
+        ];
+        assert_eq!(classify(&cancelled, None, true), (1, 1));
+        assert_eq!(classify(&cancelled, Some(2), true), (1, 1), "counted once");
+        assert_eq!(classify(&cancelled, Some(1), true), (2, 0));
     }
 
     /// The run's system carries the login's origin into every escalation

@@ -36,7 +36,10 @@ use crate::secret::Secret;
 /// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
 /// 6: the playbook's `ssh_user` — `--describe` entries carry `ssh_user`, and
 /// `Start.host` carries `login_override`.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: the host's verdict is what the playbook returns — `Summary.recovered`
+/// counts the failed steps the playbook caught, `Summary.failed` only those
+/// that failed the host, and `Failed` carries the step's `id` and `blocks`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -528,12 +531,12 @@ mod tests {
     /// attribute chose the login, what the inventory would have used, so the
     /// binary's escalation failures can say so. An orchestrator that sets
     /// nothing sends the same bytes as before, and a `Start` without the
-    /// field reads as "the inventory chose".
+    /// field reads as "the inventory chose". The number itself is pinned by
+    /// the newest version's test.
     #[test]
     fn protocol_6_carries_the_login_override() {
         use crate::ctx::{InventoryLogin, LoginOverride};
 
-        assert_eq!(PROTOCOL_VERSION, 6);
         let mut host = HostInfo::local();
         let plain = serde_json::to_value(&host).unwrap();
         assert!(plain.get("login_override").is_none(), "{plain}");
@@ -561,5 +564,53 @@ mod tests {
             panic!("not Start")
         };
         assert!(host.login_override.is_none());
+    }
+
+    /// Version 7 is the host's verdict as the playbook returns it (#44):
+    /// `Summary` gains `recovered` beside a `failed` that no longer counts
+    /// every failed step, and `Failed` names the failed step's id and block
+    /// path.
+    /// The meaning of `failed` moved with it, so a version-6 peer would
+    /// disagree about a host without failing to parse anything: the number
+    /// is what stops a mixed pair. Pinned here so the shape and the number
+    /// move together.
+    #[test]
+    fn protocol_7_carries_recovered_and_the_failed_steps_blocks() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+        let summary = crate::event::Summary {
+            ok: 4,
+            changed: 1,
+            failed: 0,
+            recovered: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Event::Finished(summary)).unwrap(),
+            r#"{"Finished":{"ok":4,"changed":1,"would_change":0,"skipped":0,"failed":0,"recovered":2,"warnings":0}}"#
+        );
+        let failed = Event::Failed {
+            step: Some("boom".into()),
+            id: Some(7),
+            blocks: vec!["outer".into(), "inner".into()],
+            error: "step `boom`: nope".into(),
+            cmd: None,
+        };
+        let json = r#"{"Failed":{"step":"boom","id":7,"blocks":["outer","inner"],"error":"step `boom`: nope","cmd":null}}"#;
+        assert_eq!(serde_json::to_string(&failed).unwrap(), json);
+        let Event::Failed { id, blocks, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not Failed")
+        };
+        assert_eq!(
+            id,
+            Some(7),
+            "the id is what pairs the frame with its step line"
+        );
+        assert_eq!(blocks, ["outer", "inner"]);
+        // A version-6 summary, with no `recovered`, does not read, and nor
+        // does a version-6 `Failed`, with no `id` or `blocks`.
+        let old = r#"{"Finished":{"ok":1,"changed":0,"would_change":0,"skipped":0,"failed":0,"warnings":0}}"#;
+        assert!(serde_json::from_str::<Event>(old).is_err());
+        let old = r#"{"Failed":{"step":"boom","error":"step `boom`: nope","cmd":null}}"#;
+        assert!(serde_json::from_str::<Event>(old).is_err());
     }
 }
