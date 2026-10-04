@@ -216,8 +216,9 @@ pub struct Ctx {
     shared: Rc<Shared>,
 }
 
-/// Where each [`Shared`]'s token comes from. Starts at 1 so no run's token
-/// is the 0 a hand-built `StepFailed` carries.
+/// Where each [`Shared`]'s token comes from. A hand-built `StepFailed`
+/// carries token 0, but that is not what keeps it from being claimed: it has
+/// no id, and `StepFailed::origin` is `None` without one, whatever the token.
 static NEXT_RUN_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// One enclosing [`Ctx::block`], as the steps inside it see it.
@@ -661,7 +662,7 @@ impl Ctx {
                     missing: None,
                 });
             }
-            // A step that failed is counted and stays a failure, even when
+            // A step that failed is recorded and stays a failure, even when
             // what failed was a read of a missing output inside its op.
             Ok(Err(e)) => match e.downcast_ref::<OutputUnavailable>() {
                 Some(u) if check_mode && e.step_failed().is_none() => u.step.clone(),

@@ -1233,6 +1233,10 @@ playbook catches the error.
 or `Error::msg(..)` makes a new error, so the step it came from counts as
 `recovered` while the host still fails.
 
+⚠️ `.unwrap()` or `.expect(..)` on a step's error panics, and the step then
+counts as `recovered` while the host fails. Use `?`, which names the step as
+the failure.
+
 **Hosts run in parallel, and one failing does not stop the others.** Every
 host runs to completion; the summary says which failed, and the process exits
 `2`. There is no `serial:` or `any_errors_fatal:` — to roll a change out in

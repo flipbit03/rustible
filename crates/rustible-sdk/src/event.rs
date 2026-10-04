@@ -132,10 +132,12 @@ pub enum Event {
         /// [`always_changes`](crate::op::Op::always_changes) is true, and
         /// `ran, unchanged` for an apply that reported no change. `rustible`
         /// holds a failed step's chain back: a [`Failed`](Event::Failed)
-        /// frame for the same step (the same id, name and blocks) arriving
-        /// next prints it instead; any other event arriving first prints it
-        /// then, so a failure the playbook caught (`recovered`) still shows
-        /// why.
+        /// frame for the same step (the same id, name and blocks) prints it
+        /// instead. The next step starting or being skipped, a `Failed`
+        /// frame for another failure, `Finished` or the end of the host
+        /// prints it first, so a failure the playbook caught (`recovered`)
+        /// still shows why. Logs and commands from outside a step that
+        /// arrive meanwhile print after it, and block events print nothing.
         note: Option<String>,
         /// Wall clock across both phases, from just before `check` to the
         /// moment the status was decided. The integration harness records it

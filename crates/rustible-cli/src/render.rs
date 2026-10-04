@@ -35,9 +35,11 @@ struct HostState {
     exit: Option<i32>,
     /// A step reported `Failed` with its chain in `note`. If its error is
     /// the one that failed the host, the binary's `Failed` frame for the same
-    /// step follows at once and prints the chain. If anything else comes
-    /// first (the playbook caught the error: the step is `recovered`), the
-    /// chain prints from here, before it.
+    /// step prints the chain. Otherwise (the playbook caught the error: the
+    /// step is `recovered`) it prints from here, by `flush`: when the next
+    /// step starts or is skipped, before a `Failed` frame for another
+    /// failure, at `Finished`, or when the host ends. Lines from outside a
+    /// step that arrive meanwhile queue in `after` and print after it.
     pending_fail: Option<PendingFail>,
     /// The failed steps whose chain was printed from `pending_fail`, with
     /// the chain as printed, so a `Failed` frame that names one later (an
