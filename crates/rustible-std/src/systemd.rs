@@ -3197,11 +3197,10 @@ mod tests {
         fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
             if p == Path::new(SOCKET) {
                 self.looks.fetch_add(1, Ordering::SeqCst);
-                let denying = self
-                    .denied
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok();
-                if denying {
+                // One `check` stats from one thread, so load then subtract
+                // cannot race.
+                if self.denied.load(Ordering::SeqCst) > 0 {
+                    self.denied.fetch_sub(1, Ordering::SeqCst);
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                 }
             }
