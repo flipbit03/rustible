@@ -193,7 +193,9 @@ pub struct HostParams {
     /// `ssh_args "-o" "StrictHostKeyChecking=no"` for several. Using both on
     /// one node is a load error. The list is not merged across levels: the
     /// nearest level that sets it wins whole, and the rest are reported as
-    /// overridden. The built-in default is empty.
+    /// overridden. Options it may not set are a load error
+    /// ([`ssh_args_problems`](super::ssh_args_problems)). The built-in
+    /// default is empty.
     pub ssh_args: Option<Vec<String>>,
 }
 

@@ -952,6 +952,63 @@ fn an_unusable_ssh_user_is_a_load_error() {
     );
 }
 
+/// `ssh_args` come first on ssh's command line and ssh keeps the first value,
+/// so what they may not set is refused at load, at every level, in both
+/// spellings, naming the node (`ssh_args.rs` has every option spelling).
+#[test]
+fn ssh_args_that_would_win_silently_are_a_load_error() {
+    one_error(
+        "host \"h\" addr=\"10.0.0.1\" ssh_args=\"-M\"\n",
+        1,
+        26,
+        "`ssh_args` on host `h` sets `ControlMaster` (`-M`), which Rustible's ssh connection depends on",
+    );
+    one_error(
+        "group \"g\" {\n    ssh_args \"-o\" \"BatchMode=no\"\n    host \"h\" addr=\"10.0.0.1\"\n}\n",
+        2,
+        5,
+        "`ssh_args` on group `g` sets `BatchMode` (`-o BatchMode=no`)",
+    );
+    one_error(
+        "defaults {\n    ssh_args \"-l\" \"admin\"\n}\nhost \"h\" addr=\"10.0.0.1\"\n",
+        2,
+        5,
+        "`ssh_args` on `defaults` sets the login user (`-l admin`); use the parameter `ssh_user=\"admin\"` instead",
+    );
+    one_error(
+        "defaults ssh_args=\"-p2222\"\nhost \"h\" addr=\"10.0.0.1\"\n",
+        1,
+        10,
+        "`ssh_args` on `defaults` sets the port (`-p2222`); use the parameter `port=2222` instead",
+    );
+    one_error(
+        "host \"h\" addr=\"10.0.0.1\" {\n    ssh_args \"-o\" \"IdentitiesOnly=yes\" \"-i\"\n}\n",
+        2,
+        5,
+        "`ssh_args` on host `h` ends with `-i`, which needs a value",
+    );
+    // Every problem in one `ssh_args` is reported, not only the first.
+    let errs =
+        errors("host \"h\" addr=\"10.0.0.1\" {\n    ssh_args \"-o\" \"User=x\" \"-NM\"\n}\n");
+    assert_eq!(errs.len(), 3, "{}", LoadErrors(errs.clone()));
+}
+
+#[test]
+fn ssh_args_that_only_add_to_ssh_still_load() {
+    let inv = load(
+        r#"
+host "vagrant" addr="192.168.121.10" ssh_user="vagrant" port=22 {
+    ssh_args "-i" "/home/me/.vagrant.d/key" "-o" "IdentitiesOnly=yes" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null"
+}
+host "gate" addr="10.0.0.1" ssh_args="-4"
+host "jump" addr="10.0.0.2" {
+    ssh_args "-o" "StrictHostKeyChecking=no" "-o" "ProxyJump=bastion"
+}
+"#,
+    );
+    assert_eq!(inv.resolve("vagrant").unwrap().params.ssh_args.len(), 8);
+}
+
 #[test]
 fn an_account_name_that_is_only_a_flag_is_refused() {
     // `sudo -u -x` would read the value as an option.

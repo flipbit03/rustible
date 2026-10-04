@@ -13,6 +13,7 @@ use rustible_sdk::vars::did_you_mean;
 use super::error::{LineIndex, LoadError, LoadErrors};
 use super::model::{Connection, Escalate, Group, Host, HostParams, Inventory, Scalar, VarBag};
 use super::resolve::Conflict;
+use super::ssh_args::ssh_args_problems;
 
 /// Reject a `ssh_user` or `escalate_user` that cannot name an account.
 ///
@@ -446,6 +447,9 @@ impl<'a> Parser<'a> {
                             ),
                         }
                     }
+                    for problem in ssh_args_problems(&args) {
+                        self.err(at, format!("`ssh_args` on {owner} {problem}"));
+                    }
                     params.ssh_args = Some(args);
                 }
                 "members" | "host" if allowed.contains(&child.name().value()) => {}
@@ -582,7 +586,11 @@ impl<'a> Parser<'a> {
                 let s = want_string!(
                     "a string (for several, use the child node `ssh_args \"-o\" \"...\"`)"
                 );
-                params.ssh_args = Some(vec![s]);
+                let args = vec![s];
+                for problem in ssh_args_problems(&args) {
+                    self.err(at, format!("`ssh_args` on {owner} {problem}"));
+                }
+                params.ssh_args = Some(args);
             }
             other => {
                 let msg = match did_you_mean(other, HostParams::NAMES.iter().copied()) {
