@@ -59,7 +59,8 @@
 //! manager, so when the socket is missing but the account has linger, a real
 //! run polls for it every 100 ms for up to `.manager_timeout(..)`
 //! ([`DEFAULT_MANAGER_TIMEOUT`], 30 s) and refuses, naming
-//! `systemctl status user@<uid>.service`, if it does not appear. Without
+//! `systemctl status user@<uid>.service` and, for a manager that stopped or
+//! failed, `systemctl start user@<uid>.service`, if it does not appear. Without
 //! linger nothing is starting a manager, so the step refuses at once and
 //! says how to give the account one. Under `--check`, where an earlier step
 //! may be the one enabling linger, nothing waits: the step reports `would
@@ -382,8 +383,11 @@ impl Runtime {
             if sys.exists(&dir)? {
                 bail!(
                     "systemd::{op}: the user manager of `{account}` is not running: {dir} exists \
-                     but {socket} does not, and `{account}` has no linger to start it; check \
-                     `systemctl status user@{uid}.service`"
+                     but {socket} does not, and `{account}` has no linger to start it. logind does \
+                     not restart a user@{uid}.service that stopped or failed: check `systemctl \
+                     status user@{uid}.service`, then start it as root (`systemctl start \
+                     user@{uid}.service`), or give `{account}` linger (`loginctl enable-linger \
+                     {account}`) to keep one running"
                 );
             }
             bail!(
@@ -437,7 +441,9 @@ fn wait(
             bail!(
                 "systemd::{op}: the user manager of `{account}` (uid {uid}) did not come up: \
                  {socket} was still missing after waiting {} although linger is enabled \
-                 ({linger}); check `systemctl status user@{uid}.service`",
+                 ({linger}). logind starts user@{uid}.service for linger but does not restart \
+                 it once it has stopped or failed: check `systemctl status user@{uid}.service`, \
+                 then start it as root with `systemctl start user@{uid}.service`",
                 human(timeout)
             );
         }
@@ -466,12 +472,15 @@ fn denied(e: &Error) -> bool {
         .is_some_and(|io| io.source.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
-/// A timeout as a reader wrote it: `30s`, `250ms`.
+/// A timeout as a reader wrote it: `30s`, `250ms`, and anything finer as
+/// `Duration`'s own `500µs` or `1.5ms`.
 fn human(d: Duration) -> String {
-    if d.subsec_millis() == 0 {
+    if d.subsec_nanos() == 0 {
         format!("{}s", d.as_secs())
-    } else {
+    } else if d.subsec_nanos().is_multiple_of(1_000_000) {
         format!("{}ms", d.as_millis())
+    } else {
+        format!("{d:?}")
     }
 }
 
@@ -1725,6 +1734,23 @@ mod tests {
         assert!(validate_unit("getty@tty1.service").is_ok());
         for bad in ["", "a b", "-x", "a\nb", "\tnginx"] {
             assert!(validate_unit(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Whole seconds and whole milliseconds as written; anything finer is
+    /// not rounded down to `0s`.
+    #[test]
+    fn human_renders_a_timeout_as_written() {
+        for (d, want) in [
+            (Duration::ZERO, "0s"),
+            (Duration::from_secs(30), "30s"),
+            (Duration::from_millis(250), "250ms"),
+            (Duration::from_millis(1500), "1500ms"),
+            (Duration::from_micros(500), "500µs"),
+            (Duration::from_micros(1500), "1.5ms"),
+            (Duration::from_nanos(1), "1ns"),
+        ] {
+            assert_eq!(human(d), want, "{d:?}");
         }
     }
 
@@ -3281,26 +3307,30 @@ mod tests {
             err,
             "systemd::Enabled: the user manager of `minecraft` (uid 1002) did not come up: \
              /run/user/1002/systemd/private was still missing after waiting 300ms although \
-             linger is enabled (/var/lib/systemd/linger/minecraft); check \
-             `systemctl status user@1002.service`"
+             linger is enabled (/var/lib/systemd/linger/minecraft). logind starts \
+             user@1002.service for linger but does not restart it once it has stopped or \
+             failed: check `systemctl status user@1002.service`, then start it as root with \
+             `systemctl start user@1002.service`"
         );
         assert_eq!(fake.argvs().len(), 1, "{:?}", fake.argvs());
     }
 
-    /// `Duration::ZERO` does not wait: one look, then the refusal. The
-    /// default (30 s) on the same box would block; the bound below is a
-    /// fraction of a single poll.
+    /// `Duration::ZERO` does not wait: one look at the socket, then the
+    /// refusal. The count is what proves no poll ran; the time bound only
+    /// proves the 30 s default did not apply, loose enough for a slow runner.
     #[test]
     fn user_mode_with_a_zero_manager_timeout_refuses_at_once() {
         let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
         let t0 = Instant::now();
         let err = Restart::new("nginx")
             .user(true)
             .manager_timeout(Duration::ZERO)
-            .check(&sys(&fake).as_user("minecraft"))
+            .check(&watched.sys())
             .unwrap_err()
             .chain();
-        assert!(t0.elapsed() < MANAGER_POLL, "{:?}", t0.elapsed());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(watched.looks(), 1);
         assert!(err.contains("still missing after waiting 0s"), "{err}");
     }
 
@@ -3461,20 +3491,26 @@ mod tests {
             err,
             "systemd::Enabled: the user manager of `minecraft` is not running: /run/user/1002 \
              exists but /run/user/1002/systemd/private does not, and `minecraft` has no linger \
-             to start it; check `systemctl status user@1002.service`"
+             to start it. logind does not restart a user@1002.service that stopped or failed: \
+             check `systemctl status user@1002.service`, then start it as root (`systemctl \
+             start user@1002.service`), or give `minecraft` linger (`loginctl enable-linger \
+             minecraft`) to keep one running"
         );
     }
 
-    /// A dry run never sleeps, linger or not: it reports what it waits for.
+    /// A dry run never sleeps, linger or not: it looks once and reports
+    /// what it waits for. The bound only has to beat the 30 s default.
     #[test]
     fn user_mode_does_not_wait_under_check() {
         let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
         let t0 = Instant::now();
         let plan = Enabled::new("nginx")
             .user(true)
-            .check(&sys(&fake).as_user("minecraft").with_check_mode(true))
+            .check(&watched.sys().with_check_mode(true))
             .unwrap();
-        assert!(t0.elapsed() < MANAGER_POLL, "{:?}", t0.elapsed());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(watched.looks(), 1);
         assert!(
             change(plan)
                 .diff()
