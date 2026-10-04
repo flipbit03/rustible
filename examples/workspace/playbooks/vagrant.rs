@@ -9,6 +9,12 @@
 //! It also makes the account `vagrant_login.rs` logs in as, with the keys
 //! the box's own login accepts, so that playbook's `ssh_user` can reach it
 //! with the inventory's key.
+//!
+//! And it steps into two unprivileged accounts with `ctx.as_user`, which
+//! cannot run the login's copy of this binary: one with a home, where the
+//! helper streams its own copy into the account's cache (cold on the first
+//! run, cached on the second), and a system account with none, which gets a
+//! private per-run copy in the temp directory every time.
 
 use std::time::Duration;
 
@@ -24,6 +30,16 @@ const LOGIN_ACCOUNT: &str = "rustible-login";
 
 /// The keys the box's login accepts; the inventory's `-i` is one of them.
 const BOX_KEYS: &str = "/home/vagrant/.ssh/authorized_keys";
+
+/// A system account with no home, for an `as_user` helper that has nowhere
+/// to cache its copy of the binary.
+const NOHOME_ACCOUNT: &str = "rustible-nohome";
+
+/// Somewhere `NOHOME_ACCOUNT` may write, since it has no home.
+const NOHOME_DIR: &str = "/var/lib/rustible-nohome";
+
+/// What the `as_user` steps write, each as its own account.
+const AS_USER_MARKER: &str = "written by rustible's as_user helper\n";
 
 #[rustible::vars]
 struct Vars {
@@ -63,6 +79,19 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     ensure!(!keys.is_empty(), "{BOX_KEYS} has no keys to give {LOGIN_ACCOUNT}");
     let account = ctx.step(format!("{LOGIN_ACCOUNT} account"), user::Present::new(LOGIN_ACCOUNT).create_home(true))?;
     ctx.step(format!("{LOGIN_ACCOUNT} keys"), authorized_keys::Present::for_user(&account).keys(keys))?;
+
+    // `as_user` to an account that cannot read the login's home. Debian
+    // makes homes 0755, which would hide that; Ubuntu makes them 0750, as
+    // this one is made. The marker is 0600 and written by the helper, so its
+    // owner is the proof of who wrote it.
+    ctx.step("login home private", file::Attrs::at("/home/vagrant").mode(0o750))?;
+    ctx.as_user(LOGIN_ACCOUNT).step(format!("marker as {LOGIN_ACCOUNT}"), file::Copy::from_str(AS_USER_MARKER).to(format!("/home/{LOGIN_ACCOUNT}/as-user-marker")).mode(0o600))?;
+
+    // An account with no home at all: its helper runs from a private copy
+    // in the temp directory, which removes itself.
+    let nohome = ctx.step(format!("{NOHOME_ACCOUNT} account"), user::Present::new(NOHOME_ACCOUNT).system(true).create_home(false).home("/nonexistent"))?;
+    ctx.step(NOHOME_DIR, file::Directory::at(NOHOME_DIR).owner(nohome.uid, nohome.gid).mode(0o700))?;
+    ctx.as_user(NOHOME_ACCOUNT).step(format!("marker as {NOHOME_ACCOUNT}"), file::Copy::from_str(AS_USER_MARKER).to(format!("{NOHOME_DIR}/as-user-marker")).mode(0o600))?;
 
     Ok(())
 }
