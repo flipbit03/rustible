@@ -81,7 +81,7 @@ pub const INSTALL: &str = concat!(
     r#"cat > "$t" || { echo "rustible: cannot write to $d" >&2; exit 10; }; "#,
     r#"n=$(wc -c < "$t" | tr -d ' '); "#,
     r#"[ "$n" = "$2" ] || { echo "rustible: received $n of $2 bytes for $d/$1" >&2; exit 1; }; "#,
-    r#"chmod 700 -- "$t" && mv -f -- "$t" "$d/$1" || exit 1; "#,
+    r#"chmod -- 700 "$t" && mv -f -- "$t" "$d/$1" || exit 1; "#,
     r#"[ -x "$d/$1" ] || { rm -f -- "$d/$1"; echo "rustible: $d is on a noexec filesystem" >&2; exit 11; }; "#,
     "exit 0",
 );
@@ -864,6 +864,15 @@ mod tests {
             std::fs::read(dir.path().join("-p/rustible-feed").join(NAME)).unwrap(),
             BIN
         );
+    }
+
+    /// `--` ends the options, so it goes before every operand, a mode
+    /// included: BSD `chmod 700 -- f` reads `--` as a file, and GNU
+    /// `chmod 700 -p/f` reads `-p/f` as options.
+    #[test]
+    fn end_of_options_precedes_every_operand() {
+        assert!(INSTALL.contains(r#"chmod -- 700 "$t""#), "{INSTALL}");
+        assert!(!INSTALL.contains("chmod 700"), "{INSTALL}");
     }
 
     /// Over ssh the command passes through the login's shell, and csh
