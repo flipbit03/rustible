@@ -786,7 +786,7 @@ impl Enabled {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -894,7 +894,7 @@ impl Disabled {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -1005,7 +1005,7 @@ impl Running {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -1074,7 +1074,7 @@ impl Stopped {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -1153,7 +1153,7 @@ impl Restart {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -1243,7 +1243,7 @@ impl Reload {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger, and refuses without one.
+    /// while it has a login session or linger; a real run refuses without one.
     /// `loginctl enable-linger` returns before logind has started the
     /// manager, so a playbook that enables linger and steps straight into
     /// the account can hit that refusal; `systemctl start
@@ -1339,8 +1339,8 @@ impl DaemonReload {
     /// Reload the user manager (`systemctl --user daemon-reload`) of the
     /// account the step runs as: the binary's own user, or the target of
     /// `ctx.as_user(..)`. Needs no root, but needs that account's user
-    /// manager, which runs while it has a login session or linger, and
-    /// refuses without one. `loginctl enable-linger` returns before logind
+    /// manager, which runs while it has a login session or linger; a real
+    /// run refuses without one. `loginctl enable-linger` returns before logind
     /// has started the manager, so a playbook that enables linger and steps
     /// straight into the account can hit that refusal; `systemctl start
     /// user@<uid>.service` as root, in between, waits for it. See [the
