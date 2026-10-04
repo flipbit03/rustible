@@ -881,7 +881,7 @@ mod tests {
             for (i, _) in script.match_indices(" -- ") {
                 let head = &script[..i];
                 let start = head
-                    .rfind(|c| matches!(c, '(' | ';' | '{' | '&' | '|' | '\''))
+                    .rfind(['(', ';', '{', '&', '|', '\''])
                     .map_or(0, |p| p + 1);
                 let words: Vec<&str> = head[start..].split_whitespace().collect();
                 let (utility, flags) = words.split_first().unwrap();
