@@ -9,6 +9,7 @@
 //! own line, so every line stands on its own however hosts interleave; a
 //! block prints no line of its own. A summary table closes the run.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -33,21 +34,32 @@ struct HostState {
     error: Option<String>,
     exit: Option<i32>,
     /// A step reported `Failed` with its chain in `note`. If its error is
-    /// the one that failed the host, the binary's `Failed` frame carrying the
-    /// same step id follows and prints the chain once. If it does not (the playbook
-    /// caught the error: the step is `recovered`), the chain prints from
-    /// here, before whatever comes next.
+    /// the one that failed the host, the binary's `Failed` frame for the same
+    /// step follows at once and prints the chain. If anything else comes
+    /// first (the playbook caught the error: the step is `recovered`), the
+    /// chain prints from here, before it.
     pending_fail: Option<PendingFail>,
+    /// The failed steps whose chain was printed from `pending_fail`, so a
+    /// `Failed` frame that names one later (an error the playbook kept and
+    /// returned after other steps) closes it without printing it twice.
+    shown: Vec<FailKey>,
+}
+
+/// Which failed step a chain or a `Failed` frame belongs to: its id, block
+/// path and name. The id alone is not enough, because every `Ctx` a playbook
+/// makes numbers its steps from 1; the name alone is not, because names
+/// repeat.
+#[derive(Clone, PartialEq, Eq)]
+struct FailKey {
+    id: u32,
+    blocks: Vec<String>,
+    step: String,
 }
 
 /// A failed step's chain, held back until it is known whether a `Failed`
 /// frame will print it.
 struct PendingFail {
-    /// The step's id, which a `Failed` frame for the same failure carries.
-    /// Names repeat (a retry reuses one), so the name is never matched on.
-    id: u32,
-    blocks: Vec<String>,
-    step: String,
+    key: FailKey,
     chain: String,
     /// Lines from outside any step that arrived while the chain was held
     /// back, typically the playbook's own word on the failure it caught
@@ -111,11 +123,16 @@ impl<W: Write> Renderer<W> {
         if let Some(p) = self.state(host).pending_fail.take() {
             self.line(
                 host,
-                &format!("FAILED at {}: {}", failed_at(&p.blocks, &p.step), p.chain),
+                &format!(
+                    "FAILED at {}: {}",
+                    failed_at(&p.key.blocks, &p.key.step),
+                    p.chain
+                ),
             );
             for l in p.after {
                 self.line(host, &l);
             }
+            self.state(host).shown.push(p.key);
         }
     }
 
@@ -188,9 +205,11 @@ impl<W: Write> Renderer<W> {
                 match note {
                     Some(chain) if *status == Status::Failed => {
                         pending = Some(PendingFail {
-                            id: *id,
-                            blocks: blocks.clone(),
-                            step: name.clone(),
+                            key: FailKey {
+                                id: *id,
+                                blocks: blocks.clone(),
+                                step: name.clone(),
+                            },
                             chain: chain.clone(),
                             after: vec![],
                         });
@@ -257,22 +276,39 @@ impl<W: Write> Renderer<W> {
                 cmd,
             } => {
                 let (step, error) = split_step(step.as_deref(), error);
-                // The frame carries the chain; the step line's copy is not
-                // needed when it is the same failure, which only the step id
-                // says. What was held back behind it still prints, before
-                // this line.
-                if let Some(p) = &self.state(host).pending_fail
-                    && *id == Some(p.id)
-                {
-                    let held = self.state(host).pending_fail.take();
-                    for l in held.map(|p| p.after).unwrap_or_default() {
-                        self.line(host, &l);
-                    }
-                }
+                // The failed step this frame closes, when it names one of
+                // this run's: by id, blocks and name together (see `FailKey`).
+                let key = match (id, step) {
+                    (Some(id), Some(step)) => Some(FailKey {
+                        id: *id,
+                        blocks: blocks.clone(),
+                        step: step.to_string(),
+                    }),
+                    _ => None,
+                };
+                let st = self.state(host);
+                let pending = st.pending_fail.take_if(|p| key.as_ref() == Some(&p.key));
+                // Anything else held back is a different failure, which the
+                // playbook caught: its reason prints first, in order.
                 self.flush(host);
-                let text = match step {
-                    Some(s) => format!("FAILED at {}: {error}", failed_at(blocks, s)),
-                    None => format!("FAILED: {error}"),
+                // Its reason was printed already, and no other failed step of
+                // the same name and blocks was, so "above" can only mean it.
+                // With such a twin the reason is printed again: repeated, but
+                // never ambiguous.
+                let st = self.state(host);
+                let shown = key.as_ref().is_some_and(|k| {
+                    st.shown.contains(k)
+                        && !st
+                            .shown
+                            .iter()
+                            .any(|o| o.step == k.step && o.blocks == k.blocks && o.id != k.id)
+                });
+                let text = match (step, shown) {
+                    // Printed already, when a later step began; this line
+                    // only says it is the one that failed the host.
+                    (Some(s), true) => format!("FAILED: {} (reason above)", failed_at(blocks, s)),
+                    (Some(s), false) => format!("FAILED at {}: {error}", failed_at(blocks, s)),
+                    (None, _) => format!("FAILED: {error}"),
                 };
                 self.line(host, &text);
                 if self.verbosity >= 1
@@ -285,6 +321,11 @@ impl<W: Write> Renderer<W> {
                     for l in c.stderr.lines() {
                         self.line(host, &format!("    {l}"));
                     }
+                }
+                // The reason first, then what the playbook printed after
+                // it, as for a failure it caught.
+                for l in pending.map(|p| p.after).unwrap_or_default() {
+                    self.line(host, &l);
                 }
             }
             Event::Finished(s) => {
@@ -414,24 +455,41 @@ fn step_line(blocks: &[String], name: &str, status: &str, tail: &str) -> String 
 /// `ctx.step` at all, and it is only a guess: a step name holding a backtick
 /// followed by a colon splits in the wrong place. That is why the field
 /// exists.
-fn split_step<'a>(step: Option<&'a str>, error: &'a str) -> (Option<&'a str>, &'a str) {
+fn split_step<'a>(step: Option<&'a str>, error: &'a str) -> (Option<&'a str>, Cow<'a, str>) {
     if let Some(s) = step {
-        let head = format!("step `{s}`");
-        let Some(rest) = error.strip_prefix(&head) else {
-            return (Some(s), error);
-        };
-        let cause = rest
-            .strip_prefix(": ")
-            .or_else(|| rest.strip_prefix(' '))
-            .unwrap_or(rest);
-        return (Some(s), cause);
+        return (Some(s), Cow::Owned(drop_step_layer(s, error)));
     }
     if let Some(rest) = error.strip_prefix("step `")
         && let Some((name, cause)) = rest.split_once("`: ")
     {
-        return (Some(name), cause);
+        return (Some(name), Cow::Borrowed(cause));
     }
-    (None, error)
+    (None, Cow::Borrowed(error))
+}
+
+/// `error` without the `` step `name` `` layer, wherever it sits: outermost
+/// for a bare `?`, further in when the playbook wrapped the step's error with
+/// `.context(..)` on its way out (`deploying the app: step `deploy`: ..`). A
+/// layer starts the chain or follows a `": "`, and is followed by `": "` or,
+/// for a cancelled step, by a space and the words after the name, which are
+/// part of the cause and stay. A chain without the layer is returned whole.
+fn drop_step_layer(step: &str, error: &str) -> String {
+    let head = format!("step `{step}`");
+    let mut from = 0;
+    while let Some(at) = error[from..].find(&head).map(|i| from + i) {
+        let rest = &error[at + head.len()..];
+        let rest = rest
+            .strip_prefix(": ")
+            .or_else(|| rest.strip_prefix(' '))
+            .or_else(|| rest.is_empty().then_some(rest));
+        if let Some(rest) = rest
+            && (at == 0 || error[..at].ends_with(": "))
+        {
+            return format!("{}{rest}", &error[..at]);
+        }
+        from = at + 1;
+    }
+    error.to_string()
 }
 
 /// A reason reduced to one line of at most `max` characters, for the summary
@@ -905,9 +963,9 @@ web1    4        1             0        0       0          2         0
         );
     }
 
-    /// What the playbook says about a failure it caught comes after the
-    /// reason the step failed, not before it; and when the error escapes
-    /// instead, the chain still prints once, from the frame.
+    /// What the playbook says about a failed step comes after the reason it
+    /// failed, never before it: when the playbook caught the error, and when
+    /// the error escapes and the frame prints the reason instead.
     #[test]
     fn a_line_after_a_held_back_chain_prints_after_it() {
         let mut finished = step_finished(1, "optional thing", Status::Failed);
@@ -954,9 +1012,173 @@ web1    4        1             0        0       0          2         0
             escaped,
             "\
 [local]  optional thing .......................................... FAILED
-[local]    WARNING: skipping: step `optional thing`: `false` exited 1
 [local]  FAILED at `optional thing`: `false` exited 1
+[local]    WARNING: skipping: step `optional thing`: `false` exited 1
 "
+        );
+    }
+
+    fn failing(id: u32, name: &str, why: &str) -> Event {
+        let mut ev = step_finished(id, name, Status::Failed);
+        if let Event::StepFinished { note, .. } = &mut ev {
+            *note = Some(why.into());
+        }
+        ev
+    }
+
+    fn failed_frame(step: Option<&str>, id: Option<u32>, error: &str) -> Event {
+        Event::Failed {
+            step: step.map(String::from),
+            id,
+            blocks: vec![],
+            error: error.into(),
+            cmd: None,
+        }
+    }
+
+    /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
+    /// second context's) share an id. `b`'s reason was held back when `a`'s
+    /// frame arrived; it is a different step, and must still print.
+    #[test]
+    fn a_frame_pairs_with_a_held_back_chain_by_id_name_and_blocks() {
+        let out = render(0, |r| {
+            r.event("local", &step_started(1, "a"));
+            r.event("local", &failing(1, "a", "`exit 3` exited 3"));
+            r.event("local", &step_started(1, "b"));
+            r.event("local", &failing(1, "b", "`exit 4` exited 4"));
+            r.event(
+                "local",
+                &failed_frame(Some("a"), Some(1), "step `a`: `exit 3` exited 3"),
+            );
+        });
+        assert_eq!(
+            out,
+            "\
+[local]  a ....................................................... FAILED
+[local]  FAILED at `a`: `exit 3` exited 3
+[local]  b ....................................................... FAILED
+[local]  FAILED at `b`: `exit 4` exited 4
+[local]  FAILED: `a` (reason above)
+"
+        );
+    }
+
+    /// A host that fails without naming a step of this run (a panic, a
+    /// `bail!`, a swallowed cancellation, another context's error) does not
+    /// swallow the reason of the step the playbook caught just before.
+    #[test]
+    fn a_frame_with_no_step_id_keeps_the_held_back_reason() {
+        for frame in [
+            failed_frame(None, None, "panic: boom"),
+            failed_frame(Some("x"), None, "step `x`: made up"),
+        ] {
+            let out = render(0, |r| {
+                r.event("local", &step_started(1, "x"));
+                r.event("local", &failing(1, "x", "`false` exited 1"));
+                r.event("local", &frame);
+            });
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(
+                lines[1], "[local]  FAILED at `x`: `false` exited 1",
+                "{out}"
+            );
+            assert!(
+                lines[2] == "[local]  FAILED: panic: boom"
+                    || lines[2] == "[local]  FAILED at `x`: made up",
+                "{out}"
+            );
+            assert_eq!(lines.len(), 3, "{out}");
+        }
+    }
+
+    /// An error the playbook kept and returned after other steps: its reason
+    /// printed when the next step began, so the frame's line says only that
+    /// this step failed the host, without the reason a second time.
+    #[test]
+    fn an_escaping_reason_already_printed_is_not_printed_twice() {
+        let out = render(0, |r| {
+            r.event("local", &in_block(step_started(1, "x"), &["b"]));
+            r.event(
+                "local",
+                &in_block(failing(1, "x", "`false` exited 3"), &["b"]),
+            );
+            r.event("local", &step_started(2, "cleanup"));
+            r.event("local", &step_finished(2, "cleanup", Status::Ok));
+            r.event(
+                "local",
+                &Event::Failed {
+                    step: Some("x".into()),
+                    id: Some(1),
+                    blocks: vec!["b".into()],
+                    error: "step `x`: `false` exited 3".into(),
+                    cmd: None,
+                },
+            );
+        });
+        assert_eq!(
+            out,
+            "\
+[local]  [b] x ................................................... FAILED
+[local]  FAILED at [b] `x`: `false` exited 3
+[local]  cleanup ................................................. ok
+[local]  FAILED: [b] `x` (reason above)
+"
+        );
+        assert_eq!(out.matches("exited 3").count(), 1, "{out}");
+    }
+
+    /// The manual's idiom for adding words, `.context(..)`, puts the step's
+    /// layer inside the chain; it is dropped there too, so the name is not
+    /// printed twice.
+    #[test]
+    fn a_step_layer_inside_the_chain_is_dropped_too() {
+        let out = render(0, |r| {
+            r.event("local", &step_started(1, "deploy"));
+            r.event(
+                "local",
+                &failing(1, "deploy", "`/bin/sh -c exit 5` exited 5"),
+            );
+            r.event(
+                "local",
+                &failed_frame(
+                    Some("deploy"),
+                    Some(1),
+                    "deploying the app: step `deploy`: `/bin/sh -c exit 5` exited 5",
+                ),
+            );
+        });
+        assert!(
+            out.ends_with(
+                "[local]  FAILED at `deploy`: deploying the app: `/bin/sh -c exit 5` exited 5\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(
+            split_step(
+                Some("x"),
+                "while waiting: step `x` not applied: cancelled: by ctrl-c"
+            ),
+            (
+                Some("x"),
+                "while waiting: not applied: cancelled: by ctrl-c".into()
+            )
+        );
+        // Only a whole layer goes: the same words elsewhere stay.
+        assert_eq!(
+            split_step(Some("x"), "copied step `x`s file: step `x`: nope"),
+            (Some("x"), "copied step `x`s file: nope".into())
+        );
+        assert_eq!(
+            split_step(Some("x"), "said step `x`: done: step `x`: nope"),
+            (Some("x"), "said step `x`: done: nope".into())
+        );
+        assert_eq!(
+            split_step(Some("x"), "a: step `x`"),
+            (Some("x"), "a: ".into())
+        );
+        assert_eq!(
+            split_step(Some("x"), "no layer: here"),
+            (Some("x"), "no layer: here".into())
         );
     }
 
@@ -1032,10 +1254,13 @@ web1    4        1             0        0       0          2         0
         let chain = format!("step `{name}`: deeper");
         assert_eq!(
             split_step(None, &chain),
-            (Some("odd "), "name`: deeper"),
+            (Some("odd "), "name`: deeper".into()),
             "the fallback parser cannot do better than this"
         );
-        assert_eq!(split_step(Some(name), &chain), (Some(name), "deeper"));
+        assert_eq!(
+            split_step(Some(name), &chain),
+            (Some(name), "deeper".into())
+        );
 
         let out = render(0, |r| {
             r.event("local", &step_started(1, name));
@@ -1060,7 +1285,7 @@ web1    4        1             0        0       0          2         0
     fn a_cancelled_step_keeps_its_reason() {
         assert_eq!(
             split_step(Some("x"), "step `x` not started: cancelled"),
-            (Some("x"), "not started: cancelled")
+            (Some("x"), "not started: cancelled".into())
         );
     }
 
@@ -1080,12 +1305,15 @@ web1    4        1             0        0       0          2         0
 
     #[test]
     fn split_step_reads_the_context_chain() {
-        assert_eq!(split_step(Some("a"), "x"), (Some("a"), "x"));
+        assert_eq!(split_step(Some("a"), "x"), (Some("a"), "x".into()));
         assert_eq!(
             split_step(None, "step `a b`: cause: deeper"),
-            (Some("a b"), "cause: deeper")
+            (Some("a b"), "cause: deeper".into())
         );
-        assert_eq!(split_step(None, "panic: boom"), (None, "panic: boom"));
+        assert_eq!(
+            split_step(None, "panic: boom"),
+            (None, "panic: boom".into())
+        );
     }
 
     // ---- blocks ----

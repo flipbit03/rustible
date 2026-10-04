@@ -131,9 +131,11 @@ pub enum Event {
         /// `action` for an op whose
         /// [`always_changes`](crate::op::Op::always_changes) is true, and
         /// `ran, unchanged` for an apply that reported no change. `rustible`
-        /// holds a failed step's chain back and prints it only if no
-        /// [`Failed`](Event::Failed) frame for the same step follows, so a
-        /// failure the playbook caught (`recovered`) still shows why.
+        /// holds a failed step's chain back: a [`Failed`](Event::Failed)
+        /// frame for the same step (the same id, name and blocks) arriving
+        /// next prints it instead; any other event arriving first prints it
+        /// then, so a failure the playbook caught (`recovered`) still shows
+        /// why.
         note: Option<String>,
         /// Wall clock across both phases, from just before `check` to the
         /// moment the status was decided. The integration harness records it
@@ -242,7 +244,7 @@ impl Event {
     /// the caller has matched the error to one of this run's steps; the
     /// layer's own id is not trusted for that, since another `Ctx` may have
     /// drawn it.
-    pub fn failed(e: &crate::Error, id: Option<u32>) -> Event {
+    pub(crate) fn failed(e: &crate::Error, id: Option<u32>) -> Event {
         let step = e.step_failed();
         Event::Failed {
             step: step.map(|s| s.step.clone()),

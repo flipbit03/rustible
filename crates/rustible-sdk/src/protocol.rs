@@ -556,9 +556,14 @@ mod tests {
         };
         let json = r#"{"Failed":{"step":"boom","id":7,"blocks":["outer","inner"],"error":"step `boom`: nope","cmd":null}}"#;
         assert_eq!(serde_json::to_string(&failed).unwrap(), json);
-        let Event::Failed { blocks, .. } = serde_json::from_str(json).unwrap() else {
+        let Event::Failed { id, blocks, .. } = serde_json::from_str(json).unwrap() else {
             panic!("not Failed")
         };
+        assert_eq!(
+            id,
+            Some(7),
+            "the id is what pairs the frame with its step line"
+        );
         assert_eq!(blocks, ["outer", "inner"]);
         // A version-5 summary, with no `recovered`, does not read.
         let old = r#"{"Finished":{"ok":1,"changed":0,"would_change":0,"skipped":0,"failed":0,"warnings":0}}"#;

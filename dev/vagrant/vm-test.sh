@@ -134,15 +134,20 @@ assert_no_change() {
         # warnings. `skipped` is deliberately not checked: ctx.skip() is
         # legitimate playbook logic, not a failure. `recovered` is: a caught
         # failure does not fail the host, but vagrant.rs catches nothing, so
-        # a recovered step there is a step that failed and was hidden. `would-change` is only ever nonzero
-        # under --check, which this script does not pass, but it is asserted
-        # anyway so that adding a --check pass later cannot pass vacuously.
+        # a recovered step there is a step that failed and was hidden.
+        # `would-change` is only ever nonzero under --check, which this script
+        # does not pass, but it is asserted anyway so that adding a --check
+        # pass later cannot pass vacuously.
         in_table && NF >= 8 {
             seen++
             if ($3 != 0) { printf "%s: %s changed on the second run\n", $1, $3 > "/dev/stderr"; bad = 1 }
             if ($4 != 0) { printf "%s: %s would still change\n", $1, $4 > "/dev/stderr"; bad = 1 }
             if ($6 != 0) { printf "%s: %s failed\n", $1, $6 > "/dev/stderr"; bad = 1 }
-            if ($7 != 0) { printf "%s: %s failed and recovered\n", $1, $7 > "/dev/stderr"; bad = 1 }
+            if ($7 != 0) {
+                printf "%s: %s recovered: a step failed and the playbook hid it\n",
+                    $1, $7 > "/dev/stderr"
+                bad = 1
+            }
         }
         END {
             # No rows at all means nothing ran, which is not a pass.
