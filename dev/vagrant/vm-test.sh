@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Run examples/workspace/playbooks/vagrant.rs, then vagrant_login.rs, against
-# whichever Vagrant machines are up, and prove both are idempotent.
-# vagrant_login.rs logs in as an account vagrant.rs creates, so the order is
-# fixed.
+# Run examples/workspace/playbooks/vagrant.rs, then vagrant_login.rs, then
+# vagrant_escalate_user.rs, against whichever Vagrant machines are up, and
+# prove each is idempotent. The last two log in as, or escalate to, accounts
+# vagrant.rs creates, so the order is fixed.
 #
 # A playbook run that reports `changed` proves the operation did something. It
 # does not prove the operation was right: an op that rewrites a correct file
@@ -25,13 +25,21 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 inventory="$root/dev/vagrant/hosts.vagrant.kdl"
 # The name form; a path would resolve against the cwd. In order: the second
-# logs in as the account the first creates.
-playbooks=(vagrant vagrant_login)
+# logs in as an account the first creates, and the third escalates to two.
+playbooks=(vagrant vagrant_login vagrant_escalate_user)
 
-
-limit=()
+# The `--limit` for each playbook, empty for none. vagrant_escalate_user
+# targets the inventory's `vagrant-escalate-user` group, which names each
+# machine `vagrant-<m>-as-login` and `vagrant-<m>-as-nohome`, so a limit to
+# `vagrant-<m>` becomes those two for it.
+hosts_csv=""
+escalate_csv=""
+# Guarded: bash 3.2 (macOS) and `set -u` do not mix with empty expansions.
 if [ "$#" -gt 0 ]; then
-    limit=(--limit "$(IFS=,; echo "$*")")
+    for h in "$@"; do
+        hosts_csv="${hosts_csv:+$hosts_csv,}$h"
+        escalate_csv="${escalate_csv:+$escalate_csv,}$h-as-login,$h-as-nohome"
+    done
 fi
 
 quick=${QUICK:-0}
@@ -102,6 +110,13 @@ MSG
 fi
 
 run() {
+    local csv=$hosts_csv limit=()
+    if [ "$1" = vagrant_escalate_user ]; then
+        csv=$escalate_csv
+    fi
+    if [ -n "$csv" ]; then
+        limit=(--limit "$csv")
+    fi
     # `${limit[@]+"${limit[@]}"}` rather than `"${limit[@]}"`: macOS ships bash
     # 3.2, where expanding an empty array under `set -u` is an unbound-variable
     # error. bash 5 on Linux allows it, so this only fails on half the

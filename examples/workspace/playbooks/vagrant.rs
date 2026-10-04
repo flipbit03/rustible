@@ -15,6 +15,7 @@
 //! helper streams its own copy into the account's cache (cold on the first
 //! run, cached on the second), and a system account with none, which gets a
 //! private per-run copy in the temp directory every time.
+//! `vagrant_escalate_user.rs` then launches a whole playbook as each of them.
 
 use std::time::Duration;
 
