@@ -728,6 +728,8 @@ mod tests {
         let (ctl, log) = (dir.path().join("master"), dir.path().join("log"));
         for (args, key, value) in [
             (&["-o=User=evil"][..], "user", "evil"),
+            (&["-o", "U\"ser\" evil"], "user", "evil"),
+            (&["-o", "Host\"Name\" 192.0.2.9"], "hostname", "192.0.2.9"),
             (&["-o", " =Port=1"], "port", "1"),
             (&["-o", "\"BatchMode\" no"], "batchmode", "no"),
             (&["-o", "HostName=192.0.2.9"], "hostname", "192.0.2.9"),

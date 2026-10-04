@@ -94,14 +94,15 @@ fn with_value(letter: char) -> SshOption {
 
 /// The keyword of an `-o` option and its value, read as loosely as `ssh`
 /// does: it skips leading whitespace, `=` and `"` before the keyword
-/// (`-o=User=x`, `-o '"User" x'`), and `Key=Value`, `Key Value` and
-/// `Key = Value` are one option. Keywords are letters, and only alphabetic
-/// ones are classified, so the keyword is the leading run of letters.
-fn config_option(option: &str) -> (&str, &str) {
+/// (`-o=User=x`, `-o '"User" x'`), removes quotes inside it (`U"ser"` is
+/// `User`), and `Key=Value`, `Key Value` and `Key = Value` are one option.
+/// Keywords are letters, and only alphabetic ones are classified, so the
+/// keyword is the leading run of letters and quotes, without the quotes.
+fn config_option(option: &str) -> (String, &str) {
     let skip = |c: char| c == '=' || c == '"' || c.is_whitespace();
     let option = option.trim_start_matches(skip);
     let end = option
-        .find(|c: char| !c.is_ascii_alphabetic())
+        .find(|c: char| !c.is_ascii_alphabetic() && c != '"')
         .unwrap_or(option.len());
     let value = option[end..].trim_start_matches(|c: char| c == '"' || c.is_whitespace());
     let value = value
@@ -109,7 +110,7 @@ fn config_option(option: &str) -> (&str, &str) {
         .unwrap_or(value)
         .trim()
         .trim_matches('"');
-    (&option[..end], value)
+    (option[..end].replace('"', ""), value)
 }
 
 /// `-o` keywords, which `ssh` matches without regard to case.
@@ -192,7 +193,7 @@ fn scan(args: &[String]) -> (Vec<Found>, Vec<Stray>) {
             };
             let (class, value) = if letter == 'o' {
                 let (key, value) = config_option(&value);
-                (config_key(key), value.to_string())
+                (config_key(&key), value.to_string())
             } else {
                 (with_value(letter), value)
             };
@@ -303,6 +304,7 @@ mod tests {
             (&["-o", "=BatchMode=no"], "`BatchMode`"),
             (&["-o", " =BatchMode=no"], "`BatchMode`"),
             (&["-o", "\"BatchMode\" no"], "`BatchMode`"),
+            (&["-o", "Bat\"chMode\" no"], "`BatchMode`"),
         ] {
             let p = problems(words);
             assert!(!p.is_empty(), "{words:?} passed");
@@ -361,6 +363,18 @@ mod tests {
             (
                 &["-o", "\"User\" admin"],
                 "sets the login user (`-o \"User\" admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o", "U\"ser\" admin"],
+                "sets the login user (`-o U\"ser\" admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o", "Po\"rt\" 1"],
+                "sets the port (`-o Po\"rt\" 1`); use the parameter `port=1` instead",
+            ),
+            (
+                &["-o", "Host\"Name\" 192.0.2.9"],
+                "sets the address (`-o Host\"Name\" 192.0.2.9`); use the parameter `addr=\"192.0.2.9\"` instead",
             ),
             (
                 &["-o=Port=1"],
