@@ -149,6 +149,7 @@ impl System {
                 method: "sudo".into(),
                 exe: std::env::current_exe().unwrap_or_default(),
                 password: None,
+                note: None,
             },
             helpers: Mutex::new(BTreeMap::new()),
         }));
@@ -167,7 +168,27 @@ impl System {
                     method: method.to_string(),
                     exe: esc.spawner.exe.clone(),
                     password,
+                    note: esc.spawner.note.clone(),
                 },
+                helpers: Mutex::new(BTreeMap::new()),
+            }));
+        }
+        self
+    }
+
+    /// A sentence appended to every escalation failure (a helper that
+    /// died, which is how a refused `sudo` shows). The runtime sets
+    /// [`LoginOverride::note`](crate::ctx::LoginOverride::note) here when the
+    /// playbook's `ssh_user` chose the account escalating. No effect on a
+    /// `Fake` system.
+    pub fn with_escalation_note(mut self, note: Option<String>) -> Self {
+        if let Some(esc) = &self.escalation {
+            let mut spawner = esc.spawner.clone();
+            spawner.note = note;
+            self.escalation = Some(Arc::new(Escalation {
+                own_user: esc.own_user.clone(),
+                local: esc.local.clone(),
+                spawner,
                 helpers: Mutex::new(BTreeMap::new()),
             }));
         }
@@ -643,5 +664,19 @@ mod tests {
         sys.symlink("/target", "/link").unwrap();
         assert_eq!(sys.read_link("/link").unwrap(), PathBuf::from("/target"));
         assert!(sys.read_dir("/").is_err(), "no such dir in the fake");
+    }
+
+    /// The runtime calls `with_escalation` and then `with_escalation_note`;
+    /// each rebuilds the escalation, so neither may drop what the other set.
+    #[test]
+    fn the_escalation_note_and_method_survive_each_other() {
+        let spawner = |s: &System| s.escalation.as_ref().unwrap().spawner.clone();
+        let sys = System::local(false, Arc::new(Collect::default()))
+            .with_escalation("doas", None)
+            .with_escalation_note(Some("the login user `x`".into()));
+        assert_eq!(spawner(&sys).method, "doas");
+        assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
+        let sys = sys.with_escalation("sudo", None);
+        assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
     }
 }

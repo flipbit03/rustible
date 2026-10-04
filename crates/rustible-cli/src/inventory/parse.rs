@@ -28,7 +28,9 @@ use super::resolve::Conflict;
 /// created, so a stricter rule here would let a playbook create an account
 /// the inventory then refuses to escalate to. The two crates cannot share the
 /// function — `rustible-cli` does not depend on `rustible-std` — so they are
-/// kept in step by this note and the tests below.
+/// kept in step by this note and the tests below. The playbook attribute's
+/// `ssh_user` is checked by a third copy, `validate_ssh_user` in
+/// `rustible-macros`, for the same reason.
 fn validate_account_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("is empty".to_string());

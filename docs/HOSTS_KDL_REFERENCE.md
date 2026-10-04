@@ -63,7 +63,9 @@ group "production" {
 
 Seven, and no others. Set them on a `host`, on a `group`, or on `defaults`;
 the nearest one wins, and `rustible inventory show` prints where each came
-from.
+from. One thing outranks them all: a playbook's `ssh_user` attribute replaces
+the host's `ssh_user` for that playbook, whichever level set it.
+`inventory show` describes this file and does not apply it.
 
 | parameter | meaning | default |
 |---|---|---|

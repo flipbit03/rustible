@@ -422,13 +422,17 @@ fn print_usage(playbooks: &[Named]) {
     eprintln!("playbooks in this binary:");
     for p in playbooks {
         eprintln!(
-            "  {}  (hosts = {:?}{})",
+            "  {}  (hosts = {:?}{}{})",
             p.name,
             p.playbook.hosts,
             if p.playbook.escalate {
                 ", escalate"
             } else {
                 ""
+            },
+            match p.playbook.ssh_user {
+                Some(u) => format!(", ssh_user = {u:?}"),
+                None => String::new(),
             }
         );
     }
@@ -463,7 +467,8 @@ fn execute(
     let counter = Arc::new(WarnCounter::new(sink));
     let sink: SharedSink = counter.clone();
     let sys = System::local(check_mode, sink.clone())
-        .with_escalation(&host.escalate_method, escalate_password);
+        .with_escalation(&host.escalate_method, escalate_password)
+        .with_escalation_note(host.login_override.as_ref().map(|o| o.note()));
     sink.emit(Event::Facts(sys.facts().clone()));
     // A host's var bag is shared by every playbook that targets it, so keys
     // this playbook does not declare are legitimate; still, a near-miss of a
@@ -570,6 +575,7 @@ mod tests {
     static WITH_VARS: Playbook = Playbook {
         hosts: "lab",
         escalate: false,
+        ssh_user: None,
         schema: vars::schema_for::<Vars>,
         entry: |_, _| Ok(()),
         check_vars: |raw| vars::from_value::<Vars>(raw).map(|_| ()),
@@ -578,6 +584,7 @@ mod tests {
     static NO_VARS: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| Ok(()),
         check_vars: |_| Ok(()),
@@ -685,6 +692,7 @@ mod tests {
         static WARNS: Playbook = Playbook {
             hosts: "local",
             escalate: false,
+            ssh_user: None,
             schema: vars::schema_for::<Vars>,
             entry: |ctx, _| {
                 ctx.warn("the playbook has an opinion");
@@ -764,6 +772,7 @@ mod tests {
         static FAILS: Playbook = Playbook {
             hosts: "local",
             escalate: false,
+            ssh_user: None,
             schema: vars::no_schema,
             entry: |ctx, _| {
                 ctx.step("odd `: name", Boom)?;
@@ -905,6 +914,7 @@ mod tests {
     static DEREF_AT_TOP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -919,6 +929,7 @@ mod tests {
     static QUESTION_MARK_AT_TOP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -948,6 +959,7 @@ mod tests {
     static RETURNS_UNAVAILABLE: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| {
             Err(crate::error::OutputUnavailable {
@@ -975,6 +987,7 @@ mod tests {
     static PANICS_IN_A_BLOCK: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             ctx.block("b", |_| -> crate::Result<()> { panic!("boom") })?;
@@ -1003,6 +1016,7 @@ mod tests {
     static DEREF_IN_A_REAL_RUN: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |_, _| {
             // A real run cannot produce this; the payload is thrown directly
@@ -1041,6 +1055,7 @@ mod tests {
     static READS_INSIDE_AN_OP: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;
@@ -1080,6 +1095,7 @@ mod tests {
     static RESTART_GUARDED_BY_AN_ABSORBED_BLOCK: Playbook = Playbook {
         hosts: "local",
         escalate: false,
+        ssh_user: None,
         schema: vars::no_schema,
         entry: |ctx, _| {
             let got = ctx.step("read", WouldChange)?;

@@ -14,6 +14,9 @@ pub struct Playbook {
     pub hosts: &'static str,
     /// Launch the binary escalated (Ansible's `become`).
     pub escalate: bool,
+    /// The account to log in as, overriding the host's `ssh_user` from the
+    /// inventory at every level. `None` leaves the login to the inventory.
+    pub ssh_user: Option<&'static str>,
     /// JSON Schema of the vars struct, or `Value::Null` when the playbook
     /// takes no vars.
     pub schema: fn() -> Value,
@@ -39,7 +42,8 @@ pub struct Named {
 
 impl Named {
     /// One entry of the `--describe` document: name, target hosts, whether
-    /// the binary wants escalation, and the vars JSON Schema, obtained by
+    /// the binary wants escalation, the login user it asks for (`null` when
+    /// the inventory decides), and the vars JSON Schema, obtained by
     /// calling [`Playbook::schema`]. The orchestrator reads this to know
     /// what to put in `Start` and to validate inventory vars before it
     /// bothers uploading the binary.
@@ -48,6 +52,7 @@ impl Named {
             "name": self.name,
             "hosts": self.playbook.hosts,
             "escalate": self.playbook.escalate,
+            "ssh_user": self.playbook.ssh_user,
             "vars_schema": (self.playbook.schema)(),
         })
     }
@@ -59,4 +64,52 @@ pub fn describe_all(playbooks: &[Named]) -> Value {
         "protocol": crate::protocol::PROTOCOL_VERSION,
         "playbooks": playbooks.iter().map(Named::describe).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static LOGIN: Playbook = Playbook {
+        hosts: "games",
+        escalate: false,
+        ssh_user: Some("minecraft"),
+        schema: crate::vars::no_schema,
+        entry: |_, _| Ok(()),
+        check_vars: |_| Ok(()),
+    };
+
+    static INVENTORY_LOGIN: Playbook = Playbook {
+        hosts: "web",
+        escalate: true,
+        ssh_user: None,
+        schema: crate::vars::no_schema,
+        entry: |_, _| Ok(()),
+        check_vars: |_| Ok(()),
+    };
+
+    /// The orchestrator reads `ssh_user` from this document, so a playbook
+    /// that leaves it to the inventory says so with an explicit `null`.
+    #[test]
+    fn describe_carries_the_playbooks_ssh_user() {
+        let doc = describe_all(&[
+            Named {
+                name: "games/minecraft",
+                playbook: &LOGIN,
+            },
+            Named {
+                name: "web/nginx",
+                playbook: &INVENTORY_LOGIN,
+            },
+        ]);
+        assert_eq!(doc["protocol"], crate::protocol::PROTOCOL_VERSION);
+        assert_eq!(doc["playbooks"][0]["ssh_user"], "minecraft");
+        assert!(doc["playbooks"][1]["ssh_user"].is_null());
+        assert!(
+            doc["playbooks"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("ssh_user")
+        );
+    }
 }

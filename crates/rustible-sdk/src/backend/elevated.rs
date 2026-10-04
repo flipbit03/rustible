@@ -457,6 +457,11 @@ pub struct Spawner {
     /// present it reaches `sudo -S` on the helper's stdin and never argv,
     /// and only after `sudo -n` has been seen to fail.
     pub password: Option<Secret>,
+    /// Appended to every report of a helper that died, which is how a
+    /// refused `sudo` reaches the step. Set when the playbook's `ssh_user`
+    /// chose the account escalating, so the failure says where that account
+    /// came from ([`LoginOverride::note`](crate::ctx::LoginOverride::note)).
+    pub note: Option<String>,
 }
 
 impl Spawner {
@@ -512,6 +517,7 @@ impl Spawner {
             rx,
             child: Some(child),
             stderr_tail: tail,
+            note: self.note.clone(),
         })
     }
 }
@@ -521,6 +527,8 @@ struct Connection {
     rx: Box<dyn Read + Send>,
     child: Option<Child>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    /// [`Spawner::note`], carried to where the failure is described.
+    note: Option<String>,
 }
 
 impl Connection {
@@ -556,10 +564,14 @@ impl Connection {
             None => "closed the connection".to_string(),
         };
         let tail = self.stderr_tail.lock().unwrap().join(" / ");
-        if tail.is_empty() {
+        let described = if tail.is_empty() {
             format!("helper {status}")
         } else {
             format!("helper {status}: {tail}")
+        };
+        match &self.note {
+            Some(note) => format!("{described}; {note}"),
+            None => described,
         }
     }
 
@@ -646,6 +658,7 @@ impl Elevated {
                 rx,
                 child: None,
                 stderr_tail: Arc::default(),
+                note: None,
             })),
             failed: Mutex::new(None),
         }
@@ -1066,13 +1079,17 @@ mod tests {
         assert!(!err.contains("exceeds limit"), "raw framing error: {err}");
     }
 
-    #[test]
-    fn dead_helper_reports_exit_and_stderr() {
-        // A "helper" that prints to stderr and exits without answering.
+    /// An `Elevated` whose "helper" printed to stderr and exited without
+    /// answering, which is what a refused `sudo -n` looks like from here.
+    /// The connection takes the spawner's `note` as [`Spawner::spawn`]
+    /// copies it, which is the one line of the path this cannot run without
+    /// a real `sudo`.
+    fn dead_helper(note: Option<String>) -> Elevated {
         let spawner = Spawner {
             method: "sudo".into(),
             exe: PathBuf::from("/nonexistent/rustible-bin"),
             password: None,
+            note,
         };
         // Bypass `sudo` by connecting to a shell that quits immediately.
         let mut child = Command::new("sh")
@@ -1095,15 +1112,21 @@ mod tests {
             rx: Box::new(child.stdout.take().unwrap()),
             child: Some(child),
             stderr_tail: tail,
+            note: spawner.note.clone(),
         };
-        let e = Elevated {
+        reader.join().unwrap();
+        Elevated {
             user: "root".into(),
             spawner: Some(spawner),
             phase: Arc::new(AtomicU8::new(0)),
             conn: Mutex::new(Some(conn)),
             failed: Mutex::new(None),
-        };
-        reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn dead_helper_reports_exit_and_stderr() {
+        let e = dead_helper(None);
         let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
         assert!(err.contains("exited 7") && err.contains("boom"), "{err}");
 
@@ -1117,5 +1140,21 @@ mod tests {
         );
         assert!(again.contains("exited 7"), "{again}");
         assert!(!again.contains("/nonexistent/rustible-bin"), "{again}");
+    }
+
+    /// A playbook whose `ssh_user` attribute chose the login has the
+    /// escalating account's origin on every report of a dead helper,
+    /// including the latched one later primitives return.
+    #[test]
+    fn a_dead_helper_carries_the_spawners_note() {
+        let note = "the login user `minecraft` comes from the playbook's `ssh_user` attribute";
+        let e = dead_helper(Some(note.into()));
+        let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
+        assert!(
+            err.contains("exited 7: boom; the login user `minecraft`"),
+            "{err}"
+        );
+        let again = e.stat(Path::new("/etc/hostname")).unwrap_err().to_string();
+        assert!(again.contains(note), "{again}");
     }
 }

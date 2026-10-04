@@ -162,7 +162,7 @@ make vm-up-x86
 make vm-up-arm
 make vm-status      # what is up, and the inventory that names it
 make vm-ssh         # a shell inside it (make vm-ssh M=arm to pick one)
-make vm-test        # recreate the guests, then run the playbook twice
+make vm-test        # recreate the guests, then run each playbook twice
 make vm-halt        # stop, keep the disks
 make vm-destroy     # delete them
 make vm-orphans     # domains left behind by a deleted checkout

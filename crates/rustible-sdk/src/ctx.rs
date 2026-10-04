@@ -48,6 +48,55 @@ pub struct HostInfo {
     /// `"none"`. How `as_user` reaches other identities (vision doc 11.3).
     #[serde(default = "default_escalate_method")]
     pub escalate_method: String,
+    /// Set when the playbook's `ssh_user` attribute chose the account this
+    /// binary logged in as, over the inventory's. Escalation runs from that
+    /// account, so a failed escalation quotes [`LoginOverride::note`].
+    /// `None` when the inventory chose the login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_override: Option<LoginOverride>,
+}
+
+/// Where the login user came from, when the playbook's `ssh_user`
+/// attribute overrode the inventory's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginOverride {
+    /// The account the attribute named, which ssh logged in as.
+    pub ssh_user: String,
+    /// What the inventory resolves `ssh_user` to for this host, which the
+    /// attribute replaced.
+    pub inventory_ssh_user: String,
+    /// The inventory level that set [`LoginOverride::inventory_ssh_user`]:
+    /// `host`, `group <name>`, `defaults`, or `built-in` when nothing in the
+    /// file set it.
+    pub inventory_source: String,
+}
+
+impl LoginOverride {
+    /// The one sentence every message about an overridden login carries:
+    /// the escalation failures on both sides of the wire, the orchestrator's
+    /// `-v` note, and a failed ssh connection.
+    pub fn note(&self) -> String {
+        let inventory = if self.inventory_source == "built-in" {
+            format!(
+                "the inventory sets no `ssh_user` for this host, so it would have used `{}`",
+                self.inventory_ssh_user
+            )
+        } else {
+            format!(
+                "which overrides the inventory's `{}` (from {})",
+                self.inventory_ssh_user, self.inventory_source
+            )
+        };
+        let sep = if self.inventory_source == "built-in" {
+            ";"
+        } else {
+            ","
+        };
+        format!(
+            "the login user `{}` comes from the playbook's `ssh_user` attribute{sep} {inventory}",
+            self.ssh_user
+        )
+    }
 }
 
 fn default_escalate_user() -> String {
@@ -74,6 +123,7 @@ impl HostInfo {
             escalate_user: default_escalate_user(),
             connection: default_connection(),
             escalate_method: default_escalate_method(),
+            login_override: None,
         }
     }
 }
@@ -871,6 +921,31 @@ fn path_str(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every message about an overridden login reads this sentence, so its
+    /// wording is pinned for both kinds of inventory source.
+    #[test]
+    fn the_login_override_note_names_both_accounts_and_the_inventory_level() {
+        let o = LoginOverride {
+            ssh_user: "minecraft".into(),
+            inventory_ssh_user: "cadu".into(),
+            inventory_source: "group games".into(),
+        };
+        assert_eq!(
+            o.note(),
+            "the login user `minecraft` comes from the playbook's `ssh_user` attribute, \
+             which overrides the inventory's `cadu` (from group games)"
+        );
+        let built_in = LoginOverride {
+            inventory_source: "built-in".into(),
+            ..o
+        };
+        assert_eq!(
+            built_in.note(),
+            "the login user `minecraft` comes from the playbook's `ssh_user` attribute; \
+             the inventory sets no `ssh_user` for this host, so it would have used `cadu`"
+        );
+    }
     use crate::backend::Fake;
     use crate::event::Collect;
     use crate::protocol::{Down, Up, UpLink};

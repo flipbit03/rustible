@@ -23,12 +23,12 @@ use rustible_cli::inventory::{
     Connection, Escalate, HostResults, Inventory, Resolved, Severity, Source, VarError,
     bag_to_json, format_vars_report,
 };
-use rustible_sdk::HostInfo;
 use rustible_sdk::event::Event;
 use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use rustible_sdk::secret::Secret;
 use rustible_sdk::stream::{WorkspaceFiles, chunks, run_dir_name};
+use rustible_sdk::{HostInfo, LoginOverride};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,8 +188,10 @@ pub fn remote_path(home: &str, playbook: &str, hash: &str) -> String {
 }
 
 /// The transport target for a resolved host. Parameters the inventory left
-/// to the built-in default are not passed, so `~/.ssh/config` applies.
-pub fn ssh_target(r: &Resolved) -> Result<SshTarget> {
+/// to the built-in default are not passed, so `~/.ssh/config` applies. A
+/// playbook's `ssh_user` replaces the host's, from whatever level, and is
+/// always passed.
+pub fn ssh_target(r: &Resolved, playbook_ssh_user: Option<&str>) -> Result<SshTarget> {
     let set = |name: &str| {
         r.sources
             .params
@@ -202,10 +204,96 @@ pub fn ssh_target(r: &Resolved) -> Result<SshTarget> {
             .addr
             .clone()
             .with_context(|| format!("host `{}` has no addr", r.host))?,
-        user: set("ssh_user").then(|| r.params.ssh_user.clone()),
+        user: match playbook_ssh_user {
+            Some(u) => Some(u.to_string()),
+            None => set("ssh_user").then(|| r.params.ssh_user.clone()),
+        },
         port: set("port").then_some(r.params.port),
         args: r.params.ssh_args.clone(),
     })
+}
+
+/// What a playbook's `ssh_user` replaced on this host: the inventory's
+/// value and the level that set it. Every message that has to say where the
+/// login user came from renders it ([`LoginOverride::note`]), and the binary
+/// gets it in `Start` for its own escalation failures. `None` when the
+/// playbook leaves the login to the inventory.
+pub fn login_override(r: &Resolved, playbook_ssh_user: Option<&str>) -> Option<LoginOverride> {
+    let ssh_user = playbook_ssh_user?;
+    Some(LoginOverride {
+        ssh_user: ssh_user.to_string(),
+        inventory_ssh_user: r.params.ssh_user.clone(),
+        inventory_source: r
+            .sources
+            .params
+            .get("ssh_user")
+            .unwrap_or(&Source::BuiltIn)
+            .to_string(),
+    })
+}
+
+/// The refusal for a playbook whose `ssh_user` reaches a host with
+/// `connection="local"`, where there is no ssh login to change. `None` when
+/// the playbook sets no `ssh_user` or every host is reached over ssh. The
+/// caller adds what to do, which differs between `run` and
+/// `inventory check`.
+pub fn local_login_refusal(d: &Describe, targets: &[Resolved]) -> Option<String> {
+    let ssh_user = d.ssh_user.as_deref()?;
+    let local: Vec<String> = targets
+        .iter()
+        .filter(|r| r.params.connection == Connection::Local)
+        .map(|r| {
+            let from = r
+                .sources
+                .params
+                .get("connection")
+                .unwrap_or(&Source::BuiltIn);
+            format!("`{}` (connection=\"local\", from {from})", r.host)
+        })
+        .collect();
+    if local.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "playbook `{}` sets `ssh_user = {ssh_user:?}`, but {} reached without ssh: {}; \
+         there is no ssh login to change",
+        d.name,
+        if local.len() == 1 {
+            "this host is"
+        } else {
+            "these hosts are"
+        },
+        local.join(", ")
+    ))
+}
+
+/// The line for a binary launched behind `sudo -n`/`doas -n` that died
+/// before its `Hello`, when the playbook's `ssh_user` chose the account that
+/// escalated: that account is the likely reason, and nothing else in the
+/// output names it. `None` in every other case, which keep the output they
+/// had (the binary's stderr and its exit code).
+pub fn launch_escalation_failure(
+    hello: bool,
+    prefix: &[String],
+    escalate_user: &str,
+    stderr: &str,
+    login: Option<&LoginOverride>,
+) -> Option<String> {
+    let login = login?;
+    if hello || prefix.is_empty() {
+        return None;
+    }
+    let said = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("no output");
+    Some(format!(
+        "escalating to `{escalate_user}` with `{} -n` failed before the playbook started \
+         ({said}); {}",
+        prefix[0],
+        login.note()
+    ))
 }
 
 /// Where rendered output goes: the step view, or raw frames as JSON lines.
@@ -390,6 +478,11 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
 
     // 3. Hosts, then vars for every one of them, before anything else.
     let targets = select_targets(inv, &d.hosts, args.limit.as_deref())?;
+    if let Some(refusal) = local_login_refusal(&d, &targets) {
+        return Err(usage(format!(
+            "{refusal}. Remove the attribute, or --limit the run to hosts reached over ssh"
+        )));
+    }
     if let Some(report) = precheck(ws, inv, &cargo, &d, &targets, &cli).await? {
         eprint!("{report}");
         return Ok(1);
@@ -471,12 +564,26 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
     let mut connects = vec![];
     for r in targets {
         let out = out.clone();
+        let ssh_user = d.ssh_user.clone();
         connects.push(tokio::spawn(async move {
             let t0 = Instant::now();
+            let login = login_override(&r, ssh_user.as_deref());
             let connected: Result<(Transport, Probe)> = async {
                 let tr = match r.params.connection {
                     Connection::Local => Transport::Local,
-                    Connection::Ssh => Transport::ssh(&ssh_target(&r)?).await?,
+                    Connection::Ssh => Transport::ssh(&ssh_target(&r, ssh_user.as_deref())?)
+                        .await
+                        // An ssh refusal for an account the inventory never
+                        // names is the case where saying where it came from
+                        // matters most.
+                        .map_err(|e| match &login {
+                            Some(o) => anyhow::anyhow!(
+                                "{}; {}",
+                                format!("{e:#}").trim_end().trim_end_matches('.'),
+                                o.note()
+                            ),
+                            None => e,
+                        })?,
                 };
                 let probe = tr.probe().await?;
                 Ok((tr, probe))
@@ -484,7 +591,8 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
             .await;
             match connected {
                 Ok((tr, probe)) => {
-                    out.lock().unwrap().note(
+                    let mut out = out.lock().unwrap();
+                    out.note(
                         &r.host,
                         &format!(
                             "connected: {} home {} in {:.2?}",
@@ -493,6 +601,9 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
                             t0.elapsed()
                         ),
                     );
+                    if let Some(o) = &login {
+                        out.note(&r.host, &o.note());
+                    }
                     Some((r, tr, probe))
                 }
                 Err(e) => {
@@ -554,6 +665,7 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
         let plan = Arc::new(Plan {
             name: name.clone(),
             escalate: d.escalate,
+            ssh_user: d.ssh_user.clone(),
             check: args.check,
             verbosity: args.verbose,
             files,
@@ -608,6 +720,8 @@ async fn build_artifacts(
 struct Plan {
     name: String,
     escalate: bool,
+    /// The playbook's `ssh_user`, which replaced every host's own.
+    ssh_user: Option<String>,
     check: bool,
     verbosity: u8,
     /// Serves `FileRequest` and receives `FetchChunk`, rooted at the
@@ -661,6 +775,8 @@ async fn drive(
         r.params.escalate,
         &r.params.escalate_user,
     );
+    let prefix = escalate_prefix(plan.escalate, r.params.escalate, &r.params.escalate_user);
+    let login = login_override(r, plan.ssh_user.as_deref());
     let run_id = new_run_id();
     let mut proc = tr
         .spawn(
@@ -668,11 +784,7 @@ async fn drive(
             Some(KillTarget {
                 binary: path.clone(),
                 run_dir: run_dir_name(&run_id),
-                escalate: escalate_prefix(
-                    plan.escalate,
-                    r.params.escalate,
-                    &r.params.escalate_user,
-                ),
+                escalate: prefix.clone(),
             }),
         )
         .await?;
@@ -680,8 +792,20 @@ async fn drive(
     // binary that dies at once, a desynced stream. Returning early would drop
     // its stderr and leave the user with "Broken pipe", so every error below
     // is caught and told with what the child said.
+    let mut hello = false;
     let killed = match drive_frames(
-        tr, &mut proc, plan, r, probe, vars, out, host, name, cancel_rx, &run_id,
+        tr,
+        &mut proc,
+        plan,
+        r,
+        login.clone(),
+        vars,
+        out,
+        host,
+        name,
+        cancel_rx,
+        &run_id,
+        &mut hello,
     )
     .await
     {
@@ -689,10 +813,17 @@ async fn drive(
         Err(e) => {
             let stderr = proc.stderr_text().await;
             let stderr = stderr.trim();
-            return Err(if stderr.is_empty() {
-                e
-            } else {
-                e.context(format!("the playbook binary said: {stderr}"))
+            let escalation = launch_escalation_failure(
+                hello,
+                &prefix,
+                &r.params.escalate_user,
+                stderr,
+                login.as_ref(),
+            );
+            return Err(match escalation {
+                Some(line) => e.context(line),
+                None if stderr.is_empty() => e,
+                None => e.context(format!("the playbook binary said: {stderr}")),
             });
         }
     };
@@ -719,28 +850,41 @@ async fn drive(
     if !stderr.trim().is_empty() {
         out.lock().unwrap().stderr(host, stderr.trim_end());
     }
+    if exit != 0
+        && let Some(line) = launch_escalation_failure(
+            hello,
+            &prefix,
+            &r.params.escalate_user,
+            &stderr,
+            login.as_ref(),
+        )
+    {
+        out.lock().unwrap().failed(host, &line);
+    }
     out.lock().unwrap().exited(host, exit);
     Ok(())
 }
 
 /// `Start` down, every `Up` frame to the renderer, until the binary closes
 /// its stdout. `true` when the binary had to be killed after ignoring
-/// `Cancel` for the whole grace period.
+/// `Cancel` for the whole grace period. `hello` is set once the binary's
+/// `Hello` arrives, and stays set if a later frame fails, so the caller can
+/// tell a binary that never started from one that broke mid-run.
 #[allow(clippy::too_many_arguments)]
 async fn drive_frames(
     tr: &Transport,
     proc: &mut crate::transport::Proc,
     plan: &Plan,
     r: &Resolved,
-    probe: &Probe,
+    login_override: Option<LoginOverride>,
     vars: Value,
     out: &Shared,
     host: &str,
     name: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     run_id: &str,
+    hello: &mut bool,
 ) -> Result<bool> {
-    let _ = probe;
     let start = Down::Start {
         run_id: run_id.to_string(),
         playbook: name.to_string(),
@@ -750,6 +894,7 @@ async fn drive_frames(
             escalate_user: r.params.escalate_user.clone(),
             escalate_method: r.params.escalate.as_str().to_string(),
             connection: r.params.connection.as_str().to_string(),
+            login_override,
         },
         vars,
         check_mode: plan.check,
@@ -785,7 +930,9 @@ async fn drive_frames(
         tokio::select! {
             frame = frames.recv() => {
                 let Some(up) = frame else { break };
-                handle_frame(plan, proc, out, host, name, up?, &cancel_rx).await?;
+                let up = up?;
+                *hello |= matches!(up, Up::Hello { .. });
+                handle_frame(plan, proc, out, host, name, up, &cancel_rx).await?;
             }
             changed = cancel_rx.changed(), if deadline.is_none() => {
                 if changed.is_err() || !*cancel_rx.borrow() {
@@ -1083,7 +1230,7 @@ host "solo" addr="10.0.0.9"
     #[test]
     fn ssh_target_passes_only_explicit_parameters() {
         let inv = inv();
-        let arm = ssh_target(&inv.resolve("arm").unwrap()).unwrap();
+        let arm = ssh_target(&inv.resolve("arm").unwrap(), None).unwrap();
         assert_eq!(
             arm,
             SshTarget {
@@ -1093,9 +1240,152 @@ host "solo" addr="10.0.0.9"
                 args: vec![],
             }
         );
-        let solo = ssh_target(&inv.resolve("solo").unwrap()).unwrap();
+        let solo = ssh_target(&inv.resolve("solo").unwrap(), None).unwrap();
         assert_eq!(solo.port, None, "built-in port stays with ssh");
         assert_eq!(solo.user.as_deref(), Some("cadu"), "from defaults");
+    }
+
+    /// Every inventory level a playbook's `ssh_user` has to beat, and the
+    /// built-in default.
+    const LOGINS: &str = r#"
+defaults ssh_user="cadu"
+group "games" ssh_user="gamer" {
+    host "by-group" addr="10.0.4.1"
+    host "by-host" addr="10.0.4.2" ssh_user="admin"
+}
+host "by-defaults" addr="10.0.4.3"
+host "laptop" connection="local"
+"#;
+
+    const BUILT_IN: &str = r#"host "bare" addr="10.0.4.4" port=2200"#;
+
+    fn describe(ssh_user: Option<&str>) -> Describe {
+        Describe {
+            name: "games/minecraft".into(),
+            hosts: "games".into(),
+            escalate: false,
+            ssh_user: ssh_user.map(Into::into),
+            vars_schema: Value::Null,
+        }
+    }
+
+    #[test]
+    fn the_playbooks_ssh_user_beats_every_inventory_level() {
+        let inv = Inventory::parse(LOGINS, "hosts.kdl").unwrap();
+        for (host, inventory, source) in [
+            ("by-host", "admin", "host"),
+            ("by-group", "gamer", "group games"),
+            ("by-defaults", "cadu", "defaults"),
+        ] {
+            let r = inv.resolve(host).unwrap();
+            assert_eq!(
+                ssh_target(&r, None).unwrap().user.as_deref(),
+                Some(inventory),
+                "{host} without the attribute"
+            );
+            assert_eq!(
+                ssh_target(&r, Some("minecraft")).unwrap().user.as_deref(),
+                Some("minecraft"),
+                "{host} with the attribute"
+            );
+            assert_eq!(
+                login_override(&r, Some("minecraft")),
+                Some(LoginOverride {
+                    ssh_user: "minecraft".into(),
+                    inventory_ssh_user: inventory.into(),
+                    inventory_source: source.into(),
+                }),
+                "{host}"
+            );
+            assert_eq!(login_override(&r, None), None, "{host}");
+        }
+    }
+
+    /// With nothing in the file, the host's login is left to ssh (no `-l`);
+    /// the attribute still passes its own, and the override records that
+    /// the inventory had only the built-in default.
+    #[test]
+    fn the_playbooks_ssh_user_is_passed_even_where_the_inventory_passes_none() {
+        let inv = Inventory::parse(BUILT_IN, "hosts.kdl").unwrap();
+        let r = inv.resolve("bare").unwrap();
+        assert_eq!(ssh_target(&r, None).unwrap().user, None);
+        let t = ssh_target(&r, Some("minecraft")).unwrap();
+        assert_eq!(t.user.as_deref(), Some("minecraft"));
+        assert_eq!(t.port, Some(2200), "nothing else moves");
+        let o = login_override(&r, Some("minecraft")).unwrap();
+        assert_eq!(o.inventory_source, "built-in");
+        assert_eq!(o.inventory_ssh_user, r.params.ssh_user);
+    }
+
+    #[test]
+    fn a_playbook_ssh_user_on_a_local_host_is_refused() {
+        let inv = Inventory::parse(LOGINS, "hosts.kdl").unwrap();
+        let laptop = vec![inv.resolve("laptop").unwrap()];
+        let refusal = local_login_refusal(&describe(Some("minecraft")), &laptop).unwrap();
+        assert_eq!(
+            refusal,
+            "playbook `games/minecraft` sets `ssh_user = \"minecraft\"`, but this host is \
+             reached without ssh: `laptop` (connection=\"local\", from host); there is no ssh \
+             login to change"
+        );
+        // No attribute, nothing to refuse.
+        assert_eq!(local_login_refusal(&describe(None), &laptop), None);
+        // Only the hosts actually targeted count: `--limit` past the local
+        // one leaves the run allowed.
+        let remote: Vec<Resolved> = ["by-host", "by-group"]
+            .iter()
+            .map(|h| inv.resolve(h).unwrap())
+            .collect();
+        assert_eq!(
+            local_login_refusal(&describe(Some("minecraft")), &remote),
+            None
+        );
+        let mixed = vec![laptop[0].clone(), remote[0].clone(), laptop[0].clone()];
+        let refusal = local_login_refusal(&describe(Some("minecraft")), &mixed).unwrap();
+        assert!(refusal.contains("these hosts are"), "{refusal}");
+        assert!(!refusal.contains("by-host"), "{refusal}");
+    }
+
+    #[test]
+    fn a_launch_refused_by_sudo_names_where_the_login_came_from() {
+        let login = LoginOverride {
+            ssh_user: "minecraft".into(),
+            inventory_ssh_user: "cadu".into(),
+            inventory_source: "defaults".into(),
+        };
+        let sudo = escalate_prefix(true, Escalate::Sudo, "root");
+        let stderr = "sudo: a password is required\n";
+        assert_eq!(
+            launch_escalation_failure(false, &sudo, "root", stderr, Some(&login)).unwrap(),
+            "escalating to `root` with `sudo -n` failed before the playbook started \
+             (sudo: a password is required); the login user `minecraft` comes from the \
+             playbook's `ssh_user` attribute, which overrides the inventory's `cadu` \
+             (from defaults)"
+        );
+        let doas = escalate_prefix(true, Escalate::Doas, "admin");
+        let line = launch_escalation_failure(false, &doas, "admin", "", Some(&login)).unwrap();
+        assert!(
+            line.starts_with("escalating to `admin` with `doas -n`"),
+            "{line}"
+        );
+        assert!(line.contains("(no output)"), "{line}");
+
+        // The inventory chose the login: the output stays what it was.
+        assert_eq!(
+            launch_escalation_failure(false, &sudo, "root", stderr, None),
+            None
+        );
+        // The binary started, so the launch did not fail.
+        assert_eq!(
+            launch_escalation_failure(true, &sudo, "root", stderr, Some(&login)),
+            None
+        );
+        // Nothing escalated: `escalate = false`, or a host with escalate="none".
+        let none = escalate_prefix(true, Escalate::None, "root");
+        assert_eq!(
+            launch_escalation_failure(false, &none, "root", stderr, Some(&login)),
+            None
+        );
     }
 
     #[test]

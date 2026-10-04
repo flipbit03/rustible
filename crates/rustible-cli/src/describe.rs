@@ -22,6 +22,11 @@ pub struct Describe {
     pub name: String,
     pub hosts: String,
     pub escalate: bool,
+    /// The attribute's `ssh_user`, which replaces every host's own for this
+    /// playbook. `None` (and absent from a cache file written before the
+    /// field existed) leaves the login to the inventory.
+    #[serde(default)]
+    pub ssh_user: Option<String>,
     pub vars_schema: Value,
 }
 
@@ -471,6 +476,7 @@ mod tests {
         assert_eq!(doc.playbooks.len(), 2);
         assert!(doc.playbooks[0].vars_schema.is_null());
         assert!(doc.playbooks[1].escalate);
+        assert_eq!(doc.playbooks[0].ssh_user, None, "absent before protocol 6");
         assert!(only(doc.playbooks.clone(), "hello").is_err());
         assert_eq!(
             only(vec![doc.playbooks[0].clone()], "hello").unwrap().hosts,
@@ -480,6 +486,25 @@ mod tests {
 
     /// The protocol-mismatch errors link a heading of the guide by its
     /// anchor; renaming the heading would leave them pointing at nothing.
+    #[test]
+    fn describe_doc_parses_the_protocol_6_shape() {
+        let doc: DescribeDoc = serde_json::from_str(
+            r#"{"protocol": 6, "playbooks": [
+                {"name": "games/minecraft", "hosts": "games", "escalate": false,
+                 "ssh_user": "minecraft", "vars_schema": null},
+                {"name": "hello", "hosts": "local", "escalate": false,
+                 "ssh_user": null, "vars_schema": null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(doc.playbooks[0].ssh_user.as_deref(), Some("minecraft"));
+        assert_eq!(doc.playbooks[1].ssh_user, None);
+        // The cache stores `Describe` itself, so it must survive the trip.
+        let text = serde_json::to_string(&doc.playbooks[0]).unwrap();
+        let back: Describe = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, doc.playbooks[0]);
+    }
+
     #[test]
     fn upgrading_url_names_a_heading_of_the_guide() {
         let guide = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/USING_RUSTIBLE.md");

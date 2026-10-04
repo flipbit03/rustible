@@ -406,7 +406,8 @@ async fn inventory(
 
 /// Vars of every playbook against every host it targets (vision 3, 10.3),
 /// through one host-native build of the whole workspace and its
-/// `--check-vars` mode.
+/// `--check-vars` mode; and a playbook's `ssh_user` against hosts that have
+/// no ssh login, which `playbook run` would refuse.
 async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result<u8> {
     let cargo = Cargo::load(ws).await?;
     cargo
@@ -432,6 +433,13 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result
         let mut resolved = vec![];
         for h in &hosts {
             resolved.push(inv.resolve(&h.name).map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+        if let Some(refusal) = run::local_login_refusal(d, &resolved) {
+            eprintln!(
+                "{src}: {refusal}; remove the attribute, or point `hosts` at hosts reached over ssh"
+            );
+            errors += 1;
+            continue;
         }
         if d.vars_schema.is_null() {
             println!("{src}: ok ({}, no vars)", count(hosts.len(), "host"));
@@ -459,7 +467,7 @@ async fn check_playbooks(ws: &Workspace, inv: &Inventory, shown: &str) -> Result
         }
     }
     if errors > 0 {
-        eprintln!("{shown}: {} with vars errors", count(errors, "playbook"));
+        eprintln!("{shown}: {} with errors", count(errors, "playbook"));
         return Ok(EXIT_ERROR);
     }
     Ok(0)
