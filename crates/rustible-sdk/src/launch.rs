@@ -57,6 +57,7 @@ pub const TRY: &str = concat!(
     r#"if [ -n "$3" ]; then p="${TMPDIR:-/tmp}/rustible-$3/$1"; "#,
     r#"else case $HOME in /*) ;; *) printf N; exit 0 ;; esac; "#,
     r#"p="$HOME/.cache/rustible/bin/$1"; fi; "#,
+    r#"case $p in /*) ;; *) p="./$p" ;; esac; "#,
     r#"if [ -f "$p" ] && [ -x "$p" ]; then printf R; exec "$p" "$2" ${3:+--ephemeral}; fi; "#,
     "printf N",
 );
@@ -869,10 +870,71 @@ mod tests {
     /// `--` ends the options, so it goes before every operand, a mode
     /// included: BSD `chmod 700 -- f` reads `--` as a file, and GNU
     /// `chmod 700 -p/f` reads `-p/f` as options.
+    ///
+    /// GNU's tools permute their arguments and accept `--` anywhere, so a
+    /// run on Linux cannot catch a misplaced one; this reads the scripts.
     #[test]
     fn end_of_options_precedes_every_operand() {
+        for script in [TRY, INSTALL] {
+            // Every `--`: only options, and the value `-m` takes, come
+            // between the utility and it.
+            for (i, _) in script.match_indices(" -- ") {
+                let head = &script[..i];
+                let start = head
+                    .rfind(|c| matches!(c, '(' | ';' | '{' | '&' | '|' | '\''))
+                    .map_or(0, |p| p + 1);
+                let words: Vec<&str> = head[start..].split_whitespace().collect();
+                let (utility, flags) = words.split_first().unwrap();
+                let mut it = flags.iter();
+                while let Some(w) = it.next() {
+                    assert!(w.starts_with('-'), "{utility}: `{w}` comes before `--`");
+                    if *w == "-m" {
+                        it.next();
+                    }
+                }
+            }
+            // Every utility that takes a path has one, before the path.
+            for utility in ["mkdir ", "rm ", "rmdir ", "chmod ", "mv "] {
+                for (i, _) in script.match_indices(utility) {
+                    if i > 0 && !script[..i].ends_with([' ', '(', '{', '\'']) {
+                        continue;
+                    }
+                    let rest = &script[i..];
+                    let first_path = rest.find('"').unwrap();
+                    assert!(
+                        rest[..first_path].contains(" -- "),
+                        "{}",
+                        &rest[..first_path]
+                    );
+                }
+            }
+        }
         assert!(INSTALL.contains(r#"chmod -- 700 "$t""#), "{INSTALL}");
-        assert!(!INSTALL.contains("chmod 700"), "{INSTALL}");
+    }
+
+    /// `exec` is given a path that cannot be read as an option: bash's
+    /// `exec` (macOS's `/bin/sh`) takes options, and a relative `TMPDIR`
+    /// could start with `-`.
+    #[test]
+    fn a_relative_temp_copy_is_execd_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("-p/rustible-feed");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(NAME), BIN).unwrap();
+        std::fs::set_permissions(d.join(NAME), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, out, err) = sh_in(
+            dir.path(),
+            TRY,
+            &[NAME, "--remote", "feed"],
+            &dir.path().join("h"),
+            Path::new("-p"),
+            b"",
+        );
+        assert_eq!(
+            out,
+            format!("Rran ./-p/rustible-feed/{NAME} --remote --ephemeral\n"),
+            "{err}"
+        );
     }
 
     /// Over ssh the command passes through the login's shell, and csh
