@@ -4,8 +4,9 @@
 //! because OpenSSH keeps the *first* value it sees for `-l`, `-p` and every
 //! `-o` option: that is what lets `ssh_args` override a default of ours. It
 //! also means an `ssh_args` that sets something the connection depends on, or
-//! that the login and port parameters own, would win silently. Those are
-//! refused at load instead, naming the node; [`SshOption`] is the
+//! that the login, port and address parameters own, would win silently, and
+//! that a word which is not an option, or a `--`, changes the destination.
+//! Those are refused at load instead, naming the node; [`SshOption`] is the
 //! classification, and `master_argv`'s tests check that every option it
 //! passes has one.
 //!
@@ -67,6 +68,10 @@ const PORT: SshOption = SshOption::Param {
     setting: "the port",
     param: "port",
 };
+const ADDR: SshOption = SshOption::Param {
+    setting: "the address",
+    param: "addr",
+};
 
 fn flag(letter: char) -> SshOption {
     match letter {
@@ -87,7 +92,27 @@ fn with_value(letter: char) -> SshOption {
     }
 }
 
-/// `-o` keys, which `ssh` matches without regard to case.
+/// The keyword of an `-o` option and its value, read as loosely as `ssh`
+/// does: it skips leading whitespace, `=` and `"` before the keyword
+/// (`-o=User=x`, `-o '"User" x'`), and `Key=Value`, `Key Value` and
+/// `Key = Value` are one option. Keywords are letters, and only alphabetic
+/// ones are classified, so the keyword is the leading run of letters.
+fn config_option(option: &str) -> (&str, &str) {
+    let skip = |c: char| c == '=' || c == '"' || c.is_whitespace();
+    let option = option.trim_start_matches(skip);
+    let end = option
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(option.len());
+    let value = option[end..].trim_start_matches(|c: char| c == '"' || c.is_whitespace());
+    let value = value
+        .strip_prefix('=')
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('"');
+    (&option[..end], value)
+}
+
+/// `-o` keywords, which `ssh` matches without regard to case.
 fn config_key(key: &str) -> SshOption {
     match key.to_ascii_lowercase().as_str() {
         "controlmaster" => CONTROL_MASTER,
@@ -105,6 +130,7 @@ fn config_key(key: &str) -> SshOption {
         "sessiontype" => SESSION_TYPE,
         "user" => LOGIN,
         "port" => PORT,
+        "hostname" => ADDR,
         "stricthostkeychecking" => SshOption::Default,
         _ => SshOption::Free,
     }
@@ -117,19 +143,33 @@ struct Found {
     class: SshOption,
 }
 
+/// A word of `ssh_args` that is not an option. Since `ssh_args` come
+/// first, each one moves where the run goes.
+enum Stray {
+    /// `ssh` reads it as the destination.
+    Word(String),
+    /// Ends `ssh`'s options, so Rustible's own become the destination.
+    DoubleDash,
+    /// An option left without its value at the end, which would take
+    /// Rustible's first option as its value.
+    Dangling(String),
+}
+
 /// Walk `args` as `ssh`'s getopt does: grouped flags (`-4M`), a value
 /// attached (`-p2222`, `-oUser=x`) or in the next word, and nothing after
-/// `--`. A word that is not an option is skipped, as `ssh` reads it as the
-/// destination and goes on parsing. The second half is the option left
-/// without its value at the end, if any.
-fn scan(args: &[String]) -> (Vec<Found>, Option<String>) {
+/// `--`. A word that is not an option is not classified; `ssh` reads it as
+/// the destination and goes on parsing.
+fn scan(args: &[String]) -> (Vec<Found>, Vec<Stray>) {
     let mut found = vec![];
+    let mut stray = vec![];
     let mut words = args.iter();
     while let Some(word) = words.next() {
         if word == "--" {
+            stray.push(Stray::DoubleDash);
             break;
         }
         let Some(letters) = word.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            stray.push(Stray::Word(word.clone()));
             continue;
         };
         for (at, letter) in letters.char_indices() {
@@ -147,18 +187,12 @@ fn scan(args: &[String]) -> (Vec<Found>, Option<String>) {
             } else if let Some(next) = words.next() {
                 (next.clone(), format!("{word} {next}"))
             } else {
-                return (found, Some(word.clone()));
+                stray.push(Stray::Dangling(word.clone()));
+                return (found, stray);
             };
             let (class, value) = if letter == 'o' {
-                // `Key=Value`, `Key Value` and `Key = Value` are all one
-                // option to `ssh`.
-                let option = value.trim_start();
-                let end = option
-                    .find(|c: char| c == '=' || c.is_whitespace())
-                    .unwrap_or(option.len());
-                let rest = option[end..].trim_start();
-                let rest = rest.strip_prefix('=').unwrap_or(rest).trim();
-                (config_key(&option[..end]), rest.to_string())
+                let (key, value) = config_option(&value);
+                (config_key(key), value.to_string())
             } else {
                 (with_value(letter), value)
             };
@@ -170,12 +204,12 @@ fn scan(args: &[String]) -> (Vec<Found>, Option<String>) {
             break;
         }
     }
-    (found, None)
+    (found, stray)
 }
 
-/// Every option in an `ssh` command line, with how it was written and what it
-/// is to Rustible. An option left without its value is not listed; see
-/// [`ssh_args_problems`].
+/// Every option in an `ssh` command line up to `--`, with how it was written
+/// and what it is to Rustible. Words that are not options, and an option
+/// left without its value, are not listed; see [`ssh_args_problems`].
 pub fn ssh_options(args: &[String]) -> Vec<(String, SshOption)> {
     scan(args)
         .0
@@ -188,7 +222,7 @@ pub fn ssh_options(args: &[String]) -> Vec<(String, SshOption)> {
 /// node it is on ("`ssh_args` on host `h` "). Empty when every option
 /// may pass.
 pub fn ssh_args_problems(args: &[String]) -> Vec<String> {
-    let (found, dangling) = scan(args);
+    let (found, stray) = scan(args);
     let mut problems: Vec<String> = found
         .into_iter()
         .filter_map(|f| match f.class {
@@ -199,22 +233,33 @@ pub fn ssh_args_problems(args: &[String]) -> Vec<String> {
             )),
             SshOption::Param { setting, param } => {
                 let value = f.value.unwrap_or_default();
-                let suggestion = if param == "port" {
-                    format!("{param}={value}")
-                } else {
-                    format!("{param}={value:?}")
+                let suggestion = match param {
+                    "port" if value.parse::<u16>().is_err() => {
+                        "the `port` parameter (a number)".to_string()
+                    }
+                    "port" => format!("the parameter `port={value}`"),
+                    _ => format!("the parameter `{param}={value:?}`"),
                 };
                 Some(format!(
-                    "sets {setting} (`{}`); use the parameter `{suggestion}` instead",
+                    "sets {setting} (`{}`); use {suggestion} instead",
                     f.spelling
                 ))
             }
             SshOption::Default | SshOption::Free => None,
         })
         .collect();
-    if let Some(word) = dangling {
-        problems.push(format!("ends with `{word}`, which needs a value"));
-    }
+    problems.extend(stray.into_iter().map(|s| {
+        match s {
+            Stray::Word(word) => format!(
+                "contains `{word}`, which is not an option: ssh would connect to it instead of \
+             the host's `addr`; remove it, or put it after the option it belongs to"
+            ),
+            Stray::DoubleDash => "contains `--`, after which ssh would read Rustible's own \
+             options as the machine to connect to; remove it"
+                .to_string(),
+            Stray::Dangling(word) => format!("ends with `{word}`, which needs a value"),
+        }
+    }));
     problems
 }
 
@@ -252,6 +297,12 @@ mod tests {
                 "`ForkAfterAuthentication`",
             ),
             (&["-o", "SessionType=default"], "`SessionType`"),
+            // `ssh` skips `=`, `"` and whitespace before the keyword, and
+            // strips quotes from it (measured with `ssh -G`).
+            (&["-o=BatchMode=no"], "`BatchMode`"),
+            (&["-o", "=BatchMode=no"], "`BatchMode`"),
+            (&["-o", " =BatchMode=no"], "`BatchMode`"),
+            (&["-o", "\"BatchMode\" no"], "`BatchMode`"),
         ] {
             let p = problems(words);
             assert!(!p.is_empty(), "{words:?} passed");
@@ -273,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn the_login_and_the_port_point_at_their_parameters() {
+    fn the_login_port_and_address_point_at_their_parameters() {
         for (words, want) in [
             (
                 &["-l", "admin"][..],
@@ -294,6 +345,34 @@ mod tests {
             (
                 &["-o", "user admin"],
                 "sets the login user (`-o user admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o=User=admin"],
+                "sets the login user (`-o=User=admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o", "=User=admin"],
+                "sets the login user (`-o =User=admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o", " =User=admin"],
+                "sets the login user (`-o  =User=admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o", "\"User\" admin"],
+                "sets the login user (`-o \"User\" admin`); use the parameter `ssh_user=\"admin\"` instead",
+            ),
+            (
+                &["-o=Port=1"],
+                "sets the port (`-o=Port=1`); use the parameter `port=1` instead",
+            ),
+            (
+                &["-p", "ssh"],
+                "sets the port (`-p ssh`); use the `port` parameter (a number) instead",
+            ),
+            (
+                &["-o", "HostName=192.0.2.9"],
+                "sets the address (`-o HostName=192.0.2.9`); use the parameter `addr=\"192.0.2.9\"` instead",
             ),
             (
                 &["-p", "2222"],
@@ -321,6 +400,27 @@ mod tests {
         assert_eq!(problems(&["-4o"]), ["ends with `-4o`, which needs a value"]);
     }
 
+    /// `ssh_args` come first, so a word that is not an option becomes the
+    /// destination, and a `--` makes Rustible's own options the destination.
+    #[test]
+    fn words_that_are_not_options_are_refused() {
+        assert_eq!(
+            problems(&["-4", "stray"]),
+            [
+                "contains `stray`, which is not an option: ssh would connect to it instead of \
+              the host's `addr`; remove it, or put it after the option it belongs to"
+            ]
+        );
+        assert_eq!(
+            problems(&["-4", "--", "-M"]),
+            [
+                "contains `--`, after which ssh would read Rustible's own options as the \
+              machine to connect to; remove it"
+            ]
+        );
+        assert_eq!(problems(&["-"]).len(), 1);
+    }
+
     #[test]
     fn everything_else_passes() {
         for words in [
@@ -337,8 +437,8 @@ mod tests {
             &["-i", "-M"],
             // The value is the option's own, not a second option.
             &["-o", "ProxyCommand=ssh -W %h:%p -l admin bastion"],
-            // Nothing after `--` is an option.
-            &["--", "-M"],
+            // A keyword with digits is not one of ours.
+            &["-o", "ForwardX11=no"],
             // What `vagrant up` writes into its inventory.
             &[
                 "-i",

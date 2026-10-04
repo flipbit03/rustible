@@ -89,11 +89,13 @@ Four rules worth knowing:
 - **`ssh_args` beats Rustible's own ssh defaults, and cannot touch what it
   depends on.** They come first on the `ssh` command line, so
   `"-o" "StrictHostKeyChecking=no"` replaces Rustible's `accept-new`. The
-  login and port have their own parameters, so `-l`, `-o User=`, `-p` and
-  `-o Port=` in `ssh_args` are a load error that names `ssh_user` or `port`;
-  so are the options the connection runs on: `-M`, `-S`, `-E`, `-f`, `-N`,
-  and `ControlMaster`, `ControlPath`, `ControlPersist`, `BatchMode`,
-  `ForkAfterAuthentication` and `SessionType` as `-o` options.
+  login, port and address have their own parameters, so `-l`, `-o User=`,
+  `-p`, `-o Port=` and `-o HostName=` in `ssh_args` are a load error that
+  names `ssh_user`, `port` or `addr`; so are the options the connection runs
+  on: `-M`, `-S`, `-E`, `-f`, `-N`, and `ControlMaster`, `ControlPath`,
+  `ControlPersist`, `BatchMode`, `ForkAfterAuthentication` and `SessionType`
+  as `-o` options. Every word must be an option or an option's value: a bare
+  word or a `--` would change the machine ssh connects to.
 - **`ssh_args` does not merge.** The nearest level that sets it wins whole.
   Write one argument as a property, several as a child node:
 

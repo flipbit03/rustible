@@ -718,6 +718,34 @@ mod tests {
         assert_eq!(config["port"], "2222");
     }
 
+    /// Spellings `ssh` honours in `ssh_args`, over Rustible's own values,
+    /// that a scanner reading `-o` more strictly than ssh would let through.
+    /// Each one is shown to take effect, then shown to be refused at load.
+    #[test]
+    fn what_would_beat_ours_in_ssh_is_refused_at_load() {
+        use rustible_cli::inventory::ssh_args_problems;
+        let dir = tempfile::tempdir().unwrap();
+        let (ctl, log) = (dir.path().join("master"), dir.path().join("log"));
+        for (args, key, value) in [
+            (&["-o=User=evil"][..], "user", "evil"),
+            (&["-o", " =Port=1"], "port", "1"),
+            (&["-o", "\"BatchMode\" no"], "batchmode", "no"),
+            (&["-o", "HostName=192.0.2.9"], "hostname", "192.0.2.9"),
+            (&["stray"], "hostname", "stray"),
+        ] {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let target = SshTarget {
+                addr: "192.0.2.1".into(),
+                user: Some("deploy".into()),
+                port: Some(2222),
+                args: args.clone(),
+            };
+            let config = ssh_g(&master_argv(&ctl, &log, &target));
+            assert_eq!(config[key], value, "ssh ignores {args:?}");
+            assert!(!ssh_args_problems(&args).is_empty(), "{args:?} loads");
+        }
+    }
+
     #[test]
     fn triples() {
         assert_eq!(
