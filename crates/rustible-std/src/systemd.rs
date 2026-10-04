@@ -7,13 +7,14 @@
 //! [`UnitState`], and [`DaemonReload`], which names no unit and so returns
 //! nothing. All of them go through `systemctl` via `sys.cmd`; `check` only
 //! runs the read-only probes `is-enabled` and `is-active`, and the actions
-//! run nothing at all in `check`.
+//! run nothing at all in `check` (with `.user(true)`, both also run `id -u`;
+//! see below).
 //!
 //! Every op refuses a host whose init is not systemd and, unless `.user(true)`
-//! selects the caller's own `systemctl --user` manager, refuses to run without
-//! root: reading unit state works unprivileged, but the purpose of each op is
-//! the change, and `systemctl enable` as a plain user only produces a polkit
-//! prompt the binary cannot answer.
+//! selects a `systemctl --user` manager, refuses to run without root: reading
+//! unit state works unprivileged, but the purpose of each op is the change,
+//! and `systemctl enable` as a plain user only produces a polkit prompt the
+//! binary cannot answer.
 //!
 //! ```no_run
 //! # use rustible_sdk::prelude::*;
@@ -29,9 +30,37 @@
 //! After writing a *new* unit file, systemd has to re-read it before any of
 //! these ops can find it. Use [`DaemonReload`] on its own, or
 //! `.daemon_reload(true)` on the [`Restart`] or [`Reload`] that follows.
+//!
+//! # User units
+//!
+//! `.user(true)` manages the units of whichever account the step runs as:
+//! the binary's own user, or another account through `ctx.as_user(..)`,
+//! which is how a playbook logged in as one account manages a service
+//! account's units:
+//!
+//! ```no_run
+//! # use rustible_sdk::prelude::*;
+//! # use rustible_std::systemd;
+//! # fn playbook(ctx: &mut Ctx) -> Result<()> {
+//! ctx.as_user("minecraft").step(
+//!     "server enabled",
+//!     systemd::Enabled::new("mine2026").user(true).now(true),
+//! )?;
+//! # Ok(()) }
+//! ```
+//!
+//! The account needs a running user manager, which systemd keeps while the
+//! account has a login session or linger (`loginctl enable-linger <name>`, as
+//! root). `check` asks `id -u` for the account's uid and passes
+//! `XDG_RUNTIME_DIR=/run/user/<uid>` to every `systemctl --user` and
+//! `journalctl --user`, since `sudo` drops it on the way to another account.
+//! When `/run/user/<uid>` does not exist the step refuses and says how to
+//! start the manager; under `--check`, where an earlier step may be the one
+//! enabling linger, it reports `would change` and the diff says it waits for
+//! that manager.
 
 use rustible_sdk::prelude::*;
-use rustible_sdk::system::Cmd;
+use rustible_sdk::system::{Cmd, Identity};
 
 /// The state of a unit as `systemctl` reports it. Output of every op here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +298,74 @@ pub fn validate_unit(name: &str) -> Result<()> {
 struct Unit {
     name: String,
     user: bool,
+    /// The user manager this step talks to, found by [`Unit::guard`]. `None`
+    /// for the system manager, and on the op's own copy: `check` binds a
+    /// clone, which is what the probes and the intent use.
+    runtime: Option<Runtime>,
+}
+
+/// Where `systemctl --user` finds the manager of the account a step runs as.
+///
+/// The commands run as that account, but with whatever environment reached
+/// them, and `sudo` (how [`System::as_user`] gets there) drops
+/// `XDG_RUNTIME_DIR`, without which `systemctl --user` cannot find the bus.
+/// So every `--user` command gets `XDG_RUNTIME_DIR` set to `/run/user/<uid>`
+/// for the uid `id -u` answers as that account, which is Ansible's fix
+/// (`systemd_service.py`, `/run/user/%s % os.geteuid()`).
+#[derive(Debug, Clone)]
+struct Runtime {
+    /// The account the step runs as, for messages: the `as_user` target, or
+    /// the binary's own user.
+    account: String,
+    /// `/run/user/<uid>`.
+    dir: String,
+    /// Whether `dir` exists. False only under `--check` (a real run's `check`
+    /// refuses), where an earlier step may enable linger: the probes are then
+    /// skipped and the diff says what the step waits for.
+    present: bool,
+}
+
+impl Runtime {
+    /// Find the user manager of the account `sys` runs as, refusing in a
+    /// real run when it has none.
+    fn find(sys: &System, op: &str) -> Result<Runtime> {
+        let account = match sys.identity() {
+            Identity::User(u) => u.clone(),
+            Identity::Own => sys.facts().user.clone(),
+        };
+        let out = sys
+            .cmd("id")
+            .arg("-u")
+            .run()
+            .with_context(|| format!("systemd::{op}: finding the uid of `{account}`"))?;
+        let uid = out.stdout_str();
+        let Ok(uid) = uid.trim().parse::<u32>() else {
+            bail!("systemd::{op}: `id -u` as `{account}` printed {uid:?}, not a uid");
+        };
+        let dir = format!("/run/user/{uid}");
+        let present = sys.exists(&dir)?;
+        if !present && !sys.check_mode() {
+            let linger = format!("/var/lib/systemd/linger/{account}");
+            if sys.exists(&linger)? {
+                bail!(
+                    "systemd::{op}: the user manager of `{account}` is not up yet: {dir} does \
+                     not exist although linger is enabled ({linger}). logind starts the manager \
+                     in the background after `loginctl enable-linger`; as root, \
+                     `systemctl start user@{uid}.service` waits for it"
+                );
+            }
+            bail!(
+                "systemd::{op}: no user manager for `{account}`: {dir} does not exist, so \
+                 `{account}` has neither a login session nor linger. Enable linger as root \
+                 (`loginctl enable-linger {account}`) or log in as `{account}` first"
+            );
+        }
+        Ok(Runtime {
+            account,
+            dir,
+            present,
+        })
+    }
 }
 
 /// One round of the read-only probes.
@@ -282,12 +379,53 @@ impl Unit {
         Unit {
             name: name.into(),
             user: false,
+            runtime: None,
         }
     }
 
     fn systemctl(&self, sys: &System) -> Cmd {
-        let cmd = sys.cmd("systemctl");
-        if self.user { cmd.arg("--user") } else { cmd }
+        self.scoped(sys.cmd("systemctl"))
+    }
+
+    /// `cmd` aimed at this unit's manager: unchanged for the system
+    /// manager; `--user`, with the user manager's `XDG_RUNTIME_DIR`, for a
+    /// user one.
+    fn scoped(&self, cmd: Cmd) -> Cmd {
+        if !self.user {
+            return cmd;
+        }
+        let cmd = cmd.arg("--user");
+        match &self.runtime {
+            Some(r) => cmd.env("XDG_RUNTIME_DIR", &r.dir),
+            None => cmd,
+        }
+    }
+
+    /// Under `--check` with no user manager yet, what the step waits for.
+    fn waits_for(&self) -> Option<String> {
+        self.runtime.as_ref().filter(|r| !r.present).map(|r| {
+            format!(
+                "waits for the user manager of `{}` ({} does not exist yet)",
+                r.account, r.dir
+            )
+        })
+    }
+
+    /// An intent's attribute diff, followed by what it waits for, if
+    /// anything.
+    fn noted(&self, diff: Diff) -> Diff {
+        match self.waits_for() {
+            Some(w) => Diff::many([diff, Diff::summary(w)]).expect("two parts"),
+            None => diff,
+        }
+    }
+
+    /// An intent's summary line, followed by what it waits for, if anything.
+    fn noted_summary(&self, line: String) -> Diff {
+        Diff::summary(match self.waits_for() {
+            Some(w) => format!("{line}\n{w}"),
+            None => line,
+        })
     }
 
     /// `systemctl` or `systemctl --user`, for diff summaries and messages.
@@ -306,19 +444,22 @@ impl Unit {
         Unit {
             name: String::new(),
             user: false,
+            runtime: None,
         }
     }
 
     /// The preconditions every op shares: a sane name, systemd as init, and
-    /// root unless the caller's own manager is the target.
-    fn guard(&self, sys: &System, op: &str) -> Result<()> {
+    /// root unless a user manager is the target. Returns the unit bound to
+    /// its manager, which is what the probes and the intent use.
+    fn guard(&self, sys: &System, op: &str) -> Result<Unit> {
         validate_unit(&self.name)?;
         self.guard_manager(sys, op)
     }
 
     /// The half of [`Unit::guard`] that is about the host and the manager
-    /// rather than the unit: systemd as init, and root unless `--user`.
-    fn guard_manager(&self, sys: &System, op: &str) -> Result<()> {
+    /// rather than the unit: systemd as init, root unless `--user`, and for
+    /// `--user` the [`Runtime`] of the account the step runs as.
+    fn guard_manager(&self, sys: &System, op: &str) -> Result<Unit> {
         // Explicit, though `Init::Systemd` already implies Linux: this op
         // reads `/proc/1/comm`'s answer and drives `systemctl`, and a reader
         // of the refusal should not have to know that the init check covers
@@ -344,14 +485,28 @@ impl Unit {
         if !self.user && !sys.is_root() {
             bail!(
                 "systemd::{op} needs root to manage system units (this binary runs as `{}`); \
-                 use `.user(true)` for the caller's own `systemctl --user` units",
+                 use `.user(true)` for the `systemctl --user` units of the account the step \
+                 runs as",
                 sys.facts().user
             );
         }
-        Ok(())
+        let mut bound = self.clone();
+        if self.user {
+            bound.runtime = Some(Runtime::find(sys, op)?);
+        }
+        Ok(bound)
     }
 
     fn probe(&self, sys: &System) -> Result<Probe> {
+        // No user manager to ask, which only `--check` lets through: report
+        // the unit as one an earlier step has yet to make reachable, the
+        // shape `probe_existing` already tolerates under `--check`.
+        if self.waits_for().is_some() {
+            return Ok(Probe {
+                enabled: EnabledState::NotFound,
+                active: ActiveState::Inactive,
+            });
+        }
         let out = self
             .systemctl(sys)
             .args(["is-enabled", &self.name])
@@ -399,11 +554,8 @@ impl Unit {
     /// The last 20 journal lines of the unit, for failure messages. Never
     /// fails: a missing journal is reported as such.
     fn journal_tail(&self, sys: &System) -> String {
-        let mut cmd = sys.cmd("journalctl");
-        if self.user {
-            cmd = cmd.arg("--user");
-        }
-        match cmd
+        match self
+            .scoped(sys.cmd("journalctl"))
             .args(["-u", &self.name, "--no-pager", "-n", "20"])
             .allow_failure()
             .run()
@@ -473,7 +625,8 @@ impl Intent for Enable {
         if let Some(from) = &self.active {
             changes.push(attr("active", from.as_str(), "active"));
         }
-        Diff::attrs(self.unit.name.clone(), changes)
+        self.unit
+            .noted(Diff::attrs(self.unit.name.clone(), changes))
     }
 }
 
@@ -499,7 +652,8 @@ impl Intent for Disable {
         if let Some(from) = &self.active {
             changes.push(attr("active", from.as_str(), "inactive"));
         }
-        Diff::attrs(self.unit.name.clone(), changes)
+        self.unit
+            .noted(Diff::attrs(self.unit.name.clone(), changes))
     }
 }
 
@@ -513,10 +667,10 @@ pub struct Start {
 
 impl Intent for Start {
     fn diff(&self) -> Diff {
-        Diff::attrs(
+        self.unit.noted(Diff::attrs(
             self.unit.name.clone(),
             vec![attr("active", self.from.as_str(), "active")],
-        )
+        ))
     }
 }
 
@@ -532,10 +686,10 @@ pub struct Stop {
 impl Intent for Stop {
     fn diff(&self) -> Diff {
         let from = self.from.as_ref().map_or("not-found", ActiveState::as_str);
-        Diff::attrs(
+        self.unit.noted(Diff::attrs(
             self.unit.name.clone(),
             vec![attr("active", from, "inactive")],
-        )
+        ))
     }
 }
 
@@ -551,7 +705,7 @@ pub struct Bounce {
 impl Intent for Bounce {
     fn diff(&self) -> Diff {
         let p = self.unit.prefix();
-        Diff::summary(if self.daemon_reload {
+        self.unit.noted_summary(if self.daemon_reload {
             format!("{p} daemon-reload && {p} {} {}", self.verb, self.unit.name)
         } else {
             format!("{p} {} {}", self.verb, self.unit.name)
@@ -567,7 +721,8 @@ pub struct ReloadUnits {
 
 impl Intent for ReloadUnits {
     fn diff(&self) -> Diff {
-        Diff::summary(format!("{} daemon-reload", self.manager.prefix()))
+        self.manager
+            .noted_summary(format!("{} daemon-reload", self.manager.prefix()))
     }
 }
 
@@ -610,7 +765,11 @@ impl Enabled {
         self
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -622,28 +781,28 @@ impl Op for Enabled {
     type Intent = Enable;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Enabled")?;
-        let p = self.unit.probe_existing(sys, "Enabled")?;
+        let unit = self.unit.guard(sys, "Enabled")?;
+        let p = unit.probe_existing(sys, "Enabled")?;
         if p.enabled.is_masked() {
             bail!(
                 "systemd::Enabled: unit `{}` is {}; unmask it first (`{} unmask {}`)",
-                self.unit.name,
+                unit.name,
                 p.enabled.as_str(),
-                self.unit.prefix(),
-                self.unit.name
+                unit.prefix(),
+                unit.name
             );
         }
         let enabled = (!p.enabled.is_enabled()).then(|| p.enabled.clone());
         let active = (self.now && !p.active.is_running()).then(|| p.active.clone());
         if enabled.is_none() && active.is_none() {
             return Ok(Plan::Satisfied(UnitState {
-                unit: self.unit.name.clone(),
+                unit: unit.name,
                 enabled: true,
                 active: self.now || p.active.is_running(),
             }));
         }
         Ok(Plan::Change(Enable {
-            unit: self.unit.clone(),
+            unit,
             now: self.now,
             enabled,
             active,
@@ -709,7 +868,11 @@ impl Disabled {
         self
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -721,16 +884,16 @@ impl Op for Disabled {
     type Intent = Disable;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Disabled")?;
-        let p = self.unit.probe_existing(sys, "Disabled")?;
+        let unit = self.unit.guard(sys, "Disabled")?;
+        let p = unit.probe_existing(sys, "Disabled")?;
         if p.enabled.cannot_be_disabled() {
             bail!(
                 "systemd::Disabled: unit `{}` is {}: it has no [Install] section, so it cannot be \
                  disabled; mask it (`{} mask {}`) or stop it instead",
-                self.unit.name,
+                unit.name,
                 p.enabled.as_str(),
-                self.unit.prefix(),
-                self.unit.name
+                unit.prefix(),
+                unit.name
             );
         }
         // `not-found` only reaches here under --check (`probe_existing`): the
@@ -741,13 +904,13 @@ impl Op for Disabled {
         let active = (self.now && p.active.is_running()).then(|| p.active.clone());
         if enabled.is_none() && active.is_none() {
             return Ok(Plan::Satisfied(UnitState {
-                unit: self.unit.name.clone(),
+                unit: unit.name,
                 enabled: false,
                 active: !self.now && p.active.is_running(),
             }));
         }
         Ok(Plan::Change(Disable {
-            unit: self.unit.clone(),
+            unit,
             now: self.now,
             enabled,
             active,
@@ -811,7 +974,11 @@ impl Running {
         }
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -823,20 +990,20 @@ impl Op for Running {
     type Intent = Start;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Running")?;
-        let p = self.unit.probe_existing(sys, "Running")?;
+        let unit = self.unit.guard(sys, "Running")?;
+        let p = unit.probe_existing(sys, "Running")?;
         if p.enabled.is_masked() {
             bail!(
                 "systemd::Running: unit `{}` is {} and cannot be started; unmask it first",
-                self.unit.name,
+                unit.name,
                 p.enabled.as_str()
             );
         }
         if p.active.is_running() {
-            return Ok(Plan::Satisfied(self.unit.state(&p)));
+            return Ok(Plan::Satisfied(unit.state(&p)));
         }
         Ok(Plan::Change(Start {
-            unit: self.unit.clone(),
+            unit,
             from: p.active,
         }))
     }
@@ -871,7 +1038,11 @@ impl Stopped {
         }
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -883,22 +1054,19 @@ impl Op for Stopped {
     type Intent = Stop;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Stopped")?;
-        let p = self.unit.probe_existing(sys, "Stopped")?;
+        let unit = self.unit.guard(sys, "Stopped")?;
+        let p = unit.probe_existing(sys, "Stopped")?;
         // `not-found` only reaches here under --check (`probe_existing`): the
         // unit an earlier step would install is reported as due, not as
         // already stopped (vision 12).
         if p.enabled == EnabledState::NotFound {
-            return Ok(Plan::Change(Stop {
-                unit: self.unit.clone(),
-                from: None,
-            }));
+            return Ok(Plan::Change(Stop { unit, from: None }));
         }
         if !p.active.is_running() {
-            return Ok(Plan::Satisfied(self.unit.state(&p)));
+            return Ok(Plan::Satisfied(unit.state(&p)));
         }
         Ok(Plan::Change(Stop {
-            unit: self.unit.clone(),
+            unit,
             from: Some(p.active),
         }))
     }
@@ -945,7 +1113,11 @@ impl Restart {
         self
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -973,9 +1145,8 @@ impl Op for Restart {
     type Intent = Bounce;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Restart")?;
         Ok(Plan::Change(Bounce {
-            unit: self.unit.clone(),
+            unit: self.unit.guard(sys, "Restart")?,
             daemon_reload: self.daemon_reload,
             verb: "restart",
         }))
@@ -1028,7 +1199,11 @@ impl Reload {
         self
     }
 
-    /// Manage the calling user's own units (`systemctl --user`). Needs no root.
+    /// Manage the user units (`systemctl --user`) of the account the step
+    /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
+    /// Needs no root, but needs that account's user manager, which runs
+    /// while it has a login session or linger; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
         self
@@ -1048,9 +1223,8 @@ impl Op for Reload {
     type Intent = Bounce;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.unit.guard(sys, "Reload")?;
         Ok(Plan::Change(Bounce {
-            unit: self.unit.clone(),
+            unit: self.unit.guard(sys, "Reload")?,
             daemon_reload: self.daemon_reload,
             verb: self.verb(),
         }))
@@ -1077,8 +1251,7 @@ impl Op for Reload {
 /// when a unit is being bounced anyway.
 ///
 /// Refuses a host whose init is not systemd, and refuses to run without root
-/// unless `.user(true)` selects the caller's own manager, like every other op
-/// here.
+/// unless `.user(true)` selects a user manager, like every other op here.
 ///
 /// Its output is `()`. The other ops here return a [`UnitState`], which needs
 /// a unit; this one names none, and the manager exposes nothing worth reading
@@ -1110,7 +1283,7 @@ impl Default for DaemonReload {
 
 impl DaemonReload {
     /// Reload the system manager's unit files; [`DaemonReload::user`] switches
-    /// to the caller's own manager. There is no unit to name, so nothing here
+    /// to a user manager. There is no unit to name, so nothing here
     /// is validated and nothing is read back afterwards.
     pub fn new() -> Self {
         DaemonReload {
@@ -1118,8 +1291,10 @@ impl DaemonReload {
         }
     }
 
-    /// Reload the calling user's own manager (`systemctl --user
-    /// daemon-reload`). Needs no root.
+    /// Reload the user manager (`systemctl --user daemon-reload`) of the
+    /// account the step runs as: the binary's own user, or the target of
+    /// `ctx.as_user(..)`. Needs no root; see [the module
+    /// docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.manager.user = on;
         self
@@ -1131,9 +1306,8 @@ impl Op for DaemonReload {
     type Intent = ReloadUnits;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
-        self.manager.guard_manager(sys, "DaemonReload")?;
         Ok(Plan::Change(ReloadUnits {
-            manager: self.manager.clone(),
+            manager: self.manager.guard_manager(sys, "DaemonReload")?,
         }))
     }
 
@@ -1405,6 +1579,25 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A box where `id -u` answers `uid` and that uid's user manager is up
+    /// (`/run/user/<uid>` exists), which is what every `--user` step needs.
+    fn user_manager(fake: Fake, uid: u32) -> Fake {
+        with_id(fake, uid).with_dir(format!("/run/user/{uid}"))
+    }
+
+    /// `id -u` answers `uid`, and nothing else is planted.
+    fn with_id(fake: Fake, uid: u32) -> Fake {
+        fake.with_cmd("id", Some(&["-u"]), 0, &format!("{uid}\n"))
+    }
+
+    /// What each command ran with as `XDG_RUNTIME_DIR`, in order.
+    fn runtime_dirs(fake: &Fake) -> Vec<Option<String>> {
+        fake.commands()
+            .iter()
+            .map(|c| c.env.get("XDG_RUNTIME_DIR").cloned())
+            .collect()
+    }
+
     const PROBES: [&[&str]; 2] = [
         &["systemctl", "is-enabled", "nginx"],
         &["systemctl", "is-active", "nginx"],
@@ -1515,6 +1708,8 @@ mod tests {
                 argv(&["systemctl", "is-active", "nginx"]),
             ]
         );
+        // The system manager needs no runtime directory, so none is set.
+        assert!(runtime_dirs(&after).iter().all(Option::is_none));
     }
 
     #[test]
@@ -2082,7 +2277,10 @@ mod tests {
 
     #[test]
     fn daemon_reload_user_mode_needs_no_root_and_carries_the_flag() {
-        let fake = Arc::new(with_ok(Fake::new(), &["--user", "daemon-reload"]));
+        let fake = Arc::new(with_ok(
+            user_manager(Fake::new(), 1000),
+            &["--user", "daemon-reload"],
+        ));
         let s = not_root(sys(&fake));
         let op = DaemonReload::new().user(true);
         let plan = op.check(&s).unwrap();
@@ -2093,8 +2291,13 @@ mod tests {
         op.apply(&s, change(plan)).unwrap();
         assert_eq!(
             fake.argvs(),
-            vec![argv(&["systemctl", "--user", "daemon-reload"])]
+            vec![
+                argv(&["id", "-u"]),
+                argv(&["id", "-u"]),
+                argv(&["systemctl", "--user", "daemon-reload"])
+            ]
         );
+        assert_eq!(runtime_dirs(&fake)[2].as_deref(), Some("/run/user/1000"));
     }
 
     /// `Default` exists only so clippy's `new_without_default` is satisfied;
@@ -2131,35 +2334,58 @@ mod tests {
 
     // ---- shared guards ----
 
-    fn all_ops_check(s: &System) -> Vec<(&'static str, Result<bool>)> {
+    /// Every op's `check` on `s`, against the system manager or, with
+    /// `user`, against the user manager of the account `s` runs as.
+    fn all_ops_check(s: &System, user: bool) -> Vec<(&'static str, Result<bool>)> {
         vec![
             (
                 "Enabled",
-                Enabled::new("nginx").check(s).map(|p| p.is_change()),
+                Enabled::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "Disabled",
-                Disabled::new("nginx").check(s).map(|p| p.is_change()),
+                Disabled::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "Running",
-                Running::new("nginx").check(s).map(|p| p.is_change()),
+                Running::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "Stopped",
-                Stopped::new("nginx").check(s).map(|p| p.is_change()),
+                Stopped::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "Restart",
-                Restart::new("nginx").check(s).map(|p| p.is_change()),
+                Restart::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "Reload",
-                Reload::new("nginx").check(s).map(|p| p.is_change()),
+                Reload::new("nginx")
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
             (
                 "DaemonReload",
-                DaemonReload::new().check(s).map(|p| p.is_change()),
+                DaemonReload::new()
+                    .user(user)
+                    .check(s)
+                    .map(|p| p.is_change()),
             ),
         ]
     }
@@ -2174,7 +2400,7 @@ mod tests {
             let mut facts = sys(&fake).facts().clone();
             facts.init = init;
             let s = sys(&fake).with_facts(facts);
-            for (name, r) in all_ops_check(&s) {
+            for (name, r) in all_ops_check(&s, false) {
                 let err = r.unwrap_err().to_string();
                 assert!(
                     err.contains(&format!("systemd::{name} needs systemd")),
@@ -2190,7 +2416,7 @@ mod tests {
     fn every_op_refuses_without_root_and_names_the_user() {
         let fake = Arc::new(probes("enabled", "active"));
         let s = not_root(sys(&fake));
-        for (name, r) in all_ops_check(&s) {
+        for (name, r) in all_ops_check(&s, false) {
             let err = r.unwrap_err().to_string();
             assert!(
                 err.contains(&format!("systemd::{name} needs root")),
@@ -2221,7 +2447,7 @@ mod tests {
     #[test]
     fn user_mode_adds_the_flag_everywhere_and_needs_no_root() {
         let fake = Arc::new(
-            Fake::new()
+            user_manager(Fake::new(), 1000)
                 .with_cmd(
                     "systemctl",
                     Some(&["--user", "is-enabled", "syncthing"]),
@@ -2262,6 +2488,7 @@ mod tests {
         assert_eq!(
             fake.argvs(),
             vec![
+                argv(&["id", "-u"]),
                 argv(&["systemctl", "--user", "is-enabled", "syncthing"]),
                 argv(&["systemctl", "--user", "is-active", "syncthing"]),
                 argv(&["systemctl", "--user", "enable", "--now", "syncthing"]),
@@ -2285,6 +2512,244 @@ mod tests {
             change(plan).diff().render(),
             "systemctl --user restart syncthing"
         );
+    }
+
+    /// Issue #55. Under `ctx.as_user(..)` every `--user` command must reach
+    /// the target account's manager: `id -u` runs as that account, and the
+    /// uid it answers names the `XDG_RUNTIME_DIR` that `sudo` drops on the
+    /// way there. A `Fake` has no helper process, so the switch shows as a
+    /// `sudo -n -u` prefix on each argv.
+    #[test]
+    fn user_mode_under_as_user_points_every_command_at_that_accounts_manager() {
+        let before = Arc::new(
+            user_manager(Fake::new(), 1002)
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-enabled", "mine2026"]),
+                    1,
+                    "disabled\n",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-active", "mine2026"]),
+                    3,
+                    "inactive\n",
+                ),
+        );
+        let op = Enabled::new("mine2026").user(true).now(true);
+        let plan = op.check(&sys(&before).as_user("minecraft")).unwrap();
+        let intent = change(plan);
+        assert_eq!(
+            intent.diff().render(),
+            "mine2026:\n  enabled: disabled -> enabled\n  active: inactive -> active\n"
+        );
+        let sudo = |rest: &[&str]| {
+            let mut v = argv(&["sudo", "-n", "-u", "minecraft"]);
+            v.extend(argv(rest));
+            v
+        };
+        assert_eq!(
+            before.argvs(),
+            vec![
+                sudo(&["id", "-u"]),
+                sudo(&["systemctl", "--user", "is-enabled", "mine2026"]),
+                sudo(&["systemctl", "--user", "is-active", "mine2026"]),
+            ]
+        );
+        let rt = Some("/run/user/1002".to_string());
+        assert_eq!(runtime_dirs(&before), vec![None, rt.clone(), rt.clone()]);
+
+        // `apply` executes the intent: the manager `check` found travels in
+        // it, so `apply` neither asks `id -u` again nor loses the variable.
+        // A second fake answers as the world after `enable --now`.
+        let after = Arc::new(
+            Fake::new()
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "enable", "--now", "mine2026"]),
+                    0,
+                    "",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-enabled", "mine2026"]),
+                    0,
+                    "enabled\n",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-active", "mine2026"]),
+                    0,
+                    "active\n",
+                ),
+        );
+        let out = op.apply(&sys(&after).as_user("minecraft"), intent).unwrap();
+        assert!(out.enabled && out.active);
+        assert_eq!(
+            after.argvs(),
+            vec![
+                sudo(&["systemctl", "--user", "enable", "--now", "mine2026"]),
+                sudo(&["systemctl", "--user", "is-enabled", "mine2026"]),
+                sudo(&["systemctl", "--user", "is-active", "mine2026"]),
+            ]
+        );
+        assert_eq!(runtime_dirs(&after), vec![rt.clone(), rt.clone(), rt]);
+    }
+
+    /// The journal in a failure message is read from the same manager.
+    #[test]
+    fn user_mode_reads_the_journal_with_the_runtime_dir_too() {
+        let fake = Arc::new(
+            user_manager(Fake::new(), 1002)
+                .with_cmd("systemctl", Some(&["--user", "start", "nginx"]), 0, "")
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-enabled", "nginx"]),
+                    0,
+                    "enabled\n",
+                )
+                .with_cmd(
+                    "systemctl",
+                    Some(&["--user", "is-active", "nginx"]),
+                    3,
+                    "failed\n",
+                )
+                .with_cmd("journalctl", None, 0, "user journal line\n"),
+        );
+        let s = sys(&fake).as_user("minecraft");
+        let op = Running::new("nginx").user(true);
+        let err = op
+            .apply(&s, change(op.check(&s).unwrap()))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("user journal line"), "{err}");
+        let journal = fake.commands().pop().unwrap();
+        assert_eq!(journal.program, "journalctl");
+        assert_eq!(
+            journal.env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1002")
+        );
+    }
+
+    /// Without `/run/user/<uid>` the account has no user manager, and
+    /// `systemctl --user` would only say `Failed to connect to bus`. Every op
+    /// refuses first, naming the account and how to give it a manager, and
+    /// runs nothing but `id -u`.
+    #[test]
+    fn user_mode_refuses_without_a_user_manager_and_says_how_to_start_one() {
+        let fake = Arc::new(with_id(Fake::new(), 1002));
+        let s = sys(&fake).as_user("minecraft");
+        for (name, r) in all_ops_check(&s, true) {
+            assert_eq!(
+                r.unwrap_err().chain(),
+                format!(
+                    "systemd::{name}: no user manager for `minecraft`: /run/user/1002 does not \
+                     exist, so `minecraft` has neither a login session nor linger. Enable linger \
+                     as root (`loginctl enable-linger minecraft`) or log in as `minecraft` first"
+                )
+            );
+        }
+        assert!(
+            fake.argvs().iter().all(|a| a[4..] == ["id", "-u"]),
+            "{:?}",
+            fake.argvs()
+        );
+
+        // Linger is on but logind has not finished starting the manager:
+        // the usual state right after `loginctl enable-linger`, which
+        // returns before the manager is up.
+        let fake =
+            Arc::new(with_id(Fake::new(), 1002).with_file("/var/lib/systemd/linger/minecraft", ""));
+        let s = sys(&fake).as_user("minecraft");
+        let err = Enabled::new("nginx")
+            .user(true)
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert_eq!(
+            err,
+            "systemd::Enabled: the user manager of `minecraft` is not up yet: /run/user/1002 \
+             does not exist although linger is enabled (/var/lib/systemd/linger/minecraft). \
+             logind starts the manager in the background after `loginctl enable-linger`; as \
+             root, `systemctl start user@1002.service` waits for it"
+        );
+    }
+
+    /// Under `--check` an earlier step may be the one enabling linger, so a
+    /// missing user manager is a prerequisite and not a refusal (vision 12):
+    /// each op reports `would change` without asking a manager that is not
+    /// there, and the diff names what it waits for.
+    #[test]
+    fn user_mode_without_a_user_manager_is_would_change_under_check() {
+        let fake = Arc::new(with_id(Fake::new(), 1002));
+        let s = sys(&fake).as_user("minecraft").with_check_mode(true);
+        let waits = "waits for the user manager of `minecraft` (/run/user/1002 does not exist yet)";
+        let render = |plan: Result<Plan<Enabled>>| change(plan.unwrap()).diff().render();
+        assert_eq!(
+            render(Enabled::new("nginx").user(true).now(true).check(&s)),
+            format!(
+                "nginx:\n  enabled: not-found -> enabled\n  active: inactive -> active\n{waits}"
+            )
+        );
+        assert_eq!(
+            change(Disabled::new("nginx").user(true).check(&s).unwrap())
+                .diff()
+                .render(),
+            format!("nginx:\n  enabled: not-found -> disabled\n{waits}")
+        );
+        assert_eq!(
+            change(Running::new("nginx").user(true).check(&s).unwrap())
+                .diff()
+                .render(),
+            format!("nginx:\n  active: inactive -> active\n{waits}")
+        );
+        assert_eq!(
+            change(Stopped::new("nginx").user(true).check(&s).unwrap())
+                .diff()
+                .render(),
+            format!("nginx:\n  active: not-found -> inactive\n{waits}")
+        );
+        assert_eq!(
+            change(
+                Restart::new("nginx")
+                    .user(true)
+                    .daemon_reload(true)
+                    .check(&s)
+                    .unwrap()
+            )
+            .diff()
+            .render(),
+            format!("systemctl --user daemon-reload && systemctl --user restart nginx\n{waits}")
+        );
+        assert_eq!(
+            change(DaemonReload::new().user(true).check(&s).unwrap())
+                .diff()
+                .render(),
+            format!("systemctl --user daemon-reload\n{waits}")
+        );
+        assert!(
+            fake.argvs().iter().all(|a| a[4..] == ["id", "-u"]),
+            "{:?}",
+            fake.argvs()
+        );
+    }
+
+    /// An `id -u` that does not answer with a uid is about the machine, not
+    /// a step that has yet to run, so `--check` refuses it too.
+    #[test]
+    fn user_mode_refuses_an_unreadable_uid_in_both_modes() {
+        let fake = Arc::new(Fake::new().with_cmd("id", Some(&["-u"]), 0, "nope\n"));
+        for s in [sys(&fake), sys(&fake).with_check_mode(true)] {
+            let err = Enabled::new("nginx")
+                .user(true)
+                .check(&s)
+                .unwrap_err()
+                .chain();
+            assert_eq!(
+                err,
+                "systemd::Enabled: `id -u` as `root` printed \"nope\\n\", not a uid"
+            );
+        }
     }
 
     // ---- through Ctx: check mode and the mutation guard ----

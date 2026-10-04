@@ -1023,6 +1023,13 @@ reports `ok` for the directory step while it happens.
 `/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
 with `not found`. Put a `systemd::DaemonReload::new()` between them.
 
+**Another account's user units: `ctx.as_user(name)` with `.user(true)`.**
+That account needs a running user manager (linger, or a login session), or
+the step refuses naming `/run/user/<uid>`. `loginctl enable-linger` returns
+before the manager is up, so a playbook that enables linger and steps
+straight into the account can hit that refusal; `systemctl start
+user@<uid>.service` as root, in between, waits for the manager.
+
 **`owner` takes numeric ids**, never names: `.owner(uid: u32, gid: u32)`. Read
 them off a `user::Account` returned by an earlier step.
 
