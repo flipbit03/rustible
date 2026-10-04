@@ -418,13 +418,20 @@ fn wait(
     if !sys.exists(&linger)? {
         return Ok(false);
     }
-    sys.debug(format!(
-        "waiting up to {} for the user manager of `{account}` ({socket})",
-        human(timeout)
-    ));
-    let deadline = Instant::now() + timeout;
+    // A timeout past what the clock can represent (`Duration::MAX`) has no
+    // deadline: wait until the socket appears.
+    let deadline = Instant::now().checked_add(timeout);
+    sys.debug(match deadline {
+        Some(_) => format!(
+            "waiting up to {} for the user manager of `{account}` ({socket})",
+            human(timeout)
+        ),
+        None => format!("waiting with no deadline for the user manager of `{account}` ({socket})"),
+    });
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.map_or(MANAGER_POLL, |d| {
+            d.saturating_duration_since(Instant::now())
+        });
         if left.is_zero() {
             bail!(
                 "systemd::{op}: the user manager of `{account}` (uid {uid}) did not come up: \
@@ -874,9 +881,11 @@ impl Enabled {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -991,9 +1000,11 @@ impl Disabled {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -1111,9 +1122,11 @@ impl Running {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -1189,9 +1202,11 @@ impl Stopped {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -1277,9 +1292,11 @@ impl Restart {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -1376,9 +1393,11 @@ impl Reload {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.unit.manager_timeout = timeout;
         self
@@ -1482,9 +1501,11 @@ impl DaemonReload {
     /// manager when linger is enabled but logind has not finished starting
     /// it, as right after `loginctl enable-linger`. Default
     /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
-    /// refuses at once. Ignored otherwise: without `.user(true)`, when the
-    /// manager is up, without linger (the step refuses), and under `--check`,
-    /// which never waits. See [the module docs](self#user-units).
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
     pub fn manager_timeout(mut self, timeout: Duration) -> Self {
         self.manager.manager_timeout = timeout;
         self
@@ -3150,6 +3171,31 @@ mod tests {
             .chain();
         assert!(t0.elapsed() < MANAGER_POLL, "{:?}", t0.elapsed());
         assert!(err.contains("still missing after waiting 0s"), "{err}");
+    }
+
+    /// `Duration::MAX` is past what an `Instant` can hold, so it means no
+    /// deadline rather than a panic adding it to the clock: the step waits
+    /// for the socket and then probes.
+    #[test]
+    fn user_mode_with_a_max_manager_timeout_waits_without_a_deadline() {
+        let fake = Arc::new(linger_starting());
+        let appear = {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                rustible_sdk::backend::Backend::write(&*fake, Path::new(SOCKET), b"").unwrap();
+            })
+        };
+        let plan = Running::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::MAX)
+            .check(&sys(&fake).as_user("minecraft"))
+            .unwrap();
+        appear.join().unwrap();
+        assert_eq!(
+            change(plan).diff().render(),
+            "nginx:\n  active: inactive -> active\n"
+        );
     }
 
     /// Every op takes the knob, and it reaches the wait.
