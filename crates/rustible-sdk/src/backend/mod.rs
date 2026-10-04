@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod elevated;
+pub(crate) use elevated::HelperGone;
 mod fake;
 mod local;
 

@@ -15,6 +15,7 @@ mod model;
 mod parse;
 mod resolve;
 mod show;
+mod ssh_args;
 mod validate;
 
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub use resolve::{
     local_username,
 };
 pub use show::render as render_show;
+pub use ssh_args::{SshOption, ssh_args_problems, ssh_options};
 pub use validate::{HostResults, Severity, VarError, format_vars_report, validate};
 
 impl Inventory {

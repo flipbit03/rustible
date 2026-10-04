@@ -34,10 +34,12 @@ use crate::secret::Secret;
 /// is gone, and `Os`, `Distro`, `Pm`, `Init` gain the macOS variants.
 /// 5: `Ctx::block` — `BlockStarted`/`BlockFinished` replace
 /// `SectionStarted`/`SectionFinished`, steps carry `blocks` instead of `depth`.
-/// 6: the host's verdict is what the playbook returns — `Summary.recovered`
+/// 6: the playbook's `ssh_user` — `--describe` entries carry `ssh_user`, and
+/// `Start.host` carries `login_override`.
+/// 7: the host's verdict is what the playbook returns — `Summary.recovered`
 /// counts the failed steps the playbook caught, `Summary.failed` only those
 /// that failed the host, and `Failed` carries the step's `id` and `blocks`.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Bytes per streamed chunk (vision doc 5.6).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
@@ -473,7 +475,7 @@ mod tests {
 
     /// Version 5 is `Ctx::block`: the block events replace the section
     /// events, and every step event carries the block path instead of a
-    /// depth.
+    /// depth. The number itself is pinned by the newest version's test.
     #[test]
     fn protocol_5_carries_block_paths() {
         let started = Event::BlockStarted {
@@ -525,17 +527,56 @@ mod tests {
         assert!(serde_json::from_str::<Event>(old).is_err());
     }
 
-    /// Version 6 is the host's verdict as the playbook returns it (#44):
+    /// Version 6 is the playbook's `ssh_user`: `Start.host` says, when the
+    /// attribute chose the login, what the inventory would have used, so the
+    /// binary's escalation failures can say so. An orchestrator that sets
+    /// nothing sends the same bytes as before, and a `Start` without the
+    /// field reads as "the inventory chose". The number itself is pinned by
+    /// the newest version's test.
+    #[test]
+    fn protocol_6_carries_the_login_override() {
+        use crate::ctx::{InventoryLogin, LoginOverride};
+
+        let mut host = HostInfo::local();
+        let plain = serde_json::to_value(&host).unwrap();
+        assert!(plain.get("login_override").is_none(), "{plain}");
+
+        host.login_override = Some(Box::new(LoginOverride {
+            ssh_user: "minecraft".into(),
+            inventory: Some(InventoryLogin {
+                ssh_user: "cadu".into(),
+                source: "defaults".into(),
+            }),
+        }));
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json["login_override"],
+            serde_json::json!({
+                "ssh_user": "minecraft",
+                "inventory": { "ssh_user": "cadu", "source": "defaults" },
+            })
+        );
+        let back: HostInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.login_override, host.login_override);
+
+        let json = r#"{"Start":{"run_id":"r","host":{"name":"h","groups":[]},"vars":{},"check_mode":false,"verbosity":0}}"#;
+        let Down::Start { host, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not Start")
+        };
+        assert!(host.login_override.is_none());
+    }
+
+    /// Version 7 is the host's verdict as the playbook returns it (#44):
     /// `Summary` gains `recovered` beside a `failed` that no longer counts
     /// every failed step, and `Failed` names the failed step's id and block
     /// path.
-    /// The meaning of `failed` moved with it, so a version-5 peer would
+    /// The meaning of `failed` moved with it, so a version-6 peer would
     /// disagree about a host without failing to parse anything: the number
     /// is what stops a mixed pair. Pinned here so the shape and the number
     /// move together.
     #[test]
-    fn protocol_6_carries_recovered_and_the_failed_steps_blocks() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_7_carries_recovered_and_the_failed_steps_blocks() {
+        assert_eq!(PROTOCOL_VERSION, 7);
         let summary = crate::event::Summary {
             ok: 4,
             changed: 1,
@@ -565,8 +606,11 @@ mod tests {
             "the id is what pairs the frame with its step line"
         );
         assert_eq!(blocks, ["outer", "inner"]);
-        // A version-5 summary, with no `recovered`, does not read.
+        // A version-6 summary, with no `recovered`, does not read, and nor
+        // does a version-6 `Failed`, with no `id` or `blocks`.
         let old = r#"{"Finished":{"ok":1,"changed":0,"would_change":0,"skipped":0,"failed":0,"warnings":0}}"#;
+        assert!(serde_json::from_str::<Event>(old).is_err());
+        let old = r#"{"Failed":{"step":"boom","error":"step `boom`: nope","cmd":null}}"#;
         assert!(serde_json::from_str::<Event>(old).is_err());
     }
 }

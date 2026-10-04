@@ -323,7 +323,7 @@ cannot, and each costs more to run than the tier below it.
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
-one playbook on each of two architectures.
+two playbooks on each of two architectures.
 
 **All four tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
@@ -487,9 +487,11 @@ system.
 - `RUSTIBLE_INTEGRATION_IMAGES=debian:12` narrows a run while iterating; there
   is a 600-second timeout per body.
 
-**Tier 4 is a step in `examples/workspace/playbooks/vagrant.rs`**, the one
+**Tier 4 is a step in `examples/workspace/playbooks/vagrant.rs`**, the
 playbook `make vm-test` runs. There is no separate test file: the assertion is
-that the step is in that playbook and the second run reports `ok`.
+that the step is in that playbook and the second run reports `ok`. The one
+thing a single playbook cannot show is a login chosen per playbook, so
+`vagrant_login.rs` runs after it, as an account it creates.
 
 ### Traps that make a test pass while proving nothing
 
@@ -560,7 +562,7 @@ distro is matrix data so the name cannot go stale.
 ```sh
 make vm-up          # the guest whose architecture matches this host
 make vm-ssh         # a shell in it, passwordless sudo
-make vm-test        # the playbook, twice
+make vm-test        # each playbook, twice
 make vm-status      # what is up, and the inventory naming it
 make vm-destroy     # give the disk back
 make vm-orphans     # domains left behind by a deleted checkout
@@ -572,8 +574,9 @@ without being told which. The other architecture is always emulated, so it is
 opt-in by name: `make vm-up-arm`, `make vm-up-x86`. Both spawn fast; the
 emulated one is slow to *work in*, not slow to start.
 
-`make vm-test` runs `examples/workspace/playbooks/vagrant.rs` **twice** and
-fails unless the second run reports nothing changed and nothing failed. The
+`make vm-test` runs `examples/workspace/playbooks/vagrant.rs` **twice**, then
+`vagrant_login.rs` twice, and fails unless each second run reports nothing
+changed and nothing failed. The
 second run is the test. A first run reporting `changed` proves only that the
 op did something; an op that rewrites a correct file every pass reports
 `changed` too. Limit it with `make vm-test HOSTS=vagrant-arm`.

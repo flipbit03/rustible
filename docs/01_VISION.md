@@ -231,18 +231,19 @@ Consequences accepted with remote-brain:
    nearest `rustible.toml` (section 10.4), load `hosts.kdl`.
 2. **Read playbook metadata** by doing a host-native debug build of the playbook
    and running it with `--describe`, which the `#[playbook]` macro generates.
-   This yields the target hosts, `escalate`, and a JSON schema of the typed vars
-   struct (section 10.3). **Accepted trade-off (final, 2026-09-06):** the
-   pre-check costs a cold build the first time (about a minute) and seconds
-   afterwards. In exchange the schema comes from the real compiled types, so
-   there is no source parser of our own to maintain and no restriction on var
-   field types. (Alternative considered twice: parse the source with `syn`. It is
-   instant but only sound for a closed set of canonically spelled types, cannot
-   see through aliases or imports, and needs a second parser kept in sync with
-   the proc macro. Rejected.) Mitigations: cache describe output by hash of the
-   playbook source plus `Cargo.lock`; dev profile with a shared target dir; the
-   describe build shares dependency compilation with the target build for
-   same-arch hosts; `rustible inventory check` runs only this step.
+   This yields the target hosts, `escalate`, an optional `ssh_user`, and a JSON
+   schema of the typed vars struct (section 10.3). **Accepted trade-off
+   (final, 2026-09-06):** the pre-check costs a cold build the first time
+   (about a minute) and seconds afterwards. In exchange the schema comes from
+   the real compiled types, so there is no source parser of our own to maintain
+   and no restriction on var field types. (Alternative considered twice: parse
+   the source with `syn`. It is instant but only sound for a closed set of
+   canonically spelled types, cannot see through aliases or imports, and needs a
+   second parser kept in sync with the proc macro. Rejected.) Mitigations: cache
+   describe output by hash of the playbook source plus `Cargo.lock`; dev profile
+   with a shared target dir; the describe build shares dependency compilation
+   with the target build for same-arch hosts; `rustible inventory check` runs
+   only this step.
 3. **Resolve hosts and validate vars.** For every resolved host, merge its vars
    (section 10.3) and check them against the schema. Any failure aborts the
    whole run before anything is compiled or uploaded, naming each host and each
@@ -251,7 +252,9 @@ Consequences accepted with remote-brain:
    opened here and reused for everything after (spike 1 measured 20 s for a
    cold Tailscale connection versus 0.4 s for a warm upload, so the connection
    is the expensive part, not the bytes). `connection="local"` hosts run the
-   binary as a child process instead.
+   binary as a child process instead. A playbook that sets `ssh_user` logs in
+   as that account on every host it targets, in place of the host's `ssh_user`
+   (section 6.1).
 5. **Probe** each host with one shell command, `uname -sm`, mapped to a musl
    triple. The real CLI also resolves `$HOME` here so later paths are absolute.
    This bootstrap probe is the only shell-dependent step; everything after it
@@ -499,11 +502,18 @@ local    0        2             0        0       0          0         0
 ```
 
 - The `#[rustible::playbook(...)]` attribute carries metadata: target hosts (a host
-  or group from the inventory), `escalate`, and later things like `serial`. The
-  macro wraps `main` with the runtime that speaks the protocol.
+  or group from the inventory), `escalate`, `ssh_user`, and later things like
+  `serial`. The macro wraps `main` with the runtime that speaks the protocol.
 - `escalate = true` (Ansible's `become`; see section 16 for the name) means
   the binary is launched under `sudo` on the target. Per-step escalation is
   `ctx.as_root()` (section 11.3).
+- `ssh_user = "<account>"` makes this playbook log in as that account instead
+  of the inventory's `ssh_user`, overriding every inventory level (host,
+  group, `defaults`): an explicit per-file choice wins, unlike Ansible, where
+  an inventory `ansible_user` beats a play's `remote_user`. Escalation
+  (`escalate = true`, `as_root`, `as_user`) runs from that account. A
+  `connection="local"` host has no login to change, so a run that targets one
+  with this attribute is refused.
 - `?` on a step means "this host's run fails here". Ansible's `ignore_errors` is
   `.ok()` or a `match`; `failed_when` is an `if` after the step.
 - Loops, conditionals, helper functions, and third-party crates are all just Rust.
@@ -1307,7 +1317,9 @@ Two kinds of data with two syntactic homes so they cannot be confused:
 | `ssh_args` | list of strings | no | empty | host, group, defaults |
 
 Parameter resolution: host, then nearest group outward, then `defaults`, then
-the built-in default. Parameters never come from `vars` and vars never from
+the built-in default. For `ssh_user` only, a playbook's `ssh_user` attribute
+outranks all four (section 6.1); `inventory show` describes the inventory and
+does not apply it. Parameters never come from `vars` and vars never from
 properties. On the orchestrator side parameters deserialize into a `HostParams`
 struct via serde.
 
@@ -1581,7 +1593,9 @@ Escalation is a property of how a step runs, not of the op, so it lives on
 `Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
 steps, or `ctx.as_user("postgres").step(..)` to step down. Playbook-level
 `escalate = true` remains for the common case and means the binary is launched
-via the inventory's escalation method as `escalate_user` (default root).
+via the inventory's escalation method as `escalate_user` (default root), from
+whichever account logged in: the inventory's `ssh_user`, or the playbook's when
+it sets one.
 
 **Three identity methods (DECIDED 2026-09-06):**
 - `as_user(name)`: explicit user.

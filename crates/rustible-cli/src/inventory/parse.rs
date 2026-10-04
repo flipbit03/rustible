@@ -13,6 +13,7 @@ use rustible_sdk::vars::did_you_mean;
 use super::error::{LineIndex, LoadError, LoadErrors};
 use super::model::{Connection, Escalate, Group, Host, HostParams, Inventory, Scalar, VarBag};
 use super::resolve::Conflict;
+use super::ssh_args::ssh_args_problems;
 
 /// Reject a `ssh_user` or `escalate_user` that cannot name an account.
 ///
@@ -28,7 +29,9 @@ use super::resolve::Conflict;
 /// created, so a stricter rule here would let a playbook create an account
 /// the inventory then refuses to escalate to. The two crates cannot share the
 /// function — `rustible-cli` does not depend on `rustible-std` — so they are
-/// kept in step by this note and the tests below.
+/// kept in step by this note and the tests below. The playbook attribute's
+/// `ssh_user` is checked by a third copy, `validate_ssh_user` in
+/// `rustible-macros`, for the same reason.
 fn validate_account_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("is empty".to_string());
@@ -444,6 +447,9 @@ impl<'a> Parser<'a> {
                             ),
                         }
                     }
+                    for problem in ssh_args_problems(&args) {
+                        self.err(at, format!("`ssh_args` on {owner} {problem}"));
+                    }
                     params.ssh_args = Some(args);
                 }
                 "members" | "host" if allowed.contains(&child.name().value()) => {}
@@ -580,7 +586,11 @@ impl<'a> Parser<'a> {
                 let s = want_string!(
                     "a string (for several, use the child node `ssh_args \"-o\" \"...\"`)"
                 );
-                params.ssh_args = Some(vec![s]);
+                let args = vec![s];
+                for problem in ssh_args_problems(&args) {
+                    self.err(at, format!("`ssh_args` on {owner} {problem}"));
+                }
+                params.ssh_args = Some(args);
             }
             other => {
                 let msg = match did_you_mean(other, HostParams::NAMES.iter().copied()) {

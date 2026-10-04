@@ -5,14 +5,25 @@
 //! container harness in `crates/rustible-std/tests/`: the real SSH transport,
 //! escalation through a real `sudo`, a live `/proc/sys` write, and a full
 //! init system. Run it twice: every step reports `changed` and then `ok`.
+//!
+//! It also makes the account `vagrant_login.rs` logs in as, with the keys
+//! the box's own login accepts, so that playbook's `ssh_user` can reach it
+//! with the inventory's key.
 
 use std::time::Duration;
 
 use rustible::prelude::*;
-use rustible_std::{apt, file, sysctl, systemd};
+use rustible_std::ssh::authorized_keys;
+use rustible_std::{apt, file, sysctl, systemd, user};
 
 /// What the marker file says, so a second run has something to compare.
 const MARKER: &str = "written by rustible from dev/vagrant\n";
+
+/// The second account, which `vagrant_login.rs` names in its `ssh_user`.
+const LOGIN_ACCOUNT: &str = "rustible-login";
+
+/// The keys the box's login accepts; the inventory's `-i` is one of them.
+const BOX_KEYS: &str = "/home/vagrant/.ssh/authorized_keys";
 
 #[rustible::vars]
 struct Vars {
@@ -44,6 +55,14 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
 
     // A full init system, queried through systemctl.
     ctx.step("time sync enabled", systemd::Enabled::new("systemd-timesyncd").now(true))?;
+
+    // The account a playbook's `ssh_user` logs in as, reachable with the
+    // same key as the box's own login.
+    let keys = ctx.sys().read_to_string(BOX_KEYS)?;
+    let keys: Vec<&str> = keys.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    ensure!(!keys.is_empty(), "{BOX_KEYS} has no keys to give {LOGIN_ACCOUNT}");
+    let account = ctx.step(format!("{LOGIN_ACCOUNT} account"), user::Present::new(LOGIN_ACCOUNT).create_home(true))?;
+    ctx.step(format!("{LOGIN_ACCOUNT} keys"), authorized_keys::Present::for_user(&account).keys(keys))?;
 
     Ok(())
 }
