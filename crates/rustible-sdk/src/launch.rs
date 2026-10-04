@@ -930,10 +930,12 @@ mod tests {
             Path::new("-p"),
             b"",
         );
-        assert_eq!(
-            out,
-            format!("Rran ./-p/rustible-feed/{NAME} --remote --ephemeral\n"),
-            "{err}"
+        // How `$0` reads differs (macOS resolves it); that it ran is the
+        // point, where bash's `exec` used to refuse `-p/...` as options.
+        assert!(out.starts_with("Rran "), "{out}{err}");
+        assert!(
+            out.ends_with(&format!("-p/rustible-feed/{NAME} --remote --ephemeral\n")),
+            "{out}{err}"
         );
     }
 
