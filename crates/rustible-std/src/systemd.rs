@@ -3197,10 +3197,11 @@ mod tests {
         fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
             if p == Path::new(SOCKET) {
                 self.looks.fetch_add(1, Ordering::SeqCst);
-                // One `check` stats from one thread, so load then subtract
-                // cannot race.
-                if self.denied.load(Ordering::SeqCst) > 0 {
-                    self.denied.fetch_sub(1, Ordering::SeqCst);
+                let denying = self
+                    .denied
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if denying {
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                 }
             }
@@ -3335,10 +3336,13 @@ mod tests {
 
     /// `Duration::MAX` is past what an `Instant` can hold, so it means no
     /// deadline rather than a panic adding it to the clock: the step waits
-    /// for the socket and then probes.
+    /// for the socket and then probes. With no deadline it still polls every
+    /// [`MANAGER_POLL`]: about three looks in 200 ms, where a spin makes
+    /// thousands.
     #[test]
     fn user_mode_with_a_max_manager_timeout_waits_without_a_deadline() {
         let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
         let appear = {
             let fake = fake.clone();
             std::thread::spawn(move || {
@@ -3349,9 +3353,10 @@ mod tests {
         let plan = Running::new("nginx")
             .user(true)
             .manager_timeout(Duration::MAX)
-            .check(&sys(&fake).as_user("minecraft"))
+            .check(&watched.sys())
             .unwrap();
         appear.join().unwrap();
+        assert!(watched.looks() <= 5, "{}", watched.looks());
         assert_eq!(
             change(plan).diff().render(),
             "nginx:\n  active: inactive -> active\n"
