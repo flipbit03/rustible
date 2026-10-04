@@ -1,9 +1,14 @@
 //! The `Elevated` backend (vision doc 11.3): every primitive is a request to
 //! a helper process, which is this same binary started as another user in
-//! `--helper` mode (`sudo -n -u <user> <exe> --helper`). The helper is a
-//! `Local` backend wrapped in a request loop (`serve_helper`); frames are the
-//! same length-prefixed JSON as the main channel. One helper per identity,
-//! spawned on first use, kept for the run, closed on drop.
+//! `--helper` mode. The helper is a `Local` backend wrapped in a request
+//! loop (`serve_helper`); frames are the same length-prefixed JSON as the
+//! main channel. One helper per identity, spawned on first use, kept for the
+//! run, closed on drop.
+//!
+//! Root runs the binary where it is (`sudo -n -u root <exe> --helper`).
+//! Any other account usually cannot read it, so [`Spawner`] streams the
+//! binary to that account's own cache, or a private per-run temp directory,
+//! and starts the helper from there ([`launch`](crate::launch), #62).
 //!
 //! ## What crosses, and what does not
 //!
@@ -39,16 +44,17 @@
 //! mail to root each time, and `pam_faillock` locking the account out after
 //! a handful.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::{Backend, CmdSpec, Local, Output, Stat};
+use crate::launch::{self, Answer, Launch, Mode, Next};
 use crate::protocol::{FrameTooLarge, MAX_FRAME_PAYLOAD, read_frame, write_frame};
 use crate::secret::Secret;
 
@@ -394,9 +400,10 @@ fn unit(r: io::Result<()>) -> HelperResponse {
 }
 
 /// The command line that starts a helper as `user` through `method`
-/// (`sudo` or `doas`, the inventory's `escalate` parameter). With a
-/// password, sudo reads it from stdin (`-S`); doas cannot, and `none` means
-/// the host forbids escalation.
+/// (`sudo` or `doas`, the inventory's `escalate` parameter) by exec'ing
+/// `exe` directly, which is how a root helper starts. With a password, sudo
+/// reads it from stdin (`-S`); doas cannot, and `none` means the host
+/// forbids escalation.
 ///
 /// The vector is safe to print, and error messages do print it: it holds the
 /// method, the user, the binary and `--helper`, and never the password,
@@ -412,35 +419,18 @@ pub fn helper_argv(
     exe: &Path,
     with_password: bool,
 ) -> io::Result<Vec<String>> {
-    let exe = exe.to_string_lossy().into_owned();
-    let tail = [exe, "--helper".to_string()];
-    let argv: Vec<String> = match (method, with_password) {
-        ("sudo", false) => ["sudo", "-n", "-u", user].map(String::from).to_vec(),
-        ("sudo", true) => ["sudo", "-S", "-p", "", "-u", user]
-            .map(String::from)
-            .to_vec(),
-        ("doas", false) => ["doas", "-n", "-u", user].map(String::from).to_vec(),
-        ("doas", true) => {
-            return Err(io::Error::other(
-                "doas cannot take a password from a pipe; configure doas for passwordless use",
-            ));
-        }
-        ("none", _) => {
-            return Err(io::Error::other(format!(
-                "cannot run as `{user}`: this host's escalation method is `none`"
-            )));
-        }
-        (other, _) => {
-            return Err(io::Error::other(format!(
-                "unknown escalation method `{other}` (expected sudo, doas, or none)"
-            )));
-        }
-    };
-    Ok(argv.into_iter().chain(tail).collect())
+    let mut argv = launch::escalation(method, user, with_password, false)?;
+    argv.extend([exe.to_string_lossy().into_owned(), "--helper".to_string()]);
+    Ok(argv)
 }
 
 /// How to start a helper: which binary, through which method, with which
 /// password. Shared by every identity of a run.
+///
+/// Root reads the binary where it is, so a root helper execs `exe`. Any
+/// other account usually cannot (vision 11.3), so the binary streams itself
+/// to that account first, through the spawns [`launch`] describes, and the
+/// helper runs from the account's own copy.
 #[derive(Clone)]
 pub struct Spawner {
     /// `sudo`, `doas` or `none`, from the inventory's `escalate` parameter.
@@ -449,7 +439,8 @@ pub struct Spawner {
     pub method: String,
     /// The binary to re-exec in `--helper` mode, normally
     /// `std::env::current_exe()`. The helper is this same playbook binary,
-    /// so escalation installs nothing on the target.
+    /// so escalation installs nothing on the target. Its file name is what a
+    /// streamed copy is cached under.
     pub exe: PathBuf,
     /// The escalation password, when the host needs one. `None` means
     /// passwordless escalation only, and a host that then asks for one gets
@@ -482,50 +473,387 @@ impl Spawner {
     }
 
     fn spawn(&self, user: &str) -> io::Result<Connection> {
+        if user == "root" {
+            self.spawn_root(user)
+        } else {
+            self.spawn_streamed(user)
+        }
+    }
+
+    /// Root execs `exe` where it is, as it always has. With a password the
+    /// command goes through [`launch::EXEC`] so it answers a byte once sudo
+    /// has accepted the password; without one there is nothing to wait for,
+    /// since `sudo -n` never prompts, and the argv is plain [`helper_argv`].
+    fn spawn_root(&self, user: &str) -> io::Result<Connection> {
         let with_password = self.needs_password(user);
-        let argv = helper_argv(&self.method, user, &self.exe, with_password)?;
-        let child = Command::new(&argv[0])
-            .args(&argv[1..])
+        if !with_password {
+            let argv = helper_argv(&self.method, user, &self.exe, false)?;
+            return Ok(self.start(user, &argv, false, Kind::Plain)?.connection());
+        }
+        let mut argv = launch::escalation(&self.method, user, true, false)?;
+        argv.extend(
+            ["/bin/sh", "-c", launch::EXEC, "rustible"]
+                .map(String::from)
+                .into_iter()
+                .chain([self.exe.to_string_lossy().into_owned(), "--helper".into()]),
+        );
+        let mut started = self.start(user, &argv, true, Kind::Exec)?;
+        match started.first_byte(launch::FIRST_BYTE_DEADLINE)? {
+            Some(b'R') => Ok(started.connection()),
+            other => Err(started.gone(other)),
+        }
+    }
+
+    /// Try the account's cached copy, install one if there is none, and
+    /// fall back to a private temp directory: [`launch::Launch`] decides,
+    /// this runs the spawns. Every spawn writes one byte before anything is
+    /// written to it, so a password line is the only thing on its stdin
+    /// until sudo has accepted it.
+    fn spawn_streamed(&self, user: &str) -> io::Result<Connection> {
+        let mut exe = std::fs::File::open(&self.exe).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("opening {} to copy it to `{user}`: {e}", self.exe.display()),
+            )
+        })?;
+        let size = exe.metadata()?.len();
+        let name = self
+            .exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut plan = Launch::new(name, size, Mode::Helper, user, format!("as_user({user})"));
+        loop {
+            let spawn = plan.spawn();
+            let with_password = self.needs_password(user);
+            let mut argv = launch::escalation(&self.method, user, with_password, true)?;
+            argv.extend(plan.argv(spawn));
+            let mut started = self.start(user, &argv, with_password, Kind::Shell)?;
+            let byte = started.first_byte(launch::FIRST_BYTE_DEADLINE)?;
+            let next = match spawn {
+                launch::Spawn::Try(_) => {
+                    let Some(answer) = byte.and_then(Answer::from_byte) else {
+                        return Err(started.gone(byte));
+                    };
+                    let next = plan.after_try(answer);
+                    if next == Next::Ready {
+                        return Ok(started.connection());
+                    }
+                    started.finish();
+                    next
+                }
+                launch::Spawn::Install(_) => {
+                    if byte != Some(launch::INSTALL_READY) {
+                        return Err(started.gone(byte));
+                    }
+                    exe.seek(io::SeekFrom::Start(0))?;
+                    started.feed(&mut exe)?;
+                    let (status, stderr) = started.finish();
+                    plan.after_install(status, &stderr)
+                }
+            };
+            match next {
+                Next::Spawn(_) => continue,
+                Next::Refuse(what) => {
+                    return Err(io::Error::other(HelperGone {
+                        what,
+                        note: self.note.clone(),
+                    }));
+                }
+                Next::Ready => unreachable!("only a try answers Ready"),
+            }
+        }
+    }
+
+    /// Start `argv` with piped stdio, as `kind` says, and write the password
+    /// line first when there is one.
+    fn start(
+        &self,
+        user: &str,
+        argv: &[String],
+        with_password: bool,
+        kind: Kind,
+    ) -> io::Result<Started> {
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| io::Error::new(e.kind(), format!("spawning `{}`: {e}", argv.join(" "))))?;
-        let mut conn = self.connection(user, child);
-        if with_password && let Some(pw) = &self.password {
-            conn.tx.write_all(pw.as_bytes())?;
-            conn.tx.write_all(b"\n")?;
-            conn.tx.flush()?;
+            .stderr(Stdio::piped());
+        if kind != Kind::Plain {
+            cmd.env("LC_ALL", "C");
         }
-        Ok(conn)
+        if kind == Kind::Shell {
+            cmd.current_dir("/");
+        }
+        let child = cmd.spawn().map_err(|e| {
+            io::Error::new(e.kind(), format!("spawning `{}`: {e}", printable(argv)))
+        })?;
+        let mut started = Started::new(user, child, kind == Kind::Plain, self.note.clone());
+        if with_password && let Some(pw) = &self.password {
+            // A sudo that already exited shows as EOF on the first byte,
+            // with its stderr; the write failing says less than that.
+            let tx = started.tx.as_mut().expect("piped");
+            let _ = tx
+                .write_all(pw.as_bytes())
+                .and_then(|()| tx.write_all(b"\n"))
+                .and_then(|()| tx.flush());
+        }
+        Ok(started)
     }
 
     /// A [`Connection`] over a started helper's pipes, with its stderr
     /// echoed and its tail kept for the failure report, and this spawner's
     /// `note` attached.
-    fn connection(&self, user: &str, mut child: Child) -> Connection {
-        let tx: Box<dyn Write + Send> = Box::new(child.stdin.take().expect("piped"));
-        let rx: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped"));
+    #[cfg(test)]
+    fn connection(&self, user: &str, child: Child) -> Connection {
+        Started::new(user, child, true, self.note.clone()).connection()
+    }
+}
+
+/// How [`Spawner::start`] starts a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A root helper without a password, exactly as before streaming
+    /// existed: the caller's working directory and environment, stderr
+    /// echoed from the start, no ready byte to wait for.
+    Plain,
+    /// A root helper behind [`launch::EXEC`], because a password is fed:
+    /// `LC_ALL=C`, so sudo's rejection line is in the words
+    /// [`launch::password_rejected`] knows. The working directory stays the
+    /// caller's, which root can always read.
+    Exec,
+    /// A [`launch`] script as another account: `LC_ALL=C`, and run from
+    /// `/`, because the caller's directory may be unreadable to the account
+    /// and macOS's `/bin/sh` complains about that on stderr before running
+    /// anything.
+    Shell,
+}
+
+/// An argv for a message: a script argument is long and says nothing the
+/// reader needs, so it is shown as `<script>`.
+fn printable(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if [launch::TRY, launch::INSTALL, launch::EXEC].contains(&a.as_str()) {
+                "<script>"
+            } else {
+                a.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What the readers of a [`Started`] child report.
+enum Event {
+    /// A line of the child's stderr.
+    Line(String),
+    /// The first byte of its stdout (`None` at EOF), and the pipe back.
+    Byte(io::Result<Option<u8>>, ChildStdout),
+}
+
+/// A child of the escalation tool, before and while it is a helper: its
+/// pipes, and a thread reading its stderr that keeps the last lines for the
+/// failure report, forwards each line to [`Started::first_byte`] while that
+/// waits, and echoes them once the child is a helper.
+struct Started {
+    user: String,
+    child: Child,
+    tx: Option<ChildStdin>,
+    rx: Option<ChildStdout>,
+    tail: Arc<Mutex<Vec<String>>>,
+    echo: Arc<AtomicBool>,
+    events: mpsc::Receiver<Event>,
+    events_tx: mpsc::Sender<Event>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    note: Option<String>,
+}
+
+impl Started {
+    fn new(user: &str, mut child: Child, echo: bool, note: Option<String>) -> Started {
+        let tx = child.stdin.take();
+        let rx = child.stdout.take();
         let stderr = child.stderr.take().expect("piped");
         let tail: Arc<Mutex<Vec<String>>> = Arc::default();
-        let tail_w = tail.clone();
-        let label = format!("helper as {user}");
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                eprintln!("[{label}] {line}");
-                let mut t = tail_w.lock().unwrap();
-                if t.len() >= 5 {
-                    t.remove(0);
+        let echo = Arc::new(AtomicBool::new(echo));
+        let (events_tx, events) = mpsc::channel();
+        let reader = {
+            let (tail, echo, events_tx) = (tail.clone(), echo.clone(), events_tx.clone());
+            let label = format!("helper as {user}");
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if echo.load(Ordering::SeqCst) {
+                        eprintln!("[{label}] {line}");
+                    }
+                    {
+                        let mut t = tail.lock().unwrap();
+                        if t.len() >= 5 {
+                            t.remove(0);
+                        }
+                        t.push(line.clone());
+                    }
+                    // Nobody listens once the handshake is over.
+                    let _ = events_tx.send(Event::Line(line));
                 }
-                t.push(line);
-            }
-        });
-        Connection {
+            })
+        };
+        Started {
+            user: user.to_string(),
+            child,
             tx,
             rx,
-            child: Some(child),
-            stderr_tail: tail,
+            tail,
+            echo,
+            events,
+            events_tx,
+            reader: Some(reader),
+            note,
+        }
+    }
+
+    /// The child's first byte on stdout, `None` at EOF. Refused, with the
+    /// child killed, when its stderr shows sudo rejecting the password
+    /// before then, or when nothing arrives within `deadline`: `sudo -S`
+    /// that did not accept a password reads another line from the same
+    /// pipe, and nothing would ever write one.
+    fn first_byte(&mut self, deadline: Duration) -> io::Result<Option<u8>> {
+        let mut rx = self.rx.take().expect("stdout is read once");
+        let events_tx = self.events_tx.clone();
+        std::thread::spawn(move || {
+            let mut b = [0u8];
+            let r = loop {
+                match rx.read(&mut b) {
+                    Ok(0) => break Ok(None),
+                    Ok(_) => break Ok(Some(b[0])),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(e),
+                }
+            };
+            let _ = events_tx.send(Event::Byte(r, rx));
+        });
+        let until = Instant::now() + deadline;
+        loop {
+            let wait = until.saturating_duration_since(Instant::now());
+            match self.events.recv_timeout(wait) {
+                Ok(Event::Byte(r, rx)) => {
+                    self.rx = Some(rx);
+                    return r;
+                }
+                Ok(Event::Line(line)) if launch::password_rejected(&line) => {
+                    self.kill();
+                    return Err(self.refusal(launch::password_rejected_message(&self.user, &line)));
+                }
+                Ok(Event::Line(_)) => {}
+                Err(_) => {
+                    self.kill();
+                    self.settle();
+                    let tail = self.tail.lock().unwrap().join("\n");
+                    return Err(self.refusal(launch::deadline_message(&self.user, deadline, &tail)));
+                }
+            }
+        }
+    }
+
+    /// Stream `src` to the child's stdin and close it. A write that fails
+    /// is not reported: the child stopped reading, and its exit status and
+    /// stderr say why. A read that fails is, with the child killed.
+    fn feed(&mut self, src: &mut impl Read) -> io::Result<()> {
+        let mut tx = self.tx.take().expect("stdin is fed once");
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    self.kill();
+                    return Err(e);
+                }
+            };
+            if tx.write_all(&buf[..n]).is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Close stdin, reap the child, and let the stderr reader finish: its
+    /// exit status (-1 for a signal) and everything it said, for
+    /// [`Launch::after_install`].
+    fn finish(&mut self) -> (i32, String) {
+        self.tx = None;
+        let status = self.child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        self.settle();
+        (status, self.tail.lock().unwrap().join("\n"))
+    }
+
+    /// Wait for the stderr reader to reach EOF, briefly: the report quotes
+    /// its tail, and a line still in the pipe is usually the one that says
+    /// why. Bounded, because something the child left running may hold the
+    /// pipe open.
+    fn settle(&mut self) {
+        let t0 = Instant::now();
+        while let Some(r) = &self.reader {
+            if r.is_finished() {
+                let _ = self.reader.take().map(|r| r.join());
+                return;
+            }
+            if t0.elapsed() > Duration::from_secs(2) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Close stdin, SIGKILL, reap. Stdin goes first: a sudo that runs with
+    /// a real uid of 0 while it reads a password cannot be signalled by the
+    /// caller, and EOF on the password read is what ends it then.
+    fn kill(&mut self) {
+        self.stop(true);
+    }
+
+    fn stop(&mut self, signal: bool) {
+        self.tx = None;
+        if signal {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    fn refusal(&self, what: String) -> io::Error {
+        io::Error::other(HelperGone {
+            what,
             note: self.note.clone(),
+        })
+    }
+
+    /// The child exited, or answered something no script writes: its exit
+    /// status and stderr, as for a helper that died.
+    fn gone(mut self, byte: Option<u8>) -> io::Error {
+        if byte.is_some() {
+            self.kill();
+        }
+        let (status, tail) = self.finish();
+        let mut what = format!("helper exited {status}");
+        let tail = tail.replace('\n', " / ");
+        if !tail.is_empty() {
+            what = format!("{what}: {tail}");
+        }
+        if let Some(b) = byte {
+            what = format!("{what} (it answered {:?} before any frame)", b as char);
+        }
+        self.refusal(what)
+    }
+
+    /// The child is a helper now: its pipes become the frame channel, and
+    /// its stderr is echoed from here on.
+    fn connection(mut self) -> Connection {
+        self.echo.store(true, Ordering::SeqCst);
+        Connection {
+            tx: Box::new(self.tx.take().expect("piped")),
+            rx: Box::new(self.rx.take().expect("piped")),
+            child: Some(self.child),
+            stderr_tail: self.tail,
+            note: self.note,
         }
     }
 }
@@ -1253,5 +1581,361 @@ mod tests {
         let cmd = sys.cmd("true").run().unwrap_err().chain();
         assert_eq!(cmd.matches(note).count(), 1, "{cmd}");
         assert!(cmd.contains("failed earlier and is not retried"), "{cmd}");
+    }
+
+    // ---- streaming, behind a stand-in `sudo` ----
+    //
+    // `sudo` is resolved through `PATH`, and changing `PATH` in this process
+    // would race every other test that spawns a program, so the outer test
+    // re-runs this binary with a stand-in first on `PATH` and the inner one
+    // does the work. The stand-in drops sudo's options, checks a password
+    // the way `sudo -S` does when told to, and runs the rest as the test's
+    // own user, with the `HOME` and `TMPDIR` the outer test chose.
+
+    const STAND_IN_SUDO: &str = r#"#!/bin/sh
+printf 'LC_ALL=%s cwd=%s | %s\n' "$LC_ALL" "$(pwd)" "$*" >> "$RUSTIBLE_TEST_SUDO_LOG"
+case "$RUSTIBLE_TEST_NO_READY $*" in
+  1*"printf I"*) ( sleep 1; kill $$ ) & exec cat > "$RUSTIBLE_TEST_DIR/early" ;;
+esac
+pw=
+while [ $# -gt 0 ]; do
+  case $1 in -n|-H) shift ;; -S) pw=1; shift ;; -p|-u) shift 2 ;; *) break ;; esac
+done
+if [ -n "$RUSTIBLE_TEST_PASSWORD" ]; then
+  [ -n "$pw" ] || { echo "sudo: a password is required" >&2; exit 1; }
+  IFS= read -r line
+  if [ "$line" != "$RUSTIBLE_TEST_PASSWORD" ]; then
+    echo "Sorry, try again." >&2
+    IFS= read -r line
+    echo "sudo: 2 incorrect password attempts" >&2
+    exit 1
+  fi
+fi
+exec "$@"
+"#;
+
+    /// The playbook binary's stand-in: it says where it ran from and how.
+    const STAND_IN_EXE: &str = "#!/bin/sh\necho \"ran $0 $*\"\n";
+
+    const HASHED: &str = "pb-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Run the inner test for `case` behind the stand-in, in a fresh
+    /// directory holding `home/`, `tmp/` and the binary to stream.
+    fn behind_stand_in_sudo(case: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("sudo"), STAND_IN_SUDO).unwrap();
+        std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        for d in ["home", "tmp"] {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "backend::elevated::tests::streamed_spawn_behind_a_stand_in_sudo",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PATH", path)
+            .env("HOME", dir.path().join("home"))
+            .env("TMPDIR", dir.path().join("tmp"))
+            .env("RUSTIBLE_TEST_SUDO_LOG", dir.path().join("sudo.log"))
+            .env("RUSTIBLE_TEST_STREAM", case)
+            .env("RUSTIBLE_TEST_DIR", dir.path())
+            .env_remove("LC_ALL")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{case}:\n{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "{case}: did not run\n{stdout}");
+    }
+
+    #[test]
+    fn a_cold_then_warm_helper_runs_from_the_accounts_own_copy() {
+        behind_stand_in_sudo("cold-warm");
+    }
+
+    #[test]
+    fn an_account_without_a_home_gets_a_private_temp_copy() {
+        behind_stand_in_sudo("no-home");
+    }
+
+    #[test]
+    fn no_home_and_no_temp_directory_is_refused_naming_both() {
+        behind_stand_in_sudo("nowhere");
+    }
+
+    #[test]
+    fn a_password_is_fed_before_each_streamed_spawn() {
+        behind_stand_in_sudo("password");
+    }
+
+    #[test]
+    fn a_rejected_password_is_refused_instead_of_hanging() {
+        behind_stand_in_sudo("wrong-password");
+    }
+
+    #[test]
+    fn a_root_helper_with_a_password_waits_for_its_ready_byte() {
+        behind_stand_in_sudo("root-password");
+    }
+
+    #[test]
+    fn a_root_helper_without_a_password_starts_as_it_always_did() {
+        behind_stand_in_sudo("root-plain");
+    }
+
+    #[test]
+    fn no_byte_of_the_binary_is_written_before_the_install_answers() {
+        behind_stand_in_sudo("no-ready");
+    }
+
+    /// The inner half of the tests above.
+    #[test]
+    #[ignore = "run by the tests that call behind_stand_in_sudo"]
+    fn streamed_spawn_behind_a_stand_in_sudo() {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(case) = std::env::var("RUSTIBLE_TEST_STREAM") else {
+            return;
+        };
+        let dir = PathBuf::from(std::env::var("RUSTIBLE_TEST_DIR").unwrap());
+        let (home, tmp) = (dir.join("home"), dir.join("tmp"));
+        let exe = dir.join(HASHED);
+        std::fs::write(&exe, STAND_IN_EXE).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spawner = |password: Option<&str>| Spawner {
+            method: "sudo".into(),
+            exe: exe.clone(),
+            password: password.map(|p| Secret::from(p.to_string())),
+            note: None,
+        };
+        let log = || std::fs::read_to_string(dir.join("sudo.log")).unwrap_or_default();
+        // Each call as `LC_ALL=<value> cwd=<dir>` and the argv.
+        let calls = || -> Vec<(String, String)> {
+            log()
+                .lines()
+                .map(|l| {
+                    let (env, argv) = l.split_once(" | ").unwrap();
+                    (env.to_string(), argv.to_string())
+                })
+                .collect()
+        };
+        // What the helper's stand-in printed: where it ran from, and how.
+        let ran = |conn: Connection| {
+            let mut out = String::new();
+            let mut rx = conn.rx;
+            rx.read_to_string(&mut out).unwrap();
+            out
+        };
+        let cached = home.join(".cache/rustible/bin").join(HASHED);
+        // The spawns, by their script: `try`, `install`, `exec`.
+        let spawns = || {
+            calls()
+                .into_iter()
+                .map(|(_, argv)| argv)
+                .filter(|l| !l.ends_with(" true"))
+                .map(|l| {
+                    if l.contains(launch::INSTALL) {
+                        "install"
+                    } else if l.contains(launch::EXEC) {
+                        "exec"
+                    } else {
+                        "try"
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        match case.as_str() {
+            "cold-warm" => {
+                let conn = spawner(None).spawn("svc").unwrap();
+                assert_eq!(ran(conn), format!("ran {} --helper\n", cached.display()));
+                assert_eq!(spawns(), ["try", "install", "try"]);
+                // Every streamed spawn runs from `/` under `LC_ALL=C`.
+                for (env, argv) in calls() {
+                    assert_eq!(env, "LC_ALL=C cwd=/", "{argv}");
+                    assert!(argv.starts_with("-n -H -u svc /bin/sh -c "), "{argv}");
+                }
+                assert_eq!(std::fs::read(&cached).unwrap(), STAND_IN_EXE.as_bytes());
+                std::fs::remove_file(dir.join("sudo.log")).unwrap();
+                let conn = spawner(None).spawn("svc").unwrap();
+                assert_eq!(ran(conn), format!("ran {} --helper\n", cached.display()));
+                assert_eq!(spawns(), ["try"]);
+            }
+            "no-home" => {
+                std::fs::remove_dir(&home).unwrap();
+                let conn = spawner(None).spawn("svc").unwrap();
+                let out = ran(conn);
+                let copy = out
+                    .strip_prefix("ran ")
+                    .and_then(|o| o.strip_suffix(" --helper --ephemeral\n"))
+                    .unwrap_or_else(|| panic!("{out}"));
+                let copy = Path::new(copy);
+                assert!(copy.starts_with(&tmp), "{out}");
+                assert!(
+                    copy.parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("rustible-")
+                );
+                let mode = std::fs::metadata(copy.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700);
+                assert_eq!(spawns(), ["try", "install", "install", "try"]);
+            }
+            "nowhere" => {
+                std::fs::remove_dir(&home).unwrap();
+                std::fs::remove_dir(&tmp).unwrap();
+                let Err(err) = spawner(None).spawn("svc") else {
+                    panic!("spawned")
+                };
+                let err = err.to_string();
+                assert!(
+                    err.starts_with(&format!(
+                        "as_user(svc): no usable home ({} does not exist) and cannot create {}/rustible-",
+                        home.display(),
+                        tmp.display()
+                    )),
+                    "{err}"
+                );
+                assert!(
+                    err.ends_with(", so svc cannot run its copy of the playbook binary"),
+                    "{err}"
+                );
+            }
+            "password" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_PASSWORD", "right") };
+                let conn = spawner(Some("right")).spawn("svc").unwrap();
+                assert_eq!(ran(conn), format!("ran {} --helper\n", cached.display()));
+                // Every spawn probed with `-n`, was refused, and got `-S`.
+                assert_eq!(spawns(), ["try", "install", "try"]);
+                assert_eq!(log().lines().filter(|l| l.ends_with(" true")).count(), 3);
+                assert_eq!(std::fs::read(&cached).unwrap(), STAND_IN_EXE.as_bytes());
+            }
+            "wrong-password" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_PASSWORD", "right") };
+                let t0 = Instant::now();
+                let Err(err) = spawner(Some("wrong")).spawn("svc") else {
+                    panic!("spawned")
+                };
+                assert_eq!(
+                    err.to_string(),
+                    "escalation as `svc` failed: the password given with \
+                     --escalate-password-env was rejected (Sorry, try again.)"
+                );
+                assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", t0.elapsed());
+                assert!(!cached.exists());
+            }
+            "root-password" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_PASSWORD", "right") };
+                let conn = spawner(Some("right")).spawn("root").unwrap();
+                // Root is not streamed: it runs the binary where it is.
+                assert_eq!(ran(conn), format!("ran {} --helper\n", exe.display()));
+                assert_eq!(spawns(), ["exec"]);
+                // `LC_ALL=C` for sudo's rejection line, and the caller's own
+                // working directory, which root can always read.
+                let (env, _) = calls()
+                    .into_iter()
+                    .find(|(_, a)| a.contains(launch::EXEC))
+                    .unwrap();
+                assert!(env.starts_with("LC_ALL=C cwd="), "{env}");
+                assert_ne!(env, "LC_ALL=C cwd=/", "{env}");
+                let Err(err) = spawner(Some("wrong")).spawn("root") else {
+                    panic!("spawned")
+                };
+                assert!(err.to_string().contains("was rejected"), "{err}");
+            }
+            "root-plain" => {
+                let conn = spawner(None).spawn("root").unwrap();
+                assert_eq!(ran(conn), format!("ran {} --helper\n", exe.display()));
+                // The argv, environment and working directory of before.
+                let cwd = std::env::current_dir().unwrap();
+                assert_eq!(
+                    calls(),
+                    [(
+                        format!("LC_ALL= cwd={}", cwd.display()),
+                        format!("-n -u root {} --helper", exe.display())
+                    )]
+                );
+            }
+            "no-ready" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_NO_READY", "1") };
+                // The stand-in's install never answers `I`: it reads what it
+                // is sent for a second, then dies.
+                let Err(err) = spawner(None).spawn("svc") else {
+                    panic!("spawned")
+                };
+                assert!(err.to_string().starts_with("helper exited "), "{err}");
+                let early = std::fs::read(dir.join("early")).unwrap();
+                assert!(early.is_empty(), "{} bytes sent before `I`", early.len());
+            }
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    /// Stopping a child closes its stdin before it is reaped, so one that
+    /// the signal does not reach still ends: a sudo reading a password as
+    /// root cannot be signalled by its caller, but sees EOF.
+    #[test]
+    fn a_child_the_signal_misses_is_reaped_through_eof() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let child = Command::new("sh")
+                .args(["-c", "cat >/dev/null"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut started = Started::new("svc", child, false, None);
+            // No signal: only the closed stdin can end it.
+            started.stop(false);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child was waited for with its stdin still open");
+    }
+
+    /// A child that never writes a byte is killed at the deadline, and the
+    /// refusal quotes what it said last.
+    #[test]
+    fn a_silent_spawn_is_killed_at_the_deadline() {
+        let child = Command::new("sh")
+            .args(["-c", "echo 'Password for svc:' >&2; exec sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut started = Started::new("svc", child, false, None);
+        let t0 = Instant::now();
+        let err = started
+            .first_byte(Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        assert_eq!(
+            err,
+            "escalation as `svc` did not answer within 300ms; it may be waiting for a \
+             password it did not accept, or at a prompt rustible does not recognise: \
+             Password for svc:"
+        );
+        assert!(started.child.try_wait().unwrap().is_some(), "not killed");
     }
 }

@@ -14,6 +14,7 @@ pub mod diff;
 pub mod error;
 pub mod event;
 pub mod facts;
+pub mod launch;
 pub mod op;
 pub mod protocol;
 pub mod registry;

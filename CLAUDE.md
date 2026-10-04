@@ -323,7 +323,7 @@ cannot, and each costs more to run than the tier below it.
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
-two playbooks on each of two architectures.
+three playbooks on each of two architectures.
 
 **All four tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
@@ -489,9 +489,10 @@ system.
 
 **Tier 4 is a step in `examples/workspace/playbooks/vagrant.rs`**, the
 playbook `make vm-test` runs. There is no separate test file: the assertion is
-that the step is in that playbook and the second run reports `ok`. The one
-thing a single playbook cannot show is a login chosen per playbook, so
-`vagrant_login.rs` runs after it, as an account it creates.
+that the step is in that playbook and the second run reports `ok`. What a
+single playbook cannot show is a login chosen per playbook and a launch as
+another `escalate_user`, so `vagrant_login.rs` runs after it, logging in as an
+account it creates, and `vagrant_escalate_user.rs` last, escalating to two.
 
 ### Traps that make a test pass while proving nothing
 
@@ -575,8 +576,8 @@ opt-in by name: `make vm-up-arm`, `make vm-up-x86`. Both spawn fast; the
 emulated one is slow to *work in*, not slow to start.
 
 `make vm-test` runs `examples/workspace/playbooks/vagrant.rs` **twice**, then
-`vagrant_login.rs` twice, and fails unless each second run reports nothing
-changed and nothing failed. The
+`vagrant_login.rs` and `vagrant_escalate_user.rs` twice each, and fails unless
+each second run reports nothing changed and nothing failed. The
 second run is the test. A first run reporting `changed` proves only that the
 op did something; an op that rewrites a correct file every pass reports
 `changed` too. Limit it with `make vm-test HOSTS=vagrant-arm`.
