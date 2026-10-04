@@ -52,6 +52,8 @@ pub struct Probe {
     pub home: String,
     /// The login user's name (`id -un`): an `escalate_user` other than this
     /// one and root cannot read its cache, so the binary is streamed to it.
+    /// Empty when the login's uid has no name (a container started with an
+    /// arbitrary uid); that is not a reason to fail the probe.
     pub user: String,
 }
 
@@ -268,7 +270,7 @@ impl Transport {
     /// user's name.
     pub async fn probe(&self) -> Result<Probe> {
         let (code, out, err) = self
-            .sh("uname -sm && printf '%s\\n' \"$HOME\" && id -un")
+            .sh("uname -sm && printf '%s\\n' \"$HOME\" && { id -un 2>/dev/null; true; }")
             .await?;
         if code != 0 {
             bail!("probe failed with exit {code}: {}", err.trim());

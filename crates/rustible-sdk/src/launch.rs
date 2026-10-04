@@ -25,7 +25,10 @@
 //!
 //! Every script is a constant; whatever varies (the binary's name, its
 //! size, the temp directory's suffix) is a positional argument, so no
-//! account or playbook name is ever interpolated into shell text. Each
+//! account or playbook name is ever interpolated into shell text. Each is
+//! one line, and every path operand follows `--` (a `TMPDIR` of `-p` is a
+//! path, not a flag): over ssh the command passes through the login's own
+//! shell first, and csh refuses a newline inside quotes. Each
 //! script writes **one byte to stdout before anything else**, and the caller
 //! waits for it before writing a frame or a byte of the binary: until then
 //! the escalation tool may still be reading a password from the same pipe.
@@ -50,18 +53,13 @@ use std::time::Duration;
 /// (`--helper` or `--remote`), and `$3`, when set, the suffix of the per-run
 /// temp directory, in which case the copy is exec'd with
 /// [`EPHEMERAL_FLAG`] so it removes itself.
-pub const TRY: &str = r#"if [ -n "$3" ]; then
-  p="${TMPDIR:-/tmp}/rustible-$3/$1"
-else
-  case $HOME in /*) ;; *) printf N; exit 0 ;; esac
-  p="$HOME/.cache/rustible/bin/$1"
-fi
-if [ -f "$p" ] && [ -x "$p" ]; then
-  printf R
-  exec "$p" "$2" ${3:+--ephemeral}
-fi
-printf N
-"#;
+pub const TRY: &str = concat!(
+    r#"if [ -n "$3" ]; then p="${TMPDIR:-/tmp}/rustible-$3/$1"; "#,
+    r#"else case $HOME in /*) ;; *) printf N; exit 0 ;; esac; "#,
+    r#"p="$HOME/.cache/rustible/bin/$1"; fi; "#,
+    r#"if [ -f "$p" ] && [ -x "$p" ]; then printf R; exec "$p" "$2" ${3:+--ephemeral}; fi; "#,
+    "printf N",
+);
 
 /// Writes the binary read on stdin into the account's cache, or into the
 /// per-run temp directory when `$3` (its suffix) is set. `$1` is the name,
@@ -71,26 +69,22 @@ printf N
 /// hold a runnable copy, which sends a home on to the temp directory; any
 /// other status is a refusal. Each failure ends with one `rustible: <cause>`
 /// line on stderr, which [`Launch`] lifts into its message.
-pub const INSTALL: &str = r#"printf I
-umask 077
-if [ -n "$3" ]; then
-  d="${TMPDIR:-/tmp}/rustible-$3"
-  e=$(mkdir -m 700 "$d" 2>&1) || { echo "rustible: cannot create $d: ${e##*: }" >&2; exit 10; }
-else
-  case $HOME in /*) ;; *) echo "rustible: no usable home (HOME is \"$HOME\", not an absolute path)" >&2; exit 10 ;; esac
-  [ -d "$HOME" ] || { echo "rustible: no usable home ($HOME does not exist)" >&2; exit 10; }
-  d="$HOME/.cache/rustible/bin"
-  e=$(mkdir -p "$d" 2>&1) || { echo "rustible: no usable home (cannot create $d: ${e##*: })" >&2; exit 10; }
-fi
-t="$d/.$1.$$.tmp"
-trap 'rm -f "$t"; [ -z "$3" ] || rmdir "$d" 2>/dev/null' EXIT
-cat > "$t" || { echo "rustible: cannot write to $d" >&2; exit 10; }
-n=$(wc -c < "$t" | tr -d ' ')
-[ "$n" = "$2" ] || { echo "rustible: received $n of $2 bytes for $d/$1" >&2; exit 1; }
-chmod 700 "$t" && mv -f "$t" "$d/$1" || exit 1
-[ -x "$d/$1" ] || { rm -f "$d/$1"; echo "rustible: $d is on a noexec filesystem" >&2; exit 11; }
-exit 0
-"#;
+pub const INSTALL: &str = concat!(
+    "printf I; umask 077; ",
+    r#"if [ -n "$3" ]; then d="${TMPDIR:-/tmp}/rustible-$3"; "#,
+    r#"e=$(mkdir -m 700 -- "$d" 2>&1) || { echo "rustible: cannot create $d: ${e##*: }" >&2; exit 10; }; "#,
+    r#"else case $HOME in /*) ;; *) echo "rustible: no usable home (HOME is \"$HOME\", not an absolute path)" >&2; exit 10 ;; esac; "#,
+    r#"[ -d "$HOME" ] || { echo "rustible: no usable home ($HOME does not exist)" >&2; exit 10; }; "#,
+    r#"d="$HOME/.cache/rustible/bin"; "#,
+    r#"e=$(mkdir -p -- "$d" 2>&1) || { echo "rustible: no usable home (cannot create $d: ${e##*: })" >&2; exit 10; }; fi; "#,
+    r#"t="$d/.$1.$$.tmp"; trap 'rm -f -- "$t"; [ -z "$3" ] || rmdir -- "$d" 2>/dev/null' EXIT; "#,
+    r#"cat > "$t" || { echo "rustible: cannot write to $d" >&2; exit 10; }; "#,
+    r#"n=$(wc -c < "$t" | tr -d ' '); "#,
+    r#"[ "$n" = "$2" ] || { echo "rustible: received $n of $2 bytes for $d/$1" >&2; exit 1; }; "#,
+    r#"chmod 700 -- "$t" && mv -f -- "$t" "$d/$1" || exit 1; "#,
+    r#"[ -x "$d/$1" ] || { rm -f -- "$d/$1"; echo "rustible: $d is on a noexec filesystem" >&2; exit 11; }; "#,
+    "exit 0",
+);
 
 /// Answers `R`, then execs its arguments: `sh -c EXEC rustible <exe>
 /// --helper`.
@@ -744,12 +738,23 @@ mod tests {
         tmp: &Path,
         bytes: &[u8],
     ) -> (i32, String, String) {
+        sh_in(Path::new("/"), script, args, home, tmp, bytes)
+    }
+
+    fn sh_in(
+        cwd: &Path,
+        script: &str,
+        args: &[&str],
+        home: &Path,
+        tmp: &Path,
+        bytes: &[u8],
+    ) -> (i32, String, String) {
         let mut child = Command::new("/bin/sh")
             .args(["-c", script, "rustible"])
             .args(args)
             .env("HOME", home)
             .env("TMPDIR", tmp)
-            .current_dir("/")
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -821,6 +826,53 @@ mod tests {
             out,
             format!("Rran {} --remote --ephemeral\n", d.join(NAME).display())
         );
+    }
+
+    /// The temp directory is 0700 because `mkdir -m 700` says so, not
+    /// because of the script's umask: run without the umask, it still is.
+    #[test]
+    fn the_temp_directory_is_private_whatever_the_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().to_path_buf();
+        let loose = format!("umask 022; {}", INSTALL.replace("umask 077; ", ""));
+        assert_ne!(loose, INSTALL);
+        let (status, _, err) = sh(&loose, &[NAME, "3", "feed"], &tmp.join("h"), &tmp, b"abc");
+        assert_eq!(status, 0, "{err}");
+        let mode = std::fs::metadata(tmp.join("rustible-feed"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// A `TMPDIR` that looks like a flag is a path: every path operand
+    /// follows `--`.
+    #[test]
+    fn a_tmpdir_that_looks_like_a_flag_is_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("-p")).unwrap();
+        let (status, _, err) = sh_in(
+            dir.path(),
+            INSTALL,
+            &[NAME, &BIN.len().to_string(), "feed"],
+            &dir.path().join("h"),
+            Path::new("-p"),
+            BIN,
+        );
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("-p/rustible-feed").join(NAME)).unwrap(),
+            BIN
+        );
+    }
+
+    /// Over ssh the command passes through the login's shell, and csh
+    /// refuses a newline inside quotes.
+    #[test]
+    fn every_script_is_one_line() {
+        for script in [TRY, INSTALL, EXEC] {
+            assert!(!script.contains('\n'), "{script}");
+        }
     }
 
     #[test]

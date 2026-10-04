@@ -465,7 +465,6 @@ impl Spawner {
         }
         let probe = Command::new("sudo")
             .args(["-n", "-u", user, "true"])
-            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -489,7 +488,7 @@ impl Spawner {
         let with_password = self.needs_password(user);
         if !with_password {
             let argv = helper_argv(&self.method, user, &self.exe, false)?;
-            return Ok(self.start(user, &argv, false, true)?.connection());
+            return Ok(self.start(user, &argv, false, Kind::Plain)?.connection());
         }
         let mut argv = launch::escalation(&self.method, user, true, false)?;
         argv.extend(
@@ -498,7 +497,7 @@ impl Spawner {
                 .into_iter()
                 .chain([self.exe.to_string_lossy().into_owned(), "--helper".into()]),
         );
-        let mut started = self.start(user, &argv, true, false)?;
+        let mut started = self.start(user, &argv, true, Kind::Exec)?;
         match started.first_byte(launch::FIRST_BYTE_DEADLINE)? {
             Some(b'R') => Ok(started.connection()),
             other => Err(started.gone(other)),
@@ -529,7 +528,7 @@ impl Spawner {
             let with_password = self.needs_password(user);
             let mut argv = launch::escalation(&self.method, user, with_password, true)?;
             argv.extend(plan.argv(spawn));
-            let mut started = self.start(user, &argv, with_password, false)?;
+            let mut started = self.start(user, &argv, with_password, Kind::Shell)?;
             let byte = started.first_byte(launch::FIRST_BYTE_DEADLINE)?;
             let next = match spawn {
                 launch::Spawn::Try(_) => {
@@ -566,31 +565,30 @@ impl Spawner {
         }
     }
 
-    /// Start `argv` with piped stdio from `/`, under `LC_ALL=C`, and write
-    /// the password line first when there is one. The working directory is
-    /// `/` because the caller's may be unreadable by the target, and macOS's
-    /// `/bin/sh` complains about that on stderr before running anything;
-    /// `LC_ALL=C` keeps sudo's rejection line in the words
-    /// [`launch::password_rejected`] knows.
+    /// Start `argv` with piped stdio, as `kind` says, and write the password
+    /// line first when there is one.
     fn start(
         &self,
         user: &str,
         argv: &[String],
         with_password: bool,
-        echo: bool,
+        kind: Kind,
     ) -> io::Result<Started> {
-        let child = Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir("/")
-            .env("LC_ALL", "C")
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("spawning `{}`: {e}", printable(argv)))
-            })?;
-        let mut started = Started::new(user, child, echo, self.note.clone());
+            .stderr(Stdio::piped());
+        if kind != Kind::Plain {
+            cmd.env("LC_ALL", "C");
+        }
+        if kind == Kind::Shell {
+            cmd.current_dir("/");
+        }
+        let child = cmd.spawn().map_err(|e| {
+            io::Error::new(e.kind(), format!("spawning `{}`: {e}", printable(argv)))
+        })?;
+        let mut started = Started::new(user, child, kind == Kind::Plain, self.note.clone());
         if with_password && let Some(pw) = &self.password {
             // A sudo that already exited shows as EOF on the first byte,
             // with its stderr; the write failing says less than that.
@@ -612,12 +610,31 @@ impl Spawner {
     }
 }
 
+/// How [`Spawner::start`] starts a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A root helper without a password, exactly as before streaming
+    /// existed: the caller's working directory and environment, stderr
+    /// echoed from the start, no ready byte to wait for.
+    Plain,
+    /// A root helper behind [`launch::EXEC`], because a password is fed:
+    /// `LC_ALL=C`, so sudo's rejection line is in the words
+    /// [`launch::password_rejected`] knows. The working directory stays the
+    /// caller's, which root can always read.
+    Exec,
+    /// A [`launch`] script as another account: `LC_ALL=C`, and run from
+    /// `/`, because the caller's directory may be unreadable to the account
+    /// and macOS's `/bin/sh` complains about that on stderr before running
+    /// anything.
+    Shell,
+}
+
 /// An argv for a message: a script argument is long and says nothing the
 /// reader needs, so it is shown as `<script>`.
 fn printable(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
-            if a.contains('\n') {
+            if [launch::TRY, launch::INSTALL, launch::EXEC].contains(&a.as_str()) {
                 "<script>"
             } else {
                 a.as_str()
@@ -787,8 +804,18 @@ impl Started {
         }
     }
 
+    /// Close stdin, SIGKILL, reap. Stdin goes first: a sudo that runs with
+    /// a real uid of 0 while it reads a password cannot be signalled by the
+    /// caller, and EOF on the password read is what ends it then.
     fn kill(&mut self) {
-        let _ = self.child.kill();
+        self.stop(true);
+    }
+
+    fn stop(&mut self, signal: bool) {
+        self.tx = None;
+        if signal {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 
@@ -1566,7 +1593,10 @@ mod tests {
     // own user, with the `HOME` and `TMPDIR` the outer test chose.
 
     const STAND_IN_SUDO: &str = r#"#!/bin/sh
-{ printf '%s' "$*" | tr '\n' ' '; echo; } >> "$RUSTIBLE_TEST_SUDO_LOG"
+printf 'LC_ALL=%s cwd=%s | %s\n' "$LC_ALL" "$(pwd)" "$*" >> "$RUSTIBLE_TEST_SUDO_LOG"
+case "$RUSTIBLE_TEST_NO_READY $*" in
+  1*"printf I"*) ( sleep 1; kill $$ ) & exec cat > "$RUSTIBLE_TEST_DIR/early" ;;
+esac
 pw=
 while [ $# -gt 0 ]; do
   case $1 in -n|-H) shift ;; -S) pw=1; shift ;; -p|-u) shift 2 ;; *) break ;; esac
@@ -1619,6 +1649,7 @@ exec "$@"
             .env("RUSTIBLE_TEST_SUDO_LOG", dir.path().join("sudo.log"))
             .env("RUSTIBLE_TEST_STREAM", case)
             .env("RUSTIBLE_TEST_DIR", dir.path())
+            .env_remove("LC_ALL")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1657,6 +1688,16 @@ exec "$@"
         behind_stand_in_sudo("root-password");
     }
 
+    #[test]
+    fn a_root_helper_without_a_password_starts_as_it_always_did() {
+        behind_stand_in_sudo("root-plain");
+    }
+
+    #[test]
+    fn no_byte_of_the_binary_is_written_before_the_install_answers() {
+        behind_stand_in_sudo("no-ready");
+    }
+
     /// The inner half of the tests above.
     #[test]
     #[ignore = "run by the tests that call behind_stand_in_sudo"]
@@ -1677,6 +1718,16 @@ exec "$@"
             note: None,
         };
         let log = || std::fs::read_to_string(dir.join("sudo.log")).unwrap_or_default();
+        // Each call as `LC_ALL=<value> cwd=<dir>` and the argv.
+        let calls = || -> Vec<(String, String)> {
+            log()
+                .lines()
+                .map(|l| {
+                    let (env, argv) = l.split_once(" | ").unwrap();
+                    (env.to_string(), argv.to_string())
+                })
+                .collect()
+        };
         // What the helper's stand-in printed: where it ran from, and how.
         let ran = |conn: Connection| {
             let mut out = String::new();
@@ -1687,13 +1738,14 @@ exec "$@"
         let cached = home.join(".cache/rustible/bin").join(HASHED);
         // The spawns, by their script: `try`, `install`, `exec`.
         let spawns = || {
-            log()
-                .lines()
+            calls()
+                .into_iter()
+                .map(|(_, argv)| argv)
                 .filter(|l| !l.ends_with(" true"))
                 .map(|l| {
-                    if l.contains("printf I") {
+                    if l.contains(launch::INSTALL) {
                         "install"
-                    } else if l.contains("printf R; exec") {
+                    } else if l.contains(launch::EXEC) {
                         "exec"
                     } else {
                         "try"
@@ -1706,13 +1758,11 @@ exec "$@"
                 let conn = spawner(None).spawn("svc").unwrap();
                 assert_eq!(ran(conn), format!("ran {} --helper\n", cached.display()));
                 assert_eq!(spawns(), ["try", "install", "try"]);
-                assert!(
-                    log()
-                        .lines()
-                        .all(|l| l.starts_with("-n -H -u svc /bin/sh -c ")),
-                    "{}",
-                    log()
-                );
+                // Every streamed spawn runs from `/` under `LC_ALL=C`.
+                for (env, argv) in calls() {
+                    assert_eq!(env, "LC_ALL=C cwd=/", "{argv}");
+                    assert!(argv.starts_with("-n -H -u svc /bin/sh -c "), "{argv}");
+                }
                 assert_eq!(std::fs::read(&cached).unwrap(), STAND_IN_EXE.as_bytes());
                 std::fs::remove_file(dir.join("sudo.log")).unwrap();
                 let conn = spawner(None).spawn("svc").unwrap();
@@ -1796,13 +1846,70 @@ exec "$@"
                 // Root is not streamed: it runs the binary where it is.
                 assert_eq!(ran(conn), format!("ran {} --helper\n", exe.display()));
                 assert_eq!(spawns(), ["exec"]);
+                // `LC_ALL=C` for sudo's rejection line, and the caller's own
+                // working directory, which root can always read.
+                let (env, _) = calls()
+                    .into_iter()
+                    .find(|(_, a)| a.contains(launch::EXEC))
+                    .unwrap();
+                assert!(env.starts_with("LC_ALL=C cwd="), "{env}");
+                assert_ne!(env, "LC_ALL=C cwd=/", "{env}");
                 let Err(err) = spawner(Some("wrong")).spawn("root") else {
                     panic!("spawned")
                 };
                 assert!(err.to_string().contains("was rejected"), "{err}");
             }
+            "root-plain" => {
+                let conn = spawner(None).spawn("root").unwrap();
+                assert_eq!(ran(conn), format!("ran {} --helper\n", exe.display()));
+                // The argv, environment and working directory of before.
+                let cwd = std::env::current_dir().unwrap();
+                assert_eq!(
+                    calls(),
+                    [(
+                        format!("LC_ALL= cwd={}", cwd.display()),
+                        format!("-n -u root {} --helper", exe.display())
+                    )]
+                );
+            }
+            "no-ready" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_NO_READY", "1") };
+                // The stand-in's install never answers `I`: it reads what it
+                // is sent for a second, then dies.
+                let Err(err) = spawner(None).spawn("svc") else {
+                    panic!("spawned")
+                };
+                assert!(err.to_string().starts_with("helper exited "), "{err}");
+                let early = std::fs::read(dir.join("early")).unwrap();
+                assert!(early.is_empty(), "{} bytes sent before `I`", early.len());
+            }
             other => panic!("unknown case {other}"),
         }
+    }
+
+    /// Stopping a child closes its stdin before it is reaped, so one that
+    /// the signal does not reach still ends: a sudo reading a password as
+    /// root cannot be signalled by its caller, but sees EOF.
+    #[test]
+    fn a_child_the_signal_misses_is_reaped_through_eof() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let child = Command::new("sh")
+                .args(["-c", "cat >/dev/null"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut started = Started::new("svc", child, false, None);
+            // No signal: only the closed stdin can end it.
+            started.stop(false);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child was waited for with its stdin still open");
     }
 
     /// A child that never writes a byte is killed at the deadline, and the

@@ -199,8 +199,15 @@ pub fn binary_name(playbook: &str, hash: &str) -> String {
 /// the login user's cache: when the playbook escalates to an account that is
 /// neither root, which reads anything, nor the login user, whose cache it
 /// is (vision 11.3, #62).
+///
+/// A login with no name (`id -un` failed: a uid without a passwd entry) is
+/// not streamed to anyone; the launch is the one it always was.
 pub fn streams_launch(escalate: bool, method: Escalate, escalate_user: &str, login: &str) -> bool {
-    escalate && method != Escalate::None && escalate_user != "root" && escalate_user != login
+    escalate
+        && method != Escalate::None
+        && !login.is_empty()
+        && escalate_user != "root"
+        && escalate_user != login
 }
 
 /// The transport target for a resolved host. Parameters the inventory left
@@ -1022,7 +1029,7 @@ async fn launch_streamed(
                 let mut proc = tr.spawn(&argv, Some(kill)).await?;
                 let byte = first_byte(tr, &mut proc, user).await?;
                 let Some(answer) = byte.and_then(Answer::from_byte) else {
-                    return Err(launch_died(&mut proc, byte, &words, user, login).await);
+                    return Err(launch_died(tr, &mut proc, byte, &words, user, login).await);
                 };
                 let next = plan.after_try(answer);
                 if next == Next::Ready {
@@ -1039,7 +1046,7 @@ async fn launch_streamed(
                 let mut proc = tr.spawn(&argv, None).await?;
                 let byte = first_byte(tr, &mut proc, user).await?;
                 if byte != Some(launch::INSTALL_READY) {
-                    return Err(launch_died(&mut proc, byte, &words, user, login).await);
+                    return Err(launch_died(tr, &mut proc, byte, &words, user, login).await);
                 }
                 // A write the script stopped reading fails; its exit status
                 // and stderr say why, so that is what is reported.
@@ -1086,13 +1093,21 @@ async fn first_byte(
 /// A launch spawn that exited before it answered, or answered something no
 /// script writes: the escalation tool's own refusal, with the playbook's
 /// `ssh_user` named when it chose the account that escalated.
+///
+/// Its stdin is closed first, and one that answered nonsense is killed
+/// before it is waited for: it is still running, and may be reading.
 async fn launch_died(
+    tr: &Transport,
     proc: &mut crate::transport::Proc,
     byte: Option<u8>,
     words: &[String],
     user: &str,
     login: Option<&LoginOverride>,
 ) -> anyhow::Error {
+    proc.stdin = Box::pin(tokio::io::sink());
+    if byte.is_some() {
+        let _ = tr.kill(proc).await;
+    }
     let code = proc.wait().await.unwrap_or(-1);
     let stderr = proc.stderr_text().await;
     let said = match stderr.trim() {
@@ -1936,7 +1951,10 @@ host "laptop" connection="local"
     /// it as the test's own user with the `HOME` and `TMPDIR` the outer test
     /// chose.
     const STAND_IN_SUDO: &str = r#"#!/bin/sh
-{ printf '%s' "$*" | tr '\n' ' '; echo; } >> "$RUSTIBLE_TEST_SUDO_LOG"
+printf '%s\n' "$*" >> "$RUSTIBLE_TEST_SUDO_LOG"
+case "$RUSTIBLE_TEST_NO_READY $*" in
+  1*"printf I"*) ( sleep 1; kill $$ ) & exec cat > "$RUSTIBLE_TEST_DIR/early" ;;
+esac
 while [ $# -gt 0 ]; do
   case $1 in -n|-H) shift ;; -u) shift 2 ;; *) break ;; esac
 done
@@ -1992,6 +2010,11 @@ exec "$@"
     #[test]
     fn an_escalate_user_with_nowhere_to_run_is_refused() {
         streamed_behind_stand_in_sudo("nowhere");
+    }
+
+    #[test]
+    fn no_byte_of_the_binary_is_streamed_before_the_install_answers() {
+        streamed_behind_stand_in_sudo("no-ready");
     }
 
     /// The inner half of the three tests above: the real `drive`, through
@@ -2109,6 +2132,16 @@ exec "$@"
                 );
                 assert!(!start.exists());
             }
+            "no-ready" => {
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_NO_READY", "1") };
+                // The stand-in's install never answers `I`: it reads what it
+                // is sent for a second, then dies.
+                let e = format!("{:#}", run().await.unwrap_err());
+                assert!(e.contains("before the playbook started"), "{e}");
+                let early = std::fs::read(dir.join("early")).unwrap();
+                assert!(early.is_empty(), "{} bytes sent before `I`", early.len());
+            }
             other => panic!("unknown case {other}"),
         }
     }
@@ -2121,6 +2154,8 @@ exec "$@"
         assert!(!streams_launch(true, Escalate::Sudo, "cadu", "cadu"));
         assert!(!streams_launch(true, Escalate::None, "svc", "cadu"));
         assert!(!streams_launch(false, Escalate::Sudo, "svc", "cadu"));
+        // The probe found no name for the login.
+        assert!(!streams_launch(true, Escalate::Sudo, "svc", ""));
     }
 
     #[test]

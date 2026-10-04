@@ -92,6 +92,9 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     let nohome = ctx.step(format!("{NOHOME_ACCOUNT} account"), user::Present::new(NOHOME_ACCOUNT).system(true).create_home(false).home("/nonexistent"))?;
     ctx.step(NOHOME_DIR, file::Directory::at(NOHOME_DIR).owner(nohome.uid, nohome.gid).mode(0o700))?;
     ctx.as_user(NOHOME_ACCOUNT).step(format!("marker as {NOHOME_ACCOUNT}"), file::Copy::from_str(AS_USER_MARKER).to(format!("{NOHOME_DIR}/as-user-marker")).mode(0o600))?;
+    // That copy deleted itself and its directory as the helper started.
+    let left: Vec<_> = ctx.sys().read_dir("/tmp")?.into_iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rustible-"))).collect();
+    ensure!(left.is_empty(), "the {NOHOME_ACCOUNT} helper's temp copy was left behind: {left:?}");
 
     Ok(())
 }
