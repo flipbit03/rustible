@@ -77,7 +77,8 @@ const SVC: &str = "rustible-svc";
 const USER_UNIT: &str = "rustible-user-test";
 
 /// Issue #55: `.user(true)` under `as_user(..)` manages another account's
-/// user units, through the account's own user manager.
+/// user units, through the account's own user manager; #60: right after
+/// `loginctl enable-linger`, with no step waiting for that manager.
 ///
 /// The harness's `Ctx` cannot step to another account itself: on a real
 /// system `as_user` starts this binary again as `--helper`, which a test
@@ -153,34 +154,41 @@ fn user_units_of_another_account_through_as_user(ctx: &mut Ctx) -> Result<()> {
         .unwrap_or_default();
     assert!(
         diff.ends_with(&format!(
-            "waits for the user manager of `{SVC}` ({runtime_dir} does not exist yet)"
+            "waits for the user manager of `{SVC}` ({runtime_dir}/systemd/private does not \
+             exist yet)"
         )),
         "{diff}"
     );
 
-    // Linger gives the account a manager. `loginctl enable-linger` returns
-    // before logind has started it; `systemctl start` on the manager's own
-    // unit waits until it is up.
+    // Linger gives the account a manager, but `loginctl enable-linger`
+    // returns before logind has started it (#60). The step right after it
+    // waits for the manager instead of refusing. In a container the manager
+    // comes up within tens of milliseconds, a window this test could win or
+    // lose by chance, so a drop-in holds it back two seconds after its
+    // runtime directory exists: long enough that a step that did not wait
+    // finds the directory and no manager, every time.
+    ctx.sys().mkdir_all("/etc/systemd/system/user@.service.d")?;
+    ctx.sys().write_atomic(
+        "/etc/systemd/system/user@.service.d/rustible-slow.conf",
+        b"[Service]\nExecStartPre=/bin/sleep 2\n",
+    )?;
+    ctx.step("systemd re-reads user@", systemd::DaemonReload::new())?;
     ctx.step(
         "linger enabled",
         shell::Command::new("loginctl")
             .args(["enable-linger", SVC])
             .creates(format!("/var/lib/systemd/linger/{SVC}")),
     )?;
-    ctx.step(
-        "user manager up",
-        shell::Command::new("systemctl").args(["start", &format!("user@{}.service", svc.uid)]),
-    )?;
 
     let mut svc_ctx = as_svc(false);
+    let (first, second) = changed_then_ok(&mut svc_ctx, "user unit enabled and started", enabled)?;
+    assert!(first.enabled && first.active);
+    assert_eq!(*second, *first);
     let reloaded = svc_ctx.step(
         "user manager re-reads its units",
         systemd::DaemonReload::new().user(true),
     )?;
     assert!(reloaded.changed);
-    let (first, second) = changed_then_ok(&mut svc_ctx, "user unit enabled and started", enabled)?;
-    assert!(first.enabled && first.active);
-    assert_eq!(*second, *first);
     // The unit is enabled in the account's own tree, not root's.
     assert!(
         ctx.sys()

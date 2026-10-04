@@ -54,13 +54,31 @@
 //! root). `check` asks `id -u` for the account's uid and passes
 //! `XDG_RUNTIME_DIR=/run/user/<uid>` to every `systemctl --user` and
 //! `journalctl --user`, since `sudo` drops it on the way to another account.
-//! When `/run/user/<uid>` does not exist the step refuses and says how to
-//! start the manager; under `--check`, where an earlier step may be the one
-//! enabling linger, it reports `would change` and the diff says it waits for
-//! that manager.
+//! The manager is up when its socket, `/run/user/<uid>/systemd/private`,
+//! exists. `loginctl enable-linger` returns before logind has started the
+//! manager, so when the socket is missing but the account has linger, a real
+//! run polls for it every 100 ms for up to `.manager_timeout(..)`
+//! ([`DEFAULT_MANAGER_TIMEOUT`], 30 s) and refuses, naming
+//! `systemctl status user@<uid>.service` and, for a manager that stopped or
+//! failed, `systemctl start user@<uid>.service`, if it does not appear. Without
+//! linger nothing is starting a manager, so the step refuses at once and
+//! says how to give the account one. Under `--check`, where an earlier step
+//! may be the one enabling linger, nothing waits: the step reports `would
+//! change` and the diff says it waits for that manager.
 
+use std::time::{Duration, Instant};
+
+use rustible_sdk::IoAt;
 use rustible_sdk::prelude::*;
 use rustible_sdk::system::{Cmd, Identity};
+
+/// How long a real run waits, by default, for a user manager that linger is
+/// still starting: see [`Enabled::manager_timeout`] and [the module
+/// docs](self#user-units).
+pub const DEFAULT_MANAGER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the wait for a user manager looks again.
+const MANAGER_POLL: Duration = Duration::from_millis(100);
 
 /// The state of a unit as `systemctl` reports it. Output of every op here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +316,8 @@ pub fn validate_unit(name: &str) -> Result<()> {
 struct Unit {
     name: String,
     user: bool,
+    /// How long `check` waits for a user manager that linger is starting.
+    manager_timeout: Duration,
     /// The user manager this step talks to, found by [`Unit::guard`]. `None`
     /// for the system manager, and on the op's own copy: `check` binds a
     /// clone, which is what the probes and the intent use.
@@ -319,16 +339,22 @@ struct Runtime {
     account: String,
     /// `/run/user/<uid>`.
     dir: String,
-    /// Whether `dir` exists. False only under `--check` (a real run's `check`
-    /// refuses), where an earlier step may enable linger: the probes are then
-    /// skipped and the diff says what the step waits for.
-    present: bool,
+    /// `/run/user/<uid>/systemd/private`: the manager's own socket, which
+    /// `systemctl --user` connects to. Its existence is what "the manager is
+    /// up" means here; `dir` appears before it, and `bus` belongs to the
+    /// session bus, which a host without `dbus-user-session` never has.
+    socket: String,
+    /// Whether `socket` exists. False only under `--check` (a real run's
+    /// `check` waits or refuses), where an earlier step may enable linger:
+    /// the probes are then skipped and the diff says what the step waits for.
+    ready: bool,
 }
 
 impl Runtime {
-    /// Find the user manager of the account `sys` runs as, refusing in a
-    /// real run when it has none.
-    fn find(sys: &System, op: &str) -> Result<Runtime> {
+    /// Find the user manager of the account `sys` runs as. In a real run,
+    /// wait up to `timeout` for one that linger is still starting, and
+    /// refuse when there is none.
+    fn find(sys: &System, op: &str, timeout: Duration) -> Result<Runtime> {
         let account = match sys.identity() {
             Identity::User(u) => u.clone(),
             Identity::Own => sys.facts().user.clone(),
@@ -343,22 +369,25 @@ impl Runtime {
             bail!("systemd::{op}: `id -u` as `{account}` printed {uid:?}, not a uid");
         };
         let dir = format!("/run/user/{uid}");
-        let present = sys.exists(&dir)?;
-        if !present && !sys.check_mode() {
-            let linger = format!("/var/lib/systemd/linger/{account}");
-            if sys.exists(&linger)? {
-                bail!(
-                    "systemd::{op}: the user manager of `{account}` is not up yet: {dir} does \
-                     not exist although linger is enabled ({linger}). logind starts the manager \
-                     in the background after `loginctl enable-linger`; as root, \
-                     `systemctl start user@{uid}.service` waits for it"
-                );
-            }
+        let socket = format!("{dir}/systemd/private");
+        let ready = socket_up(sys, &socket)?
+            || (!sys.check_mode() && wait(sys, &account, uid, &socket, op, timeout)?);
+        if !ready && !sys.check_mode() {
             if sys.is_root() {
                 bail!(
-                    "systemd::{op}: no user manager for `root`: {dir} does not exist. \
+                    "systemd::{op}: no user manager for `root`: {socket} does not exist. \
                      `.user(true)` as root targets root's own user manager; to manage another \
                      account's user units, step into it with `ctx.as_user(\"<account>\")`"
+                );
+            }
+            if sys.exists(&dir)? {
+                bail!(
+                    "systemd::{op}: the user manager of `{account}` is not running: {dir} exists \
+                     but {socket} does not, and `{account}` has no linger to start it. logind does \
+                     not restart a user@{uid}.service that stopped or failed: check `systemctl \
+                     status user@{uid}.service`, then start it as root (`systemctl start \
+                     user@{uid}.service`), or give `{account}` linger (`loginctl enable-linger \
+                     {account}`) to keep one running"
                 );
             }
             bail!(
@@ -370,8 +399,88 @@ impl Runtime {
         Ok(Runtime {
             account,
             dir,
-            present,
+            socket,
+            ready,
         })
+    }
+}
+
+/// In a real run, wait for the manager of an account with linger:
+/// `loginctl enable-linger` returns before logind has started it, so a step
+/// right after it would otherwise find no manager. Polls `socket` every
+/// [`MANAGER_POLL`] for `timeout`. False without linger (nothing is starting
+/// a manager, so there is nothing to wait for); a refusal when the manager
+/// does not come up in time.
+fn wait(
+    sys: &System,
+    account: &str,
+    uid: u32,
+    socket: &str,
+    op: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let linger = format!("/var/lib/systemd/linger/{account}");
+    if !sys.exists(&linger)? {
+        return Ok(false);
+    }
+    // A timeout past what the clock can represent (`Duration::MAX`) has no
+    // deadline: wait until the socket appears.
+    let deadline = Instant::now().checked_add(timeout);
+    sys.debug(match deadline {
+        Some(_) => format!(
+            "waiting up to {} for the user manager of `{account}` ({socket})",
+            human(timeout)
+        ),
+        None => format!("waiting with no deadline for the user manager of `{account}` ({socket})"),
+    });
+    loop {
+        let left = deadline.map_or(MANAGER_POLL, |d| {
+            d.saturating_duration_since(Instant::now())
+        });
+        if left.is_zero() {
+            bail!(
+                "systemd::{op}: the user manager of `{account}` (uid {uid}) did not come up: \
+                 {socket} was still missing after waiting {} although linger is enabled \
+                 ({linger}). logind starts user@{uid}.service for linger but does not restart \
+                 it once it has stopped or failed: check `systemctl status user@{uid}.service`, \
+                 then start it as root with `systemctl start user@{uid}.service`",
+                human(timeout)
+            );
+        }
+        std::thread::sleep(MANAGER_POLL.min(left));
+        if socket_up(sys, socket)? {
+            return Ok(true);
+        }
+    }
+}
+
+/// Whether the manager's socket exists yet. A stat refused with `EACCES`
+/// counts as "not yet": `user-runtime-dir@.service` creates `/run/user/<uid>`
+/// as root, mode 0700, before it mounts the account's tmpfs there, and a
+/// stat made as the account in between is denied rather than answered.
+fn socket_up(sys: &System, socket: &str) -> Result<bool> {
+    match sys.exists(socket) {
+        Err(e) if denied(&e) => Ok(false),
+        r => r,
+    }
+}
+
+/// Whether `e` is a path refused with `EACCES`, which [`socket_up`] reads
+/// as a runtime directory not yet handed to its account.
+fn denied(e: &Error) -> bool {
+    e.downcast_ref::<IoAt>()
+        .is_some_and(|io| io.source.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// A timeout as a reader wrote it: `30s`, `250ms`, and anything finer as
+/// `Duration`'s own `500µs` or `1.5ms`.
+fn human(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else if d.subsec_nanos().is_multiple_of(1_000_000) {
+        format!("{}ms", d.as_millis())
+    } else {
+        format!("{d:?}")
     }
 }
 
@@ -386,6 +495,7 @@ impl Unit {
         Unit {
             name: name.into(),
             user: false,
+            manager_timeout: DEFAULT_MANAGER_TIMEOUT,
             runtime: None,
         }
     }
@@ -420,10 +530,10 @@ impl Unit {
 
     /// Under `--check` with no user manager yet, what the step waits for.
     fn waits_for(&self) -> Option<String> {
-        self.runtime.as_ref().filter(|r| !r.present).map(|r| {
+        self.runtime.as_ref().filter(|r| !r.ready).map(|r| {
             format!(
                 "waits for the user manager of `{}` ({} does not exist yet)",
-                r.account, r.dir
+                r.account, r.socket
             )
         })
     }
@@ -461,6 +571,7 @@ impl Unit {
         Unit {
             name: String::new(),
             user: false,
+            manager_timeout: DEFAULT_MANAGER_TIMEOUT,
             runtime: None,
         }
     }
@@ -509,7 +620,7 @@ impl Unit {
         }
         let mut bound = self.clone();
         if self.user {
-            bound.runtime = Some(Runtime::find(sys, op)?);
+            bound.runtime = Some(Runtime::find(sys, op, self.manager_timeout)?);
         }
         Ok(bound)
     }
@@ -786,14 +897,25 @@ impl Enabled {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 }
@@ -894,14 +1016,25 @@ impl Disabled {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 }
@@ -1005,14 +1138,25 @@ impl Running {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 }
@@ -1074,14 +1218,25 @@ impl Stopped {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 }
@@ -1153,14 +1308,25 @@ impl Restart {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 }
@@ -1243,14 +1409,25 @@ impl Reload {
     /// Manage the user units (`systemctl --user`) of the account the step
     /// runs as: the binary's own user, or the target of `ctx.as_user(..)`.
     /// Needs no root, but needs that account's user manager, which runs
-    /// while it has a login session or linger; a real run refuses without one.
-    /// `loginctl enable-linger` returns before logind has started the
-    /// manager, so a playbook that enables linger and steps straight into
-    /// the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
-    /// module docs](self#user-units).
+    /// while it has a login session or linger. A real run waits for a
+    /// manager that linger is still starting ([`Self::manager_timeout`]) and
+    /// refuses when there is none. See [the module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.unit.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.unit.manager_timeout = timeout;
         self
     }
 
@@ -1339,14 +1516,26 @@ impl DaemonReload {
     /// Reload the user manager (`systemctl --user daemon-reload`) of the
     /// account the step runs as: the binary's own user, or the target of
     /// `ctx.as_user(..)`. Needs no root, but needs that account's user
-    /// manager, which runs while it has a login session or linger; a real
-    /// run refuses without one. `loginctl enable-linger` returns before logind
-    /// has started the manager, so a playbook that enables linger and steps
-    /// straight into the account can hit that refusal; `systemctl start
-    /// user@<uid>.service` as root, in between, waits for it. See [the
+    /// manager, which runs while it has a login session or linger. A real
+    /// run waits for a manager that linger is still starting
+    /// ([`Self::manager_timeout`]) and refuses when there is none. See [the
     /// module docs](self#user-units).
     pub fn user(mut self, on: bool) -> Self {
         self.manager.user = on;
+        self
+    }
+
+    /// With `.user(true)`, how long a real run waits for the account's user
+    /// manager when linger is enabled but logind has not finished starting
+    /// it, as right after `loginctl enable-linger`. Default
+    /// [`DEFAULT_MANAGER_TIMEOUT`]; `Duration::ZERO` does not wait and
+    /// refuses at once; `Duration::MAX`, or any timeout too long for the
+    /// clock to hold, has no deadline and waits until the manager is up.
+    /// Ignored otherwise: without `.user(true)`, when the manager is up,
+    /// without linger (the step refuses), and under `--check`, which never
+    /// waits. See [the module docs](self#user-units).
+    pub fn manager_timeout(mut self, timeout: Duration) -> Self {
+        self.manager.manager_timeout = timeout;
         self
     }
 }
@@ -1373,9 +1562,12 @@ impl Op for DaemonReload {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
     use rustible_sdk::{Ctx, HostInfo};
 
@@ -1545,6 +1737,44 @@ mod tests {
         }
     }
 
+    /// Whole seconds and whole milliseconds as written; anything finer is
+    /// not rounded down to `0s`.
+    #[test]
+    fn human_renders_a_timeout_as_written() {
+        for (d, want) in [
+            (Duration::ZERO, "0s"),
+            (Duration::from_secs(30), "30s"),
+            (Duration::from_millis(250), "250ms"),
+            (Duration::from_millis(1500), "1500ms"),
+            (Duration::from_micros(500), "500µs"),
+            (Duration::from_micros(1500), "1.5ms"),
+            (Duration::from_nanos(1), "1ns"),
+        ] {
+            assert_eq!(human(d), want, "{d:?}");
+        }
+    }
+
+    /// Only a stat refused with `EACCES` is "not yet"; any other failure,
+    /// or a message that merely reads like one, is still an error. That last
+    /// is also what `System` makes of an `as_user` helper that died: its
+    /// report becomes a message, never an `IoAt`, so it fails the step.
+    #[test]
+    fn denied_is_an_eacces_on_a_path_and_nothing_else() {
+        let at = |kind| {
+            Error::from(IoAt {
+                path: SOCKET.into(),
+                source: io::Error::from(kind),
+            })
+        };
+        assert!(denied(&at(io::ErrorKind::PermissionDenied)));
+        assert!(denied(
+            &at(io::ErrorKind::PermissionDenied).context("looking for the manager")
+        ));
+        assert!(!denied(&at(io::ErrorKind::NotFound)));
+        assert!(!denied(&at(io::ErrorKind::Other)));
+        assert!(!denied(&Error::msg("Permission denied (os error 13)")));
+    }
+
     // ---- fake helpers ----
 
     fn sys(fake: &Arc<Fake>) -> System {
@@ -1630,9 +1860,11 @@ mod tests {
     }
 
     /// A box where `id -u` answers `uid` and that uid's user manager is up
-    /// (`/run/user/<uid>` exists), which is what every `--user` step needs.
+    /// (its socket exists), which is what every `--user` step needs.
     fn user_manager(fake: Fake, uid: u32) -> Fake {
-        with_id(fake, uid).with_dir(format!("/run/user/{uid}"))
+        with_id(fake, uid)
+            .with_dir(format!("/run/user/{uid}/systemd"))
+            .with_file(format!("/run/user/{uid}/systemd/private"), "")
     }
 
     /// `id -u` answers `uid`, and nothing else is planted.
@@ -2704,25 +2936,6 @@ mod tests {
             "{:?}",
             fake.argvs()
         );
-
-        // Linger is on but logind has not finished starting the manager:
-        // the usual state right after `loginctl enable-linger`, which
-        // returns before the manager is up.
-        let fake =
-            Arc::new(with_id(Fake::new(), 1002).with_file("/var/lib/systemd/linger/minecraft", ""));
-        let s = sys(&fake).as_user("minecraft");
-        let err = Enabled::new("nginx")
-            .user(true)
-            .check(&s)
-            .unwrap_err()
-            .chain();
-        assert_eq!(
-            err,
-            "systemd::Enabled: the user manager of `minecraft` is not up yet: /run/user/1002 \
-             does not exist although linger is enabled (/var/lib/systemd/linger/minecraft). \
-             logind starts the manager in the background after `loginctl enable-linger`; as \
-             root, `systemctl start user@1002.service` waits for it"
-        );
     }
 
     /// Under `--check` an earlier step may be the one enabling linger, so a
@@ -2733,7 +2946,8 @@ mod tests {
     fn user_mode_without_a_user_manager_is_would_change_under_check() {
         let fake = Arc::new(with_id(Fake::new(), 1002));
         let s = sys(&fake).as_user("minecraft").with_check_mode(true);
-        let waits = "waits for the user manager of `minecraft` (/run/user/1002 does not exist yet)";
+        let waits = "waits for the user manager of `minecraft` \
+                     (/run/user/1002/systemd/private does not exist yet)";
         let render = |plan: Result<Plan<Enabled>>| change(plan.unwrap()).diff().render();
         assert_eq!(
             render(Enabled::new("nginx").user(true).now(true).check(&s)),
@@ -2909,10 +3123,412 @@ mod tests {
             .chain();
         assert_eq!(
             err,
-            "systemd::Enabled: no user manager for `root`: /run/user/0 does not exist. \
+            "systemd::Enabled: no user manager for `root`: /run/user/0/systemd/private does \
+             not exist. \
              `.user(true)` as root targets root's own user manager; to manage another \
              account's user units, step into it with `ctx.as_user(\"<account>\")`"
         );
+    }
+
+    // ---- waiting for a user manager that linger is starting (#60) ----
+
+    const LINGER: &str = "/var/lib/systemd/linger/minecraft";
+    const SOCKET: &str = "/run/user/1002/systemd/private";
+
+    /// A box where linger is on for `minecraft` (uid 1002) and logind has
+    /// made its runtime directory but the manager is not up yet: the state
+    /// right after `loginctl enable-linger`. The probes answer once asked.
+    fn linger_starting() -> Fake {
+        with_id(Fake::new(), 1002)
+            .with_file(LINGER, "")
+            .with_dir("/run/user/1002")
+            .with_cmd(
+                "systemctl",
+                Some(&["--user", "is-enabled", "nginx"]),
+                1,
+                "disabled\n",
+            )
+            .with_cmd(
+                "systemctl",
+                Some(&["--user", "is-active", "nginx"]),
+                3,
+                "inactive\n",
+            )
+    }
+
+    /// A `Fake` that counts the stats of [`SOCKET`] and refuses the first
+    /// `denied` of them with `EACCES`, as a stat as the account does between
+    /// `user-runtime-dir` creating `/run/user/<uid>` (root, 0700) and mounting
+    /// the account's tmpfs there. The `Fake` itself cannot fail a stat, so
+    /// this wraps it through [`System::new`]; everything else passes through.
+    struct Watched {
+        fake: Arc<Fake>,
+        denied: AtomicUsize,
+        looks: AtomicUsize,
+    }
+
+    impl Watched {
+        fn new(fake: &Arc<Fake>, denied: usize) -> Arc<Self> {
+            Arc::new(Watched {
+                fake: fake.clone(),
+                denied: AtomicUsize::new(denied),
+                looks: AtomicUsize::new(0),
+            })
+        }
+
+        /// A `System` over this backend with `sys(..)`'s facts, as `minecraft`.
+        fn sys(self: &Arc<Self>) -> System {
+            let facts = sys(&self.fake).facts().clone();
+            System::new(self.clone(), facts, false, Arc::new(Collect::default()))
+                .as_user("minecraft")
+        }
+
+        /// How many times the socket was looked at.
+        fn looks(&self) -> usize {
+            self.looks.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Backend for Watched {
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.fake.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
+            self.fake.write(p, bytes)
+        }
+        fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
+            if p == Path::new(SOCKET) {
+                self.looks.fetch_add(1, Ordering::SeqCst);
+                let denying = self
+                    .denied
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if denying {
+                    // The shape a stat refused inside the `as_user` helper
+                    // arrives in: the errno's kind around its message.
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Permission denied (os error 13)",
+                    ));
+                }
+            }
+            self.fake.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.fake.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+            self.fake.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fake.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
+            self.fake.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+            self.fake.set_owner(p, uid, gid)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fake.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+            self.fake.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+            self.fake.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+            self.fake.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
+            self.fake.spawn(spec)
+        }
+    }
+
+    /// The manager's socket appears while `check` waits, written into the
+    /// box from another thread as logind would; `check` then probes it.
+    #[test]
+    fn user_mode_waits_for_a_manager_that_linger_is_starting() {
+        let fake = Arc::new(linger_starting());
+        let appear = {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                rustible_sdk::backend::Backend::write(&*fake, Path::new(SOCKET), b"").unwrap();
+            })
+        };
+        let t0 = Instant::now();
+        let plan = Enabled::new("nginx")
+            .user(true)
+            .check(&sys(&fake).as_user("minecraft"))
+            .unwrap();
+        appear.join().unwrap();
+        // It waited for the socket rather than finding it on the first look.
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            change(plan).diff().render(),
+            "nginx:\n  enabled: disabled -> enabled\n"
+        );
+        let ran: Vec<_> = fake.argvs().iter().map(|a| a[4..].to_vec()).collect();
+        assert_eq!(
+            ran,
+            vec![
+                argv(&["id", "-u"]),
+                argv(&["systemctl", "--user", "is-enabled", "nginx"]),
+                argv(&["systemctl", "--user", "is-active", "nginx"]),
+            ]
+        );
+    }
+
+    /// A manager that never comes up is refused once `manager_timeout` has
+    /// passed, naming the account, the uid, the socket, the wait and where
+    /// to look; no `systemctl` ran.
+    #[test]
+    fn user_mode_refuses_a_manager_that_does_not_come_up_in_time() {
+        let fake = Arc::new(linger_starting());
+        let s = sys(&fake).as_user("minecraft");
+        let t0 = Instant::now();
+        let err = Enabled::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::from_millis(300))
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(
+            t0.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            err,
+            "systemd::Enabled: the user manager of `minecraft` (uid 1002) did not come up: \
+             /run/user/1002/systemd/private was still missing after waiting 300ms although \
+             linger is enabled (/var/lib/systemd/linger/minecraft). logind starts \
+             user@1002.service for linger but does not restart it once it has stopped or \
+             failed: check `systemctl status user@1002.service`, then start it as root with \
+             `systemctl start user@1002.service`"
+        );
+        assert_eq!(fake.argvs().len(), 1, "{:?}", fake.argvs());
+    }
+
+    /// `Duration::ZERO` does not wait: one look at the socket, then the
+    /// refusal. The count is what proves no poll ran; the time bound only
+    /// proves the 30 s default did not apply, loose enough for a slow runner.
+    #[test]
+    fn user_mode_with_a_zero_manager_timeout_refuses_at_once() {
+        let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
+        let t0 = Instant::now();
+        let err = Restart::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::ZERO)
+            .check(&watched.sys())
+            .unwrap_err()
+            .chain();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(watched.looks(), 1);
+        assert!(err.contains("still missing after waiting 0s"), "{err}");
+    }
+
+    /// `Duration::MAX` is past what an `Instant` can hold, so it means no
+    /// deadline rather than a panic adding it to the clock: the step waits
+    /// for the socket and then probes. With no deadline it still polls every
+    /// [`MANAGER_POLL`]: about three looks in 200 ms, where a spin makes
+    /// thousands.
+    #[test]
+    fn user_mode_with_a_max_manager_timeout_waits_without_a_deadline() {
+        let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
+        let appear = {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                rustible_sdk::backend::Backend::write(&*fake, Path::new(SOCKET), b"").unwrap();
+            })
+        };
+        let plan = Running::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::MAX)
+            .check(&watched.sys())
+            .unwrap();
+        appear.join().unwrap();
+        assert!(watched.looks() <= 5, "{}", watched.looks());
+        assert_eq!(
+            change(plan).diff().render(),
+            "nginx:\n  active: inactive -> active\n"
+        );
+    }
+
+    /// A stat refused with `EACCES` while `user-runtime-dir` has made
+    /// `/run/user/<uid>` but not yet mounted the account's tmpfs on it is
+    /// "not yet", in the first look and while waiting: the step waits
+    /// through it instead of failing with "Permission denied".
+    #[test]
+    fn user_mode_waits_through_a_runtime_dir_not_yet_handed_to_the_account() {
+        let fake = Arc::new(linger_starting().with_file(SOCKET, ""));
+        let watched = Watched::new(&fake, 3);
+        let plan = Enabled::new("nginx")
+            .user(true)
+            .check(&watched.sys())
+            .unwrap();
+        // The first look and two polls were denied; the third poll found it.
+        assert_eq!(watched.looks(), 4);
+        assert_eq!(
+            change(plan).diff().render(),
+            "nginx:\n  enabled: disabled -> enabled\n"
+        );
+    }
+
+    /// A denial that never ends is still a manager that did not come up, and
+    /// refuses as one once the timeout has passed.
+    #[test]
+    fn user_mode_refuses_a_runtime_dir_that_stays_denied_as_a_timeout() {
+        let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, usize::MAX);
+        let err = Enabled::new("nginx")
+            .user(true)
+            .manager_timeout(Duration::from_millis(300))
+            .check(&watched.sys())
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.starts_with(
+                "systemd::Enabled: the user manager of `minecraft` (uid 1002) did not come up"
+            ),
+            "{err}"
+        );
+        assert!(watched.looks() > 1, "{}", watched.looks());
+    }
+
+    /// Every op takes the knob, and it reaches the wait.
+    #[test]
+    fn every_op_takes_a_manager_timeout() {
+        let fake = Arc::new(linger_starting());
+        let s = sys(&fake).as_user("minecraft");
+        let z = Duration::ZERO;
+        for (name, r) in [
+            (
+                "Enabled",
+                Enabled::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "Disabled",
+                Disabled::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "Running",
+                Running::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "Stopped",
+                Stopped::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "Restart",
+                Restart::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "Reload",
+                Reload::new("nginx")
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+            (
+                "DaemonReload",
+                DaemonReload::new()
+                    .user(true)
+                    .manager_timeout(z)
+                    .check(&s)
+                    .map(|_| ()),
+            ),
+        ] {
+            let err = r.unwrap_err().chain();
+            assert!(
+                err.starts_with(&format!("systemd::{name}: the user manager of `minecraft`"))
+                    && err.contains("after waiting 0s"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// Without linger nothing is starting a manager, so there is nothing to
+    /// wait for: the default timeout would take 30 s if this waited.
+    #[test]
+    fn user_mode_does_not_wait_without_linger() {
+        let fake = Arc::new(with_id(Fake::new(), 1002).with_dir("/run/user/1002"));
+        let t0 = Instant::now();
+        let err = Enabled::new("nginx")
+            .user(true)
+            .check(&sys(&fake).as_user("minecraft"))
+            .unwrap_err()
+            .chain();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        // The runtime directory without the socket: a session whose manager
+        // is not running, not a missing session.
+        assert_eq!(
+            err,
+            "systemd::Enabled: the user manager of `minecraft` is not running: /run/user/1002 \
+             exists but /run/user/1002/systemd/private does not, and `minecraft` has no linger \
+             to start it. logind does not restart a user@1002.service that stopped or failed: \
+             check `systemctl status user@1002.service`, then start it as root (`systemctl \
+             start user@1002.service`), or give `minecraft` linger (`loginctl enable-linger \
+             minecraft`) to keep one running"
+        );
+    }
+
+    /// A dry run never sleeps, linger or not: it looks once and reports
+    /// what it waits for. The bound only has to beat the 30 s default.
+    #[test]
+    fn user_mode_does_not_wait_under_check() {
+        let fake = Arc::new(linger_starting());
+        let watched = Watched::new(&fake, 0);
+        let t0 = Instant::now();
+        let plan = Enabled::new("nginx")
+            .user(true)
+            .check(&watched.sys().with_check_mode(true))
+            .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(watched.looks(), 1);
+        assert!(
+            change(plan)
+                .diff()
+                .render()
+                .ends_with("(/run/user/1002/systemd/private does not exist yet)")
+        );
+        assert_eq!(fake.argvs().len(), 1, "{:?}", fake.argvs());
     }
 
     /// An `id -u` that does not answer with a uid is about the machine, not
