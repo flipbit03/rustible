@@ -318,8 +318,12 @@ pub fn local_login_refusal(d: &Describe, targets: &[Resolved]) -> Option<String>
 /// is the likely reason, and nothing else in the output names it. Refused
 /// means the binary never said `Hello` and the last thing on stderr is the
 /// escalation tool's own complaint (`sudo: ...`), so an exec failure, a bad
-/// `Start` or a crash keeps its own story. `None` in every other case, which
-/// keep the output they had; the stderr is always shown as well.
+/// `Start` or a crash keeps its own story. The tool reporting that it could
+/// not execute the binary is such an exec failure too: sudo's `unable to
+/// execute <path>: ...` and `<path>: command not found`, and doas's
+/// `<path>: ...`, the binary's path always being absolute. `None` in every
+/// other case, which keep the output they had; the stderr is always shown as
+/// well.
 pub fn launch_escalation_failure(
     hello: bool,
     prefix: &[String],
@@ -333,7 +337,8 @@ pub fn launch_escalation_failure(
         return None;
     }
     let last = stderr.lines().map(str::trim).rfind(|l| !l.is_empty())?;
-    if !last.starts_with(&format!("{method}:")) {
+    let complaint = last.strip_prefix(&format!("{method}:"))?.trim_start();
+    if complaint.starts_with("unable to execute") || complaint.starts_with('/') {
         return None;
     }
     Some(format!(
@@ -1443,6 +1448,28 @@ host "laptop" connection="local"
             "sudo: unable to resolve host x\nthread 'main' panicked at src/main.rs:1:1\n",
             Some(&login)
         ));
+        // The tool let the binary through and could not execute it: a
+        // `noexec` home, a missing file.
+        let bin = "/home/minecraft/.cache/rustible/bin/games_minecraft-ab12";
+        for stderr in [
+            format!("sudo: unable to execute {bin}: Permission denied"),
+            format!("sudo: {bin}: command not found"),
+        ] {
+            assert!(!blamed(false, &sudo, &stderr, Some(&login)), "{stderr}");
+        }
+        let doas_root = escalate_prefix(true, Escalate::Doas, "root");
+        assert!(!blamed(
+            false,
+            &doas_root,
+            &format!("doas: {bin}: Permission denied"),
+            Some(&login)
+        ));
+        assert!(blamed(
+            false,
+            &doas_root,
+            "doas: a password is required",
+            Some(&login)
+        ));
         // `doas:` is not `sudo:`'s complaint.
         assert!(!blamed(
             false,
@@ -1593,6 +1620,114 @@ host "laptop" connection="local"
                 login_override(&r, ssh_user),
                 "{ssh_user:?}"
             );
+        }
+    }
+
+    /// Both places `drive` blames a refused launch on the playbook's login:
+    /// `sudo -n` refusing before it read `Start` (the write fails), and after
+    /// (the binary's stdout just ends). The prefix is the literal `sudo`, so
+    /// this runs the test binary again with a stand-in `sudo` first on
+    /// `PATH`; changing `PATH` in this process would race every other test
+    /// that spawns a program.
+    #[test]
+    fn drive_blames_a_refused_launch_on_the_playbooks_login() {
+        use std::os::unix::fs::PermissionsExt;
+        let line = "escalating to `root` with `sudo -n` failed before the playbook started; \
+                    the login user `minecraft` comes from the playbook's `ssh_user` attribute";
+        for mode in ["before-start", "after-start"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sudo = dir.path().join("sudo");
+            let script = match mode {
+                "before-start" => {
+                    "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n".to_string()
+                }
+                _ => stand_in(
+                    &dir.path().join("start"),
+                    "games/minecraft",
+                    false,
+                    "sudo: a password is required",
+                ),
+            };
+            std::fs::write(&sudo, script).unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = format!(
+                "{}:{}",
+                dir.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "run::tests::drive_behind_a_refusing_sudo",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PATH", path)
+                .env("RUSTIBLE_TEST_REFUSING_SUDO", mode)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{mode}:\n{stdout}\n{stderr}");
+            assert!(stdout.contains("1 passed"), "{mode}: did not run\n{stdout}");
+            if mode == "after-start" {
+                // Reported as the host's error, next to sudo's own stderr.
+                assert!(stdout.contains(line), "{mode}:\n{stdout}");
+            }
+        }
+    }
+
+    /// The half of the test above that runs behind the stand-in `sudo`.
+    #[tokio::test]
+    #[ignore = "run by drive_blames_a_refused_launch_on_the_playbooks_login"]
+    async fn drive_behind_a_refusing_sudo() {
+        let Ok(mode) = std::env::var("RUSTIBLE_TEST_REFUSING_SUDO") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = (b"never run".to_vec(), "abc".to_string());
+        let probe = Probe {
+            triple: "x86_64-unknown-linux-musl".into(),
+            home: dir.path().display().to_string(),
+        };
+        let mut plan = plan(dir.path(), Some("minecraft"));
+        plan.escalate = true;
+        // Larger than a pipe holds, so the write of `Start` waits for a
+        // reader and fails once `sudo` exits without reading it.
+        let vars = match mode.as_str() {
+            "before-start" => Value::String("x".repeat(1 << 20)),
+            _ => Value::Null,
+        };
+        let out: Shared = Arc::new(Mutex::new(Output::Json {
+            w: std::io::stdout(),
+            failed: false,
+        }));
+        let r = by_defaults();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let result = drive(
+            &plan,
+            &r,
+            &Transport::Local,
+            &probe,
+            &artifact,
+            vars,
+            &out,
+            rx,
+        )
+        .await;
+        match mode.as_str() {
+            "before-start" => {
+                let e = format!("{:#}", result.unwrap_err());
+                assert!(
+                    e.starts_with(
+                        "escalating to `root` with `sudo -n` failed before the playbook \
+                         started; the login user `minecraft`"
+                    ),
+                    "{e}"
+                );
+                assert!(e.contains("sudo: a password is required"), "{e}");
+            }
+            _ => result.unwrap(),
         }
     }
 
