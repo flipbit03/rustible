@@ -16,26 +16,44 @@ Each sees something the tier below it cannot, and costs more to run: free,
 seconds, minutes. A test goes in the lowest one that can fail for the right
 reason (`CLAUDE.md`, "Choosing a tier").
 
-- **T1, in-process: pure functions** and the **`Fake` backend**. Parsers,
-  planners, and an op's own behaviour. `cargo test`, always.
+- **T1, in-process** (`cargo test`, always). Everything a plain `cargo
+  test` runs with nothing installed beyond the Rust toolchain: no docker,
+  no VM, no root, no network beyond loopback. Chiefly **pure functions** and
+  the **`Fake` backend** (parsers, planners, and an op's own behaviour), plus
+  the CLI's tests of its built binary and the macros' trybuild UI tests:
+  "in-process" means no environment, not one OS process. The T2 tests in
+  `crates/rustible-std/tests/` skip themselves there, without
+  `RUSTIBLE_INTEGRATION=1`. It sees nothing real: the `Fake` models what we
+  believe a tool does, and there are no real permissions, ownership,
+  processes, users or distributions, and no kernel, init, `sudo` or SSH.
 - **T2, containers** (`make integration`). Real distributions, real package
   managers, real `useradd`. They caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
   setuid.
-- **T3, machines** (`make vm-test`). A real SSH transport, a real `sudo`, a
-  live `/proc/sys`, and a real init system. A container has none of those: it
-  shares the host kernel, so `sysctl` writes are refused or leak to the host,
-  and it has no pid 1 to ask about a unit.
+- **T3, machines** (`make vm-test`). A real machine: its own kernel, init and
+  `sudo`, all real, with no harness. In CI that is a Linux VM over SSH, which
+  `make vm-test` drives, or the macOS runner itself over a local connection;
+  only the VM exercises the SSH transport. It gives what the container harness
+  cannot. Structurally: its own kernel and `/proc/sys` (a container shares the
+  host kernel, so `sysctl` writes are refused or leak to the host), and a real
+  boot (a harness container runs systemd as pid 1 only in `systemd_images`
+  mode, privileged, on the host's kernel and cgroups). By the harness's
+  choice: every body runs as root, so no non-root login escalates through the
+  host's sudoers, and nothing connects over SSH. And a target no container
+  can be, macOS (there is no macOS container), which only the macOS runner
+  covers: the Darwin probe, the Mach-O build through zig, launchd and brew.
+  On a mac, the steps of `ci.yml`'s "Run playbooks against this mac" are the
+  way to repeat that half by hand.
 
 A CI job that runs a tier names it, so a red `Test (T2): Docker
 (Debian/Ubuntu/Alpine)` is the container tier failing.
 
-**All three run in CI**, the machine tier on both architectures. So why run it
-locally at all? Two reasons. Iterating against a machine you already have up
-is far faster than waiting for a runner. And a real machine in front of you is
-the only way to find out what an operation *should* do before you have written
-the assertion — which is the tier's actual value, and not something a green
-tick provides.
+**All three run in CI**, the machine tier as a VM on both architectures and as
+the macOS runner. So why run the VM locally at all? Two reasons. Iterating
+against a machine you already have up is far faster than waiting for a runner.
+And a real machine in front of you is the only way to find out what an
+operation *should* do before you have written the assertion — which is the
+tier's actual value, and not something a green tick provides.
 
 ## What it costs
 

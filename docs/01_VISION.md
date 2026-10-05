@@ -1054,8 +1054,12 @@ costs more to run (free, seconds, minutes), so a test goes in the lowest tier
 that can fail for the right reason. CI job names carry the tier, beside the
 mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 
-1. **T1, in-process**, as two kinds of test. Choosing between them is an
-   authoring choice, not a tier: both run in `cargo test` and need nothing.
+1. **T1, in-process**: everything a plain `cargo test` runs with nothing
+   installed. The T2 tests in `crates/rustible-std/tests/` skip themselves
+   there, without `RUSTIBLE_INTEGRATION=1`. T1 includes the CLI's tests of
+   its built binary and the macros' trybuild UI tests, but it is chiefly two
+   kinds of test, and choosing between them is an authoring choice, not a
+   tier:
    - **Pure functions** for the interesting logic (line replacement and diff,
      `/etc/passwd` parsing, authorized_keys deltas, version comparison).
      Tested with strings, no fakes.
@@ -1066,6 +1070,13 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    The split shapes the op: `check` does all the thinking and `apply`
    executes its intent without inspecting again (section 6.2), so the logic
    is pure and the `Fake` can plant a tool's effect between the two.
+
+   In-process means in the test run, on the developer's machine, with no
+   environment, not one OS process: nothing beyond the Rust toolchain, no
+   docker, VM, root, or network beyond loopback. Its limit is that nothing in
+   it is real: the `Fake` models what we believe a tool does, not what it
+   does, and T1 has no real permissions, ownership, processes, users or
+   distributions, and no kernel, init, `sudo` or SSH.
 2. **T2, Docker integration tests** per distro, the source of truth for how a
    real tool behaves, which the `Fake` only models. The SDK ships a harness
    (`#[rustible::integration_test(images = ["debian:12", "alpine:3.20",
@@ -1073,17 +1084,29 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    each container. A typical test applies an op twice: first run `changed`,
    second run `ok`, and the system looks right. Static binaries drop into any
    image with no setup.
-3. **T3, VMs (Vagrant)** for what Docker does badly, because a container shares
-   the host kernel and has no pid 1: writes to `/proc/sys`, a real init system,
-   a real `sudo`, and the SSH transport itself. `dev/vagrant/` holds a Debian
-   12 guest per architecture, x86_64 and aarch64, driven by vagrant-libvirt on
-   Linux and vagrant-qemu on macOS. `make vm-test` converges
-   `examples/workspace/playbooks/vagrant.rs` against whichever are up and fails
-   unless a second run reports nothing changed. CI runs both architectures:
-   GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is accelerated
-   and the aarch64 one is interpreted by qemu. This tier is
-   distribution-specific in a way T2 is not — one guest is one distro — so a CI
-   job names the distribution it covers.
+3. **T3, a real machine**: its own kernel, init and `sudo`, all real, with
+   no harness. It gives what the container harness cannot. Structurally: its
+   own kernel and `/proc/sys` (a container shares the host kernel, so a write
+   is refused or reaches the host), and a real boot (a harness container runs
+   systemd as pid 1 only in `systemd_images` mode, privileged, on the host's
+   kernel and cgroups). By the harness's choice: every body runs as root, so
+   no non-root login escalates through the host's sudoers, and nothing
+   connects over SSH. And a target no container can be, macOS (there is no
+   macOS container), which only the macOS runner covers: the Darwin probe,
+   the Mach-O build through zig, launchd and brew. In CI the machine is a
+   Linux VM over SSH (Vagrant) or the macOS runner itself over a local
+   connection, which runs `hello` once, `mac` twice, and `macbrew` installing
+   twice and then removing twice; only the VM exercises the SSH transport.
+   `dev/vagrant/` holds a Debian 12 guest per architecture, x86_64 and
+   aarch64, driven by vagrant-libvirt on Linux and vagrant-qemu on macOS.
+   `make vm-test` converges the `vagrant`, `vagrant_login` and
+   `vagrant_escalate_user` playbooks in `examples/workspace/playbooks/`
+   against whichever are up, failing unless each second run reports nothing
+   changed, then requires `vagrant_login_escalate` to be refused at launch.
+   CI runs the VM on both architectures: GitHub's Linux runners expose
+   `/dev/kvm`, so the x86_64 guest is accelerated and the aarch64 one is
+   interpreted by qemu. The VM is distribution-specific in a way T2 is not —
+   one guest is one distro — so its CI job names the distribution it covers.
 
 ## 9. Project layout and ecosystem
 

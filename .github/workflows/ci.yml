@@ -48,9 +48,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # T1, in-process: pure functions and ops against the `Fake` backend.
+  # T1, in-process: everything a plain `cargo test` runs with nothing
+  # installed, chiefly pure functions and ops against the `Fake` backend.
+  # The T2 tests skip themselves here, without RUSTIBLE_INTEGRATION=1.
   check:
-    name: "Test (T1): unit & fake"
+    name: "Test (T1): unit & fake (Linux)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -100,20 +102,17 @@ jobs:
       # generated build script and the playbook registry.
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
-  macos:
-    # T1 on a real mac, then real playbooks against the runner itself over a
-    # local connection: no VM and no SSH, so this is not T3.
-    name: "Test (T1, real mac): macOS (controller and target)"
+  # T1 on macOS: the same plain `cargo test` as the Linux job, on a mac, so
+  # the `#[cfg(target_os = "macos")]` tests run, and the launch scripts'
+  # real /bin/sh tests meet bash 3.2 and the BSD tools.
+  macos-unit:
+    name: "Test (T1): unit & fake (macOS)"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
-      # A mac is a supported controller and, since M8, a supported target.
-      # Nothing but Rust is installed here: the C toolchain is the zig that
-      # `rustible` fetches into its own cache on first use, and the cache
-      # step below is what keeps that from being a 50 MB download per run.
-      # The runner's own clang serves `cargo test` and the CLI build, as a
-      # developer's would.
+      # Nothing but Rust is installed here; the runner's own clang serves
+      # `cargo test`, as a developer's would. `cargo test` never fetches zig.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -124,8 +123,39 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-macos-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-macos-cargo-
+          key: ci-macos-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-unit-cargo-
+
+      - run: cargo test --workspace
+
+  # T3 on the macOS runner itself: a real machine, with its own kernel,
+  # launchd and sudo, reached over a local connection rather than SSH, so
+  # this job does not exercise the SSH transport; only the VM jobs do. It
+  # runs beside the T1 mac job, not after it. Its cargo cache is its own,
+  # because it builds release where the T1 job builds tests.
+  macos-runner:
+    name: "Test (T3): macOS runner (local connection)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # A mac is a supported controller and, since M8, a supported target.
+      # Nothing but Rust is installed here: the C toolchain is the zig that
+      # `rustible` fetches into its own cache on first use, and the cache
+      # step below is what keeps that from being a 50 MB download per run.
+      # The runner's own clang serves the CLI build, as a developer's would.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-runner-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-runner-cargo-
 
       - name: Cache the zig rustible fetches
         uses: actions/cache@v5
@@ -133,17 +163,16 @@ jobs:
           path: ~/.cache/rustible/zig
           key: ci-macos-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
-      - run: cargo test --workspace
-
-      # And a mac as a *target*: the runner drives itself over the local
+      # A mac as a *target*: the runner drives itself over the local
       # transport, which builds `aarch64-apple-darwin` through zig, ships the
       # binary to itself, and gathers Darwin facts. There is no macOS
       # container, so this is the only automated check of that path
-      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks, each run
-      # twice because the second run is the test: `hello` (facts), `mac`
+      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks: `hello`
+      # once (facts); `mac` twice, because the second run is the test
       # (escalation through the runner's sudo, files as root, TLS from the
-      # target), and `macbrew` (Homebrew, which the runner ships, as the
-      # login user because brew refuses root) — installed, then removed.
+      # target); and `macbrew` (Homebrew, which the runner ships, as the
+      # login user because brew refuses root) installing twice and then
+      # removing twice.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
@@ -194,10 +223,11 @@ jobs:
         env:
           RUSTIBLE_INTEGRATION: "1"
 
-  # T3, the machine tier: a real virtual machine over a real SSH transport,
-  # with a real init system, a real sudo, and a live /proc/sys. A container has
-  # none of those -- it shares the host kernel, so `it_sysctl_present.rs` has to
-  # run with `.apply_now(false)` and assert only on the drop-in file.
+  # T3 on a Linux VM: a real machine over a real SSH transport, with a real
+  # boot, a real sudo setup, and a live /proc/sys. The container harness gives
+  # none of those -- a container shares the host kernel, so
+  # `it_sysctl_present.rs` has to run with `.apply_now(false)` and assert only
+  # on the drop-in file.
   #
   # GitHub's Linux runners expose /dev/kvm, so the x86_64 guest is genuinely
   # accelerated (`<domain type='kvm'>`); the aarch64 guest is interpreted by

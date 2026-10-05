@@ -565,8 +565,9 @@ mod tests {
     }
 
     /// The macOS branch of `gather`, which only a mac can run: `os` is
-    /// compiled in, so on Linux this branch does not exist. The macOS CI job
-    /// runs `cargo test --workspace` on a real mac, and this is what it adds.
+    /// compiled in, so on Linux this branch does not exist. The macOS T1 CI
+    /// job runs `cargo test --workspace` on a real mac, and this is what it
+    /// adds.
     /// Every source is planted in the Fake — the plist, the brew binary,
     /// launchd, and the one `sysctl` call — with the values measured on
     /// macOS 26.3, so a regression in any of the four mappings is caught

@@ -24,7 +24,9 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
-# T1: pure functions and ops against the `Fake`, in-process.
+# T1, in-process: everything a plain `cargo test` runs with nothing installed,
+# chiefly pure functions and ops against the `Fake`. The T2 tests skip
+# themselves here, without RUSTIBLE_INTEGRATION=1.
 test:
 	$(CARGO) test --workspace
 
@@ -41,11 +43,12 @@ example:
 integration:
 	RUSTIBLE_INTEGRATION=1 $(CARGO) test -p rustible-std --tests
 
-## --------------------------------------------------- the machine tier, T3
+## ------------------------------------------- the machine tier, T3: Linux VMs
 
-# Real virtual machines: a real SSH transport, real sudo, a live /proc/sys and
-# a real init system, none of which a container models. Optional day to day,
-# and expected of a new operation before it merges.
+# T3 is a real machine; here, a Linux VM over a real SSH transport, with a
+# real sudo setup, a live /proc/sys and a real boot, none of which the
+# container harness gives. Optional day to day, and expected of a new
+# operation before it merges. CI's other T3 machine is the macOS runner.
 
 # `vagrant up` with no argument brings up only the machine whose architecture
 # matches this host -- x86 on an x86_64 host, arm on Apple silicon -- because
