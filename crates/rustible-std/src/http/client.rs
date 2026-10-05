@@ -11,8 +11,11 @@
 //! - at most [`MAX_REDIRECTS`] hops;
 //! - `301`/`302` keep a `GET` or `HEAD` and turn any other method into a
 //!   bodiless `GET`; `303` is a bodiless `GET` (a `HEAD` stays `HEAD`);
-//!   `307`/`308` keep the method and the body. This is what browsers and
-//!   curl do;
+//!   `307`/`308` keep the method and the body. Browsers and curl turn only
+//!   a `POST` into a `GET` on `301`/`302`; this does it for every method
+//!   but `GET` and `HEAD` (Rustible's choice, not theirs: browsers keep a
+//!   `PUT`, `PATCH` or `DELETE`), so a mutating request is resent only when a
+//!   `307`/`308` says the method is to be kept;
 //! - when the scheme, host or port changes, every credential is dropped: the
 //!   headers given as a [`Secret`], the `.bearer`/`.basic_auth` credentials,
 //!   and `Authorization`, `Proxy-Authorization` and `Cookie` however they
@@ -149,6 +152,37 @@ pub(crate) struct Outgoing<'a> {
     pub(crate) body: Option<(&'a [u8], bool)>,
     pub(crate) follow: bool,
     pub(crate) timeout: Timeout,
+    /// Secrets that reach the wire inside a header but are not one whole
+    /// (a bearer token, a basic-auth password), so they are scrubbed from
+    /// any message on their own too.
+    pub(crate) secrets: Vec<Secret>,
+}
+
+/// Why reading a body failed: over the size limit, which the op's own
+/// message can tell the user how to raise, or anything else.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    TooLarge(String),
+    Other(String),
+}
+
+impl ReadError {
+    /// The error, with `hint` added to a size-limit message: the op that
+    /// owns the limit knows how it is raised, the client does not.
+    pub(crate) fn hinted(self, hint: &str) -> Error {
+        match self {
+            ReadError::TooLarge(m) => Error::msg(format!("{m}; {hint}")),
+            ReadError::Other(m) => Error::msg(m),
+        }
+    }
+}
+
+impl From<ReadError> for Error {
+    fn from(e: ReadError) -> Error {
+        match e {
+            ReadError::TooLarge(m) | ReadError::Other(m) => Error::msg(m),
+        }
+    }
 }
 
 /// A response whose head has arrived and whose body is still unread, so a
@@ -179,11 +213,16 @@ impl Incoming {
     /// The whole body, at most `max_bytes`. A `Content-Length` above it
     /// fails before the body is read; a body without one, or one that lies,
     /// fails as soon as the read passes it, so memory stays bounded.
-    pub(crate) fn read(mut self, max_bytes: u64) -> Result<Vec<u8>> {
+    pub(crate) fn read(mut self, max_bytes: u64) -> std::result::Result<Vec<u8>, ReadError> {
         if self.head {
             return Ok(vec![]);
         }
         let what = &self.what;
+        let too_large = || {
+            ReadError::TooLarge(format!(
+                "{what}: the body is larger than the {max_bytes} byte limit"
+            ))
+        };
         if let Some(len) = self
             .resp
             .headers()
@@ -192,9 +231,9 @@ impl Incoming {
             .and_then(|v| v.trim().parse::<u64>().ok())
             && len > max_bytes
         {
-            bail!(
-                "{what}: Content-Length {len} exceeds the {max_bytes} byte limit; raise it with .max_bytes()"
-            );
+            return Err(ReadError::TooLarge(format!(
+                "{what}: the server declares a {len} byte body (Content-Length), over the {max_bytes} byte limit"
+            )));
         }
         // Read one byte past the ceiling to tell "exactly at the limit" from
         // "over it": ureq stops the read past its limit and errors.
@@ -204,38 +243,43 @@ impl Incoming {
             .with_config()
             .limit(max_bytes.saturating_add(1))
             .read_to_vec()
-            .map_err(|e| {
-                let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
-                Error::msg(scrub(
-                    &format!(
-                        "{what}: reading the body (limit {max_bytes} bytes, raise it with .max_bytes()): {e}"
-                    ),
-                    &self.scrub,
-                ))
+            .map_err(|e| match e {
+                ureq::Error::BodyExceedsLimit(_) => too_large(),
+                e => {
+                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
+                    ReadError::Other(scrub(
+                        &format!("{what}: reading the body: {e}"),
+                        &self.scrub,
+                    ))
+                }
             })?;
         if body.len() as u64 > max_bytes {
-            bail!(
-                "{what}: the body is larger than the {max_bytes} byte limit; raise it with .max_bytes()"
-            );
+            return Err(too_large());
         }
         Ok(body)
     }
 
-    /// Up to `n` bytes of the body, for a message about a response that is
-    /// already a failure. A read error ends it early rather than replacing
-    /// the failure being reported.
-    pub(crate) fn read_prefix(mut self, n: usize) -> Vec<u8> {
+    /// Up to `n` bytes of the body as one line of text, for a message about
+    /// a response that is already a failure: every secret of the request
+    /// scrubbed (a server that echoes the request back would otherwise put
+    /// them in the error), control characters escaped, whitespace runs
+    /// collapsed to one space. A read error ends it early rather than
+    /// replacing the failure being reported.
+    pub(crate) fn snippet(mut self, n: usize) -> String {
         if self.head {
-            return vec![];
+            return String::new();
         }
+        // Read past `n` by the longest secret, so one that straddles the
+        // cut is still whole when it is scrubbed.
+        let extra = self.scrub.iter().map(String::len).max().unwrap_or(0);
         let mut out = Vec::new();
         let _ = self
             .resp
             .body_mut()
             .as_reader()
-            .take(n as u64)
+            .take((n + extra) as u64)
             .read_to_end(&mut out);
-        out
+        one_line(&scrub(&String::from_utf8_lossy(&out), &self.scrub), n)
     }
 }
 
@@ -249,21 +293,12 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
         mut body,
         follow,
         timeout,
+        secrets,
     } = req;
     let first = format!("{method} {}", mask_url(&url));
-    // Every secret value, and the URL's userinfo, is scrubbed from the text
-    // of a transport error before it becomes a message.
-    let mut scrubs: Vec<String> = headers
-        .iter()
-        .filter_map(|h| match &h.value {
-            Field::Secret(s) => s.as_str().ok().map(str::to_string),
-            Field::Plain(_) => None,
-        })
-        .filter(|s| !s.is_empty())
-        .collect();
-    if let Some(info) = userinfo(&url) {
-        scrubs.push(info.to_string());
-    }
+    // Every secret is scrubbed from the text of a transport error, and from
+    // the quoted body of a failed response, before it becomes a message.
+    let scrubs = scrub_list(&url, &headers, body, &secrets);
     let deadline = match timeout {
         Timeout::Total(d) => Some((Instant::now() + d, d)),
         Timeout::Head(_) => None,
@@ -407,7 +442,29 @@ fn hop(
         Some(bytes) => run(builder.body(bytes), timeout, remaining)?,
         None => run(builder.body(()), timeout, remaining)?,
     };
-    result.map_err(|e| timed_out(&e, deadline).unwrap_or_else(|| e.to_string()))
+    result.map_err(|e| {
+        timed_out(&e, deadline)
+            .or_else(|| untrusted_certificate(&e))
+            .unwrap_or_else(|| e.to_string())
+    })
+}
+
+/// A certificate that failed verification, with what to do about it.
+fn untrusted_certificate(e: &ureq::Error) -> Option<String> {
+    let tls = match e {
+        ureq::Error::Rustls(t) => t,
+        ureq::Error::Io(io) => io.get_ref()?.downcast_ref::<rustls::Error>()?,
+        _ => return None,
+    };
+    match tls {
+        rustls::Error::InvalidCertificate(why) => Some(format!(
+            "the server's TLS certificate failed verification ({why:?}): it is not trusted \
+             by Mozilla's roots (self-signed, or from a private CA?), has expired, or names \
+             another host. Verification is never skipped; for an admin API on the target \
+             itself, use http://127.0.0.1"
+        )),
+        _ => None,
+    }
 }
 
 /// Run one built request on the shared agent with its timeouts.
@@ -439,11 +496,91 @@ fn timed_out(e: &ureq::Error, deadline: Option<(Instant, Duration)>) -> Option<S
     }
 }
 
-/// `text` with every non-empty string in `secrets` replaced.
-fn scrub(text: &str, secrets: &[String]) -> String {
-    secrets
-        .iter()
+/// `text` with every non-empty string in `secrets` replaced, longest first
+/// so a secret that contains another is replaced whole.
+pub(crate) fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut sorted: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    sorted
+        .into_iter()
         .fold(text.to_string(), |t, s| t.replace(s.as_str(), "<secret>"))
+}
+
+/// Everything a message must never quote: each secret header's value whole
+/// and, for a value with a scheme in front (`Bearer x`, `Basic x`), the part
+/// after it; the `extra` secrets; a secret body; and the URL's userinfo
+/// whole, its password, and a lone user part (often the token itself).
+fn scrub_list(
+    url: &str,
+    headers: &[HeaderSpec],
+    body: Option<(&[u8], bool)>,
+    extra: &[Secret],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |s: &str| {
+        let s = s.trim_end_matches(['\r', '\n']);
+        if !s.is_empty() && !out.iter().any(|o| o == s) {
+            out.push(s.to_string());
+        }
+    };
+    for h in headers {
+        if let Field::Secret(s) = &h.value
+            && let Ok(v) = s.as_str()
+        {
+            add(v);
+            if let Some((_, rest)) = v.split_once(' ') {
+                add(rest.trim());
+            }
+        }
+    }
+    for s in extra {
+        if let Ok(v) = s.as_str() {
+            add(v);
+        }
+    }
+    if let Some((bytes, true)) = body
+        && let Ok(v) = std::str::from_utf8(bytes)
+    {
+        add(v);
+    }
+    if let Some(info) = userinfo(url) {
+        add(info);
+        if let Some((_, password)) = info.split_once(':') {
+            add(password);
+        }
+    }
+    out
+}
+
+/// `text` as one line of at most `max` bytes: control characters escaped
+/// (`\u{1b}`), every run of whitespace a single space, a cut marked `...`.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if out.len() > max {
+        let mut cut = max;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("...");
+    }
+    out
 }
 
 // ---- pure ----
@@ -748,6 +885,10 @@ mod tests {
                 value: Field::Plain("s=1".into()),
             },
             HeaderSpec {
+                name: "proxy-authorization".into(),
+                value: Field::Plain("Basic cHJveHk6cHc=".into()),
+            },
+            HeaderSpec {
                 name: "Accept".into(),
                 value: Field::Plain("application/json".into()),
             },
@@ -788,7 +929,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.url, "http://a/y");
-        assert_eq!(next.headers.len(), 5);
+        assert_eq!(next.headers.len(), 6);
     }
 
     #[test]
@@ -804,7 +945,7 @@ mod tests {
             follow_redirect(&get, "https://a/x", &headers(), false, 302, "http://b/y").unwrap_err();
         assert!(err.contains("leaves https for plain http"), "{err}");
         // Nothing secret attached: followed.
-        let plain = &headers()[3..];
+        let plain = &headers()[4..];
         assert!(
             follow_redirect(&get, "https://a/x", plain, false, 302, "http://a/y")
                 .unwrap()
@@ -872,6 +1013,72 @@ mod tests {
         assert!(h("authorization", Field::Plain("Bearer x".into())).is_credential());
         assert!(h("Cookie", Field::Plain("a=b".into())).is_credential());
         assert!(!h("Accept", Field::Plain("*/*".into())).is_credential());
+    }
+
+    #[test]
+    fn a_failed_certificate_check_says_what_to_do() {
+        use rustls::CertificateError;
+        let bad = || rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer);
+        // As ureq reports a handshake failure: inside an I/O error.
+        let io = ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, bad()));
+        let direct = ureq::Error::Rustls(bad());
+        for e in [io, direct] {
+            let m = untrusted_certificate(&e).unwrap();
+            assert!(m.contains("UnknownIssuer"), "{m}");
+            assert!(m.contains("Mozilla's roots"), "{m}");
+            assert!(m.contains("never skipped"), "{m}");
+            assert!(m.contains("http://127.0.0.1"), "{m}");
+        }
+        let other = ureq::Error::Rustls(rustls::Error::HandshakeNotComplete);
+        assert_eq!(untrusted_certificate(&other), None);
+        let refused = ureq::Error::Io(std::io::ErrorKind::ConnectionRefused.into());
+        assert_eq!(untrusted_certificate(&refused), None);
+    }
+
+    #[test]
+    fn one_line_escapes_controls_and_collapses_whitespace() {
+        assert_eq!(one_line("  a\n\n b\t\tc \r\n", 100), "a b c");
+        assert_eq!(one_line("a\x1bb\x07", 100), "a\\u{1b}b\\u{7}");
+        assert_eq!(one_line("abcdef", 3), "abc...");
+        assert_eq!(one_line("ééé", 3), "é...", "cut on a character boundary");
+        assert_eq!(one_line("", 3), "");
+    }
+
+    /// What a message must never quote, every form of it.
+    #[test]
+    fn the_scrub_list_has_every_form_of_every_secret() {
+        let h = |n: &str, v: &str| HeaderSpec {
+            name: n.into(),
+            value: Field::Secret(Secret::new(v)),
+        };
+        let list = scrub_list(
+            "https://bob:pw0rd@h/x",
+            &[
+                h("X-API-Key", "k3y\n"),
+                h("Authorization", "Basic Ym9iOnB3"),
+            ],
+            Some((b"body-s3cret", true)),
+            &[Secret::new("raw-t0ken")],
+        );
+        for want in [
+            "k3y",
+            "Basic Ym9iOnB3",
+            "Ym9iOnB3",
+            "raw-t0ken",
+            "body-s3cret",
+            "bob:pw0rd",
+            "pw0rd",
+        ] {
+            assert!(list.iter().any(|s| s == want), "{want}: {list:?}");
+        }
+        // A plain body is not a secret; a lone user part is.
+        assert!(scrub_list("http://h/", &[], Some((b"plain", false)), &[]).is_empty());
+        assert_eq!(scrub_list("http://t0k@h/", &[], None, &[]), ["t0k"]);
+        // Longest first, so `Basic x` goes whole rather than leaving `Basic`.
+        assert_eq!(
+            scrub("Basic Ym9iOnB3 and Ym9iOnB3", &list),
+            "<secret> and <secret>"
+        );
     }
 
     #[test]

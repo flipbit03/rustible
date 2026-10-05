@@ -11,7 +11,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use ureq::http::Method;
 
-use super::client::{self, Field, HeaderSpec, Outgoing, Timeout, base64, mask_url, secret_note};
+use super::client::{
+    self, Field, HeaderSpec, Outgoing, ReadError, Timeout, base64, mask_url, secret_note,
+};
 use super::{DEFAULT_TIMEOUT, validate_url};
 
 /// The default ceiling on a [`Request`]'s response body, raised or lowered
@@ -44,16 +46,21 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 ///
 /// fn folder(ctx: &mut Ctx, key: &Secret) -> Result<()> {
 ///     let url = "http://127.0.0.1:8384/rest/config/folders/dcim";
-///     let got = ctx.step("Read folder", http::Request::get(url).header_secret("X-API-Key", key))?;
-///     let folder: Folder = got.json_as()?;
-///     if folder.kind != "receiveonly" {
-///         ctx.step(
-///             format!("Make {} receive-only", folder.id),
-///             http::Request::patch(url)
-///                 .header_secret("X-API-Key", key)
-///                 .json(&json!({ "type": "receiveonly" })),
-///         )?;
-///     }
+///     // In a block: under --check the GET has no output, and reading it
+///     // ends this block rather than the host's dry run.
+///     ctx.block("DCIM is receive-only", |ctx| {
+///         let got = ctx.step("Read folder", http::Request::get(url).header_secret("X-API-Key", key))?;
+///         let folder: Folder = got.json_as()?;
+///         if folder.kind != "receiveonly" {
+///             ctx.step(
+///                 format!("Make {} receive-only", folder.id),
+///                 http::Request::patch(url)
+///                     .header_secret("X-API-Key", key)
+///                     .json(&json!({ "type": "receiveonly" })),
+///             )?;
+///         }
+///         Ok(())
+///     })?;
 ///     Ok(())
 /// }
 /// # fn main() {}
@@ -383,7 +390,9 @@ impl Request {
     /// request without sending it, as [`Request`] itself does.
     pub fn send(&self) -> Result<Response> {
         let method = self.validate()?;
-        self.exchange(&method, &self.url)
+        // No hint about `.max_bytes()` here: whoever calls `send` owns the
+        // limit, and their own users may have no such method to call.
+        self.exchange(&method, &self.url).map_err(Error::from)
     }
 
     /// Whether this is a read: `GET`, `HEAD` or `OPTIONS`.
@@ -425,6 +434,19 @@ impl Request {
                 .map_err(|e| Error::msg(format!("{} {}: {e}", self.method, mask_url(&self.url))))?;
         }
         Ok(method)
+    }
+
+    /// What the client cannot find in the headers for itself to scrub from
+    /// messages: the basic-auth password, which crosses the wire only in
+    /// base64 but which a server that decodes it can name back. (The
+    /// header's value whole and the part after `Bearer `/`Basic ` — the
+    /// token, the base64 pair — a secret body and the URL's userinfo, the
+    /// client finds itself.)
+    fn raw_secrets(&self) -> Vec<Secret> {
+        match &self.auth {
+            Some(Auth::Basic { password, .. }) => vec![password.clone()],
+            None | Some(Auth::Bearer(_)) => vec![],
+        }
     }
 
     /// The headers as sent: the given ones, the content type, and the
@@ -509,8 +531,9 @@ impl Request {
     }
 
     /// Send, follow, and judge the status. The one place a request leaves.
-    fn exchange(&self, method: &Method, url: &str) -> Result<Response> {
-        let headers = self.wire_headers()?;
+    fn exchange(&self, method: &Method, url: &str) -> std::result::Result<Response, ReadError> {
+        let other = |e: Error| ReadError::Other(e.chain());
+        let headers = self.wire_headers().map_err(other)?;
         let body: Option<(&[u8], bool)> = match &self.body {
             Body::Plain { bytes, .. } => Some((bytes.as_slice(), false)),
             Body::Secret(s) => Some((s.as_bytes(), true)),
@@ -531,25 +554,24 @@ impl Request {
             body,
             follow,
             timeout: Timeout::Total(self.timeout),
-        })?;
+            secrets: self.raw_secrets(),
+        })
+        .map_err(other)?;
         let status = resp.status;
         if !status_accepted(self.status.as_deref(), status) {
             let reason = resp.reason();
             let at = resp.url.clone();
             let redirected = (at != mask_url(url)).then_some(at);
             let what = format!("{method} {}", mask_url(url));
-            let quoted = resp.read_prefix(QUOTED_BODY_BYTES);
-            bail!(
-                "{}",
-                status_failure(
-                    &what,
-                    status,
-                    reason,
-                    redirected.as_deref(),
-                    self.status.as_deref(),
-                    &quoted
-                )
-            );
+            let quoted = resp.snippet(QUOTED_BODY_BYTES);
+            return Err(ReadError::Other(status_failure(
+                &what,
+                status,
+                reason,
+                redirected.as_deref(),
+                self.status.as_deref(),
+                &quoted,
+            )));
         }
         let headers = std::mem::take(&mut resp.headers);
         let body = resp.read(self.max_bytes)?;
@@ -634,6 +656,7 @@ impl Op for Request {
 
     fn apply(&self, _: &System, intent: RequestIntent) -> Result<Response> {
         self.exchange(&intent.method, &intent.url)
+            .map_err(|e| e.hinted("raise it with .max_bytes()"))
     }
 
     /// A method that changes things on the server, with no `changed_when`
@@ -699,12 +722,18 @@ impl Response {
     /// the fields the playbook reads (fields it does not name are ignored).
     /// Prefer this to [`Response::json`]: a missing or mistyped field fails
     /// here, naming it, rather than further down as a `None`.
+    ///
+    /// The error says what was wrong and where (a missing field by name, a
+    /// value of the wrong kind and what was expected, the line and column),
+    /// but never quotes a value from the body: an API's answer can hold a
+    /// key of its own.
     pub fn json_as<T: DeserializeOwned>(&self) -> Result<T> {
         serde_json::from_slice(&self.body).map_err(|e| {
             Error::msg(format!(
-                "the response body ({}) is not the JSON `{}` expects: {e}",
+                "the response body ({}) is not the JSON `{}` expects: {}",
                 self.content_type(),
-                std::any::type_name::<T>()
+                short_type_name::<T>(),
+                describe_json_error(&e)
             ))
         })
     }
@@ -713,8 +742,9 @@ impl Response {
     pub fn json(&self) -> Result<Value> {
         serde_json::from_slice(&self.body).map_err(|e| {
             Error::msg(format!(
-                "the response body ({}) is not JSON: {e}",
-                self.content_type()
+                "the response body ({}) is not JSON: {}",
+                self.content_type(),
+                describe_json_error(&e)
             ))
         })
     }
@@ -772,7 +802,7 @@ fn status_failure(
     reason: &str,
     redirected_to: Option<&str>,
     expected: Option<&[u16]>,
-    quoted: &[u8],
+    quoted: &str,
 ) -> String {
     let mut s = format!("{what} returned {status}");
     if !reason.is_empty() {
@@ -783,13 +813,110 @@ fn status_failure(
         s.push_str(&format!(" (after redirects, at {at})"));
     }
     s.push_str(&format!(", expected {}", describe_expected(expected)));
-    let text = String::from_utf8_lossy(quoted);
-    let text = text.trim_end();
-    if !text.is_empty() {
+    if !quoted.is_empty() {
         s.push_str(": ");
-        s.push_str(text);
+        s.push_str(quoted);
     }
     s
+}
+
+/// A type's name as a message shows it: the last path segment of each
+/// type in it, so `ws::__pb::Folder` reads `Folder` and
+/// `alloc::vec::Vec<my::Key>` reads `Vec<Key>`.
+fn short_type_name<T>() -> String {
+    let full = std::any::type_name::<T>();
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in full.chars() {
+        if c.is_alphanumeric() || c == '_' || c == ':' {
+            word.push(c);
+        } else {
+            out.push_str(word.rsplit("::").next().unwrap_or_default());
+            word.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(word.rsplit("::").next().unwrap_or_default());
+    out
+}
+
+/// A `serde_json` error without the text of any value from the input, which
+/// serde quotes (`invalid type: string "hunter2", expected u32`). What is
+/// kept comes from the type being read (a field's name, what it expected)
+/// or from the parser (the line and column).
+fn describe_json_error(e: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    let at = format!("line {}, column {}", e.line(), e.column());
+    match e.classify() {
+        Category::Syntax => format!("not valid JSON (at {at})"),
+        Category::Eof => format!("the JSON ends early (at {at})"),
+        Category::Io => "the body could not be read".to_string(),
+        Category::Data => {
+            let msg = e.to_string();
+            let msg = msg.rsplit_once(" at line ").map(|(m, _)| m).unwrap_or(&msg);
+            let expected = msg
+                .rsplit_once(", expected ")
+                .map(|(_, x)| format!(", expected {x}"))
+                .unwrap_or_default();
+            let what = if let Some(rest) = msg.strip_prefix("missing field `") {
+                // The field's name comes from the type, not the body.
+                format!(
+                    "missing field `{}`",
+                    rest.split('`').next().unwrap_or_default()
+                )
+            } else if let Some(rest) = msg
+                .strip_prefix("invalid type: ")
+                .or_else(|| msg.strip_prefix("invalid value: "))
+            {
+                format!(
+                    "a value of the wrong kind ({}{expected})",
+                    unexpected_kind(rest)
+                )
+            } else if msg.starts_with("invalid length ") {
+                format!("a list or map of the wrong length{expected}")
+            } else if msg.starts_with("unknown field ") {
+                format!("a field it does not know{expected}")
+            } else if msg.starts_with("unknown variant ") {
+                format!("a value it does not know{expected}")
+            } else if msg.starts_with("duplicate field ") {
+                "a field given twice".to_string()
+            } else {
+                "a value that does not fit".to_string()
+            };
+            format!("{what} at {at}")
+        }
+    }
+}
+
+/// The kind of value serde's `Unexpected` names, without the value: the
+/// words before the quoted value (`string`, `integer`, `map`, ...).
+fn unexpected_kind(rest: &str) -> &'static str {
+    const KINDS: [&str; 16] = [
+        "boolean",
+        "integer",
+        "floating point",
+        "character",
+        "string",
+        "byte array",
+        "unit value",
+        "Option value",
+        "newtype struct",
+        "sequence",
+        "map",
+        "enum",
+        "unit variant",
+        "newtype variant",
+        "tuple variant",
+        "struct variant",
+    ];
+    if rest.starts_with("null") {
+        return "null";
+    }
+    KINDS
+        .iter()
+        .find(|k| rest.starts_with(*k))
+        .copied()
+        .unwrap_or("a value")
 }
 
 /// Whether a `Content-Type` is JSON: `application/json`, or any type with a
@@ -805,30 +932,41 @@ fn is_json_content_type(ct: &str) -> bool {
 
 /// A request body as a diff shows it: pretty-printed when it is JSON, as
 /// text when it is text, as a size when it is neither, and cut at about
-/// 2 KiB with a note of how much more there was.
+/// 2 KiB with a note of how much more there was. Pretty-printed JSON is
+/// marked as reformatted: keys come out sorted and a number may be printed
+/// differently, so it is what is sent, not the bytes that are sent.
 fn body_summary(bytes: &[u8], content_type: Option<&str>) -> String {
-    let text = if content_type.is_some_and(is_json_content_type)
+    let (text, note) = if content_type.is_some_and(is_json_content_type)
         && let Ok(v) = serde_json::from_slice::<Value>(bytes)
     {
-        serde_json::to_string_pretty(&v).unwrap_or_default()
+        let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
+        let note = (pretty.as_bytes() != bytes)
+            .then(|| format!("(reformatted for display; {} bytes are sent)", bytes.len()));
+        (pretty, note)
     } else {
         match std::str::from_utf8(bytes) {
-            Ok(t) => t.to_string(),
+            Ok(t) => (t.to_string(), None),
             Err(_) => return format!("<{} bytes of binary data>", bytes.len()),
         }
     };
-    if text.len() <= SHOWN_BODY_BYTES {
-        return text;
+    let mut out = if text.len() <= SHOWN_BODY_BYTES {
+        text
+    } else {
+        let mut cut = SHOWN_BODY_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!(
+            "{}\n... ({} more bytes not shown)",
+            &text[..cut],
+            text.len() - cut
+        )
+    };
+    if let Some(note) = note {
+        out.push('\n');
+        out.push_str(&note);
     }
-    let mut cut = SHOWN_BODY_BYTES;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!(
-        "{}\n... ({} more bytes not shown)",
-        &text[..cut],
-        text.len() - cut
-    )
+    out
 }
 
 /// `application/x-www-form-urlencoded`: unreserved characters as they are,
@@ -950,7 +1088,7 @@ mod tests {
     #[test]
     fn the_status_failure_message_names_everything() {
         assert_eq!(
-            status_failure("PATCH http://h/x", 409, "Conflict", None, None, b"busy\n"),
+            status_failure("PATCH http://h/x", 409, "Conflict", None, None, "busy"),
             "PATCH http://h/x returned 409 Conflict, expected 2xx: busy"
         );
         assert_eq!(
@@ -960,7 +1098,7 @@ mod tests {
                 "",
                 Some("http://g/y"),
                 Some(&[200]),
-                b""
+                ""
             ),
             "GET http://h/x returned 599 (after redirects, at http://g/y), expected 200"
         );
@@ -992,7 +1130,19 @@ mod tests {
     fn a_body_is_shown_pretty_and_cut_at_about_2_kib() {
         assert_eq!(
             body_summary(br#"{"type":"receiveonly"}"#, Some("application/json")),
-            "{\n  \"type\": \"receiveonly\"\n}"
+            "{\n  \"type\": \"receiveonly\"\n}\n(reformatted for display; 22 bytes are sent)"
+        );
+        // Keys come out sorted, so even a pretty body is marked unless it
+        // is byte for byte what is sent.
+        assert!(
+            body_summary(b"{\"b\":1,\"a\":2}", Some("application/json"))
+                .starts_with("{\n  \"a\": 2,\n  \"b\": 1\n}\n(reformatted")
+        );
+        let as_sent = "{\n  \"a\": 1\n}";
+        assert_eq!(
+            body_summary(as_sent.as_bytes(), Some("application/json")),
+            as_sent,
+            "already as it would be shown: no note"
         );
         // Not declared JSON: shown as the text it is.
         assert_eq!(
@@ -1045,11 +1195,12 @@ mod tests {
         let d = i.diff();
         assert_eq!(
             d.render(),
-            "PATCH http://h/rest/x\n{\n  \"type\": \"receiveonly\"\n}"
+            "PATCH http://h/rest/x\n{\n  \"type\": \"receiveonly\"\n}\n\
+             (reformatted for display; 22 bytes are sent)"
         );
         assert_eq!(
             d.short(),
-            "PATCH http://h/rest/x",
+            "PATCH http://h/rest/x …",
             "one line on the step line"
         );
 
@@ -1166,7 +1317,13 @@ mod tests {
         assert_eq!(steps[1].1.as_deref(), Some("action"));
         assert_eq!(
             steps[1].2.as_deref(),
-            Some(format!("PATCH {url}\n{{\n  \"type\": \"receiveonly\"\n}}").as_str())
+            Some(
+                format!(
+                    "PATCH {url}\n{{\n  \"type\": \"receiveonly\"\n}}\n\
+                     (reformatted for display; 22 bytes are sent)"
+                )
+                .as_str()
+            )
         );
     }
 
@@ -1437,10 +1594,10 @@ mod tests {
             .unwrap_err()
             .chain();
         assert!(
-            e.contains("Content-Length 4096 exceeds the 100 byte limit"),
+            e.contains("declares a 4096 byte body (Content-Length), over the 100 byte limit"),
             "{e}"
         );
-        assert!(e.contains(".max_bytes()"), "{e}");
+        assert!(!e.contains(".max_bytes()"), "{e}");
         assert_eq!(
             Request::get(server.url("/big"))
                 .max_bytes(4096)
@@ -1461,7 +1618,16 @@ mod tests {
             .send()
             .unwrap_err()
             .chain();
-        assert!(e.contains("limit 100 bytes"), "{e}");
+        assert!(e.contains("larger than the 100 byte limit"), "{e}");
+        // `send` is for op authors, whose users may have no `.max_bytes()`:
+        // the hint is the step's alone.
+        assert!(!e.contains(".max_bytes()"), "{e}");
+        let (r, _) = step(false, Request::get(s.url("/big")).max_bytes(100));
+        let e = r.unwrap_err().chain();
+        assert!(
+            e.ends_with("larger than the 100 byte limit; raise it with .max_bytes()"),
+            "{e}"
+        );
     }
 
     /// The timeout covers the body: a server that sends its head and then
@@ -1554,5 +1720,217 @@ mod tests {
             "a given Content-Type wins over .json's"
         );
         assert_eq!(seen[3].header("content-length"), Some("0"));
+    }
+
+    // ---- review round: secrets in echoes, one-line errors, json_as ----
+
+    /// A server that echoes the request into its error page (a `400` or a
+    /// `422` often does) must not put the request's secrets into the step's
+    /// error, and so into `StepFinished` and `--json`: every form of every
+    /// secret is scrubbed from the quoted body.
+    #[test]
+    fn an_echoing_server_does_not_leak_secrets_into_the_status_error() {
+        let s = serve(vec![(
+            "/echo",
+            422,
+            vec![("X-Echo", String::new())],
+            vec![],
+        )]);
+        let url = s.url("/echo").replace("http://", "http://bob:u5er-pw@");
+        let op = with_secrets(Request::post(&url)).body_secret(&Secret::new(BODY_SECRET));
+        let (r, sink) = step(false, op);
+        let e = r.unwrap_err().chain();
+        assert!(e.contains("returned 422 Unprocessable Entity"), "{e}");
+        assert!(
+            e.contains("x-api-key: <secret>"),
+            "the echo is there, scrubbed: {e}"
+        );
+        assert_no_secret(&e);
+        for ev in sink.events() {
+            assert_no_secret(&serde_json::to_string(&ev).unwrap());
+        }
+        // The server did get them all.
+        let seen = &s.seen()[0];
+        assert_eq!(seen.header("x-api-key"), Some(KEY));
+        assert_eq!(seen.body, BODY_SECRET.as_bytes());
+
+        let basic = Request::get(s.url("/echo")).basic_auth("bob", &Secret::new(PASSWORD));
+        let e = basic.send().unwrap_err().chain();
+        let b64 = base64(format!("bob:{PASSWORD}").as_bytes());
+        assert!(!e.contains(&b64), "{e}");
+        assert!(e.contains("authorization: <secret>"), "{e}");
+        assert_no_secret(&e);
+
+        // A server that decodes the credentials and names them back: the
+        // password never crossed the wire in clear, and is scrubbed anyway.
+        let says = serve(vec![(
+            "/login",
+            401,
+            vec![],
+            format!("no user bob with password {PASSWORD}; got {b64}").into_bytes(),
+        )]);
+        let basic = Request::get(says.url("/login")).basic_auth("bob", &Secret::new(PASSWORD));
+        let e = basic.send().unwrap_err().chain();
+        assert!(
+            e.ends_with("no user bob with password <secret>; got <secret>"),
+            "{e}"
+        );
+    }
+
+    /// A failed response is quoted from its first bytes and never read to
+    /// its end: one whose body stalls past the quoted part does not hold
+    /// the step for the stall.
+    #[test]
+    fn a_failed_response_is_not_read_to_its_end() {
+        let s = serve(vec![(
+            "/slow-error",
+            500,
+            vec![("X-Stall-After", "2000:4000".into())],
+            vec![b'x'; 100_000],
+        )]);
+        let started = Instant::now();
+        let e = Request::get(s.url("/slow-error"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .unwrap_err()
+            .chain();
+        assert!(e.contains("returned 500"), "{e}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A certificate that fails verification says what to do, against a
+    /// real handshake with a self-signed server on loopback.
+    #[test]
+    fn an_untrusted_certificate_says_what_to_do() {
+        let base = super::super::test_server::serve_untrusted_tls();
+        let e = Request::get(format!("{base}/")).send().unwrap_err().chain();
+        assert!(e.contains("TLS certificate failed verification"), "{e}");
+        assert!(e.contains("never skipped"), "{e}");
+        assert!(e.contains("http://127.0.0.1"), "{e}");
+    }
+
+    /// An error page is quoted as one line, its control characters escaped,
+    /// at most 512 bytes of it, however long and however many lines it is.
+    #[test]
+    fn a_quoted_error_page_is_one_bounded_line() {
+        let page = format!(
+            "<html>\n  <body>\n\t<h1>Not Implemented</h1>\x1b[31m\r\n{}\n</body></html>\n",
+            "x".repeat(100_000)
+        );
+        let s = serve(vec![("/page", 501, vec![], page.into_bytes())]);
+        let e = Request::get(s.url("/page")).send().unwrap_err().chain();
+        assert!(!e.contains('\n') && !e.contains('\x1b'), "{e:?}");
+        assert!(
+            e.contains(": <html> <body> <h1>Not Implemented</h1>\\u{1b}[31m xxx"),
+            "{e}"
+        );
+        assert!(e.ends_with("..."), "{e}");
+        assert!(e.len() < 512 + 200, "{} bytes: {e}", e.len());
+    }
+
+    /// The error of `json_as` names the type by its last path segment and
+    /// says what was wrong and where, but never quotes a value from the
+    /// body, which can hold a key (Syncthing's `/rest/config` does).
+    #[test]
+    fn json_as_errors_quote_no_value_from_the_body() {
+        #[derive(Debug, Deserialize)]
+        struct Config {
+            #[allow(dead_code)]
+            apikey: u32,
+        }
+        let r = Response {
+            status: 200,
+            headers: vec![],
+            body: br#"{"apikey": "SUPERSECRETKEY123"}"#.to_vec(),
+        };
+        let e = r.json_as::<Config>().unwrap_err().chain();
+        assert!(!e.contains("SUPERSECRETKEY123"), "{e}");
+        assert_eq!(
+            e,
+            "the response body (no Content-Type) is not the JSON `Config` expects: a value of \
+             the wrong kind (string, expected u32) at line 1, column 30"
+        );
+        let e = r.json_as::<Vec<Config>>().unwrap_err().chain();
+        assert!(e.contains("JSON `Vec<Config>` expects"), "{e}");
+        let bad = Response {
+            body: br#"{"apikey": SUPERSECRET}"#.to_vec(),
+            ..r.clone()
+        };
+        let e = bad.json().unwrap_err().chain();
+        assert!(!e.contains("SUPERSECRET"), "{e}");
+        assert!(
+            e.ends_with("is not JSON: not valid JSON (at line 1, column 12)"),
+            "{e}"
+        );
+        let e = bad.json_as::<Config>().unwrap_err().chain();
+        assert!(!e.contains("SUPERSECRET"), "{e}");
+    }
+
+    #[test]
+    fn an_options_request_is_a_read() {
+        let server = folder_server();
+        let (r, sink) = step(
+            false,
+            Request::method("options", server.url("/rest/config/folders/dcim")),
+        );
+        assert!(!r.unwrap().changed);
+        assert_eq!(
+            (finished(&sink)[0].0, finished(&sink)[0].1.as_deref()),
+            (Status::Ok, Some("ran, unchanged"))
+        );
+        assert_eq!(server.seen()[0].method, "OPTIONS");
+    }
+
+    #[test]
+    fn a_response_debugs_its_body_as_a_size() {
+        let r = Response {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: br#"{"apikey":"SUPERSECRETKEY123"}"#.to_vec(),
+        };
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("SUPERSECRET"), "{dbg}");
+        assert!(dbg.contains("\"30 bytes\""), "{dbg}");
+    }
+
+    /// The timeout is one deadline for the whole exchange: two hops that
+    /// each take 60% of it fail, where a per-hop timeout would let both
+    /// through.
+    #[test]
+    fn the_timeout_covers_every_redirect_hop_together() {
+        let s = serve(vec![
+            (
+                "/first",
+                302,
+                vec![
+                    ("Location", "/second".into()),
+                    ("X-Stall-Head", "300".into()),
+                ],
+                vec![],
+            ),
+            (
+                "/second",
+                200,
+                vec![("X-Stall-Head", "300".into())],
+                b"ok".to_vec(),
+            ),
+        ]);
+        let e = Request::get(s.url("/first"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .unwrap_err()
+            .chain();
+        assert!(e.contains("timed out after 500ms"), "{e}");
+        assert_eq!(s.hits(), 2, "the second hop was made, and cut short");
+        // With room for both, both go through.
+        let r = Request::get(s.url("/first"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .unwrap();
+        assert_eq!(r.text().unwrap(), "ok");
     }
 }

@@ -85,7 +85,10 @@
 //! - `301` and `302` keep a `GET` or `HEAD` and turn any other method into a
 //!   `GET` without its body; `303` is a `GET` without the body (a `HEAD`
 //!   stays a `HEAD`); `307` and `308` keep the method and the body. Browsers
-//!   and curl do the same.
+//!   and curl turn only a `POST` into a `GET` on `301`/`302` and keep a
+//!   `PUT`, `PATCH` or `DELETE`; Rustible turns those into a `GET` too, so a
+//!   mutating request is resent only when a `307`/`308` says to keep the
+//!   method (and only with `.follow_redirects(true)`).
 //! - When the scheme, host or port changes, every credential is dropped: a
 //!   header given with `header_secret`, the `.bearer`/`.basic_auth`
 //!   credentials, and `Authorization`, `Proxy-Authorization` and `Cookie`

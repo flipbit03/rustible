@@ -1121,9 +1121,15 @@ lists the codes. Read the response into a struct with `json_as`;
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 `.basic_auth(user, &s)` — and show as `<secret, N bytes>` in diffs and errors.
 
+⚠️ A `.json(..)` body is shown in the diff (`-v`, `--json`). To send a secret
+in a JSON body, build the JSON yourself and send it with
+`.body_secret(&s).content_type("application/json")`.
+
+The structs need serde in your workspace: `cargo add serde --features derive`.
+
 ```rust
 use rustible::prelude::*;
-use rustible_std::{http, systemd};
+use rustible_std::http;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -1138,7 +1144,13 @@ struct FolderType {
     kind: &'static str,
 }
 
-const FOLDER: &str = "http://127.0.0.1:8384/rest/config/folders/dcim";
+#[derive(Deserialize)]
+struct RestartRequired {
+    #[serde(rename = "requiresRestart")]
+    requires_restart: bool,
+}
+
+const API: &str = "http://127.0.0.1:8384/rest";
 const CONFIG: &str = "/home/syncthing/.local/state/syncthing/config.xml";
 
 #[rustible::playbook(hosts = "nas", escalate = true)]
@@ -1151,22 +1163,27 @@ fn main(ctx: &mut Ctx) -> Result<()> {
         .and_then(|rest| rest.split("</apikey>").next())
         .context("no <apikey> in Syncthing's config.xml")?;
     let key = Secret::new(key);
+    let api = |r: http::Request| r.header_secret("X-API-Key", &key);
 
+    let folder = format!("{API}/config/folders/dcim");
     let patched = ctx.block("DCIM is receive-only", |ctx| {
-        let got = ctx.step("Read folder",
-            http::Request::get(FOLDER).header_secret("X-API-Key", &key))?;
+        let got = ctx.step("Read folder", api(http::Request::get(&folder)))?;
         if got.json_as::<Folder>()?.kind == "receiveonly" {
             return Ok(false);
         }
-        let set = http::Request::patch(FOLDER)
-            .header_secret("X-API-Key", &key)
-            .json(&FolderType { kind: "receiveonly" });
+        let set = api(http::Request::patch(&folder)).json(&FolderType { kind: "receiveonly" });
         Ok(ctx.step("Set receive-only", set)?.changed)
     })?;
-    // A block of its own, so a dry run carries on past it (see below).
-    ctx.block("Syncthing restarted", |ctx| {
+    // Syncthing applies a config change live and says when it needs a
+    // restart: GET /rest/config/restart-required, POST /rest/system/restart
+    // (docs.syncthing.net/rest/config.html, /rest/system-restart-post.html).
+    // In a block of its own, so a dry run carries on past it (see below).
+    ctx.block("Syncthing restarted if it must be", |ctx| {
         if *patched {
-            ctx.step("Restart", systemd::Restart::new("syncthing@syncthing"))?;
+            let asked = api(http::Request::get(format!("{API}/config/restart-required")));
+            if ctx.step("Restart required?", asked)?.json_as::<RestartRequired>()?.requires_restart {
+                ctx.step("Restart", api(http::Request::post(format!("{API}/system/restart"))))?;
+            }
         }
         Ok(())
     })?;
@@ -1176,8 +1193,9 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 
 ⚠️ **Nothing is sent under `--check`**, not even a `GET`: the step reports
 `would change` with no output, so reading the response ends the enclosing
-block with a warning (§15). Above, the dry run stops seeing at `json_as`,
-and the restart block, which reads the first block's value, ends too.
+block with a warning (§15). Above, the dry run stops seeing at the first
+`json_as`, and the second block, which reads the first block's value, ends
+too.
 
 ### When no operation fits
 
@@ -1296,13 +1314,14 @@ if let Err(e) = ctx.step("optional thing", op) {
 let mut attempts = 0;
 while let Err(e) = ctx.step(
     "wait for the api",
-    http::Request::get("http://127.0.0.1:8080/health").timeout(Duration::from_secs(5)),
+    http::Request::get("http://127.0.0.1:8080/health")
+        .timeout(std::time::Duration::from_secs(5)),
 ) {
     attempts += 1;
     if attempts == 5 {
         return Err(e); // gives up: this attempt is `failed`, the four before it `recovered`
     }
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 }
 ```
 

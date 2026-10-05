@@ -419,12 +419,14 @@ impl Download {
             body: None,
             follow: true,
             timeout: Timeout::Head(self.timeout),
+            secrets: vec![],
         })?;
         if !(200..300).contains(&resp.status) {
             let status = format!("{} {}", resp.status, resp.reason());
             bail!("GET {} returned {}", mask_url(url), status.trim_end());
         }
         resp.read(self.max_bytes)
+            .map_err(|e| e.hinted("raise it with .max_bytes()"))
     }
 }
 
@@ -880,7 +882,7 @@ mod tests {
         let c = expect_change(&op, &sys);
         let err = op.apply(&sys, c).unwrap_err().to_string();
         assert!(
-            err.contains("Content-Length 4096 exceeds the 100 byte limit"),
+            err.contains("declares a 4096 byte body (Content-Length), over the 100 byte limit"),
             "{err}"
         );
         assert!(err.contains(".max_bytes()"), "{err}");
@@ -907,7 +909,7 @@ mod tests {
             .max_bytes(100);
         let c = expect_change(&op, &sys);
         let err = op.apply(&sys, c).unwrap_err().to_string();
-        assert!(err.contains("limit 100 bytes"), "{err}");
+        assert!(err.contains("larger than the 100 byte limit"), "{err}");
         assert!(err.contains(".max_bytes()"), "{err}");
         assert!(fake.file("/opt/big.bin").is_none(), "nothing written");
     }
@@ -1106,6 +1108,56 @@ mod tests {
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
         assert_eq!(hits.load(Ordering::SeqCst), 2, "redirect then target");
+    }
+
+    /// `Download`'s timeout bounds connecting and the response head, not the
+    /// body: a release tarball that streams slowly is slow, not stuck. (The
+    /// opposite of `http::Request`, whose timeout covers everything.)
+    #[test]
+    fn a_slow_body_is_not_cut_by_the_timeout() {
+        let (base, _) = serve(vec![(
+            "/slow",
+            200,
+            vec![("X-Stall-Body", "700".into())],
+            HELLO.to_vec(),
+        )]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/slow"))
+            .to("/opt/hello.txt")
+            .timeout(Duration::from_millis(300));
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
+    }
+
+    /// A header that cannot be sent is refused at `check`, before anything
+    /// is fetched, and a secret one is not quoted.
+    #[test]
+    fn a_header_that_cannot_be_sent_is_refused_at_check() {
+        let (base, hits) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .header_secret("Authorization", &Secret::new("Bearer a\nb"));
+        let err = op.check(&sys).unwrap_err().chain();
+        assert!(
+            err.contains("the secret for header `Authorization` is not a valid header value"),
+            "{err}"
+        );
+        assert!(!err.contains("Bearer a"), "{err}");
+        let err = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .header("Bad Name", "x")
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("`Bad Name` is not a valid header name"),
+            "{err}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     /// `header_secret` shows as its size, the URL's userinfo is masked in

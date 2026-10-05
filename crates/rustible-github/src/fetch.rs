@@ -215,7 +215,8 @@ mod tests {
 
         let e = https.get(&format!("{base}/big.keys")).unwrap_err().chain();
         assert!(
-            e.contains(&format!("exceeds the {MAX_BODY_BYTES} byte limit")),
+            e.contains(&format!("over the {MAX_BODY_BYTES} byte limit"))
+                && !e.contains(".max_bytes()"),
             "{e}"
         );
     }

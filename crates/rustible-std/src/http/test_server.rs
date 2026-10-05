@@ -12,7 +12,12 @@ use std::time::Duration;
 /// `(path, status, extra headers, body)` the server answers with. A route
 /// carrying `X-Omit-Length` answers without a `Content-Length`, so the
 /// body's size is unknown until it is read; one carrying `X-Stall-Body`
-/// sends its head and then waits that many milliseconds before the body.
+/// sends its head and then waits that many milliseconds before the body;
+/// one carrying `X-Stall-Head` waits that long before sending anything;
+/// one carrying `X-Stall-After: <bytes>:<ms>` sends that many bytes of the
+/// body, then waits, then sends the rest; and
+/// one carrying `X-Echo` answers with the request as it arrived, head and
+/// body, as a misbehaving API's error page might.
 pub(crate) type Route = (&'static str, u16, Vec<(&'static str, String)>, Vec<u8>);
 
 /// One request as the server read it. Header names are lowercased.
@@ -102,6 +107,11 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                 headers,
                 body,
             });
+            let raw_request = [
+                head.as_bytes(),
+                &record.lock().unwrap().last().unwrap().body,
+            ]
+            .concat();
             let (status, headers, body) = routes
                 .iter()
                 .find(|(p, ..)| *p == path)
@@ -122,10 +132,21 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                 _ => "Whatever",
             };
             let omit_length = headers.iter().any(|(k, _)| *k == "X-Omit-Length");
-            let stall = headers
-                .iter()
-                .find(|(k, _)| *k == "X-Stall-Body")
-                .and_then(|(_, v)| v.parse::<u64>().ok());
+            let ms = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
+            };
+            let (stall, stall_head) = (ms("X-Stall-Body"), ms("X-Stall-Head"));
+            let body = if headers.iter().any(|(k, _)| *k == "X-Echo") {
+                raw_request
+            } else {
+                body
+            };
+            if let Some(ms) = stall_head {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
             let mut out = if omit_length {
                 format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
             } else {
@@ -134,8 +155,8 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                     body.len()
                 )
             };
-            for (k, v) in headers {
-                if k == "X-Omit-Length" || k == "X-Stall-Body" {
+            for (k, v) in &headers {
+                if k.starts_with("X-Omit") || k.starts_with("X-Stall") || *k == "X-Echo" {
                     continue;
                 }
                 out.push_str(&format!("{k}: {v}\r\n"));
@@ -146,10 +167,62 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
             if let Some(ms) = stall {
                 std::thread::sleep(Duration::from_millis(ms));
             }
+            let split = headers
+                .iter()
+                .find(|(k, _)| *k == "X-Stall-After")
+                .and_then(|(_, v)| v.split_once(':'))
+                .and_then(|(n, ms)| Some((n.parse::<usize>().ok()?, ms.parse::<u64>().ok()?)));
             if method != "HEAD" {
-                let _ = s.write_all(&body);
+                match split {
+                    Some((n, ms)) if n < body.len() => {
+                        let _ = s.write_all(&body[..n]);
+                        let _ = s.flush();
+                        std::thread::sleep(Duration::from_millis(ms));
+                        let _ = s.write_all(&body[n..]);
+                    }
+                    _ => {
+                        let _ = s.write_all(&body);
+                    }
+                }
             }
         }
     });
     Server { base, hits, seen }
+}
+
+/// An `https://` server on 127.0.0.1 whose certificate is self-signed, so
+/// no client that verifies against Mozilla's roots can finish a handshake
+/// with it. Returns its base URL. The certificate and key in `testdata/`
+/// were made for this with `openssl req -x509 -newkey ec ... -subj
+/// /CN=localhost`, valid for a hundred years, and name nothing real.
+pub(crate) fn serve_untrusted_tls() -> String {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert =
+        CertificateDer::from(include_bytes!("testdata/self-signed-localhost.cert.der").to_vec());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        include_bytes!("testdata/self-signed-localhost.key.der").to_vec(),
+    ));
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(crate::tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("https://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let Ok(mut conn) = rustls::ServerConnection::new(config.clone()) else {
+                continue;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            // The client aborts the handshake; whatever this returns is
+            // the end of the connection.
+            let _ = conn.complete_io(&mut s);
+        }
+    });
+    base
 }
