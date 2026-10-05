@@ -510,7 +510,7 @@ pub(crate) fn scrub(text: &str, secrets: &[String]) -> String {
 /// and, for a value with a scheme in front (`Bearer x`, `Basic x`), the part
 /// after it; the `extra` secrets; a secret body; and the URL's userinfo
 /// whole, its password, and a lone user part (often the token itself).
-fn scrub_list(
+pub(crate) fn scrub_list(
     url: &str,
     headers: &[HeaderSpec],
     body: Option<(&[u8], bool)>,
