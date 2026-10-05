@@ -18,15 +18,22 @@ use crate::user_keys::UserKeys;
 ///     key: https://github.com/{{ gh_login }}.keys
 /// ```
 ///
-/// Two steps run through `ctx.step` and show in the run output: `Fetch
-/// GitHub keys of <gh_login>` (a lookup, always `ok`) and `Install GitHub
-/// keys of <gh_login> for <sys_user>` (`changed` when a key was appended).
-/// The second step is `ssh::authorized_keys::Present::for_user_name`, so its
-/// rules apply: `sys_user` must exist in `/etc/passwd`, and `~/.ssh` is
-/// created (0700, owned by the account) if it is not there — the home
-/// directory above it is not, so create the account with
-/// `user::Present::new(..).create_home(true)` first. Returns the install
-/// step's report.
+/// Two steps run through `ctx.step` and show in the run output, inside a
+/// block named `GitHub keys of <gh_login> for <sys_user>`: `Fetch from
+/// GitHub` (a lookup: `ok` in a real run) and `Install in authorized_keys`
+/// (`changed` when a key was appended). The second step is
+/// `ssh::authorized_keys::Present::for_user_name`, so its rules apply:
+/// `sys_user` must exist in `/etc/passwd`, and `~/.ssh` is created (0700,
+/// owned by the account) if it is not there — the home directory above it is
+/// not, so create the account with `user::Present::new(..).create_home(true)`
+/// first. Returns the block, whose value is the install step's `Applied`:
+/// `r.changed`, `r.added` and `r.path` read through it.
+///
+/// **Under `--check`** the fetch sends no request (vision 12), so it reports
+/// `would change` and has no keys to install: the block ends after it with a
+/// warning, the install step does not appear, and the playbook carries on
+/// after the block. Reading the returned value then ends the enclosing block
+/// the same way, or, at the top level, that host's dry run.
 ///
 /// **Additive**: keys already in the file that GitHub does not list are
 /// left alone. This is the default because it can never lock anyone out;
@@ -50,13 +57,13 @@ pub fn github_ssh_keys_to_user(
     ctx: &mut Ctx,
     gh_login: impl Into<String>,
     sys_user: impl Into<String>,
-) -> Result<Applied<KeysReport>> {
+) -> Result<Block<Applied<KeysReport>>> {
     GithubSshKeysToUser::new(gh_login, sys_user).run(ctx)
 }
 
 /// The configurable form of [`github_ssh_keys_to_user`]. Not an `Op` itself: it is a
-/// helper that runs two ops, which is how a collection composes behaviour
-/// without hiding steps from the report.
+/// helper that runs two ops in a block, which is how a collection composes
+/// behaviour without hiding steps from the report.
 ///
 /// ```no_run
 /// use rustible_sdk::prelude::*;
@@ -122,50 +129,54 @@ impl GithubSshKeysToUser {
         self
     }
 
-    /// Run both steps. See [`github_ssh_keys_to_user`] for what they are.
-    pub fn run(self, ctx: &mut Ctx) -> Result<Applied<KeysReport>> {
-        let mut lookup = UserKeys::of(&self.gh_login);
-        if let Some(f) = &self.fetch {
-            lookup = lookup.fetch_with(f.clone());
-        }
-        let keys = ctx.step(format!("Fetch GitHub keys of {}", self.gh_login), lookup)?;
-
-        if keys.is_empty() {
-            if self.exclusive {
-                bail!(
-                    "GitHub user `{}` has no public keys; refusing to empty {}'s authorized_keys \
-                     in exclusive mode",
-                    self.gh_login,
-                    self.sys_user
-                );
+    /// Run both steps, in one block. See [`github_ssh_keys_to_user`] for what
+    /// they are.
+    pub fn run(self, ctx: &mut Ctx) -> Result<Block<Applied<KeysReport>>> {
+        let name = format!("GitHub keys of {} for {}", self.gh_login, self.sys_user);
+        ctx.block(name, |ctx| {
+            let mut lookup = UserKeys::of(&self.gh_login);
+            if let Some(f) = &self.fetch {
+                lookup = lookup.fetch_with(f.clone());
             }
-            ctx.warn(format!(
-                "GitHub user `{}` has no public keys; nothing to install for {}",
-                self.gh_login, self.sys_user
-            ));
-        }
+            let keys = ctx.step("Fetch from GitHub", lookup)?;
 
-        let lines: Vec<String> = keys
-            .iter()
-            .map(|k| {
-                let mut k = k.clone();
-                // Unconditional: `parse_keys_body` strips whatever comment a
-                // response carried, so this is the only label the line gets
-                // and `.comment(..)` is never silently ignored.
-                k.comment = self.comment.clone();
-                k.to_line()
-            })
-            .collect();
+            // Under `--check` the fetch sent nothing and has no output, so
+            // this read ends the block here with a warning, and the playbook
+            // carries on after it (vision 12).
+            if keys.is_empty() {
+                if self.exclusive {
+                    bail!(
+                        "GitHub user `{}` has no public keys; refusing to empty {}'s \
+                         authorized_keys in exclusive mode",
+                        self.gh_login,
+                        self.sys_user
+                    );
+                }
+                ctx.warn(format!(
+                    "GitHub user `{}` has no public keys; nothing to install for {}",
+                    self.gh_login, self.sys_user
+                ));
+            }
 
-        ctx.step(
-            format!(
-                "Install GitHub keys of {} for {}",
-                self.gh_login, self.sys_user
-            ),
-            Present::for_user_name(&self.sys_user)
-                .exclusive(self.exclusive)
-                .keys(lines),
-        )
+            let lines: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let mut k = k.clone();
+                    // Unconditional: `parse_keys_body` strips whatever comment
+                    // a response carried, so this is the only label the line
+                    // gets and `.comment(..)` is never silently ignored.
+                    k.comment = self.comment.clone();
+                    k.to_line()
+                })
+                .collect();
+
+            ctx.step(
+                "Install in authorized_keys",
+                Present::for_user_name(&self.sys_user)
+                    .exclusive(self.exclusive)
+                    .keys(lines),
+            )
+        })
     }
 }
 
@@ -258,11 +269,8 @@ mod tests {
         assert_eq!(
             finished(&sink),
             vec![
-                ("Fetch GitHub keys of flipbit03".to_string(), Status::Ok),
-                (
-                    "Install GitHub keys of flipbit03 for cadu".to_string(),
-                    Status::Changed
-                ),
+                ("Fetch from GitHub".to_string(), Status::Ok),
+                ("Install in authorized_keys".to_string(), Status::Changed),
             ]
         );
 
@@ -282,7 +290,7 @@ mod tests {
         assert_eq!(canned.asked().len(), 2, "one fetch per run");
     }
 
-    fn keys_to_user_via(ctx: &mut Ctx, fetch: Arc<Canned>) -> Result<Applied<KeysReport>> {
+    fn keys_to_user_via(ctx: &mut Ctx, fetch: Arc<Canned>) -> Result<Block<Applied<KeysReport>>> {
         GithubSshKeysToUser::new("flipbit03", "cadu")
             .fetch_with(fetch)
             .run(ctx)
@@ -390,7 +398,7 @@ mod tests {
         // The fetch step ran and passed; the install step never started.
         assert_eq!(
             finished(&sink),
-            vec![("Fetch GitHub keys of flipbit03".to_string(), Status::Ok)]
+            vec![("Fetch from GitHub".to_string(), Status::Ok)]
         );
     }
 
@@ -496,10 +504,7 @@ mod tests {
         assert!(fake.file(AK).is_none());
         assert_eq!(
             finished(&sink),
-            vec![(
-                "Fetch GitHub keys of nobody-here".to_string(),
-                Status::Failed
-            )]
+            vec![("Fetch from GitHub".to_string(), Status::Failed)]
         );
     }
 
@@ -519,17 +524,19 @@ mod tests {
         assert_eq!(
             finished(&sink),
             vec![
-                ("Fetch GitHub keys of flipbit03".to_string(), Status::Ok),
-                (
-                    "Install GitHub keys of flipbit03 for nobody".to_string(),
-                    Status::Failed
-                ),
+                ("Fetch from GitHub".to_string(), Status::Ok),
+                ("Install in authorized_keys".to_string(), Status::Failed),
             ]
         );
     }
 
+    /// Under `--check` the fetch sends nothing (vision 12), so it would
+    /// change and has no keys to hand on. The install reads them, so the
+    /// block ends there with a warning naming the block and the fetch, the
+    /// install step never appears, and nothing is written. The helper
+    /// returns normally: the playbook carries on after the block.
     #[test]
-    fn check_mode_reports_would_change_without_writing() {
+    fn check_mode_fetches_nothing_and_ends_the_block_after_the_fetch() {
         let canned = Canned::answering(URL, Ok(Response::ok(body())));
         let fake = Arc::new(fake_fs());
         let sink = Arc::new(Collect::default());
@@ -538,21 +545,58 @@ mod tests {
             HostInfo::local(),
         );
 
-        let r = keys_to_user_via(&mut ctx, canned).unwrap();
-        // A would-change step has no output under --check (vision 12); the
-        // diff is what there is to read.
-        assert!(r.changed && !r.is_available());
-        assert_eq!(
-            r.diff.as_ref().unwrap().short(),
-            "+3 -0 lines mode=0600 owner=1000:1000"
-        );
+        let r = keys_to_user_via(&mut ctx, canned.clone()).unwrap();
+        assert!(!r.completed());
+        assert!(canned.asked().is_empty(), "{:?}", canned.asked());
         assert!(fake.file(AK).is_none());
         assert_eq!(
-            finished(&sink)
-                .into_iter()
-                .map(|(_, s)| s)
-                .collect::<Vec<_>>(),
-            vec![Status::Ok, Status::WouldChange]
+            finished(&sink),
+            vec![("Fetch from GitHub".to_string(), Status::WouldChange)]
+        );
+        let w = warnings(&sink);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("[GitHub keys of flipbit03 for cadu] not evaluated further"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("`Fetch from GitHub`"), "{w:?}");
+    }
+
+    /// Both steps run inside one block named for the pair, and in a real
+    /// run the fetch is a lookup: `ok`, never `changed`.
+    #[test]
+    fn both_steps_run_in_one_block_and_the_fetch_is_ok() {
+        let canned = Canned::answering(URL, Ok(Response::ok(body())));
+        let fake = Arc::new(fake_fs());
+        let sink = Arc::new(Collect::default());
+        let mut ctx = mk_ctx(&fake, &sink);
+
+        let r = keys_to_user_via(&mut ctx, canned).unwrap();
+        assert!(r.completed() && r.changed);
+        let steps: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepFinished {
+                    blocks,
+                    name,
+                    status,
+                    ..
+                } => Some((blocks, name, status)),
+                _ => None,
+            })
+            .collect();
+        let block = vec!["GitHub keys of flipbit03 for cadu".to_string()];
+        assert_eq!(
+            steps,
+            vec![
+                (block.clone(), "Fetch from GitHub".to_string(), Status::Ok),
+                (
+                    block,
+                    "Install in authorized_keys".to_string(),
+                    Status::Changed
+                ),
+            ]
         );
     }
 }
