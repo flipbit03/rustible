@@ -145,6 +145,16 @@ pub enum Event {
         /// moment the status was decided. The integration harness records it
         /// per step; neither reporter here prints it today.
         elapsed_ms: u64,
+        /// On a `Failed` step, the command that failed when one is in the
+        /// error's chain, as [`Error::cmd_failed`](crate::Error::cmd_failed)
+        /// finds it; `None` otherwise. Reporters print it at `-v` where the
+        /// step's chain prints, so a failure the playbook caught still shows
+        /// its stderr. The stderr is whole unless the frame carrying it would
+        /// exceed [`MAX_FRAME`](crate::protocol::MAX_FRAME), in which case
+        /// only its tail travels, under a line saying how many bytes were
+        /// left out; the playbook's own error keeps all of it.
+        #[serde(default)]
+        cmd: Option<CmdFailed>,
     },
     /// [`Ctx::skip`](crate::ctx::Ctx::skip): a step the playbook decided not
     /// to run. Nothing was checked or applied, no `StepStarted` precedes it
@@ -220,8 +230,13 @@ pub enum Event {
         blocks: Vec<String>,
         /// The rendered context chain, outermost first.
         error: String,
-        /// Present when a command failure is in the chain (rendered at -v).
-        /// Additive field: absent from older binaries' frames.
+        /// Present when a command failure is in the chain, trimmed like
+        /// [`StepFinished`](Event::StepFinished)'s `cmd` to fit a frame.
+        /// Reporters print it at `-v` unless the failed step's chain was
+        /// already printed before this frame: the step's own `cmd` printed
+        /// with it, and the stderr would show twice. It is the only carrier
+        /// for a command that failed outside any step, such as the
+        /// playbook's own `ctx.sys()` call with `?`.
         #[serde(default)]
         cmd: Option<CmdFailed>,
     },
@@ -426,6 +441,10 @@ impl Collect {
 pub struct Compact<W: Write + Send> {
     w: Mutex<W>,
     verbosity: u8,
+    /// The failed steps printed so far, by id, block path and name. Their
+    /// chain is on their own line, with their command under it at `-v`, so
+    /// a `Failed` frame that names one does not print the command again.
+    failed: Mutex<Vec<(u32, Vec<String>, String)>>,
 }
 
 impl<W: Write + Send> Compact<W> {
@@ -433,13 +452,24 @@ impl<W: Write + Send> Compact<W> {
     /// per step and warning, a step inside a block prefixed with its path.
     /// At 1 it adds `debug` logs, the full diff under any step that carries
     /// one unless the step line already shows all of it (one line), and the
-    /// failing command's stderr. At 2 it adds a `$` line per
-    /// [`Event::CmdRan`]. Higher values behave like 2.
+    /// failing command and its stderr, once per failure. At 2 it adds a `$`
+    /// line per [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
             w: Mutex::new(w),
             verbosity,
+            failed: Mutex::new(vec![]),
         }
+    }
+}
+
+/// A failed command at `-v`: `$ argv (exit N)`, then its stderr, one line
+/// at a time, indented under it. `rustible`'s renderer prints the same,
+/// with arguments quoted.
+fn cmd_block(w: &mut impl Write, c: &CmdFailed) {
+    let _ = writeln!(w, "  $ {} (exit {})", c.argv.join(" "), c.status);
+    for line in c.stderr.lines() {
+        let _ = writeln!(w, "    {line}");
     }
 }
 
@@ -456,12 +486,14 @@ impl<W: Write + Send> EventSink for Compact<W> {
             | Event::BlockFinished { .. }
             | Event::StepStarted { .. } => Ok(()),
             Event::StepFinished {
+                id,
                 blocks,
                 name,
                 identity,
                 status,
                 diff,
                 note,
+                cmd,
                 ..
             } => {
                 let status_s = match status {
@@ -491,6 +523,14 @@ impl<W: Write + Send> EventSink for Compact<W> {
                         let _ = writeln!(w, "    | {line}");
                     }
                 }
+                if status == Status::Failed {
+                    if self.verbosity >= 1
+                        && let Some(c) = &cmd
+                    {
+                        cmd_block(&mut *w, c);
+                    }
+                    self.failed.lock().unwrap().push((id, blocks, name));
+                }
                 r
             }
             Event::StepSkipped {
@@ -518,22 +558,31 @@ impl<W: Write + Send> EventSink for Compact<W> {
             Event::CmdRan { .. } => Ok(()),
             Event::Failed {
                 step,
+                id,
                 blocks,
                 error,
                 cmd,
-                ..
             } => {
-                let r = match step {
+                let r = match &step {
                     Some(s) => writeln!(w, "FAILED at {}`{s}`: {error}", step_prefix(&blocks)),
                     None => writeln!(w, "FAILED: {error}"),
                 };
+                // A step's chain is on its own line, so a step printed
+                // already printed its command too.
+                let printed = match (id, step) {
+                    (Some(id), Some(step)) => self
+                        .failed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(i, b, n)| (*i, b, n) == (id, &blocks, &step)),
+                    _ => false,
+                };
                 if self.verbosity >= 1
+                    && !printed
                     && let Some(c) = cmd
                 {
-                    let _ = writeln!(w, "  $ {} (exit {})", c.argv.join(" "), c.status);
-                    for line in c.stderr.lines() {
-                        let _ = writeln!(w, "    {line}");
-                    }
+                    cmd_block(&mut *w, &c);
                 }
                 r
             }
@@ -617,6 +666,7 @@ mod tests {
             diff: None,
             note: None,
             elapsed_ms: 0,
+            cmd: None,
         });
         printer.emit(Event::StepSkipped {
             id: 2,
@@ -639,6 +689,7 @@ mod tests {
             diff: None,
             note: None,
             elapsed_ms: 0,
+            cmd: None,
         });
         let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
         assert_eq!(
@@ -689,6 +740,7 @@ mod tests {
                 diff: Some(Diff::summary("PATCH http://h/x\n{\n  \"a\": 1\n}")),
                 note: Some("returned 409".into()),
                 elapsed_ms: 0,
+                cmd: None,
             });
             String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
         };
@@ -718,6 +770,7 @@ mod tests {
                 diff: Some(Diff::summary("GET http://h/x\nq=1")),
                 note: Some("ran, unchanged".into()),
                 elapsed_ms: 0,
+                cmd: None,
             });
             String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
         };
@@ -742,6 +795,7 @@ mod tests {
             diff: Some(Diff::summary("systemctl restart nginx")),
             note: None,
             elapsed_ms: 0,
+            cmd: None,
         });
         // Lines with nothing on them do not count, as for `short()`.
         printer.emit(Event::StepFinished {
@@ -753,11 +807,117 @@ mod tests {
             diff: Some(Diff::summary("one\n \n")),
             note: None,
             elapsed_ms: 0,
+            cmd: None,
         });
         let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
         assert_eq!(
             out,
             "changed: restart  systemctl restart nginx\nchanged: spaced  one\n"
+        );
+    }
+
+    fn sh_failed() -> CmdFailed {
+        CmdFailed {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit 3".into()],
+            status: 3,
+            signal: None,
+            stderr: "nope\nstill nope\n".into(),
+        }
+    }
+
+    fn failed_step(id: u32, name: &str) -> Event {
+        Event::StepFinished {
+            id,
+            blocks: vec!["b".into()],
+            name: name.into(),
+            identity: "self".into(),
+            status: Status::Failed,
+            diff: Some(Diff::summary("PATCH http://h/x\n{}")),
+            note: Some("`/bin/sh -c exit 3` exited 3".into()),
+            elapsed_ms: 0,
+            cmd: Some(sh_failed()),
+        }
+    }
+
+    fn failed_frame(id: Option<u32>, step: Option<&str>) -> Event {
+        Event::Failed {
+            step: step.map(String::from),
+            id,
+            blocks: if step.is_some() {
+                vec!["b".into()]
+            } else {
+                vec![]
+            },
+            error: "`/bin/sh -c exit 3` exited 3".into(),
+            cmd: Some(sh_failed()),
+        }
+    }
+
+    fn print(verbosity: u8, events: Vec<Event>) -> String {
+        let printer = Compact::new(Vec::new(), verbosity);
+        for e in events {
+            printer.emit(e);
+        }
+        String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
+    }
+
+    /// A failure the playbook caught shows its command and stderr at `-v`,
+    /// under the step's line and its diff; below `-v`, only the line.
+    #[test]
+    fn compact_prints_a_caught_failures_command_at_v() {
+        let events = || vec![failed_step(1, "try"), failed_step(2, "try")];
+        assert_eq!(
+            print(0, events()),
+            "FAILED: [b] try  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n\
+             FAILED: [b] try  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n"
+        );
+        let once = "FAILED: [b] try  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n    \
+                    | PATCH http://h/x\n    | {}\n  \
+                    $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n";
+        assert_eq!(print(1, events()), format!("{once}{once}"));
+    }
+
+    /// The failure that escaped prints its stderr once, under the step's
+    /// line, and the `Failed` frame naming that step does not repeat it,
+    /// even after other steps ran. A frame naming a step it never saw
+    /// prints the command, as does one for a command that failed outside
+    /// any step.
+    #[test]
+    fn compact_prints_an_escaped_failures_command_once() {
+        let out = print(
+            1,
+            vec![
+                failed_step(1, "x"),
+                Event::StepFinished {
+                    id: 2,
+                    blocks: vec![],
+                    name: "cleanup".into(),
+                    identity: "self".into(),
+                    status: Status::Ok,
+                    diff: None,
+                    note: None,
+                    elapsed_ms: 0,
+                    cmd: None,
+                },
+                failed_frame(Some(1), Some("x")),
+            ],
+        );
+        assert_eq!(
+            out,
+            "FAILED: [b] x  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n    \
+             | PATCH http://h/x\n    | {}\n  \
+             $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n\
+             ok: cleanup\n\
+             FAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n"
+        );
+        let from_frame = "  $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n";
+        assert_eq!(
+            print(1, vec![failed_frame(None, None)]),
+            format!("FAILED: `/bin/sh -c exit 3` exited 3\n{from_frame}")
+        );
+        assert_eq!(
+            print(1, vec![failed_frame(Some(9), Some("x"))]),
+            format!("FAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n{from_frame}")
         );
     }
 

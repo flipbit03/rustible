@@ -334,7 +334,10 @@ impl Ctx {
 
         // Every exit below goes through here, and this is where the status
         // is counted: one place, so the counters and the report agree.
-        let finish = |status: Status, diff: Option<crate::Diff>, note: Option<String>| {
+        let report = |status: Status,
+                      diff: Option<crate::Diff>,
+                      note: Option<String>,
+                      cmd: Option<crate::CmdFailed>| {
             self.record(id, status);
             sink.emit(Event::StepFinished {
                 id,
@@ -345,14 +348,24 @@ impl Ctx {
                 diff: diff.clone(),
                 note,
                 elapsed_ms: t0.elapsed().as_millis() as u64,
+                cmd,
             });
         };
+        let finish = |status: Status, diff: Option<crate::Diff>, note: Option<String>| {
+            report(status, diff, note, None)
+        };
         // Every failure leaves through here: finished `Failed` with the chain
-        // as its note, then returned with the `StepFailed` layer naming this
-        // step by id, so the runtime can tell whether it is the error that
-        // left the playbook.
+        // as its note and the failed command, if one is in it, beside it,
+        // then returned with the `StepFailed` layer naming this step by id,
+        // so the runtime can tell whether it is the error that left the
+        // playbook.
         let failed = |e: Error, diff: Option<crate::Diff>, layer: StepFailed| -> Error {
-            finish(Status::Failed, diff, Some(e.chain()));
+            report(
+                Status::Failed,
+                diff,
+                Some(e.chain()),
+                e.cmd_failed().cloned(),
+            );
             e.context(layer.of_step(self.shared.token, id, blocks.clone()))
         };
 
@@ -1372,6 +1385,63 @@ mod tests {
             printed.contains("\n    | +reported by the intent\n"),
             "{printed}"
         );
+    }
+
+    /// A step whose error has a failed command in its chain reports that
+    /// command on its `StepFinished`, stderr and all, so a failure the
+    /// playbook catches still says why (#58); `--json` carries it as is.
+    /// One with no command in its chain reports none.
+    #[test]
+    fn a_failed_step_carries_the_failed_command() {
+        struct Fails;
+        impl Op for Fails {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, _: &System) -> Result<Plan<Self>> {
+                let e: Error = crate::CmdFailed {
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exit 3".into()],
+                    status: 3,
+                    signal: None,
+                    stderr: "nope\n".into(),
+                }
+                .into();
+                Err(e.context("probing"))
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
+            }
+        }
+        let sink = Arc::new(Collect::default());
+        let mut ctx = Ctx::new(
+            System::fake(Arc::new(Fake::new()), sink.clone()),
+            HostInfo::local(),
+        );
+        let err = ctx.step("probe", Fails).unwrap_err();
+        assert_eq!(err.cmd_failed().unwrap().stderr, "nope\n");
+        ctx.step("plain", reporting(Outcome::Fails)).unwrap_err();
+
+        let cmds: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepFinished { name, cmd, .. } => Some((name, cmd.map(|c| c.stderr))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cmds,
+            [
+                ("probe".to_string(), Some("nope\n".to_string())),
+                ("plain".to_string(), None)
+            ]
+        );
+        let json = serde_json::to_value(&sink.events()[1]).unwrap();
+        assert_eq!(
+            json["StepFinished"]["cmd"]["argv"],
+            serde_json::json!(["/bin/sh", "-c", "exit 3"]),
+            "{json}"
+        );
+        assert_eq!(json["StepFinished"]["cmd"]["stderr"], "nope\n", "{json}");
     }
 
     #[test]

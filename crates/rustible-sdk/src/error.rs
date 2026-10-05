@@ -319,7 +319,8 @@ impl StepFailed {
 
 /// A command exited non-zero. The message names the command and status;
 /// stderr travels in the struct and is rendered once, at `-v`, from the
-/// `Failed` event rather than being repeated in every chain that quotes it.
+/// failed step's event or the `Failed` one, rather than being repeated in
+/// every chain that quotes it.
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[error("`{}` {}", argv.join(" "), match signal {
     Some(s) => format!("was killed by signal {s}"),

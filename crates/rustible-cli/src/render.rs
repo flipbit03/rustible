@@ -586,6 +586,7 @@ mod tests {
             diff: None,
             note: None,
             elapsed_ms: 3,
+            cmd: None,
         }
     }
 
@@ -1393,6 +1394,7 @@ web1    4        1             0        0       0          2         0
                 diff,
                 note,
                 elapsed_ms,
+                cmd,
                 ..
             } => Event::StepFinished {
                 id,
@@ -1403,6 +1405,7 @@ web1    4        1             0        0       0          2         0
                 diff,
                 note,
                 elapsed_ms,
+                cmd,
             },
             other => other,
         }
