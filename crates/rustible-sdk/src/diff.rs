@@ -196,6 +196,11 @@ impl Diff {
     }
 
     /// One-line hint for the step list, e.g. "+2 -1 lines".
+    ///
+    /// Always one line: a [`Diff::summary`] contributes its first line only,
+    /// so a summary can carry detail on the lines after it (a request's body,
+    /// what a step waits for) that [`Diff::render`] shows at `-v` and the
+    /// step line, printed in every run, does not.
     pub fn short(&self) -> String {
         match &self.0 {
             Repr::Text { before, after, .. } => {
@@ -215,7 +220,7 @@ impl Diff {
                 .map(|c| format!("{}={}", c.name, c.to))
                 .collect::<Vec<_>>()
                 .join(" "),
-            Repr::Summary(s) => s.clone(),
+            Repr::Summary(s) => s.lines().next().unwrap_or_default().to_string(),
             Repr::Many(parts) => parts
                 .iter()
                 .map(Diff::short)
@@ -258,6 +263,24 @@ mod tests {
     fn short_skips_parts_with_nothing_to_say() {
         let d = Diff::many([Diff::summary(""), attrs("/tmp/x", "mode", "0600")]).unwrap();
         assert_eq!(d.short(), "mode=0600");
+    }
+
+    /// The step line is one line whatever a summary holds: the lines after
+    /// the first are for `render`, which `-v` prints, and a multi-line
+    /// `short` would break the step line in every run.
+    #[test]
+    fn short_of_a_summary_is_its_first_line() {
+        let d = Diff::summary("PATCH http://h/x\n{\n  \"a\": 1\n}");
+        assert_eq!(d.short(), "PATCH http://h/x");
+        assert_eq!(d.render(), "PATCH http://h/x\n{\n  \"a\": 1\n}");
+        assert_eq!(Diff::summary("one").short(), "one");
+        assert_eq!(Diff::summary("").short(), "");
+        let many = Diff::many([
+            attrs("/tmp/x", "mode", "0600"),
+            Diff::summary("waits for x\nmore"),
+        ])
+        .unwrap();
+        assert_eq!(many.short(), "mode=0600 waits for x");
     }
 
     /// The constructor is what keeps the recursive variant from carrying
