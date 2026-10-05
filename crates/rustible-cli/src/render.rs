@@ -321,6 +321,11 @@ impl<W: Write> Renderer<W> {
                 };
                 let st = self.state(host);
                 let pending = st.pending_fail.take_if(|p| key.as_ref() == Some(&p.key));
+                // A frame with no id cannot take the held reason, but may
+                // still be its failure: same name and blocks.
+                let same_step =
+                    |k: &FailKey| key.is_none() && step == Some(&*k.step) && k.blocks == *blocks;
+                let flushed_same = st.pending_fail.as_ref().is_some_and(|p| same_step(&p.key));
                 // Anything else held back is a different failure, which the
                 // playbook caught: its reason prints first, in order.
                 self.flush(host);
@@ -330,10 +335,16 @@ impl<W: Write> Renderer<W> {
                 // repeated, but never ambiguous. So is a reason the playbook
                 // added words to with `.context(..)`, which were not above.
                 let st = self.state(host);
-                // Its chain printed before this frame, and its command with it.
-                let printed = key
-                    .as_ref()
-                    .is_some_and(|k| st.shown.iter().any(|(o, _)| o == k));
+                // Its chain printed before this frame, and its command with
+                // it: earlier, when a later step began, or just now by the
+                // flush, for a frame that names the step but not its id. A
+                // frame that took the held chain prints the command, even
+                // beside a twin from another `Ctx` printed with the same key.
+                let printed = flushed_same
+                    || pending.is_none()
+                        && key
+                            .as_ref()
+                            .is_some_and(|k| st.shown.iter().any(|(o, _)| o == k));
                 let shown = key.as_ref().is_some_and(|k| {
                     st.shown.iter().any(|(o, chain)| o == k && *chain == *error)
                         && !st
@@ -349,8 +360,6 @@ impl<W: Write> Renderer<W> {
                     (None, _) => format!("FAILED: {error}"),
                 };
                 self.line(host, &text);
-                // Taking a held chain, this frame prints the command with
-                // it; a chain printed earlier had its command printed then.
                 if !printed && let Some(c) = cmd {
                     self.cmd_block(host, c);
                 }
@@ -1237,6 +1246,72 @@ web1    4        1             0        0       0          2         0
                  [local]  FAILED: `/bin/sh -c echo nope >&2; exit 3` exited 3\n{CMD}"
             )
         );
+    }
+
+    /// A twin of the failed step, same id, name and blocks from a second
+    /// `Ctx`, was caught and printed its command. The run's own step then
+    /// escapes: its `Failed` frame takes the held reason, and prints its own
+    /// command with it, once, beside the twin's. (The reason is word for
+    /// word the twin's, so the line points above, as it did before.)
+    #[test]
+    fn an_escaped_failure_beside_a_caught_twin_shows_its_command_once() {
+        let with_stderr = |mut ev: Event, stderr: &str| {
+            if let Event::StepFinished { cmd: Some(c), .. } | Event::Failed { cmd: Some(c), .. } =
+                &mut ev
+            {
+                c.stderr = stderr.into();
+            }
+            ev
+        };
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &with_stderr(failing_cmd(1, "x"), "BBB\n"));
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &with_stderr(failing_cmd(1, "x"), "AAA\n"));
+            r.event(
+                "local",
+                &with_stderr(
+                    failed_frame_cmd(
+                        Some("x"),
+                        Some(1),
+                        "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                    ),
+                    "AAA\n",
+                ),
+            );
+        });
+        assert_eq!(out.matches("BBB").count(), 1, "{out}");
+        assert_eq!(out.matches("AAA").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  FAILED: `x` (reason above)\n\
+                 [local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)\n\
+                 [local]      AAA\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A frame naming the step but not its id (an error another `Ctx`
+    /// returned, or one the runtime could not pair) leaves the held reason
+    /// to print on its own, command and all; the frame does not print the
+    /// same command again under its own line.
+    #[test]
+    fn a_frame_without_an_id_does_not_repeat_the_held_steps_command() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        let reason = "[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n";
+        assert_eq!(out, format!("{STEP_X}{reason}{CMD}{reason}"));
     }
 
     /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
