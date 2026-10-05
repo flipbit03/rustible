@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 
+use rustible_sdk::CmdFailed;
 use rustible_sdk::event::{Event, Level, Status, Summary, block_prefix};
 
 /// Column the status starts in on a step line, counted from the start of the
@@ -46,6 +47,8 @@ struct HostState {
     /// error the playbook kept and returned after other steps) closes it
     /// without printing it twice. Only when the frame's chain is that one:
     /// a `.context(..)` the playbook added on the way out was not printed.
+    /// The failed command printed with the chain either way, so the frame
+    /// never prints its own.
     shown: Vec<(FailKey, String)>,
 }
 
@@ -65,6 +68,8 @@ struct FailKey {
 struct PendingFail {
     key: FailKey,
     chain: String,
+    /// The failed command in the chain, if any, printed under it at `-v`.
+    cmd: Option<CmdFailed>,
     /// Lines from outside any step that arrived while the chain was held
     /// back, typically the playbook's own word on the failure it caught
     /// (`ctx.warn(format!("skipping: {e:#}"))`). They print after the chain,
@@ -133,10 +138,27 @@ impl<W: Write> Renderer<W> {
                     p.chain
                 ),
             );
+            if let Some(c) = &p.cmd {
+                self.cmd_block(host, c);
+            }
             for l in p.after {
                 self.line(host, &l);
             }
             self.state(host).shown.push((p.key, p.chain));
+        }
+    }
+
+    /// The failed command under its `FAILED` line at `-v`: `$ argv (exit
+    /// N)`, then its stderr. Printed once per failure, wherever its chain is.
+    fn cmd_block(&mut self, host: &str, c: &CmdFailed) {
+        if self.verbosity >= 1 {
+            self.line(
+                host,
+                &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
+            );
+            for l in c.stderr.lines() {
+                self.line(host, &format!("    {l}"));
+            }
         }
     }
 
@@ -199,6 +221,7 @@ impl<W: Write> Renderer<W> {
                 status,
                 diff,
                 note,
+                cmd,
                 ..
             } => {
                 let mut tail = String::new();
@@ -215,6 +238,7 @@ impl<W: Write> Renderer<W> {
                                 step: name.clone(),
                             },
                             chain: chain.clone(),
+                            cmd: cmd.clone(),
                             after: vec![],
                         });
                     }
@@ -306,6 +330,10 @@ impl<W: Write> Renderer<W> {
                 // repeated, but never ambiguous. So is a reason the playbook
                 // added words to with `.context(..)`, which were not above.
                 let st = self.state(host);
+                // Its chain printed before this frame, and its command with it.
+                let printed = key
+                    .as_ref()
+                    .is_some_and(|k| st.shown.iter().any(|(o, _)| o == k));
                 let shown = key.as_ref().is_some_and(|k| {
                     st.shown.iter().any(|(o, chain)| o == k && *chain == *error)
                         && !st
@@ -321,16 +349,10 @@ impl<W: Write> Renderer<W> {
                     (None, _) => format!("FAILED: {error}"),
                 };
                 self.line(host, &text);
-                if self.verbosity >= 1
-                    && let Some(c) = cmd
-                {
-                    self.line(
-                        host,
-                        &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
-                    );
-                    for l in c.stderr.lines() {
-                        self.line(host, &format!("    {l}"));
-                    }
+                // Taking a held chain, this frame prints the command with
+                // it; a chain printed earlier had its command printed then.
+                if !printed && let Some(c) = cmd {
+                    self.cmd_block(host, c);
                 }
                 // The reason first, then what the playbook printed after
                 // it, as for a failure it caught.
@@ -1057,6 +1079,164 @@ web1    4        1             0        0       0          2         0
             error: error.into(),
             cmd: None,
         }
+    }
+
+    // ---- the failed command ----
+
+    fn sh_failed() -> CmdFailed {
+        CmdFailed {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo nope >&2; exit 3".into(),
+            ],
+            status: 3,
+            signal: None,
+            stderr: "nope\nstill nope\n".into(),
+        }
+    }
+
+    /// `failing`, with the failed command and a diff of two lines.
+    fn failing_cmd(id: u32, name: &str) -> Event {
+        let mut ev = failing(id, name, "`/bin/sh -c echo nope >&2; exit 3` exited 3");
+        if let Event::StepFinished { cmd, diff, .. } = &mut ev {
+            *cmd = Some(sh_failed());
+            *diff = Some(rustible_sdk::Diff::summary("PATCH http://h/x\n{}"));
+        }
+        ev
+    }
+
+    fn failed_frame_cmd(step: Option<&str>, id: Option<u32>, error: &str) -> Event {
+        let mut ev = failed_frame(step, id, error);
+        if let Event::Failed { cmd, .. } = &mut ev {
+            *cmd = Some(sh_failed());
+        }
+        ev
+    }
+
+    const STEP_X: &str = "\
+[local]  x ....................................................... FAILED          PATCH http://h/x …
+[local]      | PATCH http://h/x
+[local]      | {}
+";
+
+    const CMD: &str = "\
+[local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)
+[local]      nope
+[local]      still nope
+";
+
+    /// A failure the playbook caught shows its command and stderr at `-v`,
+    /// after its reason and before what the playbook said about it: the
+    /// step line, its diff, the reason, the command, then the warning.
+    /// Below `-v`, the reason alone.
+    #[test]
+    fn a_caught_failure_shows_its_command_at_v() {
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &Event::Log {
+                    level: Level::Warn,
+                    msg: "skipping x".into(),
+                },
+            );
+            r.event("local", &step_started(2, "next"));
+            r.event("local", &step_finished(2, "next", Status::Ok));
+        };
+        let reason = "[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n";
+        let rest = "\
+[local]    WARNING: skipping x
+[local]  next .................................................... ok
+";
+        assert_eq!(render(1, feed), format!("{STEP_X}{reason}{CMD}{rest}"));
+        let step_line = STEP_X.lines().next().unwrap();
+        assert_eq!(render(0, feed), format!("{step_line}\n{reason}{rest}"));
+    }
+
+    /// The failure that escaped: the `Failed` frame takes the held reason
+    /// and prints the command with it, once, though both the step and the
+    /// frame carry it.
+    #[test]
+    fn an_escaped_failure_shows_its_command_once() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    Some(1),
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(
+            out,
+            format!(
+                "{STEP_X}[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n{CMD}"
+            )
+        );
+    }
+
+    /// An error the playbook kept and returned after other steps: the
+    /// command printed with the reason when the next step began, so the
+    /// frame prints neither again. With context the playbook added on the
+    /// way out, the frame prints the reason again for its new words, but
+    /// the command still only once.
+    #[test]
+    fn a_reason_above_shows_its_command_once() {
+        for (error, closing) in [
+            (
+                "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                "[local]  FAILED: `x` (reason above)\n",
+            ),
+            (
+                "deploying: step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                "[local]  FAILED at `x`: deploying: `/bin/sh -c echo nope >&2; exit 3` exited 3\n",
+            ),
+        ] {
+            let out = render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                r.event("local", &failing_cmd(1, "x"));
+                r.event("local", &step_started(2, "cleanup"));
+                r.event("local", &step_finished(2, "cleanup", Status::Ok));
+                r.event("local", &failed_frame_cmd(Some("x"), Some(1), error));
+            });
+            assert_eq!(
+                out,
+                format!(
+                    "{STEP_X}[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n\
+                     {CMD}\
+                     [local]  cleanup ................................................. ok\n\
+                     {closing}"
+                )
+            );
+            assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        }
+    }
+
+    /// A command that failed outside any step, the playbook's own
+    /// `ctx.sys()` call with `?`: no step carries it, so the `Failed` frame
+    /// prints it.
+    #[test]
+    fn a_command_failing_outside_any_step_shows_it_from_the_frame() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "first"));
+            r.event("local", &step_finished(1, "first", Status::Ok));
+            r.event(
+                "local",
+                &failed_frame_cmd(None, None, "`/bin/sh -c echo nope >&2; exit 3` exited 3"),
+            );
+        });
+        assert_eq!(
+            out,
+            format!(
+                "[local]  first ................................................... ok\n\
+                 [local]  FAILED: `/bin/sh -c echo nope >&2; exit 3` exited 3\n{CMD}"
+            )
+        );
     }
 
     /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
