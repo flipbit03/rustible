@@ -887,6 +887,7 @@ apt::Present::new(["nginx", "curl"])
 systemd::Enabled::new("nginx").now(true)
 user::Present::new("deploy").shell("/bin/bash").groups(["docker"])
 user::Present::new("deploy").gid("www-data")     // primary group
+http::Request::post(URL).bearer(&token).json(&body)
 
 // needs a finisher
 file::Copy::from_str(CONF).to("/etc/nginx/nginx.conf").mode(0o644)
@@ -1109,6 +1110,75 @@ rendering happens on the target inside your playbook binary.
 
 ⚠️ `from_str` takes `&str`, so a `String` you built is passed as `&conf`.
 
+### Calling an HTTP API
+
+`http::Request` is Ansible's `uri`: `Request::get(url)`, `post`, `put`,
+`patch`, `delete`, `head`, or `Request::method("OPTIONS", url)`. A `GET`,
+`HEAD` or `OPTIONS` reports `ok`; any other method reports `changed` unless
+`.changed_when(|resp| ..)` decides. Any `2xx` is success unless `.status([..])`
+lists the codes. Read the response into a struct with `json_as`;
+`rustible_std::http` re-exports `json!` and `Value` for the untyped case.
+Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
+`.basic_auth(user, &s)` — and show as `<secret, N bytes>` in diffs and errors.
+
+```rust
+use rustible::prelude::*;
+use rustible_std::{http, systemd};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Folder {
+    #[serde(rename = "type")] // `type` is a Rust keyword
+    kind: String,
+}
+
+#[derive(Serialize)]
+struct FolderType {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+const FOLDER: &str = "http://127.0.0.1:8384/rest/config/folders/dcim";
+const CONFIG: &str = "/home/syncthing/.local/state/syncthing/config.xml";
+
+#[rustible::playbook(hosts = "nas", escalate = true)]
+fn main(ctx: &mut Ctx) -> Result<()> {
+    // The API key, read on the target into a Secret: never printed.
+    let config = ctx.sys().read_to_string(CONFIG)?;
+    let key = config
+        .split("<apikey>")
+        .nth(1)
+        .and_then(|rest| rest.split("</apikey>").next())
+        .context("no <apikey> in Syncthing's config.xml")?;
+    let key = Secret::new(key);
+
+    let patched = ctx.block("DCIM is receive-only", |ctx| {
+        let got = ctx.step("Read folder",
+            http::Request::get(FOLDER).header_secret("X-API-Key", &key))?;
+        if got.json_as::<Folder>()?.kind == "receiveonly" {
+            return Ok(false);
+        }
+        let set = http::Request::patch(FOLDER)
+            .header_secret("X-API-Key", &key)
+            .json(&FolderType { kind: "receiveonly" });
+        Ok(ctx.step("Set receive-only", set)?.changed)
+    })?;
+    // A block of its own, so a dry run carries on past it (see below).
+    ctx.block("Syncthing restarted", |ctx| {
+        if *patched {
+            ctx.step("Restart", systemd::Restart::new("syncthing@syncthing"))?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+```
+
+⚠️ **Nothing is sent under `--check`**, not even a `GET`: the step reports
+`would change` with no output, so reading the response ends the enclosing
+block with a warning (§15). Above, the dry run stops seeing at `json_as`,
+and the restart block, which reads the first block's value, ends too.
+
 ### When no operation fits
 
 `shell::Command` runs something Rustible has no operation for:
@@ -1222,16 +1292,17 @@ if let Err(e) = ctx.step("optional thing", op) {
 
 // Retry: a loop. Failed attempts print FAILED; the attempt that succeeds
 // prints its status, and the recap shows the failures as recovered.
+// `.timeout` bounds each attempt (30 seconds by default).
 let mut attempts = 0;
 while let Err(e) = ctx.step(
     "wait for the api",
-    shell::Command::new("curl").args(["-fsS", "--max-time", "5", "http://127.0.0.1:8080/health"]),
+    http::Request::get("http://127.0.0.1:8080/health").timeout(Duration::from_secs(5)),
 ) {
     attempts += 1;
     if attempts == 5 {
         return Err(e); // gives up: this attempt is `failed`, the four before it `recovered`
     }
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(2));
 }
 ```
 
@@ -1311,7 +1382,8 @@ Three things to know:
   (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
   key this kernel lacks) hold in both modes.
 - **Nothing outside the target is contacted.** A step whose answer is remote,
-  such as `rustible_github::UserKeys`, reports `would change` with no output.
+  such as `http::Request` (any method) or `rustible_github::UserKeys`,
+  reports `would change` with no output.
   `apt::Latest::update_cache(..)` does not refresh under `--check`: if the
   lists are older than the age you gave (with `Duration::ZERO`, always), the
   step reports `would change` with "candidate versions unknown"; a real run

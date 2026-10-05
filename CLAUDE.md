@@ -673,8 +673,9 @@ hangs instead of failing and wedges CI until the workflow timeout.
 
 ## TLS, and why zig
 
-Rustible speaks TLS in `http::Download` and `rustible-github`; the provider is
-`ring`, which is why a C toolchain exists at all.
+Rustible speaks TLS in `rustible_std::http` (`Download` and `Request`), which
+`rustible-github` builds on; the provider is `ring`, which is why a C
+toolchain exists at all.
 
 Every build goes through `cargo_zigbuild::Build` (`describe.rs`), which points
 `-C linker=` and `CC_<triple>` at wrapper scripts that exec `rustible zig cc`;
