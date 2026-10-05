@@ -443,7 +443,8 @@ pub struct Compact<W: Write + Send> {
     verbosity: u8,
     /// The failed steps printed so far, by id, block path and name. Their
     /// chain is on their own line, with their command under it at `-v`, so
-    /// a `Failed` frame that names one does not print the command again.
+    /// a `Failed` frame that names one (by all three, or by name and blocks
+    /// when it has no id) does not print the command again.
     failed: Mutex<Vec<(u32, Vec<String>, String)>>,
 }
 
@@ -568,16 +569,14 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     None => writeln!(w, "FAILED: {error}"),
                 };
                 // A step's chain is on its own line, so a step printed
-                // already printed its command too.
-                let printed = match (id, step) {
-                    (Some(id), Some(step)) => self
-                        .failed
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|(i, b, n)| (*i, b, n) == (id, &blocks, &step)),
-                    _ => false,
-                };
+                // already printed its command too. Without an id, the name
+                // and blocks are all there is to go on.
+                let printed =
+                    step.is_some_and(|step| {
+                        self.failed.lock().unwrap().iter().any(|(i, b, n)| {
+                            id.is_none_or(|id| *i == id) && *b == blocks && *n == step
+                        })
+                    });
                 if self.verbosity >= 1
                     && !printed
                     && let Some(c) = cmd
@@ -918,6 +917,19 @@ mod tests {
         assert_eq!(
             print(1, vec![failed_frame(Some(9), Some("x"))]),
             format!("FAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n{from_frame}")
+        );
+    }
+
+    /// A frame naming the step but not its id (an error another `Ctx`
+    /// returned) is still that step's failure when the name and blocks
+    /// match one printed: its command printed there and is not repeated.
+    #[test]
+    fn compact_does_not_repeat_the_command_for_a_frame_without_an_id() {
+        let out = print(1, vec![failed_step(1, "x"), failed_frame(None, Some("x"))]);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(
+            out.ends_with("\nFAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n"),
+            "{out}"
         );
     }
 

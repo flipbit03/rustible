@@ -10,7 +10,9 @@
 //! Adding a field with `#[serde(default)]` leaves an older peer's frames
 //! readable; any other change to the shapes is incompatible and bumps
 //! [`PROTOCOL_VERSION`], which the two ends compare in [`Up::Hello`] before
-//! the first step runs.
+//! the first step runs. A compatible field may bump it too, on purpose, when
+//! an older peer would read the frames but show less than it should: version
+//! 8 did, so a mixed pair is refused at `Hello`.
 //!
 //! Byte fields (file chunks, command stdin) travel as base64 strings: a JSON
 //! array of numbers would cost 3.5x the payload, base64 costs 1.33x, and the
@@ -40,7 +42,9 @@ use crate::secret::Secret;
 /// counts the failed steps the playbook caught, `Summary.failed` only those
 /// that failed the host, and `Failed` carries the step's `id` and `blocks`.
 /// 8: a failed `StepFinished` carries the failed command (`cmd`), so a
-/// failure the playbook caught shows its stderr at `-v`.
+/// failure the playbook caught shows its stderr at `-v`. The field is
+/// defaulted and would not need a bump; this one is on purpose, so a mixed
+/// pair is refused at `Hello` rather than silently showing less.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Bytes per streamed chunk (vision doc 5.6).
@@ -316,17 +320,26 @@ pub struct FrameSink<W: Write + Send>(pub std::sync::Mutex<W>);
 
 impl<W: Write + Send> crate::event::EventSink for FrameSink<W> {
     fn emit(&self, event: Event) {
+        self.emit_within(event, MAX_FRAME);
+    }
+}
+
+impl<W: Write + Send> FrameSink<W> {
+    /// `emit`, with the frame limit as a parameter, so a test can trim
+    /// without building a frame of [`MAX_FRAME`] bytes.
+    pub(crate) fn emit_within(&self, event: Event, limit: usize) {
         let mut up = Up::Event(event);
-        fit_stderr(&mut up, MAX_FRAME);
+        fit_stderr(&mut up, limit);
         let _ = self.send(&up);
     }
 }
 
 /// Make an event that carries a failed command fit in a frame of `limit`
 /// bytes, by keeping only the tail of the command's stderr under a line
-/// saying how much was left out. A frame that fits, or that carries no
-/// command, is left alone, and so is one that a stderr cut to nothing
-/// would not save.
+/// saying how much was left out. When the frame has room for some stderr
+/// but not for that line, it carries none. A frame that fits, or that
+/// carries no command, is left alone, and so is one that a stderr cut to
+/// nothing would not save.
 ///
 /// Sizes are measured as encoded, since JSON escaping makes a string
 /// longer than its bytes: a control character takes six.
@@ -366,7 +379,13 @@ fn fit_stderr(up: &mut Up, limit: usize) {
         }
         *stderr_mut(up).expect("taken above") = format!("{}{}", omitted(start), &full[start..]);
         let len = encoded_len(up);
-        if len <= limit || start == full.len() {
+        if len <= limit {
+            return;
+        }
+        if start == full.len() {
+            // Not even the marker fits. Empty, the frame is `bare` bytes,
+            // which is under the limit.
+            stderr_mut(up).expect("taken above").clear();
             return;
         }
         // Escaping cost more than counted: shrink by the difference.
@@ -827,6 +846,48 @@ mod tests {
             write_frame(&mut buf, &up).unwrap();
             assert_eq!(buf.len() - 4, len);
         }
+    }
+
+    /// Room for some stderr but not for the line saying it was cut: the
+    /// frame still fits, carrying none of it.
+    #[test]
+    fn stderr_with_no_room_for_the_marker_is_dropped() {
+        let full = "x".repeat(10_000);
+        let bare = encoded_len(&Up::Event(failed_step(Some(cmd("")))));
+        let limit = bare + 20;
+        let mut up = Up::Event(failed_step(Some(cmd(&full))));
+        fit_stderr(&mut up, limit);
+        assert!(encoded_len(&up) <= limit, "{} bytes", encoded_len(&up));
+        assert_eq!(stderr_of(&up), "");
+    }
+
+    /// The channel itself trims: an event sent through `FrameSink` comes
+    /// back from `read_frame` within the limit, with its stderr's tail.
+    /// One that fits comes back as it went in.
+    #[test]
+    fn frame_sink_sends_a_failed_commands_stderr_within_the_limit() {
+        let full: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let small = failed_step(Some(cmd("short\n")));
+        let sink = FrameSink(std::sync::Mutex::new(Vec::new()));
+        sink.emit_within(failed_step(Some(cmd(&full))), 4096);
+        sink.emit_within(small.clone(), 4096);
+        let buf = sink.0.into_inner().unwrap();
+        let mut rd = buf.as_slice();
+        let first: Up = read_frame(&mut rd).unwrap().unwrap();
+        assert!(
+            buf.len() - rd.len() - 4 <= 4096,
+            "{} bytes",
+            buf.len() - rd.len() - 4
+        );
+        let got = stderr_of(&first);
+        assert!(got.starts_with("… ("), "{got:?}");
+        let tail = got.split_once('\n').unwrap().1;
+        assert!(tail.len() > 3000 && full.ends_with(tail), "{tail:?}");
+        let second: Up = read_frame(&mut rd).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&second).unwrap(),
+            serde_json::to_value(Up::Event(small)).unwrap()
+        );
     }
 
     /// Below the limit nothing changes, and a frame that a stderr cut to
