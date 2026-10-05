@@ -482,7 +482,7 @@ mod tests {
     ///
     /// Note what this test cannot do: `Present` reads its state with a
     /// command, and the `Fake` answers every `brew` invocation with the same
-    /// canned stdout, so changed-then-ok is not expressible at this tier
+    /// canned stdout, so changed-then-ok is not expressible against the `Fake`
     /// (CLAUDE.md, "the Fake models files well and commands badly"). The
     /// second run is proved against a real mac instead.
     #[test]

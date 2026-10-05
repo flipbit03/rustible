@@ -1,4 +1,4 @@
-//! Docker integration test for `file::Line` (vision 8, tier 3).
+//! Docker integration test for `file::Line` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_line`.
 
 use rustible::prelude::*;

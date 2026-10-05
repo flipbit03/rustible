@@ -1,4 +1,4 @@
-//! Docker integration harness: tier 3 of the testing strategy (vision 8).
+//! Docker integration harness: T2 of the testing strategy (vision 8).
 //!
 //! An op author writes one integration test per op and marks it with
 //! `#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]`.

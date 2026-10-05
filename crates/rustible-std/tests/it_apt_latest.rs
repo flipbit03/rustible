@@ -1,4 +1,4 @@
-//! Docker integration test for `apt::Latest` (vision 8, tier 3).
+//! Docker integration test for `apt::Latest` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_apt_latest`.
 //!
 //! The point of interest is the check-time cache refresh: a stock image ships

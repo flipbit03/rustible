@@ -24,6 +24,7 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
+# T1: pure functions and ops against the `Fake`, in-process.
 test:
 	$(CARGO) test --workspace
 
@@ -36,11 +37,11 @@ doc:
 example:
 	$(CARGO) build --manifest-path examples/workspace/Cargo.toml
 
-# The container tier. Needs docker.
+# The container tier, T2. Needs docker.
 integration:
 	RUSTIBLE_INTEGRATION=1 $(CARGO) test -p rustible-std --tests
 
-## ------------------------------------------------------- the machine tier
+## --------------------------------------------------- the machine tier, T3
 
 # Real virtual machines: a real SSH transport, real sudo, a live /proc/sys and
 # a real init system, none of which a container models. Optional day to day,

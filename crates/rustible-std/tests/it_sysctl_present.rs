@@ -1,4 +1,4 @@
-//! Docker integration test for `sysctl::Present` (vision 8, tier 3).
+//! Docker integration test for `sysctl::Present` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_sysctl_present`.
 //!
 //! Containers cannot write `/proc/sys`, so the op runs with

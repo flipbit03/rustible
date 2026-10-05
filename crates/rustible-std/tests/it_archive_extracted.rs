@@ -1,4 +1,4 @@
-//! Docker integration test for `archive::Extracted` (vision 8, tier 3).
+//! Docker integration test for `archive::Extracted` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_archive_extracted`.
 //!
 //! The four fixtures under `fixtures/archive/` are the same tree encoded

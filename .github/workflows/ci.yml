@@ -48,9 +48,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Tiers 1 and 2: pure functions and ops against the `Fake` backend.
+  # T1, in-process: pure functions and ops against the `Fake` backend.
   check:
-    name: "Test: unit & fake"
+    name: "Test (T1): unit & fake"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -101,7 +101,9 @@ jobs:
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
   macos:
-    name: "Test: macOS (controller and target)"
+    # T1 on a real mac, then real playbooks against the runner itself over a
+    # local connection: no VM and no SSH, so this is not T3.
+    name: "Test (T1, real mac): macOS (controller and target)"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -164,7 +166,7 @@ jobs:
           run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +1 +0 +0 +0 +0 +0 +0$'
 
   harness:
-    name: "Test: Docker (Debian/Ubuntu/Alpine)"
+    name: "Test (T2): Docker (Debian/Ubuntu/Alpine)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -186,13 +188,13 @@ jobs:
 
       # The harness builds each test as a static musl binary and runs it inside
       # the images the test names; without RUSTIBLE_INTEGRATION=1 these tests
-      # skip themselves (vision 8, tier 3).
+      # skip themselves (vision 8, T2).
       - name: Integration tests in containers
         run: cargo test -p rustible-std --tests
         env:
           RUSTIBLE_INTEGRATION: "1"
 
-  # Tier 4, the machine tier: a real virtual machine over a real SSH transport,
+  # T3, the machine tier: a real virtual machine over a real SSH transport,
   # with a real init system, a real sudo, and a live /proc/sys. A container has
   # none of those -- it shares the host kernel, so `it_sysctl_present.rs` has to
   # run with `.apply_now(false)` and assert only on the drop-in file.
@@ -202,13 +204,13 @@ jobs:
   # qemu, which is what makes it the slowest job here and also the only
   # automated check that an operation behaves the same on another architecture.
   machine:
-    # Job names say the mechanism first, then what it ran against, because a
-    # reader of a CI run has none of this file's context: `Test: VM (Debian
-    # 12/aarch64)` says where it ran and on what, where "machine tier" said
-    # nothing. `distro` and `arch` are matrix data rather than words in the
-    # name, so adding a distribution cannot leave a job claiming to test
-    # something it does not.
-    name: "Test: VM (${{ matrix.distro }}/${{ matrix.arch }})"
+    # Job names carry the tier, then the mechanism, then what it ran against.
+    # The tier tells a contributor which kind of test broke; the rest tells a
+    # reader with none of this file's context where it ran and on what, which
+    # "T3" alone would not: `Test (T3): VM (Debian 12/aarch64)`. `distro` and
+    # `arch` are matrix data rather than words in the name, so adding a
+    # distribution cannot leave a job claiming to test something it does not.
+    name: "Test (T3): VM (${{ matrix.distro }}/${{ matrix.arch }})"
     # Pinned, not `ubuntu-latest`: the steps below name Ubuntu package names,
     # the `libvirt` group, and the `libvirtd.socket` unit, all under
     # `set -euo pipefail`. A silent runner bump should not be able to break

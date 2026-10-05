@@ -1,4 +1,4 @@
-//! Docker integration test for `user` and `group` (vision 8, tier 3): the
+//! Docker integration test for `user` and `group` (vision 8, T2): the
 //! real `groupadd`/`useradd`/`usermod`/`userdel` as root, with `/etc/passwd`
 //! and `/etc/group` checked afterwards, plus a check-mode dry run of the
 //! fresh-host shape (group, then the user and membership that depend on it)

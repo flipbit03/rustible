@@ -363,7 +363,7 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
     }
 }
 
-/// Marks a Docker integration test (vision doc section 8, tier 3).
+/// Marks a Docker integration test (vision doc section 8, T2).
 ///
 /// ```no_run
 /// # use rustible::prelude::*;

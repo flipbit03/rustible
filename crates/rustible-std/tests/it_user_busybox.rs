@@ -1,5 +1,5 @@
-//! Docker integration test for `user` and `group` on BusyBox (vision 8, tier
-//! 3). The Debian and Ubuntu legs live in `it_user_group`; Alpine is a
+//! Docker integration test for `user` and `group` on BusyBox (vision 8,
+//! T2). The Debian and Ubuntu legs live in `it_user_group`; Alpine is a
 //! separate binary because BusyBox is a different toolset, not a variation:
 //! `adduser`/`addgroup` instead of `useradd`/`groupadd`, and no `usermod` at
 //! all. Two of this branch's findings only exist here, so a Fake test is not

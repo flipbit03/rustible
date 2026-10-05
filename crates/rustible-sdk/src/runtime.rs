@@ -1875,7 +1875,7 @@ mod tests {
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
     }
 
-    // ---- classify: tier 1 ----
+    // ---- classify: pure ----
 
     fn step(id: u32) -> FailedStep {
         FailedStep {
