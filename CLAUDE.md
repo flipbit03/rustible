@@ -324,7 +324,7 @@ below it:
 
 | tier | what it is | sees what the tier below cannot | where it runs | cost |
 |---|---|---|---|---|
-| T1. in-process | everything a plain `cargo test` runs with nothing installed: chiefly pure functions and ops against the `Fake` backend, plus the CLI's tests of its built binary and the macros' trybuild UI tests. The T2 tests in `crates/rustible-std/tests/` skip themselves there, without `RUSTIBLE_INTEGRATION=1` | — | `cargo test` | free |
+| T1. in-process | everything a plain `cargo test` runs with nothing installed: chiefly pure functions and ops against the `Fake` backend (below) | — | `cargo test` | free |
 | T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
 | T3. machine | a playbook against a real VM over SSH | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH | `make vm-test`, and CI | minutes, needs vagrant |
 
@@ -332,6 +332,26 @@ The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
 three playbooks converged, and one refused at launch, on each of two
 architectures.
+
+**What "in-process" means.** T1 is a plain `cargo test` with nothing
+installed beyond the Rust toolchain: no docker, no VM, no network beyond
+loopback, no root, nothing set up on the host. The label means in the test
+run, on the developer's machine, with no environment; it does not mean one
+OS process. The CLI's tests in `crates/rustible-cli/tests/` spawn the built
+`rustible` binary and `rustible-macros`' trybuild UI tests run the compiler,
+and both are T1 because they need nothing beyond `cargo`. The T2 tests in
+`crates/rustible-std/tests/` are compiled by the same `cargo test` and skip
+themselves, without `RUSTIBLE_INTEGRATION=1`. What T1 cannot see:
+
+- **What a tool really does.** The `Fake` models what we believe `useradd`,
+  `apt-get`, `systemctl` or `chown` does; that `chown` clears setuid showed
+  up only at T2.
+- **Real permissions and ownership, real processes and users**, and the
+  differences between distributions.
+- **A kernel (`/proc/sys`), an init system, `sudo`, SSH.**
+- **The `Fake`'s own blind spots**: a command answers the same way every
+  time, and `argvs()` drops stdin. See "Traps that make a test pass while
+  proving nothing".
 
 **All three tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely

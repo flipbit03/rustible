@@ -1070,6 +1070,13 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    The split shapes the op: `check` does all the thinking and `apply`
    executes its intent without inspecting again (section 6.2), so the logic
    is pure and the `Fake` can plant a tool's effect between the two.
+
+   In-process means in the test run, on the developer's machine, with no
+   environment, not one OS process: nothing beyond the Rust toolchain, no
+   docker, VM, root, or network beyond loopback. Its limit is that nothing in
+   it is real: the `Fake` models what we believe a tool does, not what it
+   does, and T1 has no real permissions, ownership, processes, users or
+   distributions, and no kernel, init, `sudo` or SSH.
 2. **T2, Docker integration tests** per distro, the source of truth for how a
    real tool behaves, which the `Fake` only models. The SDK ships a harness
    (`#[rustible::integration_test(images = ["debian:12", "alpine:3.20",

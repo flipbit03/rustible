@@ -16,12 +16,16 @@ Each sees something the tier below it cannot, and costs more to run: free,
 seconds, minutes. A test goes in the lowest one that can fail for the right
 reason (`CLAUDE.md`, "Choosing a tier").
 
-- **T1, in-process**: everything a plain `cargo test` runs with nothing
-  installed, chiefly **pure functions** and the **`Fake` backend** (parsers,
-  planners, and an op's own behaviour), plus the CLI's tests of its built
-  binary and the macros' trybuild UI tests. The T2 tests in
+- **T1, in-process** (`cargo test`, always). Everything a plain `cargo
+  test` runs with nothing installed beyond the Rust toolchain: no docker,
+  no VM, no root, no network beyond loopback. Chiefly **pure functions** and
+  the **`Fake` backend** (parsers, planners, and an op's own behaviour), plus
+  the CLI's tests of its built binary and the macros' trybuild UI tests:
+  "in-process" means no environment, not one OS process. The T2 tests in
   `crates/rustible-std/tests/` skip themselves there, without
-  `RUSTIBLE_INTEGRATION=1`. Always.
+  `RUSTIBLE_INTEGRATION=1`. It sees nothing real: the `Fake` models what we
+  believe a tool does, and there are no real permissions, ownership,
+  processes, users or distributions, and no kernel, init, `sudo` or SSH.
 - **T2, containers** (`make integration`). Real distributions, real package
   managers, real `useradd`. They caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
