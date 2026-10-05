@@ -23,9 +23,16 @@ pub const REQUEST_MAX_BYTES: u64 = 16 << 20;
 /// How much of a request body a diff shows before it says it was cut.
 const SHOWN_BODY_BYTES: usize = 2048;
 
-/// The largest request body a diff reads whole: reindented when it is JSON,
-/// scrubbed throughout. Above it, only the start that is shown is read.
+/// The largest JSON request body a diff validates and reindents. Above it
+/// the body is shown as it is sent. Either way, only the start that is
+/// shown is scrubbed and escaped.
 const WHOLE_BODY_BYTES: usize = 64 << 10;
+
+/// The deepest JSON a diff reindents; deeper, it is shown as it is sent.
+const MAX_REINDENT_DEPTH: usize = 128;
+
+/// What [`client::scrub`] puts in place of a secret.
+const SCRUBBED: &str = "<secret>";
 
 /// How much of an unexpected response's body a status failure quotes.
 const QUOTED_BODY_BYTES: usize = 512;
@@ -99,10 +106,13 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// The diff never names a header or a credential; a `body_secret` shows
 /// there as `<secret, N bytes>`. A URL's `user:pass@` is masked everywhere
 /// too. A body given with `.json`, `.form` or `.body` is not a secret, and
-/// the diff shows it; a value given as a `Secret` anywhere on the request
+/// the diff shows it. A value given as a `Secret` anywhere on the request
 /// (a header, the bearer token, the basic-auth password, the URL's
-/// password) shows inside it as `<secret>`. To send a password in a JSON
-/// body, use `.body_secret(&s).content_type("application/json")`.
+/// password) shows inside it as `<secret>` when it appears as it is, as
+/// `.json` or `.form` encode it, or in the variants other encoders commonly
+/// write (`\/`, `\u00e4`, lowercase `%xx`, `%20`); encoded any other way by
+/// hand (base64, another escaping), it is shown. To send a password in a
+/// JSON body, use `.body_secret(&s).content_type("application/json")`.
 ///
 /// **Redirects** are followed for `GET` and `HEAD` and not for anything
 /// else (Ansible's `safe`); [`Request::follow_redirects`] changes that. At
@@ -959,8 +969,12 @@ fn is_form_content_type(ct: &str) -> bool {
 
 /// What to scrub from a shown body: the client's list, plus each secret in
 /// the forms a body carries it in. The URL's userinfo percent-decoded, as
-/// the server reads it; for a JSON body each one JSON-escaped (a `"` in it
-/// is `\"` there); for a form each one form-encoded (`p@ss` is `p%40ss`).
+/// the server reads it. For a JSON body each one JSON-escaped as `.json`
+/// writes it (a `"` in it is `\"`), and as PHP and Python do by default
+/// (`/` as `\/`, non-ASCII as `\u00e4`). For a form each one form-encoded
+/// as `.form` writes it (`p@ss` is `p%40ss`, a space `+`), and with
+/// lowercase hex and `%20`, as other encoders do. A secret encoded any
+/// other way is not recognised.
 fn body_scrubs(mut list: Vec<String>, url: &str, json: bool, form: bool) -> Vec<String> {
     let add = |list: &mut Vec<String>, s: String| {
         if !s.is_empty() && !list.contains(&s) {
@@ -979,13 +993,36 @@ fn body_scrubs(mut list: Vec<String>, url: &str, json: bool, form: bool) -> Vec<
     }
     for s in list.clone() {
         if json && let Ok(quoted) = serde_json::to_string(&s) {
-            add(&mut list, quoted[1..quoted.len() - 1].to_string());
+            let escaped = &quoted[1..quoted.len() - 1];
+            let ascii = json_ascii(escaped);
+            for v in [&ascii, escaped] {
+                add(&mut list, v.replace('/', "\\/"));
+                add(&mut list, v.to_string());
+            }
         }
         if form {
-            add(&mut list, form_component(&s));
+            for (lower, plus) in [(false, true), (false, false), (true, true), (true, false)] {
+                add(&mut list, form_component_with(&s, lower, plus));
+            }
         }
     }
     list
+}
+
+/// JSON-escaped text with every non-ASCII character as `\uXXXX` (UTF-16,
+/// so a surrogate pair past the BMP), as Python's `ensure_ascii` writes it.
+fn json_ascii(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    for c in escaped.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
 }
 
 /// `%XX` decoded, everything else as it is; `None` when the result is not
@@ -1014,38 +1051,38 @@ fn percent_decode(s: &str) -> Option<String> {
 
 /// A request body as a diff shows it: reindented when it is JSON, as text
 /// when it is text, as a size when it is neither. Every one of `secrets` is
-/// scrubbed, control characters but a newline and a tab are escaped
-/// (`\u{1b}`), and the result is cut at about 2 KiB. A note on the last line
-/// says when it was reindented or cut, and how many bytes are sent.
+/// scrubbed, control and format characters but a newline and a tab are
+/// escaped (`\u{1b}`, `\u{202e}`), and the result is cut at about 2 KiB. A
+/// note on the last line says when it was reindented or cut, and how many
+/// bytes are sent.
 ///
 /// Reindenting changes only the whitespace between JSON's tokens: keys,
 /// their order, duplicates and every value are shown as they are sent. A
-/// body over [`WHOLE_BODY_BYTES`] is not reindented, and only the start of
-/// it that is shown is scrubbed, ending where no secret is cut in two.
+/// body over [`WHOLE_BODY_BYTES`], or nested deeper than
+/// [`MAX_REINDENT_DEPTH`], is shown as it is sent. Past validation the work
+/// is bounded by what is shown, not by the body: only the start that is
+/// shown is reindented, scrubbed and escaped, and that start ends where no
+/// secret is cut in two.
 fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) -> String {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return format!("<{} bytes of binary data>", bytes.len());
     };
-    let large = text.len() > WHOLE_BODY_BYTES;
-    let pretty = (!large && content_type.is_some_and(is_json_content_type))
-        .then(|| reindent_json(text))
-        .flatten();
-    let reformatted = pretty.as_deref().is_some_and(|p| p != text);
-    let source = match &pretty {
-        Some(p) => p.as_str(),
-        None if large => clean_prefix(text, secrets),
-        None => text,
+    let longest = secrets.iter().map(String::len).max().unwrap_or(0);
+    // Room past the shown 2 KiB for `clean_prefix` to see a secret on its
+    // cut whole: it extends by at most `longest`, and checks `longest` on.
+    let enough = SHOWN_BODY_BYTES + 2 * longest + 1;
+    let reindented = (text.len() <= WHOLE_BODY_BYTES
+        && content_type.is_some_and(is_json_content_type))
+    .then(|| reindent_json(text, enough))
+    .flatten();
+    let (source, reformatted, mut cut) = match &reindented {
+        Some((r, true)) => (r.as_str(), r != text.trim_end(), false),
+        Some((r, false)) => (r.as_str(), !text.starts_with(r.as_str()), true),
+        None => (text, false, false),
     };
-    let mut shown = escape_controls(&client::scrub(source, secrets));
-    let mut end = shown.floor_char_boundary(SHOWN_BODY_BYTES);
-    // A `<secret>` the cut would split is kept whole.
-    if let Some(at) =
-        (end.saturating_sub(7)..end).find(|&i| shown.as_bytes()[i..].starts_with(b"<secret>"))
-    {
-        end = at + "<secret>".len();
-    }
-    let cut = large || end < shown.len();
-    shown.truncate(end);
+    let start = clean_prefix(source, secrets);
+    let (shown, whole) = escape_controls(&client::scrub(start, secrets), SHOWN_BODY_BYTES);
+    cut |= start.len() < source.len() || !whole;
     let note = match (reformatted, cut) {
         (false, false) => return shown,
         (true, false) => "(reformatted",
@@ -1058,78 +1095,108 @@ fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) ->
     )
 }
 
-/// The start of `text` a large body's diff shows: [`SHOWN_BODY_BYTES`] of
-/// it, or more where a secret would otherwise be cut in two, so the scrub
-/// sees each secret it shows whole.
+/// The start of `text` a diff shows: [`SHOWN_BODY_BYTES`] of it, ending
+/// where no secret is cut in two, so the scrub sees each secret it shows
+/// whole. It extends past a secret on the cut, at most by the longest
+/// secret; where overlapping secrets would carry it further, it ends
+/// before them instead.
 fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
-    let mut end = text.floor_char_boundary(SHOWN_BODY_BYTES);
-    loop {
-        let past = secrets
+    // The first start and the last end of the secrets that span `end`.
+    let spanning = |end: usize| {
+        secrets
             .iter()
             .filter(|s| !s.is_empty())
-            .filter_map(|s| {
+            .flat_map(|s| {
                 (end.saturating_sub(s.len() - 1)..end)
                     .filter(|&i| text.is_char_boundary(i) && text[i..].starts_with(s.as_str()))
-                    .map(|i| i + s.len())
-                    .max()
+                    .map(|i| (i, i + s.len()))
             })
-            .max();
-        match past {
-            Some(p) => end = p,
-            None => return &text[..end],
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+    };
+    let first = text.floor_char_boundary(SHOWN_BODY_BYTES);
+    let cap = SHOWN_BODY_BYTES + secrets.iter().map(String::len).max().unwrap_or(0);
+    let mut end = first;
+    while let Some((_, past)) = spanning(end) {
+        if past > cap {
+            end = first;
+            while let Some((before, _)) = spanning(end) {
+                end = before;
+            }
+            break;
         }
+        end = past;
     }
+    &text[..end]
 }
 
 /// `text` with every control character escaped (`\u{1b}`, `\r`) except a
 /// newline, a tab, and the `\r` of a `\r\n`, so a body cannot move the
-/// cursor or recolour the terminal it is shown on.
-fn escape_controls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+/// cursor or recolour the terminal it is shown on; and every format
+/// character that reorders or hides text (bidi overrides and isolates,
+/// zero-width characters, a byte-order mark). Stops once `budget` bytes are
+/// written, never inside an escape or a `<secret>`; the flag says whether
+/// all of `text` was.
+fn escape_controls(text: &str, budget: usize) -> (String, bool) {
+    let format = |c: char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+    let mut out = String::with_capacity(text.len().min(budget) + 16);
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if out.len() >= budget {
+            return (out, false);
+        }
+        if let Some(after) = rest.strip_prefix(SCRUBBED) {
+            out.push_str(SCRUBBED);
+            rest = after;
+            continue;
+        }
+        rest = &rest[c.len_utf8()..];
         match c {
             '\n' | '\t' => out.push(c),
-            '\r' if chars.peek() == Some(&'\n') => out.push(c),
-            c if c.is_control() => out.extend(c.escape_default()),
+            '\r' if rest.starts_with('\n') => out.push(c),
+            c if c.is_control() || format(c) => out.extend(c.escape_default()),
             c => out.push(c),
         }
     }
-    out
+    (out, true)
 }
 
 /// Valid JSON laid out as `serde_json` pretty-prints it (two-space indent,
 /// `"key": value`, `{}` and `[]` when empty) by changing only the whitespace
-/// between tokens. `None` when `text` is not valid JSON.
-fn reindent_json(text: &str) -> Option<String> {
+/// between tokens, stopping once more than `limit` bytes are written. The
+/// flag says whether all of it was. `None` when `text` is not valid JSON or
+/// is nested deeper than [`MAX_REINDENT_DEPTH`].
+fn reindent_json(text: &str, limit: usize) -> Option<(String, bool)> {
     serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    // Strings scanned the same way below: a bracket inside one is text.
+    let mut tokens = Tokens::default();
+    let mut depth = 0;
+    for c in text.chars() {
+        match tokens.structural(c) {
+            Some('{' | '[') => depth += 1,
+            Some('}' | ']') => depth -= 1,
+            _ => {}
+        }
+        if depth > MAX_REINDENT_DEPTH {
+            return None;
+        }
+    }
     let is_ws = |c: &char| matches!(c, ' ' | '\t' | '\n' | '\r');
     let newline = |out: &mut String, depth: usize| {
         out.push('\n');
         out.push_str(&"  ".repeat(depth));
     };
-    let mut out = String::with_capacity(text.len() * 2);
+    let mut out = String::with_capacity(limit.min(text.len() * 2) + 64);
     let mut depth = 0;
-    let (mut in_string, mut escaped) = (false, false);
+    let mut tokens = Tokens::default();
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
+        if out.len() > limit {
+            return Some((out, false));
         }
-        match c {
-            _ if is_ws(&c) => {}
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '{' | '[' => {
+        match tokens.structural(c) {
+            None => out.push(c),
+            Some(c) if is_ws(&c) => {}
+            Some(c @ ('{' | '[')) => {
                 out.push(c);
                 while chars.next_if(is_ws).is_some() {}
                 match chars.next_if(|n| matches!(n, '}' | ']')) {
@@ -1140,20 +1207,47 @@ fn reindent_json(text: &str) -> Option<String> {
                     }
                 }
             }
-            '}' | ']' => {
+            Some(c @ ('}' | ']')) => {
                 depth -= 1;
                 newline(&mut out, depth);
                 out.push(c);
             }
-            ',' => {
-                out.push(c);
+            Some(',') => {
+                out.push(',');
                 newline(&mut out, depth);
             }
-            ':' => out.push_str(": "),
-            _ => out.push(c),
+            Some(':') => out.push_str(": "),
+            Some(c) => out.push(c),
         }
     }
-    Some(out)
+    Some((out, true))
+}
+
+/// Where a character of JSON text falls: inside a string, or between them.
+#[derive(Default)]
+struct Tokens {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl Tokens {
+    /// `c` itself when it is outside a string (a quote that opens one
+    /// included), `None` when it is inside one (its closing quote included).
+    fn structural(&mut self, c: char) -> Option<char> {
+        if self.in_string {
+            match c {
+                _ if self.escaped => self.escaped = false,
+                '\\' => self.escaped = true,
+                '"' => self.in_string = false,
+                _ => {}
+            }
+            return None;
+        }
+        if c == '"' {
+            self.in_string = true;
+        }
+        Some(c)
+    }
 }
 
 /// `application/x-www-form-urlencoded`: unreserved characters as they are,
@@ -1168,13 +1262,20 @@ fn form_encode(pairs: &[(String, String)]) -> String {
 
 /// One key or value of a form, encoded as [`form_encode`] encodes it.
 fn form_component(s: &str) -> String {
+    form_component_with(s, false, true)
+}
+
+/// [`form_component`] with lowercase hex, or `%20` for a space, as other
+/// encoders write them.
+fn form_component_with(s: &str, lower: bool, plus: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
                 out.push(b as char)
             }
-            b' ' => out.push('+'),
+            b' ' if plus => out.push('+'),
+            _ if lower => out.push_str(&format!("%{b:02x}")),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -1395,6 +1496,133 @@ mod tests {
         assert!(
             body_summary(bytes, Some("application/json"), &[])
                 .starts_with("{\n  \"id\": \"dcim\",\n  \"kind\": \"receiveonly\"\n}")
+        );
+    }
+
+    /// `check` runs on the target, so showing a body costs what is shown,
+    /// not what nesting multiplies it into: 32,000 levels once took 48 s
+    /// and 8 GB. Deeper than `MAX_REINDENT_DEPTH`, the text is shown as it
+    /// is. Time-bounded, so a regression fails instead of hanging.
+    #[test]
+    fn a_deeply_nested_json_body_is_shown_in_bounded_time_and_size() {
+        let deep = format!("{}1{}", "[".repeat(32000), "]".repeat(32000));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body_summary(deep.as_bytes(), Some("application/json"), &[]));
+        });
+        let shown = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("showing a deeply nested body took over 5 s");
+        assert!(
+            shown.len() < SHOWN_BODY_BYTES + 100,
+            "{} bytes",
+            shown.len()
+        );
+        assert_eq!(
+            shown,
+            format!(
+                "{}\n... (cut for display; 64001 bytes are sent)",
+                "[".repeat(SHOWN_BODY_BYTES)
+            ),
+            "as sent, not reindented"
+        );
+
+        // Within the depth, only the start that is shown is reindented (all
+        // of it would be 180 KB), and a secret on its cut is still scrubbed
+        // whole: one of these spans it.
+        let secrets = vec!["t0k3n-on-the-cut".to_string()];
+        let wide = format!(
+            "{}\"{}\",{}{}",
+            "[".repeat(20),
+            "x".repeat(35), // puts one at 2040..2056 once reindented
+            vec!["\"t0k3n-on-the-cut\""; 3000].join(","),
+            "]".repeat(20)
+        );
+        let sent = wide.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body_summary(
+                wide.as_bytes(),
+                Some("application/json"),
+                &secrets,
+            ));
+        });
+        let shown = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("showing a wide nested body took over 5 s");
+        assert!(
+            shown.len() < SHOWN_BODY_BYTES + 300,
+            "{} bytes",
+            shown.len()
+        );
+        assert!(!shown.contains("t0k"), "{shown}");
+        assert!(shown.contains("\"<secret>\""), "{shown}");
+        assert!(
+            shown.ends_with(&format!(
+                "\n... (reformatted and cut for display; {sent} bytes are sent)"
+            )),
+            "{shown}"
+        );
+    }
+
+    /// However secrets overlap, the start a large body shows stays about
+    /// 2 KiB: the extension past a secret on the cut is capped.
+    /// Reindenting stops once it has written what can be shown: 128 levels
+    /// of a 64 KiB array would otherwise be 8 MB.
+    #[test]
+    fn reindenting_stops_past_its_limit() {
+        let wide = format!(
+            "{}{}{}",
+            "[".repeat(127),
+            vec!["1"; 30000].join(","),
+            "]".repeat(127)
+        );
+        let (out, whole) = reindent_json(&wide, 4096).unwrap();
+        assert!(!whole);
+        assert!(out.len() <= 4096 + 2 * 127 + 1, "{} bytes", out.len());
+        let (out, whole) = reindent_json("[1,2]", 4096).unwrap();
+        assert!(whole);
+        assert_eq!(out, "[\n  1,\n  2\n]");
+    }
+
+    #[test]
+    fn the_shown_start_of_a_body_is_bounded() {
+        let all = "a".repeat(300 << 10);
+        let start = clean_prefix(&all, &["aa".to_string()]);
+        assert!(start.len() <= SHOWN_BODY_BYTES + 2, "{} bytes", start.len());
+    }
+
+    /// Format characters reorder or hide text (`safe\u{202e}txt.exe` reads
+    /// as `safeexe.txt`), so they are escaped too; and the cut never splits
+    /// an escape.
+    #[test]
+    fn format_characters_are_escaped_and_no_escape_is_cut() {
+        assert_eq!(
+            body_summary(
+                "safe\u{202e}txt.exe\u{2066}\u{200b}\u{feff}".as_bytes(),
+                None,
+                &[]
+            ),
+            "safe\\u{202e}txt.exe\\u{2066}\\u{200b}\\u{feff}"
+        );
+        let body = format!("{}\x1byyyy", "x".repeat(SHOWN_BODY_BYTES - 2));
+        assert_eq!(
+            body_summary(body.as_bytes(), None, &[]),
+            format!(
+                "{}\\u{{1b}}\n... (cut for display; 2051 bytes are sent)",
+                "x".repeat(SHOWN_BODY_BYTES - 2)
+            )
+        );
+    }
+
+    /// A body already laid out as it would be shown, but for a trailing
+    /// newline, is not marked as reformatted.
+    #[test]
+    fn a_trailing_newline_is_not_a_reformat() {
+        let body = "{\n  \"a\": 1\n}\n";
+        assert_eq!(
+            body_summary(body.as_bytes(), Some("application/json"), &[]),
+            "{\n  \"a\": 1\n}"
         );
     }
 
@@ -1676,6 +1904,54 @@ mod tests {
         assert_eq!(render(url), "POST http://bob:********@h/x\npw=<secret>");
         let lone = Request::post("http://t%2Fk@h/x").body("t/k");
         assert_eq!(render(lone), "POST http://********@h/x\n<secret>");
+    }
+
+    /// Bodies built by hand often come from another encoder: PHP's JSON
+    /// writes `/` as `\/`, Python's escapes non-ASCII as `\u00e4`, and form
+    /// encoders differ on hex case and on `+` or `%20` for a space.
+    #[test]
+    fn a_secret_is_scrubbed_as_common_encoders_write_it() {
+        let (s, _) = sys(false);
+        let render = |secret: &str, body: &str, ct: &str| {
+            let op = Request::post("http://h/x")
+                .bearer(&Secret::new(secret))
+                .body(body)
+                .content_type(ct);
+            let Plan::Change(i) = op.check(&s).unwrap() else {
+                panic!()
+            };
+            i.diff().render()
+        };
+        let json = "application/json";
+        for (secret, body) in [
+            ("t/k", r#"{"t":"t\/k"}"#),
+            ("pässwörd", r#"{"t":"p\u00e4ssw\u00f6rd"}"#),
+            ("k🔑", r#"{"t":"k\ud83d\udd11"}"#),
+            ("ä/x", r#"{"t":"\u00e4\/x"}"#),
+        ] {
+            assert_eq!(
+                render(secret, body, json),
+                "POST http://h/x\n{\n  \"t\": \"<secret>\"\n}\n\
+                 (reformatted for display; "
+                    .to_string()
+                    + &body.len().to_string()
+                    + " bytes are sent)",
+                "{body}"
+            );
+        }
+        let form = "application/x-www-form-urlencoded";
+        for body in [
+            "s=p%40ss+w%2Frd",
+            "s=p%40ss%20w%2Frd",
+            "s=p%40ss+w%2frd",
+            "s=p%40ss%20w%2frd",
+        ] {
+            assert_eq!(
+                render("p@ss w/rd", body, form),
+                "POST http://h/x\ns=<secret>",
+                "{body}"
+            );
+        }
     }
 
     #[test]
