@@ -184,10 +184,11 @@ pub struct Member {
     pub kind: Kind,
     /// Permission bits (`& 0o7777`).
     pub mode: u32,
-    /// Content length as the tar header declares it, `0` for directories,
-    /// symlinks and hard links. Attacker-controlled and unverified, so it is
-    /// only ever a capacity hint, capped at 1 MiB before the real stream is
-    /// read.
+    /// Content length as the archive declares it (the header's `size`,
+    /// overridden by a pax `size` record or a GNU sparse map's real size),
+    /// `0` for directories, symlinks and hard links. Attacker-controlled and
+    /// unverified, so it is only ever a capacity hint, capped at 1 MiB
+    /// before the real stream is read.
     pub size: u64,
 }
 
@@ -211,7 +212,9 @@ pub struct ExtractReport {
     pub dirs: usize,
     /// Symlink members. Hard links are counted in `files`, not here.
     pub symlinks: usize,
-    /// Bytes of regular-file content, as the archive's headers declare it.
+    /// Bytes of regular-file content, as the archive declares it: the
+    /// headers' sizes, or a pax `size` record or a GNU sparse map's real
+    /// size where the archive gives one.
     /// A hard link's header carries `size == 0`, so a hard link raises
     /// `files` but adds nothing here, even though `apply` writes it as a
     /// full copy of its target: this counts what the archive holds, not
@@ -280,7 +283,10 @@ pub struct ExtractReport {
 ///
 /// **Limits.** The compressed archive is held in memory (zstd: the
 /// decompressed stream too), and so is each file member's data while it is
-/// written; this is for release tarballs, not backups.
+/// written; this is for release tarballs, not backups. Under
+/// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
+/// helper in one frame of just under 48 MiB, so the archive and each
+/// member are limited to that size there.
 /// Files already in `dest` that the archive does not mention are left
 /// alone.
 #[derive(Debug, Clone)]
@@ -642,7 +648,11 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         }
         let header = entry.header();
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
-        let size = header.size().unwrap_or(0);
+        // The archive's length for the member: `Header::size()` gives a GNU
+        // sparse member's real size but ignores a pax `size` record, which
+        // `Entry::size()` honours. `apply` checks what it reads against the
+        // same length.
+        let size = entry.size();
         let ty = header.entry_type();
         let kind = if ty.is_dir() {
             Kind::Dir
@@ -1513,10 +1523,13 @@ mod tests {
         // bytes the stream does not hold, the name check passes; the
         // member's reader hands over the 1536 bytes the stream still holds
         // and stops without an error, so the length is what fails the step.
-        // The size `write_member` reserves from is the one `check` planned
-        // (4), so this does not reach the clamp:
+        // The member `check` planned is 1536 bytes, as many as the cut
+        // stream still holds, so only the length the archive declares where
+        // `apply` reads it (2^62) tells the read apart from a complete one;
+        // the planned size would pass it. That planned size is also what
+        // `write_member` reserves from, so this does not reach the clamp:
         // `write_member_clamps_the_capacity_hint` does.
-        let (fake, sys) = sys_with(&raw_tar(&[("sub/f", b'0', b"data", "")]));
+        let (fake, sys) = sys_with(&raw_tar(&[("sub/f", b'0', &[b'p'; 1536], "")]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
         sys.write_atomic("/tmp/a.tar", &tar_ending_inside(&[], "sub/f"))
@@ -1606,8 +1619,53 @@ mod tests {
         let (fake, sys) = sys_with(&archive);
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        op.apply(&sys, c).unwrap();
+        // The report counts the record's 4 bytes, not the header's 0.
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 4 bytes) into /opt"
+        );
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.bytes, 4);
         assert_eq!(fake.content("/opt/f").unwrap(), "data");
+    }
+
+    /// A GNU sparse member (type `S`): a hole at the start, 4 bytes of data,
+    /// and a hole at the end. The header's `size` is the 4 bytes stored;
+    /// the sparse map's real size is 2048, which is what `apply` reads, what
+    /// the member must come to, and what the report counts.
+    #[test]
+    fn a_gnu_sparse_member_extracts_with_its_holes() {
+        let mut h = tar::Header::new_gnu();
+        h.set_path("sparse").unwrap();
+        h.set_entry_type(tar::EntryType::GNUSparse);
+        h.set_mode(0o644);
+        h.set_size(4);
+        {
+            let g = h.as_gnu_mut().unwrap();
+            g.set_real_size(2048);
+            g.sparse[0].set_offset(1024);
+            g.sparse[0].set_length(4);
+            // The zero-length block at the real size is how GNU tar marks
+            // a hole running to the end of the file.
+            g.sparse[1].set_offset(2048);
+            g.sparse[1].set_length(0);
+        }
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend_from_slice(b"data");
+        archive.extend(std::iter::repeat_n(0u8, 508 + 1024));
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 2048 bytes) into /opt"
+        );
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.bytes, 2048);
+        let mut want = vec![0u8; 2048];
+        want[1024..1028].copy_from_slice(b"data");
+        assert_eq!(fake.file("/opt/sparse").unwrap().bytes, want);
     }
 
     /// The reservation `write_member` makes from a member's size is clamped,
