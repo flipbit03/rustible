@@ -165,6 +165,45 @@ fn extracted_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         "chown must not have cleared the setuid bit"
     );
 
+    // A member the archive no longer holds in full (issue #52): swapped
+    // between `check` and `apply` for one under the same name whose header
+    // claims 4096 bytes and whose stream ends after 1536. The step fails
+    // and nothing lands at the member's path; a file already there keeps
+    // its bytes and mode, and no staging file is left beside it.
+    let short_src = format!("{work}/short.tar");
+    let short_dest = format!("{work}/short");
+    ctx.sys().mkdir_all(&short_dest)?;
+    let mut cut = one_member_tar("f", 0o644, &[b'x'; 4096]);
+    cut.truncate(512 + 1536);
+    for existing in [None, Some("old contents\n")] {
+        let sys = ctx.sys();
+        let target = format!("{short_dest}/f");
+        if let Some(old) = existing {
+            sys.write_atomic(&target, old.as_bytes())?;
+            sys.set_mode(&target, 0o640)?;
+        }
+        sys.write_atomic(&short_src, &one_member_tar("f", 0o644, b"data"))?;
+        let op = Extracted::from_path(&short_src).to(&short_dest);
+        let Plan::Change(intent) = op.check(sys)? else {
+            panic!("expected a change")
+        };
+        sys.write_atomic(&short_src, &cut)?;
+        let err = op.apply(sys, intent).unwrap_err().chain();
+        assert!(
+            err.contains("member `f` ends after 1536 of the 4096 bytes"),
+            "{err}"
+        );
+        match existing {
+            None => assert!(!sys.exists(&target)?, "no partial file"),
+            Some(old) => {
+                assert_eq!(sys.read_to_string(&target)?, old);
+                assert_eq!(sys.stat(&target)?.unwrap().mode, 0o640);
+            }
+        }
+        let left = sys.read_dir(&short_dest)?;
+        assert_eq!(left.len(), usize::from(existing.is_some()), "{left:?}");
+    }
+
     // A refusal: the destination must exist (vision 6.7).
     let err = ctx
         .step(
