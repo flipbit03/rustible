@@ -1281,6 +1281,17 @@ mod tests {
         assert_eq!((st.mode, st.size), (0o600, 256));
         e.copy(&f, &dir.path().join("y")).unwrap();
         assert_eq!(e.read(&dir.path().join("y")).unwrap(), payload);
+        // `copy` never writes through an existing path or a link, and the
+        // refusal comes back as `AlreadyExists`, which `System::backup`
+        // reads to try the next name (issue #75).
+        let y_link = dir.path().join("y-link");
+        e.symlink(&dir.path().join("y"), &y_link).unwrap();
+        e.write(&f, b"other").unwrap();
+        for to in [dir.path().join("y"), y_link] {
+            let taken = e.copy(&f, &to).unwrap_err();
+            assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists, "{taken}");
+        }
+        assert_eq!(e.read(&dir.path().join("y")).unwrap(), payload, "untouched");
         e.remove(&f).unwrap();
         assert_eq!(e.stat(&f).unwrap(), None);
 

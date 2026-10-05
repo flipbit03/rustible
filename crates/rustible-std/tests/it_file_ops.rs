@@ -110,6 +110,54 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(ctx.sys().read_to_string(sgid)?.contains("exit 0\n"));
     assert_eq!(mode(ctx, sgid)?, 0o2755);
 
+    // A backup, as root, of another user's setuid file, with a symlink
+    // planted at its predictable name (issue #75). The name is
+    // `<file>.~rustible.<unix seconds>`, so a link sits at every second from
+    // just before now to two minutes on, each pointing at a root file the
+    // backup must not write through. The backup goes to a free name with a
+    // random suffix instead, is a new regular file with the file's owner,
+    // and carries no setuid: `std::fs::copy` wrote the old contents through
+    // the link and gave a root-owned copy mode 4755, and a root-owned copy of
+    // another user's content is one a tool trusting root-owned files would
+    // act on as root.
+    let victim = "/etc/rustible-test/files/victim";
+    ctx.sys().write_atomic(victim, b"victim\n")?;
+    ctx.sys().set_mode(victim, 0o600)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    for ts in now - 2..now + 120 {
+        ctx.sys()
+            .symlink(victim, format!("{suid}.~rustible.{ts}"))?;
+    }
+    let (first, _) = changed_then_ok(ctx, "suid backup past a planted link", || {
+        file::Copy::from_str("v5\n").to(suid).backup(true)
+    })?;
+    assert_eq!(ctx.sys().read_to_string(victim)?, "victim\n");
+    let st = ctx.sys().stat(victim)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o600, 0, 0), "{:o}", st.mode);
+    let backup = first.backup_path.clone().expect("a backup was taken");
+    let name = backup.to_string_lossy().into_owned();
+    let suffix = name
+        .strip_prefix(&format!("{suid}.~rustible."))
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, random)| random);
+    assert!(
+        suffix.is_some_and(|r| r.len() == 8 && r.chars().all(|c| c.is_ascii_hexdigit())),
+        "the planted name is skipped for a random one: {name}"
+    );
+    let st = ctx.sys().stat(&backup)?.expect("the backup exists");
+    assert_eq!(
+        (st.kind, st.mode, st.uid, st.gid),
+        (FileKind::File, 0o755, 65534, 65534),
+        "{:o}",
+        st.mode
+    );
+    assert_eq!(ctx.sys().read_to_string(&backup)?, "v4\nexit 0\n");
+    let st = ctx.sys().stat(suid)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
+
     // Attrs: mode and owner on the existing file (uid 1 = daemon everywhere).
     changed_then_ok(ctx, "attrs", || {
         file::Attrs::at(conf).mode(0o644).owner(1, 1)
