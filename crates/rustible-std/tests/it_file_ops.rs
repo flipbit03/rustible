@@ -114,10 +114,12 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     // planted at its predictable name (issue #75). The name is
     // `<file>.~rustible.<unix seconds>`, so a link sits at every second from
     // just before now to two minutes on, each pointing at a root file the
-    // backup must not write through. The backup goes to the next free name
-    // instead, is a new regular file owned by root, and carries no setuid:
-    // `std::fs::copy` wrote the old contents through the link and gave a
-    // root-owned copy mode 4755.
+    // backup must not write through. The backup goes to a free name with a
+    // random suffix instead, is a new regular file with the file's owner,
+    // and carries no setuid: `std::fs::copy` wrote the old contents through
+    // the link and gave a root-owned copy mode 4755, and a root-owned copy of
+    // another user's content is one a tool trusting root-owned files would
+    // act on as root.
     let victim = "/etc/rustible-test/files/victim";
     ctx.sys().write_atomic(victim, b"victim\n")?;
     ctx.sys().set_mode(victim, 0o600)?;
@@ -136,15 +138,19 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     let st = ctx.sys().stat(victim)?.expect("exists");
     assert_eq!((st.mode, st.uid, st.gid), (0o600, 0, 0), "{:o}", st.mode);
     let backup = first.backup_path.clone().expect("a backup was taken");
+    let name = backup.to_string_lossy().into_owned();
+    let suffix = name
+        .strip_prefix(&format!("{suid}.~rustible."))
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_, random)| random);
     assert!(
-        backup.to_string_lossy().ends_with(".1"),
-        "the planted name is skipped: {}",
-        backup.display()
+        suffix.is_some_and(|r| r.len() == 8 && r.chars().all(|c| c.is_ascii_hexdigit())),
+        "the planted name is skipped for a random one: {name}"
     );
     let st = ctx.sys().stat(&backup)?.expect("the backup exists");
     assert_eq!(
         (st.kind, st.mode, st.uid, st.gid),
-        (FileKind::File, 0o755, 0, 0),
+        (FileKind::File, 0o755, 65534, 65534),
         "{:o}",
         st.mode
     );

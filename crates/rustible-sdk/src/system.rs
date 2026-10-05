@@ -512,40 +512,41 @@ impl System {
     /// return that path.
     ///
     /// The backup is always a new file: anything already at the name, a
-    /// symlink included, is left untouched and the next name is tried
-    /// (`<name>.~rustible.<unix-ts>.1`, `.2`, up to `.9`); when all ten are
-    /// taken the backup fails naming them, and nothing is written. The copy
-    /// has `p`'s permission bits without setuid, setgid and sticky, and the
-    /// owner of whoever runs it ([`Backend::copy`] has the rules, and why).
+    /// symlink included, is left untouched and another name is tried,
+    /// `<name>.~rustible.<unix-ts>.<8 random hex digits>`, up to ten names in
+    /// all; when every one is taken the backup fails naming them, and nothing
+    /// is written. The suffixes are random so that nobody can plant every
+    /// name in advance and stop the backup. The copy has `p`'s permission
+    /// bits without setuid, setgid and sticky, and `p`'s owner and group
+    /// where the runner may give them ([`Backend::copy`] has the rules, and
+    /// why).
     pub fn backup(&self, p: impl AsRef<Path>) -> Result<PathBuf> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.backup_at(p.as_ref(), ts)
+        self.backup_at(p.as_ref(), ts, random_suffix)
     }
 
     /// How many names [`backup`](Self::backup) tries before it gives up.
     const BACKUP_NAMES: u32 = 10;
 
-    /// [`backup`](Self::backup) with the clock read, so a test can plant
-    /// what sits at each name.
-    fn backup_at(&self, p: &Path, ts: u64) -> Result<PathBuf> {
+    /// [`backup`](Self::backup) with the clock read and the suffix of each
+    /// retry given, so a test can plant what sits at each name.
+    fn backup_at(&self, p: &Path, ts: u64, mut suffix: impl FnMut() -> String) -> Result<PathBuf> {
         self.guard_mutation(p)?;
-        let base = p.file_name().unwrap_or_default();
-        let name = |n: u32| {
-            let mut name = base.to_os_string();
-            name.push(format!(".~rustible.{ts}"));
-            if n > 0 {
-                name.push(format!(".{n}"));
-            }
-            p.with_file_name(name)
-        };
+        let mut first = p.file_name().unwrap_or_default().to_os_string();
+        first.push(format!(".~rustible.{ts}"));
+        let mut tried = Vec::new();
         for n in 0..Self::BACKUP_NAMES {
-            let dest = name(n);
+            let mut name = first.clone();
+            if n > 0 {
+                name.push(format!(".{}", suffix()));
+            }
+            let dest = p.with_file_name(name);
             match self.backend.copy(p, &dest) {
                 Ok(()) => return Ok(dest),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tried.push(dest),
                 Err(e) => {
                     return Err(Self::io(p)(e).context(format!(
                         "could not back up {} to {}",
@@ -555,14 +556,14 @@ impl System {
                 }
             }
         }
+        let tried: Vec<String> = tried.iter().map(|d| d.display().to_string()).collect();
         Err(Error::msg(format!(
-            "could not back up {}: {} and the next {} names after it ({}) all exist already. \
+            "could not back up {}: all {} names tried exist already ({}). \
              A backup is never written through an existing path or symlink; \
              look at what is there, and move it away if it is stale",
             p.display(),
-            name(0).display(),
-            Self::BACKUP_NAMES - 1,
-            name(Self::BACKUP_NAMES - 1).display(),
+            Self::BACKUP_NAMES,
+            tried.join(", "),
         )))
     }
 
@@ -728,6 +729,16 @@ impl Cmd {
     }
 }
 
+/// Eight hex digits nobody can predict, for a backup's retry names. Each
+/// `RandomState` is keyed from the OS's randomness (per thread, then stepped
+/// for every new one), so hashing nothing with a fresh one is enough and needs
+/// no dependency.
+fn random_suffix() -> String {
+    use std::hash::BuildHasher;
+    let h = std::collections::hash_map::RandomState::new().hash_one(());
+    format!("{:08x}", h as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +780,15 @@ mod tests {
         System::fake(fake.clone(), Arc::new(Collect::default()))
     }
 
+    /// Retry suffixes `1`, `2`, ... in place of random ones, so a test can
+    /// plant every name; `calls` counts how many were asked for.
+    fn counting(calls: &std::cell::Cell<u32>) -> impl FnMut() -> String + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            calls.get().to_string()
+        }
+    }
+
     /// A symlink at the backup's name, dangling or not, is never written
     /// through: the backup takes the next free name, and the links and the
     /// file one points at stay exactly as they were.
@@ -781,7 +801,9 @@ mod tests {
                 .with_symlink("/etc/x.~rustible.100", "/etc/victim")
                 .with_symlink("/etc/x.~rustible.100.1", "/etc/nowhere"),
         );
-        let dest = fake_sys(&fake).backup_at(Path::new("/etc/x"), 100).unwrap();
+        let dest = fake_sys(&fake)
+            .backup_at(Path::new("/etc/x"), 100, counting(&Default::default()))
+            .unwrap();
         assert_eq!(dest, PathBuf::from("/etc/x.~rustible.100.2"));
         assert_eq!(fake.content(&dest).unwrap(), "old\n");
         let victim = fake.file("/etc/victim").unwrap();
@@ -814,7 +836,9 @@ mod tests {
             "earlier\n",
             0o640,
         ));
-        let dest = fake_sys(&fake).backup_at(Path::new("/etc/x"), 7).unwrap();
+        let dest = fake_sys(&fake)
+            .backup_at(Path::new("/etc/x"), 7, counting(&Default::default()))
+            .unwrap();
         assert_eq!(dest, PathBuf::from("/etc/x.~rustible.7.1"));
         assert_eq!(fake.content(&dest).unwrap(), "new\n");
         let earlier = fake.file("/etc/x.~rustible.7").unwrap();
@@ -824,8 +848,8 @@ mod tests {
         );
     }
 
-    /// When every name is taken the backup fails, names the first and last
-    /// name it tried, and writes nothing anywhere.
+    /// When every name is taken the backup fails, names every name it
+    /// tried, and writes nothing anywhere.
     #[test]
     fn a_backup_with_every_name_taken_fails_and_writes_nothing() {
         let names: Vec<String> = std::iter::once("/etc/x.~rustible.5".to_string())
@@ -840,12 +864,14 @@ mod tests {
         }
         let fake = Arc::new(fake);
         let err = fake_sys(&fake)
-            .backup_at(Path::new("/etc/x"), 5)
+            .backup_at(Path::new("/etc/x"), 5, counting(&Default::default()))
             .unwrap_err()
             .chain();
         assert!(
-            err.contains("could not back up /etc/x: /etc/x.~rustible.5 and the next 9 names")
-                && err.contains("(/etc/x.~rustible.5.9) all exist already"),
+            err.contains(&format!(
+                "could not back up /etc/x: all 10 names tried exist already ({})",
+                names.join(", ")
+            )),
             "{err}"
         );
         for name in &names {
@@ -912,7 +938,9 @@ mod tests {
         std::fs::write(at("x.~rustible.42.1"), "earlier\n").unwrap();
 
         let sys = System::local(false, Arc::new(Collect::default()));
-        let dest = sys.backup_at(&p, 42).unwrap();
+        let dest = sys
+            .backup_at(&p, 42, counting(&Default::default()))
+            .unwrap();
         assert_eq!(dest, at("x.~rustible.42.2"));
         assert!(
             std::fs::symlink_metadata(&dest)
@@ -930,5 +958,75 @@ mod tests {
             std::fs::read_to_string(at("x.~rustible.42.1")).unwrap(),
             "earlier\n"
         );
+    }
+
+    /// Root backing up another user's file gives the backup that user's
+    /// owner and group: a root-owned copy of their content is something a
+    /// tool that trusts root-owned files (logrotate) would act on as root.
+    #[test]
+    fn a_backup_keeps_the_owner_of_the_file() {
+        let fake = Arc::new(Fake::new().with_file_mode("/home/x/app.conf", "cfg", 0o4644));
+        let sys = fake_sys(&fake);
+        sys.set_owner("/home/x/app.conf", 65534, 65534).unwrap();
+        let dest = sys.backup("/home/x/app.conf").unwrap();
+        let b = fake.file(&dest).unwrap();
+        assert_eq!((b.uid, b.gid, b.mode), (65534, 65534, 0o644));
+    }
+
+    /// Only a name already taken moves the backup on to the next one. Any
+    /// other failure ends it there, naming the backup it was making, rather
+    /// than trying nine more and reporting that they all exist.
+    #[test]
+    fn a_backup_that_fails_otherwise_tries_one_name() {
+        let fake = Arc::new(Fake::new());
+        let calls = std::cell::Cell::new(0);
+        let err = fake_sys(&fake)
+            .backup_at(Path::new("/etc/missing"), 5, counting(&calls))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains("could not back up /etc/missing to /etc/missing.~rustible.5:")
+                && !err.contains("exist already"),
+            "{err}"
+        );
+        assert_eq!(calls.get(), 0, "a second name was tried");
+    }
+
+    /// A directory is not backed up, and nothing is created for it.
+    #[test]
+    fn a_backup_of_a_directory_is_refused() {
+        let fake = Arc::new(Fake::new().with_dir("/etc/d"));
+        let calls = std::cell::Cell::new(0);
+        let err = fake_sys(&fake)
+            .backup_at(Path::new("/etc/d"), 5, counting(&calls))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(calls.get(), 0);
+        assert!(fake.file("/etc/d.~rustible.5").is_none());
+    }
+
+    /// The retry names are random, so planting every name a counter would
+    /// produce does not stop a backup.
+    #[test]
+    fn predictable_names_do_not_block_a_backup() {
+        let mut fake = Fake::new().with_file("/etc/x", "old\n");
+        fake = fake.with_file("/etc/x.~rustible.5", "planted");
+        for n in 0..100 {
+            fake = fake.with_file(format!("/etc/x.~rustible.5.{n}"), "planted");
+        }
+        let fake = Arc::new(fake);
+        let dest = fake_sys(&fake)
+            .backup_at(Path::new("/etc/x"), 5, random_suffix)
+            .unwrap();
+        let name = dest.to_string_lossy().into_owned();
+        let suffix = name.strip_prefix("/etc/x.~rustible.5.").expect(&name);
+        assert!(
+            suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "{name}"
+        );
+        assert_eq!(fake.content(&dest).unwrap(), "old\n");
+        let (a, b) = (random_suffix(), random_suffix());
+        assert_ne!(a, b, "two suffixes in a row");
     }
 }

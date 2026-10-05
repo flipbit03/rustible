@@ -188,22 +188,43 @@ impl Backend for Local {
     // `create_new` is `O_CREAT | O_EXCL`, and POSIX makes that fail with
     // `EEXIST` when `to` is a symlink, "regardless of the contents of the
     // symbolic link", so it never follows one, dangling or not; that is what
-    // stands in for `O_NOFOLLOW`, which `std` has no constant for. The copy
-    // is created `0600`, so its content is never readable by anyone else
-    // while it is being written, and gets its mode, without `0o7000`, by
-    // `fchmod` once the data is in. `EEXIST` keeps its errno, so the
-    // `Elevated` helper hands `AlreadyExists` back intact.
+    // stands in for `O_NOFOLLOW`, which `std` has no constant for. `EEXIST`
+    // keeps its errno, so the `Elevated` helper hands `AlreadyExists` back
+    // intact.
+    //
+    // The source is checked with a `stat` before it is opened, because
+    // opening a FIFO for reading blocks until a writer appears, and again on
+    // the descriptor, in case it was swapped in between.
+    //
+    // Once the data is in, through the descriptor: (1) `fchmod` to the
+    // source's mode without setuid, setgid and sticky, while the runner
+    // still owns the copy, so a root without `CAP_FOWNER` can still do it;
+    // (2) `fchown` to the source's owner and group when they differ, so a
+    // root-owned copy of another user's file never exists for something
+    // that trusts root-owned files (logrotate did, in the review), with
+    // `EPERM` ignored as Ansible's `preserved_copy` does: an unprivileged
+    // runner keeps its own copy. With `0o7000` gone there is nothing for the
+    // `chown` to clear, so this order loses nothing.
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
 
+        let not_regular = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: not a regular file, so not copied", from.display()),
+            )
+        };
+        if !std::fs::metadata(from)?.is_file() {
+            return Err(not_regular());
+        }
         let mut src = std::fs::File::open(from)?;
         let meta = src.metadata()?;
         if !meta.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{}: not a regular file, so not copied", from.display()),
-            ));
+            return Err(not_regular());
         }
+        // Load-bearing: the copy is `0600` until the data is in, so nobody
+        // else can read it in between; nothing outside this function can
+        // observe that window, so no test holds it.
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -211,7 +232,17 @@ impl Backend for Local {
             .open(to)?;
         let mode = meta.permissions().mode() & 0o777;
         let filled = io::copy(&mut src, &mut dst)
-            .and_then(|_| dst.set_permissions(std::fs::Permissions::from_mode(mode)));
+            .and_then(|_| dst.set_permissions(std::fs::Permissions::from_mode(mode)))
+            .and_then(|()| {
+                let mine = dst.metadata()?;
+                if (mine.uid(), mine.gid()) == (meta.uid(), meta.gid()) {
+                    return Ok(());
+                }
+                match std::os::unix::fs::fchown(&dst, Some(meta.uid()), Some(meta.gid())) {
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+                    other => other,
+                }
+            });
         if let Err(e) = filled {
             drop(dst);
             // `create_new` succeeded, so the path is ours to remove; unlink
@@ -375,6 +406,53 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&to).unwrap(), "data");
         }
+    }
+
+    /// Unprivileged, a copy of a file someone else owns cannot be given to
+    /// them: the `EPERM` from `fchown` is ignored, as Ansible's
+    /// `preserved_copy` does, and the runner keeps its own copy. As root the
+    /// owner is given (T2 in `it_file_ops`); this one is skipped as root.
+    #[test]
+    fn a_copy_that_cannot_be_given_its_owner_is_kept() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let src = Path::new("/etc/passwd");
+        assert_eq!(
+            Local.stat(src).unwrap().unwrap().uid,
+            0,
+            "a root-owned source"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("passwd");
+        Local.copy(src, &to).unwrap();
+        let st = Local.stat(&to).unwrap().unwrap();
+        assert_eq!(st.uid, rustix::process::geteuid().as_raw());
+        assert_eq!(Local.read(&to).unwrap(), Local.read(src).unwrap());
+    }
+
+    /// A FIFO source is refused at once, before it is opened: opening one
+    /// for reading blocks until a writer appears, which would hang the step.
+    /// Bounded, so a regression fails instead of wedging the suite.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fifo, to) = (dir.path().join("fifo"), dir.path().join("copy"));
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (f, t) = (fifo.clone(), to.clone());
+        std::thread::spawn(move || tx.send(Local.copy(&f, &t)));
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("copy blocked on a FIFO")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(Local.stat(&to).unwrap().is_none());
     }
 
     /// A copy that fails part-way removes what it created. `/proc/self/mem`

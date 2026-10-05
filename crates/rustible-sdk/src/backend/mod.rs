@@ -181,8 +181,11 @@ pub trait Backend: Send + Sync {
     /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) and is left as it
     /// was, so nothing is ever written through a link planted at `to`. The
     /// copy gets `from`'s permission bits **without** setuid, setgid and
-    /// sticky (`0o7000`), and the owner of whoever runs it: it never
-    /// `chown`s. Unlike [`write`](Backend::write) this is not atomic, but a
+    /// sticky (`0o7000`), and `from`'s owner and group when the runner
+    /// may give them (root); otherwise, `EPERM` ignored, the runner's. A
+    /// source that is not a regular file (a directory, a FIFO) is refused
+    /// before it is opened, with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput). Unlike [`write`](Backend::write) this is not atomic, but a
     /// failure part-way removes the `to` it created, so it never leaves a
     /// half-written copy behind. [`System::backup`](crate::System::backup)
     /// is its one caller, and these rules are its safety (issue #75).

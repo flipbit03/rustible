@@ -439,13 +439,15 @@ impl Backend for Fake {
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
         // `Local::copy`'s rules (issue #75): the source is followed and must
         // be a regular file; anything at `to`, a symlink included, refuses
-        // with `AlreadyExists` and stays as it was; the copy is new, owned by
-        // whoever runs it (root, as everywhere in the fake), and carries the
-        // source's mode without setuid, setgid and sticky.
+        // with `AlreadyExists` and stays as it was; the copy is new, carries
+        // the source's mode without setuid, setgid and sticky, and is given
+        // the source's owner and group, which always succeeds here because
+        // the fake runs as root (`Local` ignores the `EPERM` an unprivileged
+        // runner gets).
         let mut files = self.files.lock().unwrap();
         let real = Self::resolve(&files, from);
-        let (bytes, mode) = match files.get(&real) {
-            Some(f) if f.kind == FileKind::File => (f.bytes.clone(), f.mode),
+        let (bytes, mode, uid, gid) = match files.get(&real) {
+            Some(f) if f.kind == FileKind::File => (f.bytes.clone(), f.mode, f.uid, f.gid),
             Some(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -468,8 +470,8 @@ impl Backend for Fake {
             FakeFile {
                 bytes,
                 mode: mode & 0o777,
-                uid: 0,
-                gid: 0,
+                uid,
+                gid,
                 kind: FileKind::File,
             },
         );
