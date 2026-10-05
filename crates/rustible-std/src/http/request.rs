@@ -108,11 +108,12 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// too. A body given with `.json`, `.form` or `.body` is not a secret, and
 /// the diff shows it. A value given as a `Secret` anywhere on the request
 /// (a header, the bearer token, the basic-auth password, the URL's
-/// password) shows inside it as `<secret>` when it appears as it is, as
-/// `.json` or `.form` encode it, or in the variants other encoders commonly
-/// write (`\/`, `\u00e4`, lowercase `%xx`, `%20`); encoded any other way by
-/// hand (base64, another escaping), it is shown. To send a password in a
-/// JSON body, use `.body_secret(&s).content_type("application/json")`.
+/// password) shows inside it as `<secret>` where it appears as it is, as
+/// `.json` writes it, or as `.form` writes it. A secret inside a body you
+/// encoded yourself (`.body(..)`) in any other way is shown as you wrote
+/// it. For a body that is secret, use [`Request::body_secret`]: to send a
+/// password in a JSON body,
+/// `.body_secret(&s).content_type("application/json")`.
 ///
 /// **Redirects** are followed for `GET` and `HEAD` and not for anything
 /// else (Ansible's `safe`); [`Request::follow_redirects`] changes that. At
@@ -546,16 +547,16 @@ impl Request {
         Ok(match &self.body {
             Body::None | Body::Invalid(_) => Shown::None,
             Body::Plain { bytes, .. } if bytes.is_empty() => Shown::None,
-            Body::Plain { bytes, kind } => {
-                let content_type = self.content_type_to_send();
-                let ct = content_type.as_deref();
+            Body::Plain { bytes, .. } => {
                 let scrubs = body_scrubs(
                     client::scrub_list(&self.url, &self.wire_headers()?, None, &self.raw_secrets()),
                     &self.url,
-                    *kind == Kind::Json || ct.is_some_and(is_json_content_type),
-                    *kind == Kind::Form || ct.is_some_and(is_form_content_type),
                 );
-                Shown::Text(body_summary(bytes, ct, &scrubs))
+                Shown::Text(body_summary(
+                    bytes,
+                    self.content_type_to_send().as_deref(),
+                    &scrubs,
+                ))
             }
             Body::Secret(s) => Shown::Secret(s.len()),
         })
@@ -961,21 +962,14 @@ fn is_json_content_type(ct: &str) -> bool {
     sub == "json" || sub.ends_with("+json")
 }
 
-/// Whether a `Content-Type` is `application/x-www-form-urlencoded`.
-fn is_form_content_type(ct: &str) -> bool {
-    let media = ct.split(';').next().unwrap_or_default().trim();
-    media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
-}
-
-/// What to scrub from a shown body: the client's list, plus each secret in
-/// the forms a body carries it in. The URL's userinfo percent-decoded, as
-/// the server reads it. For a JSON body each one JSON-escaped as `.json`
-/// writes it (a `"` in it is `\"`), and as PHP and Python do by default
-/// (`/` as `\/`, non-ASCII as `\u00e4`). For a form each one form-encoded
-/// as `.form` writes it (`p@ss` is `p%40ss`, a space `+`), and with
-/// lowercase hex and `%20`, as other encoders do. A secret encoded any
-/// other way is not recognised.
-fn body_scrubs(mut list: Vec<String>, url: &str, json: bool, form: bool) -> Vec<String> {
+/// What to scrub from a shown body: the client's list, with the URL's
+/// userinfo and password percent-decoded as the server reads them, and each
+/// of those in the two forms Rustible's own encoders write: JSON-escaped as
+/// `.json` writes it (a `"` in it is `\"`), and form-encoded as `.form`
+/// writes it (`p@ss` is `p%40ss`, a space `+`). Both, whatever the body's
+/// kind or content type. A secret in a body encoded by hand any other way
+/// is not recognised, and is shown as written (Decision 4 on #83).
+fn body_scrubs(mut list: Vec<String>, url: &str) -> Vec<String> {
     let add = |list: &mut Vec<String>, s: String| {
         if !s.is_empty() && !list.contains(&s) {
             list.push(s);
@@ -992,37 +986,12 @@ fn body_scrubs(mut list: Vec<String>, url: &str, json: bool, form: bool) -> Vec<
         }
     }
     for s in list.clone() {
-        if json && let Ok(quoted) = serde_json::to_string(&s) {
-            let escaped = &quoted[1..quoted.len() - 1];
-            let ascii = json_ascii(escaped);
-            for v in [&ascii, escaped] {
-                add(&mut list, v.replace('/', "\\/"));
-                add(&mut list, v.to_string());
-            }
+        if let Ok(quoted) = serde_json::to_string(&s) {
+            add(&mut list, quoted[1..quoted.len() - 1].to_string());
         }
-        if form {
-            for (lower, plus) in [(false, true), (false, false), (true, true), (true, false)] {
-                add(&mut list, form_component_with(&s, lower, plus));
-            }
-        }
+        add(&mut list, form_component(&s));
     }
     list
-}
-
-/// JSON-escaped text with every non-ASCII character as `\uXXXX` (UTF-16,
-/// so a surrogate pair past the BMP), as Python's `ensure_ascii` writes it.
-fn json_ascii(escaped: &str) -> String {
-    let mut out = String::with_capacity(escaped.len());
-    for c in escaped.chars() {
-        if c.is_ascii() {
-            out.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                out.push_str(&format!("\\u{unit:04x}"));
-            }
-        }
-    }
-    out
 }
 
 /// `%XX` decoded, everything else as it is; `None` when the result is not
@@ -1279,20 +1248,13 @@ fn form_encode(pairs: &[(String, String)]) -> String {
 
 /// One key or value of a form, encoded as [`form_encode`] encodes it.
 fn form_component(s: &str) -> String {
-    form_component_with(s, false, true)
-}
-
-/// [`form_component`] with lowercase hex, or `%20` for a space, as other
-/// encoders write them.
-fn form_component_with(s: &str, lower: bool, plus: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
                 out.push(b as char)
             }
-            b' ' if plus => out.push('+'),
-            _ if lower => out.push_str(&format!("%{b:02x}")),
+            b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -1747,7 +1709,7 @@ mod tests {
     /// left half shown; in JSON, in its escaped form too.
     #[test]
     fn a_shown_body_is_scrubbed_of_every_secret() {
-        let secrets = body_scrubs(vec!["t0k\"en".to_string()], "http://h/", true, false);
+        let secrets = body_scrubs(vec!["t0k\"en".to_string()], "http://h/");
         assert_eq!(
             body_summary(b"x t0k\"en y", Some("text/plain"), &secrets),
             "x <secret> y"
@@ -1961,11 +1923,14 @@ mod tests {
         assert_eq!(render(lone), "POST http://********@h/x\n<secret>");
     }
 
-    /// Bodies built by hand often come from another encoder: PHP's JSON
-    /// writes `/` as `\/`, Python's escapes non-ASCII as `\u00e4`, and form
-    /// encoders differ on hex case and on `+` or `%20` for a space.
+    /// Decision 4 on #83: a secret is scrubbed raw and in the two forms
+    /// Rustible's own encoders write, whatever the body's kind or content
+    /// type, and in no other. A body encoded by hand some other way (PHP's
+    /// `\/`, Python's `\u00e4`, lowercase hex, `%20`) shows it as written:
+    /// that is the documented limit, and `.body_secret` is the way to send
+    /// a body that is secret.
     #[test]
-    fn a_secret_is_scrubbed_as_common_encoders_write_it() {
+    fn a_secret_encoded_by_hand_another_way_is_shown_as_written() {
         let (s, _) = sys(false);
         let render = |secret: &str, body: &str, ct: &str| {
             let op = Request::post("http://h/x")
@@ -1977,36 +1942,41 @@ mod tests {
             };
             i.diff().render()
         };
-        let json = "application/json";
-        for (secret, body) in [
-            ("t/k", r#"{"t":"t\/k"}"#),
-            ("pässwörd", r#"{"t":"p\u00e4ssw\u00f6rd"}"#),
-            ("k🔑", r#"{"t":"k\ud83d\udd11"}"#),
-            ("ä/x", r#"{"t":"\u00e4\/x"}"#),
-        ] {
-            assert_eq!(
-                render(secret, body, json),
-                "POST http://h/x\n{\n  \"t\": \"<secret>\"\n}\n\
-                 (reformatted for display; "
-                    .to_string()
-                    + &body.len().to_string()
-                    + " bytes are sent)",
-                "{body}"
-            );
-        }
+        // Our own forms, whatever the content type says.
+        assert_eq!(
+            render("t0k\"en", r#"{"t":"t0k\"en"}"#, "text/plain"),
+            r#"POST http://h/x
+{"t":"<secret>"}"#
+        );
+        assert_eq!(
+            render("p@ss w/rd", r#"{"s":"p%40ss+w%2Frd"}"#, "application/json"),
+            "POST http://h/x\n{\n  \"s\": \"<secret>\"\n}\n\
+             (reformatted for display; 21 bytes are sent)"
+        );
+        // Other encoders' forms: shown as written.
+        assert_eq!(
+            render("t/k", r#"{"t":"t\/k"}"#, "application/json"),
+            "POST http://h/x\n{\n  \"t\": \"t\\/k\"\n}\n\
+             (reformatted for display; 12 bytes are sent)"
+        );
+        assert!(
+            render(
+                "pässwörd",
+                r#"{"t":"p\u00e4ssw\u00f6rd"}"#,
+                "application/json"
+            )
+            .contains(r#""p\u00e4ssw\u00f6rd""#)
+        );
         let form = "application/x-www-form-urlencoded";
-        for body in [
-            "s=p%40ss+w%2Frd",
-            "s=p%40ss%20w%2Frd",
-            "s=p%40ss+w%2frd",
-            "s=p%40ss%20w%2frd",
-        ] {
-            assert_eq!(
-                render("p@ss w/rd", body, form),
-                "POST http://h/x\ns=<secret>",
-                "{body}"
-            );
-        }
+        assert_eq!(
+            render("p@ss w/rd", "s=p%40ss%20w%2frd", form),
+            "POST http://h/x\ns=p%40ss%20w%2frd"
+        );
+        assert_eq!(
+            render("p@ss w/rd", "s=p%40ss+w%2Frd", form),
+            "POST http://h/x\ns=<secret>",
+            "as .form writes it"
+        );
     }
 
     #[test]
