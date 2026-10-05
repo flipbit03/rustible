@@ -231,12 +231,15 @@ impl<W: Write> Renderer<W> {
                 self.line(host, &text);
                 // Whatever the status: a step carries a diff only when its
                 // `check` planned something (changed, would change, failed
-                // in `apply`, or ran and changed nothing), and the step line
-                // shows only the diff's first line.
+                // in `apply`, cancelled between `check` and `apply`, or ran
+                // and changed nothing), and the step line shows only the
+                // diff's first line. One line is already whole there.
                 if self.verbosity >= 1
                     && let Some(d) = diff
+                    && let full = d.render()
+                    && full.trim_end_matches('\n') != d.short()
                 {
-                    for l in d.render().lines() {
+                    for l in full.lines() {
                         self.line(host, &format!("    | {l}"));
                     }
                 }
@@ -1593,6 +1596,29 @@ web1    4        1             0        0       0          2         0
                  [local]      | }}\n"
             )
         );
+    }
+
+    /// A diff of one line is already whole on the step line: `-v` does not
+    /// repeat it underneath, whatever the status.
+    #[test]
+    fn a_one_line_diff_is_not_repeated_at_v() {
+        for status in [
+            Status::Ok,
+            Status::Changed,
+            Status::WouldChange,
+            Status::Failed,
+        ] {
+            let mut ev = step_finished(1, "query", status);
+            if let Event::StepFinished { diff, .. } = &mut ev {
+                *diff = Some(rustible_sdk::Diff::summary("GET http://h/x\n"));
+            }
+            let out = render(1, |r| {
+                r.event("local", &step_started(1, "query"));
+                r.event("local", &ev);
+            });
+            assert_eq!(out.lines().count(), 1, "{status:?}: {out}");
+            assert!(out.contains("GET http://h/x"), "{out}");
+        }
     }
 
     #[test]

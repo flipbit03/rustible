@@ -1344,6 +1344,34 @@ mod tests {
         let (status, diff, note) = finished(&sink);
         assert_eq!((status, diff.as_deref()), (Status::Failed, Some(SHOWN)));
         assert!(note.is_some_and(|n| n.contains("cancelled")));
+
+        // And `-v` prints what it would have done under its FAILED line.
+        #[derive(Clone, Default)]
+        struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Shared::default();
+        let printer = crate::event::Compact::new(out.clone(), 1);
+        for ev in sink.events() {
+            if matches!(ev, Event::StepFinished { .. }) {
+                crate::event::EventSink::emit(&printer, ev);
+            }
+        }
+        let printed = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            printed.starts_with("FAILED: cancelled  +1 -1 lines  "),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("\n    | +reported by the intent\n"),
+            "{printed}"
+        );
     }
 
     #[test]

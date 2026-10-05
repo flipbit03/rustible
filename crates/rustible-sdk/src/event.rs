@@ -121,10 +121,12 @@ pub enum Event {
         status: Status,
         /// What `check` planned. Absent when the step was already satisfied
         /// and when `check` itself failed; present for `Changed`,
-        /// `WouldChange`, a failed `apply`, and the `ran, unchanged` case.
+        /// `WouldChange`, a failed `apply`, a step cancelled between `check`
+        /// and `apply` (a `Failed` one), and the `ran, unchanged` case.
         /// Reporters put [`Diff::short`](crate::diff::Diff::short) on the
-        /// step line and the full [`Diff::render`](crate::diff::Diff::render)
-        /// underneath at `-v`.
+        /// step line and, at `-v`, the full
+        /// [`Diff::render`](crate::diff::Diff::render) underneath, unless it
+        /// is the one line the step line already shows.
         diff: Option<Diff>,
         /// A short suffix for the step line, except on `Failed` where it
         /// carries the whole rendered error chain instead. `Ctx::step` sets
@@ -478,11 +480,14 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     tail.push_str(&format!("  as {identity}"));
                 }
                 let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
-                // Whatever the status: a satisfied step carries no diff.
+                // Whatever the status (a satisfied step carries no diff),
+                // unless the step line already shows all of it.
                 if self.verbosity >= 1
                     && let Some(d) = diff
+                    && let full = d.render()
+                    && full.trim_end_matches('\n') != d.short()
                 {
-                    for line in d.render().lines() {
+                    for line in full.lines() {
                         let _ = writeln!(w, "    | {line}");
                     }
                 }
@@ -709,6 +714,25 @@ mod tests {
             print(1),
             "ok: query  GET http://h/x …  ran, unchanged\n    | GET http://h/x\n    | q=1\n"
         );
+    }
+
+    /// A diff of one line is already whole on the step line; `-v` does not
+    /// repeat it.
+    #[test]
+    fn compact_does_not_repeat_a_one_line_diff_at_v() {
+        let printer = Compact::new(Vec::new(), 1);
+        printer.emit(Event::StepFinished {
+            id: 1,
+            blocks: vec![],
+            name: "restart".into(),
+            identity: "self".into(),
+            status: Status::Changed,
+            diff: Some(Diff::summary("systemctl restart nginx")),
+            note: None,
+            elapsed_ms: 0,
+        });
+        let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
+        assert_eq!(out, "changed: restart  systemctl restart nginx\n");
     }
 
     #[test]
