@@ -174,6 +174,10 @@ fn policy(sys: &System, name: &str) -> Result<Policy> {
 /// Age of the apt lists: mtime of `/var/lib/apt/lists`, else of
 /// `/var/cache/apt/pkgcache.bin`, via `stat -c %Y` (the SDK's `Stat` carries
 /// no mtime). `None` when neither can be read.
+///
+/// Known gap (#70): an `apt-get update` that changes no index leaves the
+/// directory's mtime where it was, so lists just confirmed fresh can still
+/// read as stale here.
 fn cache_age(sys: &System) -> Result<Option<Duration>> {
     for path in ["/var/lib/apt/lists", "/var/cache/apt/pkgcache.bin"] {
         let Some(out) = sys.cmd("stat").args(["-c", "%Y", path]).ok()? else {

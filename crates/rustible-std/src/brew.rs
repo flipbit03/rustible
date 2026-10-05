@@ -8,9 +8,15 @@
 //! `brew list --formula --versions` does: a formula is a directory
 //! `<Cellar>/<name>/`, and its installed versions are the directories in it.
 //! Running `brew` itself, even `brew list`, starts Homebrew's Ruby, which may
-//! first download a vendored Ruby from `ghcr.io` into the prefix; a dry run
-//! contacts nothing outside the target and changes nothing (vision 12). Only
-//! `apply` runs `brew install` and `brew uninstall`.
+//! first download a vendored Ruby from `ghcr.io` into the Homebrew
+//! installation (`HOMEBREW_LIBRARY`); a dry run contacts nothing outside the
+//! target and changes nothing (vision 12). Only `apply` runs `brew install`
+//! and `brew uninstall`.
+//!
+//! Known gaps, both older than the Cellar read: an alias or an old name of a
+//! formula never matches its rack, so [`Present`] installs it on every run
+//! (#72); and [`Absent`] runs `brew uninstall` without `--force`, which
+//! leaves a formula with several versions installed (#71).
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -56,8 +62,11 @@ const BREW_PATHS: [&str; 3] = [
 /// One formula and the version Homebrew has for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formula {
-    /// The formula name as the op was given it. Nothing is resolved: a tap
-    /// or an alias is whatever brew makes of it.
+    /// The formula name as the op was given it, which is also the name of
+    /// its rack in the Cellar: the two are compared exactly. A tap-qualified
+    /// name is refused (see [`validate_formula`]), and an alias or an old
+    /// name does not match the rack its formula is installed under, so it
+    /// reads as not installed (#72).
     pub name: String,
     /// The installed version. Empty for a formula [`Present`] is about to
     /// install, since brew has not resolved it yet.
@@ -83,20 +92,26 @@ pub struct RemoveReport {
     pub already_absent: Vec<String>,
 }
 
-/// Pure: the formula one Cellar rack stands for, given the rack's name and
-/// the names of the version directories in it, by the rule
-/// `brew list --formula --versions` follows (`Formula.racks`): a name
-/// starting with `.` is not a formula, and neither is a rack with no version
-/// in it. The version is the directory's name exactly, revision suffix and
-/// all (`3.6.7_1`). With several installed, the first in byte order is
-/// reported; `brew list` prints them in the directory's own order, so which
-/// one it named first was never specified.
-pub fn rack_formula(name: &str, mut versions: Vec<String>) -> Option<Formula> {
+/// Pure: the formula one Cellar rack stands for, given the rack's name, the
+/// names of the version directories in it, and the version
+/// `<prefix>/opt/<name>` points at, if it is a link into one. The rule is
+/// `brew list --formula --versions`' (`Formula.racks`): a name starting with
+/// `.` is not a formula, and neither is a rack with no version in it. The
+/// version is a directory's name exactly, revision suffix and all
+/// (`3.6.7_1`). With several installed, it is the one the opt link points
+/// at, which is Homebrew's current version (`list.sh`'s `optlinked_version`,
+/// the first choice of `resolve_default_keg`); an opt link to a version not
+/// in this rack is ignored. Without one, the first in byte order, which is
+/// not version order (`10.0` sorts before `9.1`) but is at least stable.
+fn rack_formula(name: &str, mut versions: Vec<String>, opt: Option<&str>) -> Option<Formula> {
     if name.starts_with('.') {
         return None;
     }
     versions.sort();
-    let version = versions.into_iter().next()?;
+    let version = match opt {
+        Some(v) if versions.iter().any(|have| have == v) => v.to_string(),
+        _ => versions.into_iter().next()?,
+    };
     Some(Formula {
         name: name.to_string(),
         version,
@@ -130,7 +145,7 @@ fn normalize(p: &Path) -> PathBuf {
 /// a directory, else `<prefix>/Cellar`.
 fn cellar_candidates(brew: &Path, link_target: Option<&Path>) -> Vec<PathBuf> {
     let bin = brew.parent().unwrap_or(Path::new("/"));
-    let prefix = bin.parent().unwrap_or(Path::new("/"));
+    let prefix = prefix_of(brew);
     let mut out = vec![];
     if let Some(target) = link_target {
         let target = normalize(&bin.join(target));
@@ -216,21 +231,39 @@ fn require_brew_not_root(sys: &System, op: &str) -> Result<String> {
     brew_bin(sys)
 }
 
-/// Whether `p` is a directory, following symlinks, as Ruby's `directory?`.
+fn is_symlink(sys: &System, p: &Path) -> Result<bool> {
+    Ok(matches!(sys.stat(p)?, Some(s) if s.kind == FileKind::Symlink))
+}
+
+/// Whether `p` is a directory, following symlinks, as Ruby's `directory?`
+/// decides it: a symlink that cannot be followed (a loop, a target this
+/// account may not stat) is not a directory, rather than an error. An error
+/// on a path that is not a symlink still fails the step.
 fn is_dir(sys: &System, p: &Path) -> Result<bool> {
-    Ok(matches!(sys.stat_follow(p)?, Some(s) if s.kind == FileKind::Dir))
+    match sys.stat_follow(p) {
+        Ok(stat) => Ok(matches!(stat, Some(s) if s.kind == FileKind::Dir)),
+        Err(_) if is_symlink(sys, p)? => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The two directories above `brew`: Homebrew's prefix.
+fn prefix_of(brew: &Path) -> &Path {
+    brew.parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("/"))
 }
 
 /// The Cellar of the `brew` at `brew`: the first of [`cellar_candidates`]
 /// that is a directory. `None` when none is, which is a Homebrew with
 /// nothing installed yet.
-fn cellar(sys: &System, brew: &str) -> Result<Option<PathBuf>> {
-    let path = Path::new(brew);
-    let target = match sys.stat(path)? {
-        Some(s) if s.kind == FileKind::Symlink => Some(sys.read_link(path)?),
-        _ => None,
+fn cellar(sys: &System, brew: &Path) -> Result<Option<PathBuf>> {
+    let target = if is_symlink(sys, brew)? {
+        Some(sys.read_link(brew)?)
+    } else {
+        None
     };
-    for candidate in cellar_candidates(path, target.as_deref()) {
+    for candidate in cellar_candidates(brew, target.as_deref()) {
         if is_dir(sys, &candidate)? {
             return Ok(Some(candidate));
         }
@@ -238,23 +271,57 @@ fn cellar(sys: &System, brew: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Every formula brew currently has installed, read from the Cellar through
-/// `sys` exactly as `brew list --formula --versions` reads it, and without
-/// running `brew` (see the module docs). A rack is a directory in the Cellar
-/// that is not itself a symlink; its versions are the directories in it.
-fn installed(sys: &System, brew: &str) -> Result<Vec<Formula>> {
+/// The version directory `<prefix>/opt/<name>` resolves to, when it is a
+/// symlink to a directory (`list.sh`: `-L` and `-d`), followed hop by hop
+/// through `sys` as `realpath` would. `None` otherwise.
+fn opt_version(sys: &System, prefix: &Path, name: &str) -> Result<Option<String>> {
+    let mut cur = prefix.join("opt").join(name);
+    if !is_symlink(sys, &cur)? {
+        return Ok(None);
+    }
+    // Hop by hop, with `..` resolved by name at each step, so the end is a
+    // plain path; the bound is the kernel's own, and a chain longer than it
+    // (a loop) is not a directory.
+    for _ in 0..40 {
+        if !is_symlink(sys, &cur)? {
+            if !is_dir(sys, &cur)? {
+                return Ok(None);
+            }
+            return Ok(cur.file_name().and_then(|n| n.to_str()).map(str::to_string));
+        }
+        let target = sys.read_link(&cur)?;
+        let dir = cur.parent().unwrap_or(Path::new("/"));
+        cur = normalize(&dir.join(target));
+    }
+    Ok(None)
+}
+
+/// Which of `names` brew has installed, read from the Cellar through `sys`
+/// as `brew list --formula --versions` reads it, and without running `brew`
+/// (see the module docs). Only the named racks are read, not the whole
+/// Cellar, which matters when every read is a round trip to a helper under
+/// `ctx.as_user`. A rack is a directory in the Cellar, not itself a symlink,
+/// whose name is the requested name exactly: the Cellar is listed once and
+/// compared by name, because on a case-insensitive volume (APFS by default)
+/// `<Cellar>/Python` answers for `python`. Its versions are the directories
+/// in it, symlinks to directories included (`Pathname#subdirs`).
+fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>> {
+    let brew = Path::new(brew);
     let Some(cellar) = cellar(sys, brew)? else {
         return Ok(vec![]);
     };
-    let mut racks = sys.read_dir(&cellar)?;
-    racks.sort();
+    let racks: Vec<String> = sys
+        .read_dir(&cellar)?
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
     let mut formulae = vec![];
-    for rack in racks {
-        let Some(name) = rack.file_name().and_then(|n| n.to_str()) else {
+    for name in names {
+        if !racks.iter().any(|r| r == name) {
             continue;
-        };
-        let linked = matches!(sys.stat(&rack)?, Some(s) if s.kind == FileKind::Symlink);
-        if linked || !is_dir(sys, &rack)? {
+        }
+        let rack = cellar.join(name);
+        if is_symlink(sys, &rack)? || !is_dir(sys, &rack)? {
             continue;
         }
         let mut versions = vec![];
@@ -265,7 +332,14 @@ fn installed(sys: &System, brew: &str) -> Result<Vec<Formula>> {
                 versions.push(v.to_string());
             }
         }
-        formulae.extend(rack_formula(name, versions));
+        // The opt link only decides between several versions; with one,
+        // the answer is the same either way and the reads are saved.
+        let opt = if versions.len() > 1 {
+            opt_version(sys, prefix_of(brew), name)?
+        } else {
+            None
+        };
+        formulae.extend(rack_formula(name, versions, opt.as_deref()));
     }
     Ok(formulae)
 }
@@ -329,7 +403,7 @@ impl Op for Present {
                 bail!("brew::Present: {why}");
             }
         }
-        let have = installed(sys, &brew)?;
+        let have = installed(sys, &brew, &self.names)?;
         let mut report = InstallReport::default();
         let mut missing = vec![];
         for name in &self.names {
@@ -358,7 +432,7 @@ impl Op for Present {
             .args(missing.iter().cloned())
             .run()?;
         // Read the versions back so the report names what actually landed.
-        let now = installed(sys, &brew)?;
+        let now = installed(sys, &brew, &self.names)?;
         let mut report = InstallReport::default();
         for name in &self.names {
             let f = now
@@ -441,7 +515,7 @@ impl Op for Absent {
                 bail!("brew::Absent: {why}");
             }
         }
-        let have = installed(sys, &brew)?;
+        let have = installed(sys, &brew, &self.names)?;
         let mut report = RemoveReport::default();
         for name in &self.names {
             match have.iter().find(|f| &f.name == name) {
@@ -541,7 +615,7 @@ mod tests {
     #[test]
     fn a_rack_is_its_name_and_its_version_directory_verbatim() {
         assert_eq!(
-            rack_formula("nethack", vec!["3.6.7".into()]),
+            rack_formula("nethack", vec!["3.6.7".into()], None),
             Some(Formula {
                 name: "nethack".into(),
                 version: "3.6.7".into()
@@ -549,25 +623,31 @@ mod tests {
         );
         // The revision suffix is part of the version, as `brew list` prints it.
         assert_eq!(
-            rack_formula("openssl@3", vec!["3.6.1_1".into()])
+            rack_formula("openssl@3", vec!["3.6.1_1".into()], None)
                 .unwrap()
                 .version,
             "3.6.1_1"
         );
-        // Several versions: the first in byte order, whatever order they came in.
-        assert_eq!(
-            rack_formula("openssl@3", vec!["3.6.1".into(), "3.5.0".into()])
-                .unwrap()
-                .version,
-            "3.5.0"
-        );
+    }
+
+    /// Several versions: the one the opt link points at is Homebrew's
+    /// current one, whatever byte order says (`10.0` sorts before `9.1`).
+    /// Without an opt link, or with one pointing at a version this rack does
+    /// not have, the first in byte order, whatever order they came in.
+    #[test]
+    fn several_versions_report_the_opt_linked_one_else_the_first_in_byte_order() {
+        let versions = || vec!["9.1".to_string(), "10.0".to_string()];
+        let version = |opt| rack_formula("x", versions(), opt).unwrap().version;
+        assert_eq!(version(Some("9.1")), "9.1");
+        assert_eq!(version(None), "10.0");
+        assert_eq!(version(Some("11.0")), "10.0");
     }
 
     /// The two racks `brew list` does not list.
     #[test]
     fn a_hidden_rack_or_one_with_no_version_is_not_a_formula() {
-        assert_eq!(rack_formula(".DS_Store", vec!["x".into()]), None);
-        assert_eq!(rack_formula("cowsay", vec![]), None);
+        assert_eq!(rack_formula(".DS_Store", vec!["x".into()], None), None);
+        assert_eq!(rack_formula("cowsay", vec![], None), None);
     }
 
     #[test]
@@ -648,9 +728,156 @@ mod tests {
             .unwrap();
         fake.write(Path::new("/opt/homebrew/Cellar/onlyfile/1.0"), b"")
             .unwrap();
-        let installed = installed(&mac_sys(&fake), BREW).unwrap();
+        let names: Vec<String> = ["agg", "empty", ".hidden", "onlyfile", "linked", "stray"]
+            .map(String::from)
+            .into();
+        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(
             installed,
+            vec![Formula {
+                name: "agg".into(),
+                version: "1.7.0".into()
+            }]
+        );
+    }
+
+    /// Only the requested racks are read: a formula that is installed but
+    /// not asked about is not in the answer, and its rack is never listed.
+    #[test]
+    fn only_the_named_racks_are_read() {
+        let fake = mac_fake(&[("agg", &["1.7.0"]), ("nethack", &["3.6.7"])]);
+        let names = vec!["nethack".to_string()];
+        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "nethack");
+    }
+
+    /// A version directory may be a symlink to a directory: Homebrew's
+    /// `Pathname#subdirs` follows links (`children.select(&:directory?)`).
+    #[test]
+    fn a_symlinked_version_directory_counts() {
+        let fake = mac_fake(&[("agg", &[])]);
+        fake.mkdir_all(Path::new("/elsewhere/agg-1.7.0")).unwrap();
+        fake.symlink(
+            Path::new("/elsewhere/agg-1.7.0"),
+            Path::new("/opt/homebrew/Cellar/agg/1.7.0"),
+        )
+        .unwrap();
+        let installed = installed(&mac_sys(&fake), BREW, &["agg".to_string()]).unwrap();
+        assert_eq!(installed[0].version, "1.7.0");
+    }
+
+    /// A symlink that loops, as a rack or as a version, is "not a
+    /// directory", as Ruby's `directory?` says, and does not fail `check`.
+    #[test]
+    fn a_looping_symlink_is_not_a_directory_and_not_an_error() {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        for (a, b) in [
+            ("/opt/homebrew/Cellar/loop", "/opt/homebrew/Cellar/loop2"),
+            ("/opt/homebrew/Cellar/loop2", "/opt/homebrew/Cellar/loop"),
+            (
+                "/opt/homebrew/Cellar/agg/2.0",
+                "/opt/homebrew/Cellar/agg/2.1",
+            ),
+            (
+                "/opt/homebrew/Cellar/agg/2.1",
+                "/opt/homebrew/Cellar/agg/2.0",
+            ),
+        ] {
+            fake.symlink(Path::new(b), Path::new(a)).unwrap();
+        }
+        let names = vec!["agg".to_string(), "loop".to_string()];
+        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version, "1.7.0");
+    }
+
+    /// With several versions installed, the one `<prefix>/opt/<name>`
+    /// points at, through a relative link as Homebrew writes it.
+    #[test]
+    fn the_opt_link_names_the_current_version() {
+        let fake = mac_fake(&[("python@3", &["3.9.1", "3.10.0"])]);
+        fake.mkdir_all(Path::new("/opt/homebrew/opt")).unwrap();
+        fake.symlink(
+            Path::new("../Cellar/python@3/3.9.1"),
+            Path::new("/opt/homebrew/opt/python@3"),
+        )
+        .unwrap();
+        let names = vec!["python@3".to_string()];
+        let found = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        assert_eq!(found[0].version, "3.9.1");
+
+        // No opt link: the first in byte order.
+        let fake = mac_fake(&[("python@3", &["3.9.1", "3.10.0"])]);
+        let found = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        assert_eq!(found[0].version, "3.10.0");
+    }
+
+    /// Intel: `/usr/local/bin/brew -> ../Homebrew/bin/brew`. When the
+    /// repository has a Cellar of its own it wins over the prefix's
+    /// (`brew.sh` L41-46), so the link must be read, and both candidates
+    /// tried in order.
+    #[test]
+    fn the_repository_cellar_wins_over_the_prefix_cellar() {
+        let fake = Fake::new()
+            .with_dir("/usr/local/bin")
+            .with_symlink("/usr/local/bin/brew", "../Homebrew/bin/brew");
+        plant(
+            &fake,
+            "/usr/local/Homebrew/Cellar",
+            &[("nethack", &["3.6.7"])],
+        );
+        plant(&fake, "/usr/local/Cellar", &[("nethack", &["3.6.6"])]);
+        let names = vec!["nethack".to_string()];
+        let installed =
+            installed(&mac_sys(&Arc::new(fake)), "/usr/local/bin/brew", &names).unwrap();
+        assert_eq!(installed[0].version, "3.6.7");
+    }
+
+    /// A regular file named `Cellar` is not a Cellar: nothing is installed,
+    /// and nothing fails.
+    #[test]
+    fn a_file_named_cellar_is_not_a_cellar() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file(BREW, "")
+                .with_file(CELLAR, "not a directory"),
+        );
+        let names = vec!["nethack".to_string()];
+        assert!(installed(&mac_sys(&fake), BREW, &names).unwrap().is_empty());
+    }
+
+    /// The same two rules against the real filesystem, through the `Local`
+    /// backend, because the `Fake` cannot show them: a symlink loop is a
+    /// real `ELOOP` from `stat`, which must read as "not a directory"; and
+    /// on a case-insensitive volume (the macOS runner's APFS)
+    /// `<Cellar>/Python` answers for `python`, which must not count as
+    /// installed. On a case-sensitive Linux volume the second half holds
+    /// trivially.
+    #[test]
+    fn on_a_real_filesystem_loops_are_not_directories_and_names_match_exactly() {
+        let root = std::env::temp_dir().join(format!("rustible-brew-{}", std::process::id()));
+        let s = System::local(false, Arc::new(Collect::default()));
+        let _ = s.remove_all(&root);
+        let brew = root.join("bin/brew");
+        s.mkdir_all(root.join("bin")).unwrap();
+        s.write_atomic(&brew, b"").unwrap();
+        s.mkdir_all(root.join("Cellar/Python/3.12.0")).unwrap();
+        s.mkdir_all(root.join("Cellar/agg/1.7.0")).unwrap();
+        s.symlink(root.join("Cellar/agg/x"), root.join("Cellar/agg/y"))
+            .unwrap();
+        s.symlink(root.join("Cellar/agg/y"), root.join("Cellar/agg/x"))
+            .unwrap();
+        s.symlink(root.join("Cellar/loop2"), root.join("Cellar/loop"))
+            .unwrap();
+        s.symlink(root.join("Cellar/loop"), root.join("Cellar/loop2"))
+            .unwrap();
+
+        let names = ["agg", "loop", "python"].map(String::from).to_vec();
+        let found = installed(&s, brew.to_str().unwrap(), &names);
+        let _ = s.remove_all(&root);
+        assert_eq!(
+            found.unwrap(),
             vec![Formula {
                 name: "agg".into(),
                 version: "1.7.0".into()
