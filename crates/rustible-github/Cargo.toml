@@ -14,13 +14,10 @@ readme = "../../README.md"
 # rustible-std. Never on rustible-cli (vision 9).
 [dependencies]
 rustible-sdk.workspace = true
+# HTTPS for the `.keys` endpoint is `rustible_std::http::Request::send`: no
+# HTTP client and no crypto entry of its own, so this crate and the standard
+# ops agree on TLS, redirects and limits by construction.
 rustible-std.workspace = true
-# HTTPS for the `.keys` endpoint. The crypto provider is not chosen here: see
-# the note below.
-ureq.workspace = true
-# No crypto entry of its own: the provider comes from `rustible_std::tls`,
-# which this crate already depends on, so the two agree by construction.
-# Nothing here names a `rustls::` path either.
 
 [dev-dependencies]
 # Only so the module-header doctest can show a real `#[rustible::playbook]`.

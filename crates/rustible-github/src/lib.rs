@@ -86,11 +86,11 @@
 //! [`GithubSshKeysToUser`] adds one guard on top: in exclusive mode an empty list is
 //! refused rather than emptying `authorized_keys`.
 //!
-//! `ureq` over `rustls` with the `ring` provider, taken from
-//! `rustible_std::tls` so this crate and `rustible_std::http` share one crypto
-//! path; no OpenSSL and no system certificate store. `ring` detects CPU
-//! features at runtime, so there is no hardware floor for a fetch; see
-//! `rustible_std::tls` for the build-time cost.
+//! The request is a `rustible_std::http::Request`, so this crate shares
+//! the standard ops' TLS (`rustls` with the `ring` provider; no OpenSSL and no
+//! system certificate store) and their redirect and secret policy. `ring`
+//! detects CPU features at runtime, so there is no hardware floor for a
+//! fetch; see `rustible_std::tls` for the build-time cost.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

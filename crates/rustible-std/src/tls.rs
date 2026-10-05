@@ -22,7 +22,12 @@
 //!
 //! ## Using it from a collection
 //!
-//! One call, when the agent is built. There is nothing to do per request.
+//! A collection that talks HTTP should use
+//! [`http::Request::send`](crate::http::Request::send), which already uses
+//! this provider and adds the redirect, secret and size policy of
+//! `rustible_std::http`; that is what `rustible-github` does. A collection
+//! that needs its own `ureq` agent anyway makes one call, when the agent is
+//! built. There is nothing to do per request.
 //!
 //! ```no_run
 //! use rustible_std::tls;
@@ -41,9 +46,10 @@ use std::sync::Arc;
 
 /// The crypto provider every Rustible HTTPS request uses.
 ///
-/// Both `rustible_std::http` and `rustible-github` call this, so the two
-/// cannot drift apart on which crypto they speak; a third-party collection
-/// should call it too rather than naming a provider of its own.
+/// `rustible_std::http` calls this, and `rustible-github` sends through
+/// `rustible_std::http`, so the two cannot drift apart on which crypto they
+/// speak; a third-party collection with an agent of its own should call it
+/// too rather than naming a provider of its own.
 pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
