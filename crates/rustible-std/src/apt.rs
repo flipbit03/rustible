@@ -5,31 +5,37 @@
 //!
 //! Every op refuses on a host whose package manager is not apt and when not
 //! running as root. `check` reads with `dpkg-query`, `apt-cache policy` and
-//! `stat`, and runs no `apt-get` at all unless `.update_cache()` asked for a
-//! refresh on [`Latest`] (see below).
+//! `stat`. It runs no `apt-get` at all under `--check`, and in a real run
+//! only the refresh [`Latest`] asks for with `.update_cache()` (see below).
 //!
 //! **Cache refresh.** [`Present`] and [`Latest`] take `.update_cache(max_age)`:
 //! `apt-get update` runs when the lists in `/var/lib/apt/lists` (or, failing
-//! that, `/var/cache/apt/pkgcache.bin`) are older than `max_age`;
-//! `Duration::ZERO` means always. *Where* it runs differs, because the two ops
-//! need the lists at different moments:
+//! that, `/var/cache/apt/pkgcache.bin`) are older than `max_age` or of unknown
+//! age; `Duration::ZERO` means always. *Where* it runs differs, because the
+//! two ops need the lists at different moments:
 //!
 //! - [`Present`] only asks whether a package is installed, which dpkg answers
 //!   without the lists. It refreshes in `apply`, right before installing, and
 //!   never in `check`.
 //! - [`Latest`] compares installed versions against the *candidate* versions
-//!   the lists carry, so stale lists give a wrong answer. It refreshes in
-//!   `check`, before reading the candidates, exactly as Ansible's
-//!   `apt: state=latest` does.
+//!   the lists carry, so stale lists give a wrong answer. A real run
+//!   refreshes in `check`, before reading the candidates.
 //!
-//! **A `Latest` dry run with `.update_cache()` therefore writes
-//! `/var/lib/apt/lists` on the target.** This is the one place in this module
-//! where `--check` is not read-only: `apt-get update` is a command, not a
-//! mutation through `sys`, so the check-mode guard does not stop it, and
-//! without it a dry run against month-old lists reports every package current
-//! and is simply wrong. The step logs a warning saying so whenever it happens
-//! in check mode. Leave `.update_cache()` off if a dry run must touch nothing;
-//! the plan is then computed against whatever the lists already say.
+//! **Neither refreshes under `--check`**: `apt-get update` contacts the
+//! distribution's mirrors and rewrites `/var/lib/apt/lists`, and a dry run
+//! touches nothing outside the target (vision 12). For [`Latest`] that means
+//! a dry run whose lists are stale cannot know the candidates, and says so:
+//! the step reports `would change`, with a diff saying the lists were not
+//! refreshed, and has no output. It runs no `apt-cache policy` either, since
+//! the answer would come from the stale lists. Lists within `max_age` need no
+//! refresh, so the dry run plans from them exactly as the real run will.
+//!
+//! Ansible's `apt` also skips the refresh under check mode
+//! (`ansible/ansible@4da24b8128c8e334f3817f4700f4276c855856db`,
+//! `lib/ansible/modules/apt.py` L1460,
+//! `if not module.check_mode: cache.update()`), but then plans from the
+//! stale lists, so its dry run can call a package current that the real run
+//! upgrades. Rustible says it does not know instead.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -168,6 +174,10 @@ fn policy(sys: &System, name: &str) -> Result<Policy> {
 /// Age of the apt lists: mtime of `/var/lib/apt/lists`, else of
 /// `/var/cache/apt/pkgcache.bin`, via `stat -c %Y` (the SDK's `Stat` carries
 /// no mtime). `None` when neither can be read.
+///
+/// Known gap (#70): an `apt-get update` that changes no index leaves the
+/// directory's mtime where it was, so lists just confirmed fresh can still
+/// read as stale here.
 fn cache_age(sys: &System) -> Result<Option<Duration>> {
     for path in ["/var/lib/apt/lists", "/var/cache/apt/pkgcache.bin"] {
         let Some(out) = sys.cmd("stat").args(["-c", "%Y", path]).ok()? else {
@@ -184,18 +194,92 @@ fn cache_age(sys: &System) -> Result<Option<Duration>> {
     Ok(None)
 }
 
-/// Run `apt-get update` when the lists are older than `max_age` (or their age
-/// is unknown). `Duration::ZERO` always updates. Returns whether it ran.
-fn update_cache_if_stale(sys: &System, max_age: Duration) -> Result<bool> {
-    let stale = max_age.is_zero() || cache_age(sys)?.is_none_or(|age| age > max_age);
-    if !stale {
-        return Ok(false);
+/// Why the apt lists count as stale under the `.update_cache(max_age)` rule.
+/// Deciding it reads `stat` and nothing else, so `check` can ask in either
+/// mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stale {
+    /// `Duration::ZERO`: a refresh on every run.
+    Always,
+    /// Neither `/var/lib/apt/lists` nor `pkgcache.bin` has a readable age.
+    AgeUnknown,
+    /// Older than the age the op was given.
+    Older { age: Duration, max_age: Duration },
+}
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stale::Always => write!(
+                f,
+                "`.update_cache(Duration::ZERO)` refreshes the package lists on every run"
+            ),
+            Stale::AgeUnknown => write!(
+                f,
+                "the age of the package lists cannot be read (from /var/lib/apt/lists or \
+                 /var/cache/apt/pkgcache.bin)"
+            ),
+            Stale::Older { age, max_age } => write!(
+                f,
+                "the package lists are {} old, older than the `.update_cache()` age of {}",
+                human_duration(*age),
+                human_duration(*max_age)
+            ),
+        }
     }
-    sys.cmd("apt-get")
-        .arg("update")
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .run()?;
-    Ok(true)
+}
+
+/// Pure: a duration as a person reads it, in its largest unit and the one
+/// below it, a zero left out: `45s`, `1m 30s`, `1h`, `2h 1m`, `3d 4h`, and
+/// `less than a second` below one.
+fn human_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        return "less than a second".to_string();
+    }
+    let units = [
+        (secs / 86_400, "d"),
+        (secs % 86_400 / 3_600, "h"),
+        (secs % 3_600 / 60, "m"),
+        (secs % 60, "s"),
+    ];
+    units
+        .iter()
+        .skip_while(|(n, _)| *n == 0)
+        .take(2)
+        .filter(|(n, _)| *n != 0)
+        .map(|(n, unit)| format!("{n}{unit}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether the lists need a refresh before they can be trusted: `max_age` is
+/// `Duration::ZERO`, their age is unknown, or they are older than `max_age`.
+/// `None` when they are within it. Runs `stat` at most, never `apt-get`.
+fn staleness(sys: &System, max_age: Duration) -> Result<Option<Stale>> {
+    if max_age.is_zero() {
+        return Ok(Some(Stale::Always));
+    }
+    Ok(match cache_age(sys)? {
+        None => Some(Stale::AgeUnknown),
+        Some(age) if age > max_age => Some(Stale::Older { age, max_age }),
+        Some(_) => None,
+    })
+}
+
+/// `apt-get update`: fetch the package lists from the host's mirrors. Never
+/// under `--check` (vision 12).
+fn refresh_lists(sys: &System) -> Result<()> {
+    apt_get(sys).arg("update").run()?;
+    Ok(())
+}
+
+/// Run `apt-get update` when [`staleness`] says the lists need it.
+fn update_cache_if_stale(sys: &System, max_age: Duration) -> Result<()> {
+    if staleness(sys, max_age)?.is_some() {
+        refresh_lists(sys)?;
+    }
+    Ok(())
 }
 
 /// The host's package managers, for a refusal message: named if there are
@@ -334,6 +418,7 @@ impl Op for Present {
     fn apply(&self, sys: &System, intent: Install) -> Result<InstallReport> {
         // Install what `check` planned, not what dpkg says now (vision 6.2).
         let missing = intent.names;
+        // `apply` never runs under `--check`, so this refresh never does.
         if let Some(max_age) = self.update_cache {
             update_cache_if_stale(sys, max_age)?;
         }
@@ -524,11 +609,13 @@ impl Op for Absent {
 /// upgraded with `apt-get install --only-upgrade`. A name apt cannot resolve
 /// fails the step.
 ///
-/// With [`update_cache`](Latest::update_cache), the refresh happens in
-/// `check`, before the candidates are read, **including in check mode**: a
-/// dry run then writes `/var/lib/apt/lists` on the target and logs a warning
-/// saying it did. Without it, the comparison uses whatever the lists already
-/// say and a dry run touches nothing. See the module docs.
+/// With [`update_cache`](Latest::update_cache), a real run refreshes the
+/// lists in `check`, before the candidates are read. **Under `--check` it
+/// does not**: when the lists are stale the step reports `would change`,
+/// with a diff saying the candidates are unknown because the lists were not
+/// refreshed, and has no output. Lists within the age need no refresh, so a
+/// dry run plans from them exactly as the real run will. Without
+/// `update_cache` neither mode refreshes. See the module docs.
 #[derive(Debug, Clone)]
 pub struct Latest {
     names: Vec<String>,
@@ -540,8 +627,8 @@ impl Latest {
     /// Ensure every one of `names` is installed at the candidate version
     /// apt currently knows. No cache refresh until
     /// [`Latest::update_cache`] asks for one, so by default the candidates
-    /// come from whatever `/var/lib/apt/lists` already holds and a dry run
-    /// writes nothing at all. Recommends are off, as with [`Present`].
+    /// come from whatever `/var/lib/apt/lists` already holds, in a real run
+    /// and a dry run alike. Recommends are off, as with [`Present`].
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -558,11 +645,13 @@ impl Latest {
     /// read, if the apt lists are older than `max_age`. `Duration::ZERO`
     /// always updates. Ansible's `update_cache` with `cache_valid_time`.
     ///
-    /// This runs in check mode too, so **a dry run refreshes the package
-    /// lists on the target** and the step logs a warning when it does. That
-    /// is the point: candidates read from stale lists would make the dry run
-    /// report packages as current when they are not. Leave this off for a
-    /// dry run that must not write anything.
+    /// **Not under `--check`**: a dry run contacts no mirror (vision 12).
+    /// When the lists are stale, it cannot know the candidates, so the step
+    /// reports `would change` with a diff saying the lists were not
+    /// refreshed, and has no output; it does not plan from the stale lists,
+    /// where a package could look current that the real run then upgrades.
+    /// When they are within `max_age`, the dry run plans from them as the
+    /// real run will.
     pub fn update_cache(mut self, max_age: Duration) -> Self {
         self.update_cache = Some(max_age);
         self
@@ -574,35 +663,42 @@ impl Latest {
         self
     }
 
-    /// The `check`-time refresh: `apt-get update` when the caller asked for
-    /// it and the lists are stale. Says out loud when a dry run did it.
-    fn refresh_cache(&self, sys: &System) -> Result<()> {
+    /// The `check`-time refresh, when the caller asked for one and the lists
+    /// are stale. In a real run it runs `apt-get update` and returns `None`.
+    /// Under `--check` it runs nothing and returns why the lists would have
+    /// been refreshed, for the step to report that it cannot decide.
+    fn refresh_cache(&self, sys: &System) -> Result<Option<Stale>> {
         let Some(max_age) = self.update_cache else {
-            return Ok(());
+            return Ok(None);
         };
-        if !update_cache_if_stale(sys, max_age)? {
-            return Ok(());
-        }
-        let msg = "apt::Latest ran `apt-get update`: the lists were older than the \
-                   `.update_cache()` age, and the candidate versions come from them";
+        let Some(stale) = staleness(sys, max_age)? else {
+            return Ok(None);
+        };
         if sys.check_mode() {
-            sys.warn(format!(
-                "{msg}. A dry run does not otherwise change the target, but this \
-                 rewrote /var/lib/apt/lists"
-            ));
-        } else {
-            sys.debug(msg);
+            return Ok(Some(stale));
         }
-        Ok(())
+        refresh_lists(sys)?;
+        sys.debug(format!(
+            "apt::Latest ran `apt-get update` before reading the candidate versions: {stale}"
+        ));
+        Ok(None)
     }
 }
 
-/// What [`Latest`]'s `check` decided, package by package, in the order the
-/// op named them: install a missing one, or upgrade an outdated one from the
-/// version dpkg has.
+/// What [`Latest`]'s `check` decided: package by package, in the order the
+/// op named them, install a missing one or upgrade an outdated one from the
+/// version dpkg has. Under `--check` with stale lists, that it cannot say.
 #[derive(Debug)]
-pub struct Upgrade {
-    packages: Vec<(String, Bump)>,
+pub struct Upgrade(Decision);
+
+#[derive(Debug)]
+enum Decision {
+    /// What to install and what to upgrade, read from the lists.
+    Packages(Vec<(String, Bump)>),
+    /// Under `--check` only: the lists are stale and were not refreshed, so
+    /// no candidate was read. Nothing here can be applied, and a real run
+    /// never plans it: its `check` refreshes instead.
+    Unrefreshed { names: Vec<String>, stale: Stale },
 }
 
 #[derive(Debug)]
@@ -618,21 +714,28 @@ enum Bump {
 
 impl Intent for Upgrade {
     fn diff(&self) -> Diff {
-        Diff::attrs(
-            "apt packages",
-            self.packages
-                .iter()
-                .map(|(name, bump)| match bump {
-                    Bump::Install { candidate } => {
-                        AttrChange::new(name.as_str(), "absent", candidate.as_str())
-                    }
-                    Bump::From {
-                        installed,
-                        candidate,
-                    } => AttrChange::new(name.as_str(), installed.as_str(), candidate.as_str()),
-                })
-                .collect(),
-        )
+        match &self.0 {
+            Decision::Packages(packages) => Diff::attrs(
+                "apt packages",
+                packages
+                    .iter()
+                    .map(|(name, bump)| match bump {
+                        Bump::Install { candidate } => {
+                            AttrChange::new(name.as_str(), "absent", candidate.as_str())
+                        }
+                        Bump::From {
+                            installed,
+                            candidate,
+                        } => AttrChange::new(name.as_str(), installed.as_str(), candidate.as_str()),
+                    })
+                    .collect(),
+            ),
+            Decision::Unrefreshed { names, stale } => Diff::summary(format!(
+                "apt packages {}: candidate versions unknown; {stale}, and the lists are not \
+                 refreshed under --check",
+                names.join(", ")
+            )),
+        }
     }
 }
 
@@ -643,8 +746,18 @@ impl Op for Latest {
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
         require_apt_root(sys, "Latest")?;
         // Before the candidates are read, not after: `apt-cache policy` can
-        // only answer from the lists on disk.
-        self.refresh_cache(sys)?;
+        // only answer from the lists on disk. Under `--check` stale lists are
+        // not refreshed, and their candidates are not read either: an answer
+        // from them could call a package current that the real run upgrades.
+        // With no names there is nothing to be unsure about.
+        if let Some(stale) = self.refresh_cache(sys)?
+            && !self.names.is_empty()
+        {
+            return Ok(Plan::Change(Upgrade(Decision::Unrefreshed {
+                names: self.names.clone(),
+                stale,
+            })));
+        }
         let mut current = vec![];
         let mut packages = vec![];
         for name in &self.names {
@@ -676,13 +789,21 @@ impl Op for Latest {
                 ..UpgradeReport::default()
             }));
         }
-        Ok(Plan::Change(Upgrade { packages }))
+        Ok(Plan::Change(Upgrade(Decision::Packages(packages))))
     }
 
     fn apply(&self, sys: &System, intent: Upgrade) -> Result<UpgradeReport> {
+        let packages = match intent.0 {
+            Decision::Packages(packages) => packages,
+            Decision::Unrefreshed { stale, .. } => bail!(
+                "apt::Latest cannot apply a plan made under --check, which names no candidate \
+                 versions because the package lists were not refreshed ({stale}). A real run \
+                 refreshes them in `check` and plans from the result"
+            ),
+        };
         let mut to_install = vec![];
         let mut to_upgrade = vec![];
-        for (name, bump) in intent.packages {
+        for (name, bump) in packages {
             match bump {
                 Bump::Install { .. } => to_install.push(name),
                 Bump::From { installed, .. } => to_upgrade.push((name, installed)),
@@ -873,6 +994,22 @@ mod tests {
         assert_eq!(parse_policy(""), Policy::default());
         let text = "foo:\n  Installed: (none)\n  Candidate: (none)\n  Version table:\n";
         assert_eq!(parse_policy(text), Policy::default());
+    }
+
+    #[test]
+    fn human_duration_shows_the_two_largest_units() {
+        let d = Duration::from_secs;
+        assert_eq!(human_duration(d(0)), "less than a second");
+        assert_eq!(
+            human_duration(Duration::from_millis(999)),
+            "less than a second"
+        );
+        assert_eq!(human_duration(d(45)), "45s");
+        assert_eq!(human_duration(d(90)), "1m 30s");
+        assert_eq!(human_duration(d(3_600)), "1h");
+        assert_eq!(human_duration(d(7_261)), "2h 1m");
+        assert_eq!(human_duration(d(86_400 + 60)), "1d");
+        assert_eq!(human_duration(d(3 * 86_400 + 4 * 3_600 + 5)), "3d 4h");
     }
 
     #[test]
@@ -1521,40 +1658,218 @@ mod tests {
         );
     }
 
-    /// With `.update_cache()`, a dry run does refresh the lists, and says so
-    /// out loud rather than doing it silently.
-    #[test]
-    fn latest_check_mode_refreshes_the_cache_and_warns() {
+    fn warnings(sink: &Collect) -> Vec<String> {
+        sink.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                rustible_sdk::event::Event::Log {
+                    level: rustible_sdk::event::Level::Warn,
+                    msg,
+                } => Some(msg),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every tool an outdated `openssl` and a missing `curl` would need, so
+    /// that what the op leaves unasked is its own choice and not the Fake's.
+    fn openssl_outdated_curl_missing() -> Fake {
         let fake = dpkg(
             Fake::new(),
             "openssl",
             0,
             "install ok installed\t3.0.15-1\n",
         );
-        let fake = Arc::new(
-            policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
-        );
+        let fake = dpkg(fake, "curl", 1, "");
+        let fake = policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1");
+        policy_of(fake, "curl", "(none)", "7.88.1-10").with_cmd("apt-get", None, 0, "")
+    }
+
+    /// Under `--check`, stale lists are not refreshed (vision 12: a dry run
+    /// contacts no mirror), and the candidates are not read from them
+    /// either. The step cannot decide, says why, and has no output.
+    #[test]
+    fn latest_check_mode_does_not_refresh_stale_lists_and_cannot_decide() {
+        let fake = Arc::new(openssl_outdated_curl_missing());
         let sink = Arc::new(Collect::default());
         let s = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
-        let op = Latest::new(["openssl"]).update_cache(Duration::ZERO);
-        let Plan::Change(_) = op.check(&s).unwrap() else {
-            panic!("expected change")
-        };
+        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let r = ctx
+            .step(
+                "up",
+                Latest::new(["openssl", "curl"]).update_cache(Duration::ZERO),
+            )
+            .unwrap();
+        assert!(r.changed && !r.is_available());
+        assert_eq!(
+            r.diff.as_ref().unwrap().render(),
+            "apt packages openssl, curl: candidate versions unknown; \
+             `.update_cache(Duration::ZERO)` refreshes the package lists on every run, \
+             and the lists are not refreshed under --check"
+        );
         let argvs = fake.argvs();
         assert!(
-            argvs.iter().any(|a| a[..2] == ["apt-get", "update"]),
+            argvs
+                .iter()
+                .all(|a| a[0] != "apt-get" && a[0] != "apt-cache"),
+            "no refresh, and no candidate read from the stale lists: {argvs:?}"
+        );
+        // Nothing was rewritten, so there is nothing to warn about.
+        assert!(warnings(&sink).is_empty(), "{:?}", sink.events());
+    }
+
+    /// The other two ways the lists are stale, by age and of unknown age,
+    /// each named in the diff, and neither refreshed under `--check`.
+    #[test]
+    fn latest_check_mode_names_why_the_lists_are_stale() {
+        let old = (now_secs() - 7_260).to_string();
+        let fake = Arc::new(openssl_outdated_curl_missing().with_cmd("stat", None, 0, &old));
+        let s = sys(&fake).with_check_mode(true);
+        let op = Latest::new(["openssl"]).update_cache(Duration::from_secs(3_600));
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        let rendered = c.diff().render();
+        assert!(
+            rendered.starts_with("apt packages openssl: candidate versions unknown; "),
+            "{rendered}"
+        );
+        // Shown to the minute, so the second or two the test takes to get
+        // here does not move it.
+        assert!(
+            rendered.contains(
+                "the package lists are 2h 1m old, older than the \
+                 `.update_cache()` age of 1h, and the lists are not refreshed under --check"
+            ),
+            "{rendered}"
+        );
+        let argvs = fake.argvs();
+        assert!(argvs.iter().all(|a| a[0] == "stat"), "{argvs:?}");
+
+        let fake = Arc::new(openssl_outdated_curl_missing().with_cmd("stat", None, 1, ""));
+        let s = sys(&fake).with_check_mode(true);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert!(
+            c.diff()
+                .render()
+                .contains("the age of the package lists cannot be read"),
+            "{}",
+            c.diff().render()
+        );
+        let argvs = fake.argvs();
+        assert!(argvs.iter().all(|a| a[0] == "stat"), "{argvs:?}");
+    }
+
+    /// Lists within the max age need no refresh in a real run either, so the
+    /// dry run plans from them, and its `ok` is the real run's `ok`.
+    #[test]
+    fn latest_check_mode_plans_normally_from_fresh_lists() {
+        let fresh = (now_secs() - 60).to_string();
+        let fake = Arc::new(
+            openssl_outdated_curl_missing()
+                .with_cmd("stat", None, 0, &fresh)
+                .with_cmd(
+                    "dpkg-query",
+                    Some(&[DPKG_ARGS[0], DPKG_ARGS[1], "zlib1g"]),
+                    0,
+                    "install ok installed\t1:1.2.13\n",
+                )
+                .with_cmd(
+                    "apt-cache",
+                    Some(&["policy", "zlib1g"]),
+                    0,
+                    "zlib1g:\n  Installed: 1:1.2.13\n  Candidate: 1:1.2.13\n",
+                ),
+        );
+        let s = sys(&fake).with_check_mode(true);
+        let hour = Duration::from_secs(3_600);
+
+        // Up to date: satisfied, with the version as output.
+        let Plan::Satisfied(r) = Latest::new(["zlib1g"])
+            .update_cache(hour)
+            .check(&s)
+            .unwrap()
+        else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(r.current[0].version, "1:1.2.13");
+
+        // Outdated and missing: the usual attribute diff, candidates and all.
+        let Plan::Change(c) = Latest::new(["openssl", "curl"])
+            .update_cache(hour)
+            .check(&s)
+            .unwrap()
+        else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "apt packages:\n  openssl: 3.0.15-1 -> 3.0.16-1\n  curl: absent -> 7.88.1-10\n"
+        );
+
+        let argvs = fake.argvs();
+        assert!(
+            argv_starting(&argvs, &["apt-cache", "policy"]).is_some(),
             "{argvs:?}"
         );
-        let warned = sink.events().iter().any(|e| {
-            matches!(
-                e,
-                rustible_sdk::event::Event::Log {
-                    level: rustible_sdk::event::Level::Warn,
-                    msg
-                } if msg.contains("rewrote /var/lib/apt/lists")
-            )
-        });
-        assert!(warned, "{:?}", sink.events());
+        assert!(argvs.iter().all(|a| a[0] != "apt-get"), "{argvs:?}");
+    }
+
+    /// The plan a dry run makes from stale lists names no candidate, so it
+    /// cannot be executed. `Ctx::step` never hands it to `apply` (it is only
+    /// made under `--check`); called directly, `apply` refuses and runs
+    /// nothing.
+    #[test]
+    fn latest_unrefreshed_plan_cannot_be_applied() {
+        let fake = Arc::new(openssl_outdated_curl_missing());
+        let op = Latest::new(["openssl"]).update_cache(Duration::ZERO);
+        let Plan::Change(c) = op.check(&sys(&fake).with_check_mode(true)).unwrap() else {
+            panic!("expected change")
+        };
+        let err = op.apply(&sys(&fake), c).unwrap_err().chain();
+        assert!(
+            err.contains("cannot apply a plan made under --check"),
+            "{err}"
+        );
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// The refusals about the machine stand under `--check` too, and come
+    /// before the stale-lists answer: a dry run on a box that is not root,
+    /// or has no apt, is refused rather than told the candidates are
+    /// unknown, and runs nothing.
+    #[test]
+    fn latest_refusals_stand_under_check_before_the_stale_lists_answer() {
+        let op = Latest::new(["x"]).update_cache(Duration::ZERO);
+
+        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
+        let err = op
+            .check(&non_root(&fake).with_check_mode(true))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("apt::Latest needs root"), "{err}");
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+
+        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
+        let err = op
+            .check(&alpine(&fake).with_check_mode(true))
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("apt::Latest needs apt"), "{err}");
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// No names, nothing to be unsure about: `ok` in both modes, and the dry
+    /// run still refreshes nothing.
+    #[test]
+    fn latest_with_no_names_is_satisfied_under_check_with_stale_lists() {
+        let fake = Arc::new(Fake::new().with_cmd("apt-get", None, 0, ""));
+        let op = Latest::new(Vec::<String>::new()).update_cache(Duration::ZERO);
+        let s = sys(&fake).with_check_mode(true);
+        assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
 
     /// Outside check mode the same refresh is unremarkable: debug, not warn.

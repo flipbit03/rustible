@@ -830,10 +830,17 @@ cargo add rustible-github
 use rustible_github::github_ssh_keys_to_user;
 
 // fetches flipbit03's public keys from GitHub and puts them in cadu's
-// authorized_keys, as two visible steps
+// authorized_keys, as two visible steps in one block
 let keys = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
-ctx.log(format!("{} key(s) added", keys.added.len()));
+ctx.block("report", |ctx| {
+    ctx.log(format!("{} key(s) added", keys.added.len()));
+    Ok(())
+})?;
 ```
+
+Under `--check` nothing is fetched, so the helper has no value: reading
+`.changed` or `.added` ends the enclosing block, or the host's dry run.
+Put the code that depends on it in a block, as above.
 
 `rustible-github` is the worked example of a collection, and small enough to
 read end to end if you are writing your own. It also exports `rustible_github::UserKeys` for the fetch on its own,
@@ -1301,10 +1308,12 @@ Three things to know:
   account exists). Refusals about the machine itself
   (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
   key this kernel lacks) hold in both modes.
-- ⚠️ **`apt::Latest::update_cache(..)` refreshes the package lists even in
-  check mode**, because its answer is read from them. That is the one place
-  `--check` is not entirely read-only, and the run says so when it happens.
-  Without `.update_cache(..)` — the default — a dry run writes nothing.
+- **Nothing outside the target is contacted.** A step whose answer is remote,
+  such as `rustible_github::UserKeys`, reports `would change` with no output.
+  `apt::Latest::update_cache(..)` does not refresh under `--check`: if the
+  lists are older than the age you gave (with `Duration::ZERO`, always), the
+  step reports `would change` with "candidate versions unknown"; a real run
+  refreshes and decides.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,

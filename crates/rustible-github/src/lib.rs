@@ -14,11 +14,13 @@
 //!
 //! - [`UserKeys`]: a read-only op (a lookup, vision 6.5) returning a GitHub
 //!   user's public SSH keys from `https://github.com/<user>.keys` as typed
-//!   [`PublicKey`]s. It can never report `changed`.
+//!   [`PublicKey`]s. It can never report `changed`, and under `--check` it
+//!   sends no request: the step reports `would change` and has no output.
 //! - [`github_ssh_keys_to_user`] and [`GithubSshKeysToUser`]: the composition the Ansible
 //!   `ssh_keys_from_github` role does with `lookup('url', ...)`, `set_fact`,
 //!   `combine`, `product` and a loop over `ansible.posix.authorized_key`.
-//!   Here it is one function running two steps through `ctx.step`.
+//!   Here it is one function running two steps through `ctx.step`, in a
+//!   `ctx.block`.
 //! - [`Fetch`] and [`Https`]: the HTTP boundary. `UserKeys` calls the
 //!   network through a trait, so tests inject canned responses and a
 //!   playbook behind a proxy or against GitHub Enterprise can supply its own.
@@ -50,17 +52,27 @@
 //!     // below makes `~/.ssh` itself, but never the home above it.
 //!     ctx.step("Ensure cadu exists", user::Present::new("cadu").create_home(true))?;
 //!
-//!     // Two steps in the run output: the fetch (always `ok`) and the install.
+//!     // Two steps in the run output, in one block: the fetch (`ok` in a real
+//!     // run) and the install.
 //!     let installed = github::github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
-//!     if installed.changed {
-//!         ctx.log(format!("installed {} GitHub key(s)", installed.added.len()));
-//!     }
+//!     // Under --check nothing is fetched, so `installed` has no value; code
+//!     // that reads it goes in a block of its own, and only that block ends.
+//!     ctx.block("report", |ctx| {
+//!         if installed.changed {
+//!             ctx.log(format!("installed {} GitHub key(s)", installed.added.len()));
+//!         }
+//!         Ok(())
+//!     })?;
 //!
-//!     // Or take the keys and do something else with them.
-//!     let keys = ctx.step("Fetch keys", github::UserKeys::of("flipbit03"))?;
-//!     for k in keys.iter() {
-//!         ctx.log(format!("{} {}...", k.key_type, &k.key[..16]));
-//!     }
+//!     // Or take the keys and do something else with them, in a block for
+//!     // the same reason.
+//!     ctx.block("list keys", |ctx| {
+//!         let keys = ctx.step("Fetch keys", github::UserKeys::of("flipbit03"))?;
+//!         for k in keys.iter() {
+//!             ctx.log(format!("{} {}...", k.key_type, &k.key[..16]));
+//!         }
+//!         Ok(())
+//!     })?;
 //!     Ok(())
 //! }
 //! # fn main() {}
@@ -91,7 +103,7 @@ mod user_keys;
 pub use fetch::{Fetch, Https, MAX_BODY_BYTES, Response};
 pub use github_ssh_keys_to_user::{GithubSshKeysToUser, github_ssh_keys_to_user};
 pub use login::validate_login;
-pub use user_keys::{KEYS_URL_BASE, UserKeys, parse_keys_body};
+pub use user_keys::{KEYS_URL_BASE, KeysLookup, UserKeys, parse_keys_body};
 
 /// Re-exported from `rustible_std::ssh::authorized_keys`: the parsed public
 /// key type [`UserKeys`] returns and `Present` consumes, so the two compose

@@ -804,17 +804,19 @@ if empty. `apply`: `apt-get update` if the cache is older than the max age, then
 `apt-get install -y` the missing set.
 
 `Latest` compares each installed version against the *candidate* apt would
-install, and candidates come from the package lists, so it refreshes in `check`
-instead: `apt-get update` if the lists are older than the max age, then
-`apt-cache policy` per name, then `apt-get install -y --only-upgrade`. Ansible's
-`apt: state=latest` behaves the same way. The cost is deliberate and is the one
-exception to "check mode changes nothing": with `.update_cache(...)`, a `--check`
-run rewrites `/var/lib/apt/lists` on the target. It is a command rather than a
-mutation through `sys`, so 7.3's guard does not catch it; the op logs a warning
-saying it happened. Without `.update_cache(...)` nothing is refreshed and the
-comparison uses whatever the lists already say. Refreshing in `apply` would be
-worse: a dry run against month-old lists reports every package current, which is
-a wrong answer rather than a stale one.
+install, and candidates come from the package lists. With `.update_cache(max_age)`,
+a real run refreshes them in `check` — `apt-get update` when the lists are older
+than the max age — then reads `apt-cache policy` per name, then `apt-get install
+-y --only-upgrade`. Under `--check` the refresh is not run: a dry run contacts no
+mirror and writes nothing (12). So when the lists are older than the max age the
+step cannot know the candidates, and says so: it reports `would change`, with a
+diff saying the lists were not refreshed, and has no output. Lists within the max
+age need no refresh, and the dry run plans from them exactly as the real run
+will. Without `.update_cache(...)` neither mode refreshes, and both compare
+against whatever the lists already say. Ansible's `apt` also skips the refresh
+under check mode (`apt.py`, `if not module.check_mode: cache.update()`), but then
+plans against the stale lists, so its dry run can call a package current that the
+real run upgrades; Rustible says it does not know instead.
 
 **`ansible.builtin.lineinfile`**
 ```rust
@@ -1795,13 +1797,8 @@ where the dry run stopped seeing.
   reports `would change` under check mode, with a diff saying what it would
   send and that the remote state was not read; its output is unavailable, as
   for any would-change step. What this costs is a dry run that cannot report
-  such a step `ok`, and that cost is accepted. Two places in the tree still
-  break this rule, and issue #48 fixes both: `apt::Latest::update_cache`
-  (6.8), which runs `apt-get update` against the distribution's mirrors in
-  `check`, and `rustible_github::UserKeys`, which fetches from GitHub in
-  `check`.
-- `check` still cannot mutate (7.3), and `apt::Latest` with `.update_cache`
-  is still the one place a dry run writes (6.8).
+  such a step `ok`, and that cost is accepted.
+- `check` still cannot mutate (7.3).
 
 ## 13. Facts (DECIDED 2026-09-06)
 

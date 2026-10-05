@@ -37,6 +37,13 @@ pub const KEYS_URL_BASE: &str = "https://github.com";
 /// comments). Feed them to `ssh::authorized_keys::Present` with
 /// `k.to_line()`, or add a comment first.
 ///
+/// **Under `--check` no request is sent** (vision 12): a dry run contacts
+/// nothing outside the target. `check` never fetches, in either mode; the
+/// request is `apply`'s. So a dry run reports the step `would change`, with
+/// the URL as its diff and no output, and a later read of the keys ends the
+/// enclosing `ctx.block` there with a warning. A real run fetches and
+/// reports `ok`, never `changed`.
+///
 /// **Failure versus empty**: a login that is not legal (see
 /// [`validate_login`]) fails at `check` without any request. A `404` fails
 /// the step naming the user: the account does not exist. Any other non-`200`
@@ -161,12 +168,31 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
     Ok(keys)
 }
 
+/// What [`UserKeys`]'s `check` decided: send `GET <url>`. It holds no keys,
+/// because `check` reads none: they are remote state, and `check` contacts
+/// nothing outside the target (vision 12).
+#[derive(Debug)]
+pub struct KeysLookup {
+    url: String,
+}
+
+impl Intent for KeysLookup {
+    /// The request and nothing else, because the step line shows it in
+    /// both modes: under `--check` it is what the step would send, and in a
+    /// real run, next to `ran, unchanged`, what it sent.
+    fn diff(&self) -> Diff {
+        Diff::summary(format!("GET {}", self.url))
+    }
+}
+
 impl Op for UserKeys {
     type Output = Vec<PublicKey>;
-    /// A lookup: `check` never plans a change, so there is no intent and
-    /// `apply` cannot be reached.
-    type Intent = std::convert::Infallible;
+    type Intent = KeysLookup;
 
+    /// Contacts nothing, in either mode: the platform gate and the login's
+    /// syntax are all it can judge without the request, and the request is
+    /// `apply`'s. So `check` always plans it, and a dry run reports `would
+    /// change` with no output, as for anything whose answer is remote state.
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
         // Portable. github::UserKeys is an HTTPS GET parsed in Rust; nothing
         // touches the host but the network, which is why `sys` is otherwise
@@ -181,10 +207,16 @@ impl Op for UserKeys {
             ),
         }
         validate_login(&self.login)?;
-        let url = self.url();
+        Ok(Plan::Change(KeysLookup { url: self.url() }))
+    }
+
+    /// The request, and everything that depends on its answer: the status,
+    /// then the body.
+    fn apply(&self, _: &System, intent: KeysLookup) -> Result<Vec<PublicKey>> {
+        let KeysLookup { url } = intent;
         let resp = self.fetcher().get(&url)?;
         match resp.status {
-            200 => Ok(Plan::Satisfied(parse_keys_body(&self.login, &resp.body)?)),
+            200 => parse_keys_body(&self.login, &resp.body),
             404 => bail!(
                 "GitHub user `{}` does not exist (404 from {url}); an existing user with no keys \
                  would return an empty list, not an error",
@@ -194,8 +226,10 @@ impl Op for UserKeys {
         }
     }
 
-    fn apply(&self, _: &System, intent: Self::Intent) -> Result<Vec<PublicKey>> {
-        match intent {}
+    /// A lookup changes nothing (vision 6.5): a real run reports it `ok`,
+    /// with the note `ran, unchanged`.
+    fn changed_by_apply(&self, _: &Vec<PublicKey>) -> bool {
+        false
     }
 }
 
@@ -258,6 +292,15 @@ pub(crate) mod tests {
 
     pub(crate) const URL_FOR_TESTS: &str = "https://github.com/flipbit03.keys";
 
+    /// `check`, then `apply` on what it planned: the lookup a real run makes,
+    /// without a `Ctx`. `check` contacts nothing, so it always plans.
+    fn look_up(op: &UserKeys, sys: &System) -> Result<Vec<PublicKey>> {
+        let Plan::Change(intent) = op.check(sys)? else {
+            panic!("UserKeys::check always plans the request")
+        };
+        op.apply(sys, intent)
+    }
+
     /// The one op in an external collection, so the worked example of the
     /// platform claim for collection authors: it runs on a mac (an HTTPS GET
     /// touches nothing on the host) and refuses a platform nobody claimed,
@@ -272,8 +315,7 @@ pub(crate) mod tests {
         mac.os = Os::Macos;
         let sys_mac = base_sys.clone().with_facts(mac);
         let op = UserKeys::of("flipbit03").fetch_with(canned.clone());
-        // A lookup is always satisfied: its intent is `Infallible`.
-        let Plan::Satisfied(keys) = op.check(&sys_mac).unwrap();
+        let keys = look_up(&op, &sys_mac).unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(canned.asked().len(), 1);
 
@@ -386,9 +428,7 @@ pub(crate) mod tests {
         let fake = Arc::new(Fake::new());
         let sys = System::fake(fake, Arc::new(Collect::default()));
         let canned = Canned::answering(URL_FOR_TESTS, Ok(Response::ok(hostile)));
-        let err = UserKeys::of("flipbit03")
-            .fetch_with(canned)
-            .check(&sys)
+        let err = look_up(&UserKeys::of("flipbit03").fetch_with(canned), &sys)
             .unwrap_err()
             .to_string();
         assert!(err.contains("options field"), "{err}");
@@ -404,8 +444,10 @@ pub(crate) mod tests {
         assert_eq!(keys[0].options, None);
     }
 
+    /// A real run sends the request, in `apply`, and reports the lookup `ok`
+    /// with the note `ran, unchanged`: never `changed` (vision 6.5).
     #[test]
-    fn ok_returns_keys_and_never_changes() {
+    fn a_real_run_fetches_and_reports_ok_not_changed() {
         let canned = Canned::answering(
             "https://github.com/flipbit03.keys",
             Ok(Response::ok(body())),
@@ -426,6 +468,11 @@ pub(crate) mod tests {
             finished(&sink),
             vec![("Fetch keys".to_string(), Status::Ok)]
         );
+        let note = sink.events().into_iter().find_map(|e| match e {
+            Event::StepFinished { note, .. } => note,
+            _ => None,
+        });
+        assert_eq!(note.as_deref(), Some("ran, unchanged"));
     }
 
     #[test]
@@ -433,29 +480,39 @@ pub(crate) mod tests {
         let canned = Canned::answering("https://github.com/nokeys.keys", Ok(Response::ok("")));
         let (sys, _) = sys();
         let op = UserKeys::of("nokeys").fetch_with(canned);
-        // A lookup's intent is `Infallible`: `Satisfied` is the only plan
-        // it has, and the compiler knows it.
-        let Plan::Satisfied(keys) = op.check(&sys).unwrap();
-        assert!(keys.is_empty());
+        assert!(look_up(&op, &sys).unwrap().is_empty());
     }
 
+    /// The status is the answer to the request, so it is judged where the
+    /// request is sent: `check` plans the lookup of a user who does not
+    /// exist without asking anyone, and `apply` fails it.
     #[test]
-    fn not_found_fails_naming_the_user() {
+    fn not_found_fails_in_apply_naming_the_user() {
         let canned = Canned::answering(
             "https://github.com/nobody-here.keys",
             Ok(Response::with_status(404, "Not Found")),
         );
         let (sys, sink) = sys();
-        let mut ctx = Ctx::new(sys, HostInfo::local());
-        let e = ctx
-            .step("Fetch keys", UserKeys::of("nobody-here").fetch_with(canned))
-            .unwrap_err()
-            .chain();
+        let op = UserKeys::of("nobody-here").fetch_with(canned.clone());
+        let Plan::Change(intent) = op.check(&sys).unwrap() else {
+            panic!("expected the request planned")
+        };
+        assert!(canned.asked().is_empty(), "check asked nobody");
+        let e = op.apply(&sys, intent).unwrap_err().chain();
         assert!(
             e.contains("GitHub user `nobody-here` does not exist"),
             "{e}"
         );
         assert!(e.contains("404"), "{e}");
+        assert_eq!(canned.asked().len(), 1);
+
+        // And through a step, which fails rather than reporting anything.
+        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let e = ctx
+            .step("Fetch keys", UserKeys::of("nobody-here").fetch_with(canned))
+            .unwrap_err()
+            .chain();
+        assert!(e.contains("does not exist"), "{e}");
         assert_eq!(
             finished(&sink),
             vec![("Fetch keys".to_string(), Status::Failed)]
@@ -469,9 +526,7 @@ pub(crate) mod tests {
             Ok(Response::with_status(503, "unavailable")),
         );
         let (sys, _) = sys();
-        let e = UserKeys::of("flipbit03")
-            .fetch_with(canned)
-            .check(&sys)
+        let e = look_up(&UserKeys::of("flipbit03").fetch_with(canned), &sys)
             .unwrap_err()
             .chain();
         assert!(e.contains("HTTP 503"), "{e}");
@@ -487,9 +542,7 @@ pub(crate) mod tests {
             )),
         );
         let (sys, _) = sys();
-        let e = UserKeys::of("flipbit03")
-            .fetch_with(canned)
-            .check(&sys)
+        let e = look_up(&UserKeys::of("flipbit03").fetch_with(canned), &sys)
             .unwrap_err()
             .chain();
         assert!(e.contains("dns error"), "{e}");
@@ -510,21 +563,53 @@ pub(crate) mod tests {
         assert!(canned.asked().is_empty(), "no request may be made");
     }
 
+    /// A dry run contacts nothing outside the target (vision 12): the canned
+    /// fetcher, which would answer, is asked nothing. The step says what it
+    /// would send and has no output, as for any would-change step.
     #[test]
-    fn check_mode_still_returns_the_keys() {
-        // A lookup is Satisfied, so its output is available in check mode and
-        // a chained step can use it (vision 12).
+    fn check_mode_fetches_nothing_and_has_no_output() {
         let canned = Canned::answering(
             "https://github.com/flipbit03.keys",
             Ok(Response::ok(body())),
         );
-        let (sys, _) = sys();
+        let (sys, sink) = sys();
         let mut ctx = Ctx::new(sys.with_check_mode(true), HostInfo::local());
         let keys = ctx
-            .step("Fetch keys", UserKeys::of("flipbit03").fetch_with(canned))
+            .step(
+                "Fetch keys",
+                UserKeys::of("flipbit03").fetch_with(canned.clone()),
+            )
             .unwrap();
-        assert!(keys.is_available());
-        assert_eq!(keys.len(), 3);
+        assert!(canned.asked().is_empty(), "{:?}", canned.asked());
+        assert!(keys.changed && !keys.is_available());
+        assert_eq!(
+            keys.diff.as_ref().unwrap().render(),
+            "GET https://github.com/flipbit03.keys"
+        );
+        assert_eq!(
+            finished(&sink),
+            vec![("Fetch keys".to_string(), Status::WouldChange)]
+        );
+        // A lookup, not an action: no `action` note (`always_changes` is
+        // false).
+        let note = sink.events().into_iter().find_map(|e| match e {
+            Event::StepFinished { note, .. } => Some(note),
+            _ => None,
+        });
+        assert_eq!(note, Some(None));
+    }
+
+    /// `base_url` reaches the request `apply` sends, not just `url()`.
+    #[test]
+    fn base_url_is_the_host_apply_asks() {
+        let url = "https://ghe.example.com/cadu.keys";
+        let canned = Canned::answering(url, Ok(Response::ok(body())));
+        let (sys, _) = sys();
+        let op = UserKeys::of("cadu")
+            .base_url("https://ghe.example.com/")
+            .fetch_with(canned.clone());
+        assert_eq!(look_up(&op, &sys).unwrap().len(), 3);
+        assert_eq!(canned.asked(), vec![url]);
     }
 
     /// Real HTTPS through `ring` against GitHub. Not part of
