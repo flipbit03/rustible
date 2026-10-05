@@ -1,4 +1,4 @@
-//! Docker integration test for the `file` family (vision 8, tier 3):
+//! Docker integration test for the `file` family (vision 8, T2):
 //! `Directory`, `Copy`, `Attrs`, `Symlink`, `Line`, `Block`, `Absent`, each
 //! applied twice on the real filesystem. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_file_ops`.

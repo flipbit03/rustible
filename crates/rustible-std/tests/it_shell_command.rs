@@ -1,4 +1,4 @@
-//! Docker integration test for `shell::Command` (vision 8, tier 3): the
+//! Docker integration test for `shell::Command` (vision 8, T2): the
 //! action itself plus `creates`, `removes`, `stdin`, `env`, `cwd` and
 //! `changed_when` against a real `/bin/sh`. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command`.

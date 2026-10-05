@@ -168,26 +168,30 @@ costs one message. Not raising it costs an architecture nobody chose.
 Every change goes through a branch and a pull request, even a one-line doc
 fix. CI runs eight jobs on each, and all eight must be green:
 
-A job is named for the **mechanism** it runs the code with, then what it ran
-against, because the people reading a CI run do not have this file open:
+A job that runs tests is named for the **tier** it runs (see "Testing
+tiers"), then the **mechanism** it runs the code with, then what it ran
+against:
 
 | job | what it protects |
 |---|---|
 | `Lint: fmt, clippy, docs` | the code is well-formed and documented |
-| `Test: unit & fake` | tiers 1 and 2 |
+| `Test (T1): unit & fake` | T1: pure functions and ops against the `Fake` |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Test: macOS (controller and target)` | the suite on macOS, and three playbooks run against the runner itself as a target |
-| `Test: Docker (Debian/Ubuntu/Alpine)` | tier 3 |
-| `Test: VM (Debian 12/x86_64)` | tier 4, on a KVM-accelerated guest |
-| `Test: VM (Debian 12/aarch64)` | tier 4, on an emulated guest |
+| `Test (T1, real mac): macOS (controller and target)` | T1 on macOS, and three playbooks run against the runner itself as a target, over a local connection |
+| `Test (T2): Docker (Debian/Ubuntu/Alpine)` | T2 |
+| `Test (T3): VM (Debian 12/x86_64)` | T3, on a KVM-accelerated guest |
+| `Test (T3): VM (Debian 12/aarch64)` | T3, on an emulated guest |
 
-Keep that shape when adding a job: `<verb>: <mechanism> (<what it ran
-against>)`. Lint and tests are deliberately separate jobs, because one says
-the code is malformed and the other says it is wrong, and a single red tick
-covering both is ambiguous. "Tier 4" and "the harness" are this repository's
-words for its own machinery; a job title that uses them tells a reader nothing
-about what broke or where it ran.
+Keep that shape when adding a job: `<verb> (<tier>): <mechanism> (<what it
+ran against>)`, and `<verb>: <mechanism>` for a job that runs no tests. The
+tier is added to the mechanism, never put in its place, because the two
+answer different readers. The tier tells a contributor which kind of test
+broke, in the words this file and every test header use, and so where the
+fix goes. The mechanism tells someone who has never opened this file what
+broke and where it ran. Lint and tests are deliberately separate jobs,
+because one says the code is malformed and the other says it is wrong, and a
+single red tick covering both is ambiguous.
 
 To work against your checkout rather than the published crates — which is what
 you want when changing Rustible itself — build the CLI from the tree and point
@@ -202,7 +206,7 @@ Before pushing, run what CI runs:
 
 ```sh
 make                # fmt, clippy, test, rustdoc, example workspace
-make integration    # the container tier; needs docker
+make integration    # the container tier, T2; needs docker
 ```
 
 which is these, in the order that fails soonest:
@@ -311,23 +315,27 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 
 ## Testing tiers
 
-Four. They are not redundant: each one can see something the tier below it
-cannot, and each costs more to run than the tier below it.
+Three, numbered by what a test needs in order to run. They are not redundant:
+each one can see something the tier below it cannot, and each costs more to
+run than the tier below it.
 
 | tier | what it is | where it runs | cost |
 |---|---|---|---|
-| 1. pure | functions with no I/O | `cargo test` | free |
-| 2. fake | ops against the `Fake` backend | `cargo test` | free |
-| 3. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
-| 4. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | minutes, needs vagrant |
+| T1. in-process | pure functions, and ops against the `Fake` backend | `cargo test` | free |
+| T2. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
+| T3. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | minutes, needs vagrant |
+
+T1 holds two kinds of test, a pure-function test and a `Fake` test. They
+differ in what they are written against, not in what they need to run, so
+they share a tier; "Choosing a tier" says which one a test should be.
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
 three playbooks on each of two architectures.
 
-**All four tiers run in CI**, the machine tier on both architectures.
+**All three tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
-accelerated and the aarch64 one is interpreted by qemu. Run tier 4 locally
+accelerated and the aarch64 one is interpreted by qemu. Run T3 locally
 anyway while writing an op: iterating against a machine you already have up
 beats waiting on a runner.
 
@@ -335,37 +343,39 @@ beats waiting on a runner.
 
 Put a test in the *lowest* tier that can actually fail for the right reason.
 A test in too high a tier is slow and flaky; a test in too low a tier passes
-while the thing is broken.
+while the thing is broken. Within T1, the same rule picks the kind of test:
+a pure function where the logic can be one.
 
-- **Parsing, planning, diffing, any decision made from data** → tier 1.
-- **An op's behaviour**: satisfied, change, apply, failure, refusal → tier 2.
-  The `Fake` lets you plant a tool's output and assert on the op's reaction,
-  which is why `check` must do all the thinking and `apply` must execute the
-  intent rather than re-inspecting.
-- **Anything where the answer comes from a real tool** → tier 3. This is the
+- **Parsing, planning, diffing, any decision made from data** → T1, a pure
+  function test: strings in, strings out, no `Fake`.
+- **An op's behaviour**: satisfied, change, apply, failure, refusal → T1, a
+  `Fake` test. The `Fake` lets you plant a tool's output and assert on the
+  op's reaction, which is why `check` must do all the thinking and `apply`
+  must execute the intent rather than re-inspecting.
+- **Anything where the answer comes from a real tool** → T2. This is the
   source of truth for how `useradd`, `apt-get`, `systemctl` and friends
   behave, and it has earned it: it caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
   setuid. A fake models what you *believe*; a container shows what is.
-- **Anything a container structurally cannot do** → tier 4. That list is
+- **Anything a container structurally cannot do** → T3. That list is
   short and specific: writes to `/proc/sys` (a container shares the host
   kernel, so the write is refused or hits the *host*), a real init system, a
   real `sudo`, and the SSH transport itself. `it_sysctl_present.rs` says so in
   its own header — it runs with `.apply_now(false)` and asserts only on the
   drop-in file, because the live write is not available to it.
 
-If a new op needs nothing from tier 4, it does not need a tier-4 test. Say so
+If a new op needs nothing from T3, it does not need a T3 test. Say so
 in the pull request rather than adding a step to the playbook for symmetry.
 
 ### Where tests go, and how to write them
 
 Choosing the tier is the judgement; this is the mechanism.
 
-**Tiers 1 and 2 live in the op's own file**, in a `#[cfg(test)] mod tests` at
+**T1 lives in the op's own file**, in a `#[cfg(test)] mod tests` at
 the bottom. Every module in `rustible-std` that has tests does this — all
 twenty of them; `lib.rs` and `ssh/mod.rs` only re-export — and none has a
-separate unit-test file. Inside it, separate the two tiers with a banner
-comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and
+separate unit-test file. Inside it, separate the two kinds of test with a
+banner comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and
 `// ---- Fake ----`, which is the pair to copy; older modules use their own
 wording.
 
@@ -415,7 +425,7 @@ mod tests {
         // Read the box back: `.content(path)`, `.argvs()`, `.commands()`.
         assert_eq!(fake.content("/etc/thing").unwrap(), "after\n");
 
-        // And the op is now satisfied, which is idempotence at tier 2.
+        // And the op is now satisfied, which is idempotence at T1.
         assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
     }
 }
@@ -434,7 +444,7 @@ wiring. `with_check_mode(true)` is a consuming builder on it —
 `System::fake(..).with_check_mode(true)` — and gives you the dry `System` a
 check-mode test needs.
 
-**Tier 3 lives in `crates/rustible-std/tests/it_<op>.rs`** — usually one file
+**T2 lives in `crates/rustible-std/tests/it_<op>.rs`** — usually one file
 per op, sometimes one per state or per toolset where the behaviour genuinely
 differs (`it_apt_present.rs` / `it_apt_absent.rs` / `it_apt_latest.rs`,
 `it_user_group.rs` / `it_user_busybox.rs`). The
@@ -443,7 +453,7 @@ name the harness reads at compile time. Each new file is another musl build,
 so prefer adding cases to one file over adding files.
 
 ```rust
-//! Docker integration test for `thing::Present` (vision 8, tier 3).
+//! Docker integration test for `thing::Present` (vision 8, T2).
 
 use rustible::prelude::*;                        // Ctx, Result, ensure!, bail!
 use rustible::sdk::testing::changed_then_ok;
@@ -487,7 +497,7 @@ system.
 - `RUSTIBLE_INTEGRATION_IMAGES=debian:12` narrows a run while iterating; there
   is a 600-second timeout per body.
 
-**Tier 4 is a step in `examples/workspace/playbooks/vagrant.rs`**, the
+**T3 is a step in `examples/workspace/playbooks/vagrant.rs`**, the
 playbook `make vm-test` runs. There is no separate test file: the assertion is
 that the step is in that playbook and the second run reports `ok`. What a
 single playbook cannot show is a login chosen per playbook and a launch as
@@ -503,7 +513,7 @@ Each of these has already produced a test that could not fail.
 
 - **Check-mode behaviour only shows under check mode.** Asserting that a
   step's output is unavailable, or that a missing prerequisite is tolerated,
-  inside a tier-3 body is vacuous, because harness bodies run with check mode
+  inside a T2 body is vacuous, because harness bodies run with check mode
   off. A review found exactly this in a merged Alpine test (it asserted on a
   prediction, back when there were predictions). To test a dry run, build a
   second dry `Ctx` over the same machine — see
@@ -512,9 +522,9 @@ Each of these has already produced a test that could not fail.
   *first* canned entry matching the program, and `with_cmd` consumes `self`,
   so there is no way to make a command answer differently on a second call. An
   op that reads its state with a command therefore cannot express
-  changed-then-ok at tier 2 at all. Where the state is a *file*, you can drive
-  the second answer by writing into the Fake between the two checks — the
-  builders consume `self`, so this goes through the `Backend` trait, as
+  changed-then-ok against the `Fake` at all. Where the state is a *file*, you
+  can drive the second answer by writing into the Fake between the two checks
+  — the builders consume `self`, so this goes through the `Backend` trait, as
   `sysctl.rs:756` does:
 
   ```rust
@@ -529,9 +539,9 @@ Each of these has already produced a test that could not fail.
   anything but a directory, even to the owner the file already has, and a
   rewrite through `write` loses them the same way `Local::write` does — so an
   op that sets the mode before the owner, or not at all after a rewrite, now
-  fails at tier 2. What it cannot show in the final state is a call that
-  changed nothing: a `chown` that changes the owner needs root, and one that
-  doesn't is a needless call that also clears setuid, and on a 0600 file
+  fails against the `Fake`. What it cannot show in the final state is a call
+  that changed nothing: a `chown` that changes the owner needs root, and one
+  that doesn't is a needless call that also clears setuid, and on a 0600 file
   leaves no trace at all. Assert on the calls for that: `fake.attr_calls()`
   records every `set_mode` and `set_owner` in order (`fake.chowns()` and
   `fake.chmods()` filter it), as `authorized_keys`'s
@@ -546,9 +556,9 @@ Each of these has already produced a test that could not fail.
   ignores the entire payload.
 - **The harness images are minimal.** They are not "a Debian box": stock
   `debian:12` has no `/etc/sysctl.d`, and several common tools are absent. If
-  the tool your op drives is not in the image, tier 3 cannot test the op
+  the tool your op drives is not in the image, T2 cannot test the op
   without first installing it — which is a test of `apt::Present` wearing your
-  op's clothes, and a reason to reach for tier 4 instead.
+  op's clothes, and a reason to reach for T3 instead.
 - **The backend forces `LANG=C` and `LC_ALL=C`** on every command, which is
   why parsers here do not defend against localised output. Do not add
   defences the environment makes unnecessary, and do not rely on a locale.
@@ -557,7 +567,7 @@ Each of these has already produced a test that could not fail.
 
 `dev/vagrant/` holds two Debian 12 guests, `x86` and `arm`, from one
 multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS. The
-CI jobs name their distribution — `Test: VM (Debian 12/x86_64)` — because
+CI jobs name their distribution — `Test (T3): VM (Debian 12/x86_64)` — because
 this tier is distribution-specific where the container tier is not: one guest
 is one distro. A second distribution means a second pair of jobs, and the
 distro is matrix data so the name cannot go stale.
@@ -632,9 +642,9 @@ the describe build passes `--target <host>` like every other, or cargo-zigbuild
 leaves the C compiler alone; and build scripts link with the *host* linker, so
 `wire_host_linker` points that at zig too.
 
-The container-tier harness (`rustible-sdk::testing`) is the one build not on
-zig, on purpose — every playbook links the SDK. It uses the developer's C
-compiler, like it uses docker.
+The container-tier (T2) harness (`rustible-sdk::testing`) is the one build
+not on zig, on purpose — every playbook links the SDK. It uses the
+developer's C compiler, like it uses docker.
 
 ## Platforms
 

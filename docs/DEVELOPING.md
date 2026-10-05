@@ -5,27 +5,26 @@ for testing against real systems, and this file is how to turn them on.
 
 ```sh
 make            # fmt, clippy, test, rustdoc, and the example workspace
-make integration    # the container tier: needs docker
+make integration    # the container tier, T2: needs docker
 make vm-up          # a virtual machine
-make vm-test        # the machine tier: needs vagrant
+make vm-test        # the machine tier, T3: needs vagrant
 ```
 
 ## The three tiers, and when to reach for the machine one
 
-1. **Pure functions** and the **`Fake` backend**. Parsers, planners, and an
-   op's own behaviour. `cargo test`, always.
-2. **Containers** (`make integration`). Real distributions, real package
-   managers, real `useradd`. They caught that `useradd` refuses to create a
-   private group when one already carries the name, and that `chown` clears
-   setuid.
-3. **Machines** (`make vm-test`). A real SSH transport, a real `sudo`, a live
-   `/proc/sys`, and a real init system. A container has none of those: it
-   shares the host kernel, so `sysctl` writes are refused or leak to the host,
-   and it has no pid 1 to ask about a unit.
+- **T1, in-process: pure functions** and the **`Fake` backend**. Parsers,
+  planners, and an op's own behaviour. `cargo test`, always.
+- **T2, containers** (`make integration`). Real distributions, real package
+  managers, real `useradd`. They caught that `useradd` refuses to create a
+  private group when one already carries the name, and that `chown` clears
+  setuid.
+- **T3, machines** (`make vm-test`). A real SSH transport, a real `sudo`, a
+  live `/proc/sys`, and a real init system. A container has none of those: it
+  shares the host kernel, so `sysctl` writes are refused or leak to the host,
+  and it has no pid 1 to ask about a unit.
 
-(`CLAUDE.md` counts four, splitting pure functions from the `Fake` backend,
-because choosing between those two matters when you are writing a test. Here
-they install the same way — they need nothing — so they are one line.)
+A CI job that runs a tier names it, so a red `Test (T2): Docker
+(Debian/Ubuntu/Alpine)` is the container tier failing.
 
 **All three run in CI**, the machine tier on both architectures. So why run it
 locally at all? Two reasons. Iterating against a machine you already have up

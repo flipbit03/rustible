@@ -4,7 +4,7 @@
 // This crate implements the `Local` backend that vision 7.2's rule routes
 // everything else through, so it is the one place real filesystem and
 // process calls belong. The lint stays on for the op crates, which is where
-// reaching past `sys` would make the `Fake` tier a fiction.
+// reaching past `sys` would make every `Fake` test a fiction.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod backend;

@@ -1,6 +1,6 @@
 # Vision 7.2: "all file reads, writes, and process spawns go through `sys`,
-# reads included, otherwise the fake is one nobody hits." That rule is what the
-# whole `Fake` tier rests on, and until now it was enforced by review alone.
+# reads included, otherwise the fake is one nobody hits." That rule is what
+# every `Fake` test rests on, and until now it was enforced by review alone.
 #
 # This is a lint, not a wall. The crates that legitimately touch the real
 # filesystem -- `rustible-sdk`, which implements the `Local` backend the rest

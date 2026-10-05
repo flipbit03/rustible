@@ -1674,7 +1674,7 @@ mod tests {
     /// that one — it refuses only a directory writable by others, and root
     /// ownership is allowed — which is the point: the op holds both at the
     /// recommended modes rather than at the minimum sshd tolerates, the way
-    /// Ansible does. `wrong_modes_and_ownership_are_repaired` at tier 3 uses
+    /// Ansible does. `wrong_modes_and_ownership_are_repaired` at T2 uses
     /// 0775, which sshd does refuse.
     ///
     /// A key *is* being added here, so Ansible would repair too;
@@ -2207,7 +2207,7 @@ mod tests {
             "the link itself is left alone"
         );
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
-        // Where the *file* lands is the one thing this tier cannot answer.
+        // Where the *file* lands is the one thing a `Fake` test cannot answer.
         // `Fake::resolve` follows only the final component of a path, so the
         // fake puts it at `/home/cadu/.ssh/authorized_keys` while a real
         // kernel resolves the directory and puts it under `/srv/keys/cadu`.
@@ -2491,9 +2491,10 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
-    /// The headline divergence from Ansible, at the tier that can express
-    /// it: keys right, file right, directory still wrong. Ansible's
-    /// `do_write` gate reports `ok` here and leaves it; this op repairs it.
+    /// The headline divergence from Ansible, in the kind of test that can
+    /// plant it exactly: keys right, file right, directory still wrong.
+    /// Ansible's `do_write` gate reports `ok` here and leaves it; this op
+    /// repairs it.
     #[test]
     fn the_directory_alone_being_wrong_is_a_change() {
         let fake = fake_with_user();

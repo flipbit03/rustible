@@ -1,12 +1,12 @@
-//! Docker integration test for `ssh::authorized_keys` (vision 8, tier 3):
+//! Docker integration test for `ssh::authorized_keys` (vision 8, T2):
 //! `Present` (plain and `exclusive`) and `Absent` for a user created in the
 //! same test, with the file mode, `.ssh` mode and ownership checked on the
 //! real filesystem. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_authorized_keys`.
 //!
 //! What this tier adds over the `Fake`, having checked rather than assumed:
-//! a missing `mkdir_all` *is* caught at tier 2 (the fake's `set_mode` errors
-//! on an absent path), so that is not the reason. The reasons are real
+//! a missing `mkdir_all` *is* caught by a `Fake` test (the fake's `set_mode`
+//! errors on an absent path), so that is not the reason. The reasons are real
 //! `chmod`/`chown` semantics on a real inode, a real `/etc/passwd` that
 //! `useradd` wrote, the fact that `useradd -m` does not make `~/.ssh` — which
 //! is the premise the whole change rests on and which only a real `useradd`
@@ -242,9 +242,9 @@ fn refusals_that_need_a_human(ctx: &mut Ctx) -> Result<()> {
 }
 
 /// Symlink resolution through a directory component, which the `Fake` does
-/// not model: `Fake::resolve` follows only a path's final component, so tier
-/// 2 cannot say where the file actually lands when `~/.ssh` is a link. Here a
-/// real kernel answers.
+/// not model: `Fake::resolve` follows only a path's final component, so a
+/// `Fake` test cannot say where the file actually lands when `~/.ssh` is a
+/// link. Here a real kernel answers.
 #[rustible::integration_test(images = ["debian:12"])]
 fn symlinked_ssh_dir_is_followed_to_the_real_directory(ctx: &mut Ctx) -> Result<()> {
     let account = ctx.step("user", user::Present::new("rustible-ak7"))?;

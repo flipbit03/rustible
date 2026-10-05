@@ -1,5 +1,5 @@
 //! Docker integration test for the harness's systemd variant (vision 8,
-//! tier 3; M6 brief "SystemdImage"). Proves the image boots with systemd as
+//! T2; M6 brief "SystemdImage"). Proves the image boots with systemd as
 //! PID 1 and that `systemctl` works inside, which is what the systemd ops
 //! (`Enabled`, `Running`, ...) will build on. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd_image`.

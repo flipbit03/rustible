@@ -1,4 +1,4 @@
-//! Docker integration test for the `systemd` ops (vision 8, tier 3). Runs on
+//! Docker integration test for the `systemd` ops (vision 8, T2). Runs on
 //! the systemd images with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_systemd`.
 
