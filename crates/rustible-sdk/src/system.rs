@@ -410,8 +410,13 @@ impl System {
     /// directory and a rename, so a concurrent reader sees either the old
     /// file or the new one and a failure part way leaves the old one intact.
     ///
-    /// An existing file keeps its mode and owner; a new one is created with
-    /// the mode any newly created file gets, 0666 minus the umask. Refused
+    /// An existing file keeps its owner and its whole mode, setuid and setgid
+    /// included: the replacement is given the old owner first and the old
+    /// mode after, because a `chown` clears those bits. That takes root: an
+    /// unprivileged rewrite of a file another user owns leaves it owned by
+    /// this identity, since the `chown` back fails and is ignored. A new
+    /// file is created with the mode any newly created file gets, 0666 minus
+    /// the umask. Refused
     /// with [`MutationDuringCheck`] inside `check`, and errors as [`IoAt`]
     /// if the directory is not writable or the rename fails. Logs the path
     /// and byte count at debug level.

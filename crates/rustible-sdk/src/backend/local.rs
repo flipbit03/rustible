@@ -55,10 +55,16 @@ impl Backend for Local {
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         if let Some(meta) = existing {
-            std::fs::set_permissions(tmp.path(), meta.permissions())?;
-            // Best effort: only root can chown; ignore EPERM so unprivileged
-            // rewrites of own files still work.
+            // Owner first, then mode. On Linux every successful `chown` of a
+            // non-directory clears setuid, and setgid when group execute is
+            // set, even to the ids the file already has (`[FAKE-CHOWN]` in
+            // docs/plan/DECISIONS.md has the measurements), so the other
+            // order rewrote a 4755 file as 0755 and reported success.
+            //
+            // Best effort: only root can give a file away; ignore EPERM so
+            // unprivileged rewrites of their own files still work.
             let _ = std::os::unix::fs::chown(tmp.path(), Some(meta.uid()), Some(meta.gid()));
+            std::fs::set_permissions(tmp.path(), meta.permissions())?;
         }
         tmp.persist(p).map_err(|e| e.error)?;
         Ok(())

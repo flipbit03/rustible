@@ -353,6 +353,33 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
+    /// Editing a setuid script, or a setgid one with group execute, keeps
+    /// the bits: `Line` sets no mode, so the rewrite has to keep the one the
+    /// file had, and a rewrite that dropped it would report success and be
+    /// `Satisfied` on the next run (issue #51).
+    #[test]
+    fn editing_a_setuid_or_setgid_file_keeps_its_mode() {
+        for mode in [0o4755, 0o2755] {
+            let fake =
+                Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "#!/bin/sh\n", mode));
+            let sys = fake_sys(&fake);
+            let op = Line::in_path("/usr/local/bin/x")
+                .matching("^exit")
+                .set("exit 0");
+            let Plan::Change(change) = op.check(&sys).unwrap() else {
+                panic!("expected change")
+            };
+            op.apply(&sys, change).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, f.bytes.as_slice()),
+                (mode, b"#!/bin/sh\nexit 0\n".as_slice()),
+                "{mode:o}"
+            );
+            assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        }
+    }
+
     /// With duplicates, the satisfied report has to name the line
     /// `matching` selected, not the first line that happens to equal the
     /// desired one. Only the report is at stake; the file is untouched

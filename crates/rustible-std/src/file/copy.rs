@@ -407,12 +407,11 @@ mod tests {
         assert_eq!(d.short(), "+1 -0 lines");
     }
 
-    /// A rewrite of a setuid file keeps the bit. The mode and owner already
-    /// matched when `check` planned the write, but the rewrite `chown`s the
-    /// replacement file, which clears setuid on Linux (and in the `Fake`,
-    /// which models it), so `apply` sets every wanted attribute again after
-    /// writing. An `apply` that set only the attributes that differed would
-    /// leave 0755.
+    /// A rewrite of a setuid file with `.mode()` and `.owner()` keeps the
+    /// bit. The rewrite keeps it (the backend gives the replacement the old
+    /// owner before the old mode), and `apply` then sets every wanted
+    /// attribute again, owner first: its own `chown` clears setuid on Linux
+    /// (and in the `Fake`, which models it), so the mode has to come after.
     #[test]
     fn copy_rewrite_of_a_setuid_file_keeps_the_bit() {
         let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
@@ -429,19 +428,29 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
+    /// Without `.mode()`, a rewrite keeps the mode the file had, setuid and
+    /// setgid with group execute included, and the next `check` is
+    /// `Satisfied`. Nothing in `apply` sets a mode here, so this is the
+    /// backend's rewrite alone: one that `chown`ed the replacement after
+    /// copying the old mode onto it would leave 0755, and `check`, which
+    /// compares no mode, would never notice (issue #51).
     #[test]
     fn copy_rewrite_preserves_existing_mode_when_none_given() {
-        let fake = Arc::new(Fake::new().with_file_mode("/etc/shadowish", "old\n", 0o600));
-        let sys = fake_sys(&fake);
-        let op = Copy::from_str("new\n").to("/etc/shadowish");
-        let c = expect_change(&op, &sys);
-        op.apply(&sys, c).unwrap();
-        let f = fake.file("/etc/shadowish").unwrap();
-        assert_eq!(
-            f.mode, 0o600,
-            "write_atomic keeps the mode of an existing file"
-        );
-        assert_eq!(String::from_utf8(f.bytes).unwrap(), "new\n");
+        for mode in [0o600, 0o4755, 0o2755, 0o6755] {
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "old\n", mode));
+            let sys = fake_sys(&fake);
+            let op = Copy::from_str("new\n").to("/usr/local/bin/x");
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, String::from_utf8(f.bytes).unwrap()),
+                (mode, "new\n".into()),
+                "write_atomic keeps the whole mode of an existing file: {mode:o}"
+            );
+            assert!(fake.attr_calls().is_empty(), "no mode was asked for");
+            assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        }
     }
 
     #[test]

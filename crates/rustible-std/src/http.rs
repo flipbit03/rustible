@@ -1076,6 +1076,29 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "check never fetched");
     }
 
+    /// Without `.mode()`, a download over a setuid file keeps `4755`, and
+    /// the next `check` is `Satisfied`: nothing in `apply` sets a mode, so
+    /// this is the rewrite keeping the one the file had (issue #51).
+    #[test]
+    fn a_download_over_a_setuid_file_without_mode_keeps_the_bit() {
+        let (base, _) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
+            "/opt/hello.txt",
+            "old",
+            0o4755,
+        ));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"));
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!((f.mode, f.bytes.as_slice()), (0o4755, HELLO));
+        assert!(fake.attr_calls().is_empty(), "no mode was asked for");
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
     #[test]
     fn download_follows_redirects_and_sends_headers() {
         let (base, hits) = hello_server();

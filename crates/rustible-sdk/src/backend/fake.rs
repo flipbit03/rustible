@@ -289,17 +289,15 @@ impl Backend for Fake {
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
         // Mirrors `Local::write` (tempfile + rename): writing at a symlink's
         // path replaces the link itself with a regular file; the target is
-        // untouched. New files get 0644. An existing file keeps its owner,
-        // and its mode as `Local::write` leaves it: that copies the mode onto
-        // the temporary file and then `chown`s it to the same owner, and the
-        // `chown` clears setuid (and setgid with group execute) as any does
-        // (`mode_after_chown`). An op that wants those bits after a rewrite
-        // has to set the mode again.
+        // untouched. New files get 0644. An existing file keeps its owner and
+        // its whole mode, setuid and setgid included, as `Local::write` leaves
+        // it: that `chown`s the temporary file to the old owner first and
+        // copies the old mode onto it after, so the bits the `chown` clears
+        // (`mode_after_chown`) are set again.
         let mut files = self.files.lock().unwrap();
         match files.get_mut(p) {
             Some(f) if f.kind == FileKind::File => {
                 f.bytes = bytes.to_vec();
-                f.mode = mode_after_chown(f.kind, f.mode);
             }
             Some(f) if f.kind == FileKind::Dir => {
                 return Err(io::Error::new(
@@ -440,10 +438,11 @@ impl Backend for Fake {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
-        // The real `copy` (`std::fs::copy`) never `chown`s. Going through
-        // `write` here would clear setuid on an existing destination, which
-        // `Local` does not; harmless today, because the one caller,
-        // `System::backup`, always copies to a new path.
+        // The real `copy` (`std::fs::copy`) never `chown`s, and gives the
+        // destination the source's mode. Going through `write` gives a new
+        // destination 0644 and an existing one its own mode and owner; the
+        // one caller, `System::backup`, always copies to a new path, and no
+        // test reads a backup's mode.
         let bytes = self.read(from)?;
         Backend::write(self, to, &bytes)
     }
@@ -626,16 +625,30 @@ mod tests {
         assert_eq!((real.mode, real.uid, real.gid), (0o4755, 7, 8));
     }
 
-    /// A rewrite of an existing file keeps its owner and loses setuid, as
-    /// `Local::write` does: it copies the mode onto the replacement and then
-    /// `chown`s it to the same owner. A new file is 0644.
+    /// A rewrite of an existing file keeps its owner and its whole mode,
+    /// setuid and setgid with group execute included, as `Local::write`
+    /// does: it `chown`s the replacement to the same owner first and copies
+    /// the mode onto it after, so the bits that `chown` clears come back
+    /// (issue #51). Neither is recorded: they are the backend's own calls,
+    /// not an op's.
     #[test]
-    fn a_rewrite_clears_setuid_as_local_write_does() {
-        let fake = Fake::new().with_file_mode("/bin/x", "v1", 0o4755);
-        fake.write(Path::new("/bin/x"), b"v2").unwrap();
-        let f = fake.file("/bin/x").unwrap();
-        assert_eq!((f.mode, f.bytes.as_slice()), (0o755, b"v2".as_slice()));
-        assert!(fake.attr_calls().is_empty(), "the backend's own chown");
+    fn a_rewrite_keeps_owner_and_mode_setuid_included() {
+        for mode in [0o4755, 0o2755, 0o6755, 0o2745, 0o1755, 0o600] {
+            // Owner first, then mode, so the planted mode is the one asked.
+            let fake = Fake::new().with_file("/bin/x", "v1");
+            fake.set_owner(Path::new("/bin/x"), 5, 6).unwrap();
+            fake.set_mode(Path::new("/bin/x"), mode).unwrap();
+            let planted = fake.attr_calls().len();
+
+            fake.write(Path::new("/bin/x"), b"v2").unwrap();
+            let f = fake.file("/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+                (mode, 5, 6, b"v2".as_slice()),
+                "{mode:o}"
+            );
+            assert_eq!(fake.attr_calls().len(), planted, "the backend's own calls");
+        }
     }
 
     /// `chmod` and `chown` follow symlinks, and `System::set_mode` and

@@ -437,6 +437,33 @@ mod tests {
         assert!(matches!(op3.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
+    /// Editing a setuid script, or a setgid one with group execute, keeps
+    /// the bits: `Block` sets no mode, so the rewrite has to keep the one
+    /// the file had, and a rewrite that dropped it would report success and
+    /// be `Satisfied` on the next run (issue #51).
+    #[test]
+    fn editing_a_setuid_or_setgid_file_keeps_its_mode() {
+        for mode in [0o4755, 0o2755] {
+            let fake =
+                Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "#!/bin/sh\n", mode));
+            let sys = fake_sys(&fake);
+            let op = Block::in_path("/usr/local/bin/x").set("exit 0\n");
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, String::from_utf8(f.bytes).unwrap()),
+                (
+                    mode,
+                    "#!/bin/sh\n# BEGIN MANAGED BY RUSTIBLE\nexit 0\n# END MANAGED BY RUSTIBLE\n"
+                        .into()
+                ),
+                "{mode:o}"
+            );
+            assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        }
+    }
+
     #[test]
     fn block_op_default_marker_and_create() {
         let fake = Arc::new(Fake::new());
