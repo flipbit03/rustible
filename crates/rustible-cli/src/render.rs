@@ -47,9 +47,17 @@ struct HostState {
     /// error the playbook kept and returned after other steps) closes it
     /// without printing it twice. Only when the frame's chain is that one:
     /// a `.context(..)` the playbook added on the way out was not printed.
-    /// The failed command printed with the chain either way, so the frame
-    /// never prints its own.
-    shown: Vec<(FailKey, String)>,
+    /// The failed command printed with the chain either way, so a frame
+    /// for the same step does not print its own.
+    shown: Vec<Shown>,
+}
+
+/// A failed step's reason as `flush` printed it, and the command printed
+/// under it.
+struct Shown {
+    key: FailKey,
+    chain: String,
+    cmd: Option<CmdFailed>,
 }
 
 /// Which failed step a chain or a `Failed` frame belongs to: its id, block
@@ -144,7 +152,11 @@ impl<W: Write> Renderer<W> {
             for l in p.after {
                 self.line(host, &l);
             }
-            self.state(host).shown.push((p.key, p.chain));
+            self.state(host).shown.push(Shown {
+                key: p.key,
+                chain: p.chain,
+                cmd: p.cmd,
+            });
         }
     }
 
@@ -321,11 +333,6 @@ impl<W: Write> Renderer<W> {
                 };
                 let st = self.state(host);
                 let pending = st.pending_fail.take_if(|p| key.as_ref() == Some(&p.key));
-                // A frame with no id cannot take the held reason, but may
-                // still be its failure: same name and blocks.
-                let same_step =
-                    |k: &FailKey| key.is_none() && step == Some(&*k.step) && k.blocks == *blocks;
-                let flushed_same = st.pending_fail.as_ref().is_some_and(|p| same_step(&p.key));
                 // Anything else held back is a different failure, which the
                 // playbook caught: its reason prints first, in order.
                 self.flush(host);
@@ -336,21 +343,29 @@ impl<W: Write> Renderer<W> {
                 // added words to with `.context(..)`, which were not above.
                 let st = self.state(host);
                 // Its chain printed before this frame, and its command with
-                // it: earlier, when a later step began, or just now by the
-                // flush, for a frame that names the step but not its id. A
+                // it, when a later step began or just now by the flush. A
                 // frame that took the held chain prints the command, even
                 // beside a twin from another `Ctx` printed with the same key.
-                let printed = flushed_same
-                    || pending.is_none()
-                        && key
-                            .as_ref()
-                            .is_some_and(|k| st.shown.iter().any(|(o, _)| o == k));
+                // One with no id names the step only by name, which another
+                // failure can borrow, so the command must be the same too.
+                let printed = match &key {
+                    Some(k) => pending.is_none() && st.shown.iter().any(|o| o.key == *k),
+                    None => step.is_some_and(|s| {
+                        st.shown.iter().any(|o| {
+                            o.key.step == s
+                                && o.key.blocks == *blocks
+                                && o.cmd
+                                    .as_ref()
+                                    .zip(cmd.as_ref())
+                                    .is_some_and(|(a, b)| same_command(a, b))
+                        })
+                    }),
+                };
                 let shown = key.as_ref().is_some_and(|k| {
-                    st.shown.iter().any(|(o, chain)| o == k && *chain == *error)
-                        && !st
-                            .shown
-                            .iter()
-                            .any(|(o, _)| o.step == k.step && o.blocks == k.blocks && o.id != k.id)
+                    st.shown.iter().any(|o| o.key == *k && o.chain == *error)
+                        && !st.shown.iter().any(|o| {
+                            o.key.step == k.step && o.key.blocks == k.blocks && o.key.id != k.id
+                        })
                 });
                 let text = match (step, shown) {
                     // Printed already, when a later step began; this line
@@ -447,6 +462,28 @@ fn argv_text(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether `a` and `b` are one failed command: the same argv and status,
+/// and stderr the same once a frame's cut (a marker line, then the tail) is
+/// allowed for, so one is the end of the other. The SDK's `Compact` has its
+/// own copy.
+fn same_command(a: &CmdFailed, b: &CmdFailed) -> bool {
+    fn tail(stderr: &str) -> &str {
+        match stderr.split_once('\n') {
+            Some((first, rest))
+                if first.starts_with("… (")
+                    && first.ends_with(
+                        " earlier bytes of stderr not shown: more than one frame carries)",
+                    ) =>
+            {
+                rest
+            }
+            _ => stderr,
+        }
+    }
+    let (x, y) = (tail(&a.stderr), tail(&b.stderr));
+    a.argv == b.argv && a.status == b.status && (x.ends_with(y) || y.ends_with(x))
 }
 
 /// Where a step failed, after `FAILED at`: its block path as the step line
@@ -1312,6 +1349,80 @@ web1    4        1             0        0       0          2         0
         });
         let reason = "[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n";
         assert_eq!(out, format!("{STEP_X}{reason}{CMD}{reason}"));
+    }
+
+    /// The same id-less frame after a later step ran: the reason printed
+    /// with its command when that step began, so the frame still does not
+    /// print the command again.
+    #[test]
+    fn a_frame_without_an_id_does_not_repeat_a_command_printed_earlier() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event("local", &step_started(2, "next"));
+            r.event("local", &step_finished(2, "next", Status::Ok));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  next .................................................... ok\n\
+                 [local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A frame naming a step only by name is not that step's failure when
+    /// its command is another: the playbook caught `x` (command A), then a
+    /// command outside any step failed (B) and was returned under `x`'s
+    /// name. Both commands print, once each. The same command, its stderr
+    /// cut to fit the frame, is still the same, and is not repeated.
+    #[test]
+    fn a_frame_without_an_id_prints_a_different_command() {
+        let other = CmdFailed {
+            argv: vec!["false".into()],
+            status: 1,
+            signal: None,
+            stderr: "BBB\n".into(),
+        };
+        let feed = |frame_cmd: CmdFailed| {
+            render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                r.event("local", &failing_cmd(1, "x"));
+                r.event("local", &step_started(2, "next"));
+                r.event("local", &step_finished(2, "next", Status::Ok));
+                let mut frame = failed_frame(Some("x"), None, "step `x`: `false` exited 1");
+                if let Event::Failed { cmd, .. } = &mut frame {
+                    *cmd = Some(frame_cmd);
+                }
+                r.event("local", &frame);
+            })
+        };
+        let out = feed(other);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  FAILED at `x`: `false` exited 1\n\
+                 [local]    $ false (exit 1)\n\
+                 [local]      BBB\n"
+            ),
+            "{out}"
+        );
+        let mut cut = sh_failed();
+        cut.stderr = "… (5 earlier bytes of stderr not shown: more than one frame carries)\n\
+                      still nope\n"
+            .into();
+        let out = feed(cut);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(!out.contains("earlier bytes"), "{out}");
     }
 
     /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
