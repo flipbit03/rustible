@@ -105,8 +105,8 @@ impl Copy {
         self
     }
 
-    /// Numeric owner (`chown uid:gid`). Changing the owner of a setuid or
-    /// setgid file clears those bits, as `chown` does; give `.mode(..)` too
+    /// Numeric owner (`chown uid:gid`). Changing the owner clears setuid,
+    /// and setgid with group execute, as `chown` does; give `.mode(..)` too
     /// to keep them.
     pub fn owner(mut self, uid: u32, gid: u32) -> Self {
         self.owner = Some(Owner { uid, gid });
@@ -258,14 +258,22 @@ impl Op for Copy {
         // here: one that changed since `check` is written as it is now, an
         // accepted race like the other ops' (`[ISSUE-43]`).
         let bytes = self.source_bytes(sys)?;
+        // Only what is wrong: a rewrite keeps the old owner and mode, and a
+        // `chown` to the owner the file already has would clear setuid with
+        // nothing to set it back when no mode was asked for. After a rewrite
+        // the owner is read again, because a rewrite that could not keep it
+        // does not fail.
         let backup_path = match intent.rewrite {
-            Some(_) => super::write_with_backup(sys, &intent.dest, self.backup, &bytes)?,
-            None => None,
+            Some(_) => {
+                let backup = super::write_with_backup(sys, &intent.dest, self.backup, &bytes)?;
+                intent.attrs.apply_after_rewrite(sys, &intent.dest)?;
+                backup
+            }
+            None => {
+                intent.attrs.apply_differing(sys, &intent.dest)?;
+                None
+            }
         };
-        // Only what `check` found wrong: a rewrite keeps the old owner and
-        // mode, and a `chown` to the owner the file already has would clear
-        // setuid with nothing to set it back when no mode was asked for.
-        intent.attrs.apply_differing(sys, &intent.dest)?;
         Ok(CopyReport {
             content_changed: intent.rewrite.is_some(),
             path: intent.dest,
@@ -474,6 +482,35 @@ mod tests {
             assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
             assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         }
+    }
+
+    /// A rewrite that could not keep the owner does not fail
+    /// (`System::write_atomic` ignores its `chown`'s `EPERM`), so `apply`
+    /// reads the owner again after it and `chown`s back. On a real machine
+    /// that `chown` fails as the rewrite's did, failing the step where it
+    /// used to report `changed` with the wrong owner (found by the second
+    /// review of #74). The `Fake`'s `chown` always succeeds and its rewrite
+    /// keeps the owner, so the lost owner is planted between `check` and
+    /// `apply`, and the test asserts the `chown` is issued.
+    #[test]
+    fn a_rewrite_that_did_not_keep_the_owner_is_chowned_back() {
+        let fake = Arc::new(Fake::new().with_file_mode("/srv/app.conf", "v1\n", 0o640));
+        let sys = fake_sys(&fake);
+        let op = Copy::from_str("v2\n").to("/srv/app.conf").owner(0, 0);
+        let c = expect_change(&op, &sys);
+        // What an unprivileged rewrite, or a root without CAP_CHOWN, leaves.
+        rustible_sdk::backend::Backend::set_owner(&*fake, Path::new("/srv/app.conf"), 1000, 1000)
+            .unwrap();
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/srv/app.conf").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o640, 0, 0));
+        assert_eq!(
+            fake.chowns().len(),
+            2,
+            "the planted chown and apply's: {:?}",
+            fake.attr_calls()
+        );
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
     /// A `chown` that changes the owner, with no `.mode()`, leaves a setuid

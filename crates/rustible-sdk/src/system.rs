@@ -410,22 +410,28 @@ impl System {
     /// directory and a rename, so a concurrent reader sees either the old
     /// file or the new one and a failure part way leaves the old one intact.
     ///
-    /// An existing file keeps its whole mode, setuid and setgid included,
-    /// and its owner. Keeping the mode needs no privilege, and an
-    /// unprivileged rewrite of this identity's own setuid file stays setuid.
-    /// Keeping an owner other than this identity takes root: an unprivileged
-    /// rewrite of another user's file leaves it owned by this identity with
-    /// the same mode, so another user's `4755` file becomes this identity's
-    /// `4755` file. `p` is followed if it is a symlink for the mode and owner
-    /// to keep, and the link itself is replaced by the new file. A new file
-    /// is created with the mode any newly created file gets, 0666 minus the
-    /// umask.
+    /// An existing file keeps its mode, setuid and setgid included, and its
+    /// owner and group, or the write fails and the old file stays. Keeping
+    /// the mode needs no privilege: an unprivileged rewrite of this
+    /// identity's own setuid file stays setuid. Keeping an owner and group
+    /// other than this identity's takes root (`CAP_CHOWN`), and without it
+    /// the change of owner is not an error: an unprivileged rewrite of
+    /// another user's file, or of one whose group this identity is not in,
+    /// leaves it with this identity's user or group and the same mode, so
+    /// another user's `4755` file becomes this identity's `4755` file. An
+    /// op that needs the owner checks it afterwards. `p` is followed if it
+    /// is a symlink for the mode and owner to keep, and the link itself is
+    /// replaced by the new file. A new file is created with the mode any
+    /// newly created file gets, 0666 minus the umask.
     ///
-    /// Refused with [`MutationDuringCheck`] inside `check`, and errors as
-    /// [`IoAt`] if the directory is not writable or the rename fails, or if
-    /// a root without `CAP_FOWNER` rewrites another user's setuid or setgid
-    /// file (the bits cannot be set again after the `chown`, and the old
-    /// file is left as it was). Logs the path and byte count at debug level.
+    /// Refused with [`MutationDuringCheck`] inside `check`. Errors as
+    /// [`IoAt`], leaving the old file as it was, if the directory is not
+    /// writable or the rename fails, or if the mode cannot be kept: a root
+    /// without `CAP_FOWNER` cannot set setuid or setgid again on another
+    /// user's file after giving it back, and setgid on a file whose group
+    /// this identity is not in takes `CAP_FSETID` (the kernel drops the bit
+    /// without an error, so the write reads the mode back). Logs the path
+    /// and byte count at debug level.
     pub fn write_atomic(&self, p: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;

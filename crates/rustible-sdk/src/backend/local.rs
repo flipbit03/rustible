@@ -59,6 +59,21 @@ impl Local {
 ///    `chmod` fails only for a root without `CAP_FOWNER` whose `chown`
 ///    succeeded, and then the write fails saying so, rather than leaving
 ///    the file without its bits.
+///
+/// Then the mode the replacement ended up with is read back. A `chmod`
+/// that asks for setgid does not fail when the caller is neither in the
+/// file's group nor holds `CAP_FSETID`: the kernel drops the bit and
+/// reports success (a root without `CAP_FSETID` rewriting a `2755` file
+/// another group owns got `0755`). That too fails the write, before the
+/// rename, so the old file stays as it was.
+///
+/// Step 1 sets the old group bits while the file still has the writer's
+/// group, so for that moment members of the writer's group could open the
+/// new content as the old file's group could. That is accepted rather than
+/// masked: masking them means a `chmod` after the `chown` for nearly every
+/// rewrite, which is exactly what a root without `CAP_FOWNER` cannot do.
+/// For root the writer's group is gid 0, already privileged; unprivileged,
+/// it is the writer's own group, and the content is the writer's.
 fn keep_owner_and_mode(tmp: &Path, old: &std::fs::Metadata) -> io::Result<()> {
     let mode = old.permissions().mode() & 0o7777;
     let special = mode & 0o6000;
@@ -77,6 +92,19 @@ fn keep_owner_and_mode(tmp: &Path, old: &std::fs::Metadata) -> io::Result<()> {
                 ),
             )
         })?;
+    }
+    let got = std::fs::metadata(tmp)?;
+    let got_mode = got.permissions().mode() & 0o7777;
+    if got_mode != mode {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "set mode {mode:04o} on the replacement file but the kernel left {got_mode:04o} \
+                 (group {}); setting setgid on a file whose group this process is not in \
+                 takes CAP_FSETID. The file was not replaced",
+                got.gid()
+            ),
+        ));
     }
     Ok(())
 }

@@ -207,6 +207,33 @@ impl AttrPlan {
         Ok(())
     }
 
+    /// [`AttrPlan::apply_differing`] for an op that has just rewritten the
+    /// path, with the owner read again when one is wanted. The rewrite keeps
+    /// the old owner only when its `chown` succeeds, and it ignores a
+    /// failure (`System::write_atomic`): an unprivileged identity, or a
+    /// root without `CAP_CHOWN`, leaves the replacement with its own user or
+    /// group. Planning from what `check` saw would then issue no `chown`
+    /// and report the step changed with the wrong owner; read again, the
+    /// owner differs, the `chown` is issued, and it fails the step as it
+    /// failed in the rewrite. This is `apply` checking its own effect, not
+    /// planning again: the wanted values are the intent's. Without a wanted
+    /// owner there is nothing to verify, and no extra `stat`.
+    ///
+    /// That `chown` runs as the same identity as the rewrite's own, so it
+    /// fails as that one did, and the step fails there, before any mode.
+    pub(crate) fn apply_after_rewrite(&self, sys: &System, path: &Path) -> Result<()> {
+        if self.owner.is_none() {
+            return self.apply_differing(sys, path);
+        }
+        let now = sys.stat(path)?;
+        plan_attrs(
+            now.as_ref(),
+            self.mode.map(|m| m.want),
+            self.owner.map(|o| o.want),
+        )
+        .apply_differing(sys, path)
+    }
+
     /// The owner this plan changes the path to, when it changes it.
     pub(crate) fn owner_to_set(&self) -> Option<Owner> {
         self.owner.filter(Wanted::differs).map(|o| o.want)
