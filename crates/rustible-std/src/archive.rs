@@ -184,10 +184,11 @@ pub struct Member {
     pub kind: Kind,
     /// Permission bits (`& 0o7777`).
     pub mode: u32,
-    /// Content length as the tar header declares it, `0` for directories,
-    /// symlinks and hard links. Attacker-controlled and unverified, so it is
-    /// only ever a capacity hint, capped at 1 MiB before the real stream is
-    /// read.
+    /// Content length as the archive declares it (the header's `size`,
+    /// overridden by a pax `size` record or a GNU sparse map's real size),
+    /// `0` for directories, symlinks and hard links. Attacker-controlled and
+    /// unverified, so it is only ever a capacity hint, capped at 1 MiB
+    /// before the real stream is read.
     pub size: u64,
 }
 
@@ -211,7 +212,9 @@ pub struct ExtractReport {
     pub dirs: usize,
     /// Symlink members. Hard links are counted in `files`, not here.
     pub symlinks: usize,
-    /// Bytes of regular-file content, as the archive's headers declare it.
+    /// Bytes of regular-file content, as the archive declares it: the
+    /// headers' sizes, or a pax `size` record or a GNU sparse map's real
+    /// size where the archive gives one.
     /// A hard link's header carries `size == 0`, so a hard link raises
     /// `files` but adds nothing here, even though `apply` writes it as a
     /// full copy of its target: this counts what the archive holds, not
@@ -271,8 +274,19 @@ pub struct ExtractReport {
 /// archive is ignored; `.owner(uid, gid)` sets one owner on every file and
 /// directory (not on symlinks). Modification times are not restored.
 ///
+/// A file member is read in full before anything is created for it. One
+/// whose data falls short of the length the archive declares for it (the
+/// archive was truncated or replaced since `check`) fails the step with
+/// nothing written at its path and no parent directory created for it, and
+/// a file already there is left as it was. Members extracted before it in
+/// the same run stay; the step is not rolled back.
+///
 /// **Limits.** The compressed archive is held in memory (zstd: the
-/// decompressed stream too); this is for release tarballs, not backups.
+/// decompressed stream too), and so is each file member's data while it is
+/// written; this is for release tarballs, not backups. Under
+/// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
+/// helper in one frame of just under 48 MiB, so the archive and each
+/// member are limited to that size there.
 /// Files already in `dest` that the archive does not mention are left
 /// alone.
 #[derive(Debug, Clone)]
@@ -436,11 +450,17 @@ impl Extracted {
         Ok(())
     }
 
+    /// Write one planned member. `data` is the member's stream from the
+    /// archive and `declared` the length the archive gives it there (its
+    /// header, a pax `size` record, or a sparse map's real size): a file
+    /// member is read in full and must come to exactly that length before
+    /// anything, its parent directories included, is created for it.
     fn write_member(
         &self,
         sys: &System,
         dest: &Path,
         m: &Member,
+        declared: u64,
         data: &mut dyn Read,
     ) -> Result<()> {
         let full = dest.join(&m.path);
@@ -455,9 +475,6 @@ impl Extracted {
                 sys.mkdir_all(&full)?;
             }
             Kind::File => {
-                if let Some(parent) = full.parent() {
-                    sys.mkdir_all(parent)?;
-                }
                 // The capacity is a hint from the archive's header, as
                 // `check` walked it. A base-256 `size` of 2^62 would ask for
                 // an allocation the process cannot survive (Rust aborts on
@@ -472,6 +489,25 @@ impl Extracted {
                 let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
                     .with_context(|| format!("reading member {}", m.path.display()))?;
+                // The member's reader stops where the archive does, without
+                // an error, so a stream that ends inside the member reads as
+                // a short file. Only the archive's own length for it says
+                // the data is all there; until it does, nothing is written.
+                // `write_atomic` then stages the bytes in a temporary file
+                // beside `full` and renames it over, so an existing file is
+                // replaced whole or not at all (issue #52).
+                ensure!(
+                    bytes.len() as u64 == declared,
+                    "member `{}` ends after {} of the {declared} bytes the archive declares for \
+                     it; the archive is truncated, or changed between check and apply, and \
+                     nothing was written at {}; run the step again once the archive is whole",
+                    m.path.display(),
+                    bytes.len(),
+                    full.display()
+                );
+                if let Some(parent) = full.parent() {
+                    sys.mkdir_all(parent)?;
+                }
                 sys.write_atomic(&full, &bytes)?;
             }
             Kind::Hardlink(target) => {
@@ -612,7 +648,11 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         }
         let header = entry.header();
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
-        let size = header.size().unwrap_or(0);
+        // The archive's length for the member: `Header::size()` gives a GNU
+        // sparse member's real size but ignores a pax `size` record, which
+        // `Entry::size()` honours. `apply` checks what it reads against the
+        // same length.
+        let size = entry.size();
         let ty = header.entry_type();
         let kind = if ty.is_dir() {
             Kind::Dir
@@ -842,7 +882,8 @@ impl Op for Extracted {
                 );
             };
             if let Some(m) = &slot.member {
-                self.write_member(sys, &intent.dest, m, &mut entry)
+                let declared = entry.size();
+                self.write_member(sys, &intent.dest, m, declared, &mut entry)
                     .with_context(|| format!("extracting {}", intent.src.display()))?;
             }
         }
@@ -1456,27 +1497,175 @@ mod tests {
         assert!(err.contains("ended before"), "{err}");
     }
 
+    /// The tar from `raw_tar(members)` followed by one member `name` whose
+    /// header claims 2^62 bytes and whose stream holds 1536: `members`
+    /// complete, then the archive running out inside `name`.
+    fn tar_ending_inside(members: &[(&str, u8, &[u8], &str)], name: &str) -> Vec<u8> {
+        let mut out = raw_tar(members);
+        out.truncate(out.len() - 1024);
+        out.extend(tar_claiming_size(name, 1u64 << 62));
+        out
+    }
+
+    /// What `apply` says about the member `tar_ending_inside` cuts short.
+    fn short_member_err(path: &str) -> String {
+        format!(
+            "member `{path}` ends after 1536 of the 4611686018427387904 bytes the archive \
+             declares for it; the archive is truncated, or changed between check and apply, \
+             and nothing was written at /opt/{path}; run the step again once the archive is whole"
+        )
+    }
+
     #[test]
     fn a_swapped_member_whose_header_lies_fails_the_step() {
         // `apply` reads each member's data from the archive again. Swapped
         // after `check` for one with the same name whose header claims 2^62
-        // bytes the stream does not hold, the name check passes and the step
-        // fails when the walk runs out of archive.
-        // The size `write_member` reserves from is the one `check` planned
-        // (4), so this does not reach the clamp:
+        // bytes the stream does not hold, the name check passes; the
+        // member's reader hands over the 1536 bytes the stream still holds
+        // and stops without an error, so the length is what fails the step.
+        // The member `check` planned is 1536 bytes, as many as the cut
+        // stream still holds, so only the length the archive declares where
+        // `apply` reads it (2^62) tells the read apart from a complete one;
+        // the planned size would pass it. That planned size is also what
+        // `write_member` reserves from, so this does not reach the clamp:
         // `write_member_clamps_the_capacity_hint` does.
-        let (fake, sys) = sys_with(&raw_tar(&[("f", b'0', b"data", "")]));
+        let (fake, sys) = sys_with(&raw_tar(&[("sub/f", b'0', &[b'p'; 1536], "")]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
-        sys.write_atomic("/tmp/a.tar", &tar_claiming_size("f", 1u64 << 62))
+        sys.write_atomic("/tmp/a.tar", &tar_ending_inside(&[], "sub/f"))
             .unwrap();
         let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("unexpected EOF"), "{err}");
-        // The member's reader hands over whatever the stream still holds and
-        // stops, so that much is written before the walk runs out of archive
-        // and the step fails: a KNOWN GAP (`[ISSUE-43]` in `DECISIONS.md`),
-        // as it was before the intent.
-        assert_eq!(fake.file("/opt/f").map(|f| f.bytes.len()), Some(1536));
+        assert!(err.contains(&short_member_err("sub/f")), "{err}");
+        // Nothing under the member's name, not even the parent directory
+        // the archive implies for it, and nothing beside it: no partial
+        // file, no staging file left behind (issue #52).
+        assert!(fake.file("/opt/sub/f").is_none(), "no partial file");
+        assert!(fake.file("/opt/sub").is_none(), "no parent created");
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
+    }
+
+    /// A file already at the short member's path is left exactly as it was:
+    /// content, mode and owner, and no `chmod` or `chown` issued on it.
+    #[test]
+    fn a_short_member_leaves_the_file_already_there_untouched() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file_mode("/opt/f", "old contents\n", 0o4750)
+                .with_file("/tmp/a.tar", raw_tar(&[("f", b'0', b"data", "")])),
+        );
+        let sys = fake_sys(&fake);
+        let before = fake.file("/opt/f").unwrap();
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &tar_ending_inside(&[], "f"))
+            .unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains(&short_member_err("f")), "{err}");
+        let after = fake.file("/opt/f").unwrap();
+        assert_eq!(
+            (after.bytes, after.mode, after.uid, after.gid, after.kind),
+            (
+                before.bytes,
+                before.mode,
+                before.uid,
+                before.gid,
+                before.kind
+            )
+        );
+        assert!(fake.attr_calls().is_empty(), "{:?}", fake.attr_calls());
+        assert_eq!(sys.read_dir("/opt").unwrap(), vec![PathBuf::from("/opt/f")]);
+    }
+
+    /// The step is not rolled back: members extracted before the short one
+    /// stay, as they did before #52; only the short member writes nothing.
+    #[test]
+    fn members_before_a_short_one_stay_extracted() {
+        let (fake, sys) = sys_with(&raw_tar(&[
+            ("a", b'0', b"one", ""),
+            ("f", b'0', b"data", ""),
+        ]));
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        sys.write_atomic(
+            "/tmp/a.tar",
+            &tar_ending_inside(&[("a", b'0', b"one", "")], "f"),
+        )
+        .unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains(&short_member_err("f")), "{err}");
+        assert_eq!(fake.content("/opt/a").unwrap(), "one");
+        assert!(fake.file("/opt/f").is_none());
+    }
+
+    /// The length a member must come to is the one the archive gives it
+    /// where `apply` reads it, which a pax `size` record overrides: here the
+    /// header's own field says 0 and the record says 4. Checked against the
+    /// header field (the `size` `check` planned), this complete member would
+    /// be refused as short.
+    #[test]
+    fn a_member_sized_by_a_pax_record_is_read_to_that_length() {
+        let mut archive = raw_tar(&[("PaxHeaders/f", b'x', b"10 size=4\n", "")]);
+        archive.truncate(archive.len() - 1024);
+        let mut h = tar::Header::new_gnu();
+        h.set_path("f").unwrap();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(0);
+        h.set_cksum();
+        archive.extend_from_slice(h.as_bytes());
+        archive.extend_from_slice(b"data");
+        archive.extend(std::iter::repeat_n(0u8, 508 + 1024));
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        // The report counts the record's 4 bytes, not the header's 0.
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 4 bytes) into /opt"
+        );
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.bytes, 4);
+        assert_eq!(fake.content("/opt/f").unwrap(), "data");
+    }
+
+    /// A GNU sparse member (type `S`): a hole at the start, 4 bytes of data,
+    /// and a hole at the end. The header's `size` is the 4 bytes stored;
+    /// the sparse map's real size is 2048, which is what `apply` reads, what
+    /// the member must come to, and what the report counts.
+    #[test]
+    fn a_gnu_sparse_member_extracts_with_its_holes() {
+        let mut h = tar::Header::new_gnu();
+        h.set_path("sparse").unwrap();
+        h.set_entry_type(tar::EntryType::GNUSparse);
+        h.set_mode(0o644);
+        h.set_size(4);
+        {
+            let g = h.as_gnu_mut().unwrap();
+            g.set_real_size(2048);
+            g.sparse[0].set_offset(1024);
+            g.sparse[0].set_length(4);
+            // The zero-length block at the real size is how GNU tar marks
+            // a hole running to the end of the file.
+            g.sparse[1].set_offset(2048);
+            g.sparse[1].set_length(0);
+        }
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend_from_slice(b"data");
+        archive.extend(std::iter::repeat_n(0u8, 508 + 1024));
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 2048 bytes) into /opt"
+        );
+        let report = op.apply(&sys, c).unwrap();
+        assert_eq!(report.bytes, 2048);
+        let mut want = vec![0u8; 2048];
+        want[1024..1028].copy_from_slice(b"data");
+        assert_eq!(fake.file("/opt/sparse").unwrap().bytes, want);
     }
 
     /// The reservation `write_member` makes from a member's size is clamped,
@@ -1494,7 +1683,7 @@ mod tests {
             mode: 0o644,
             size: 1u64 << 62,
         };
-        op.write_member(&sys, Path::new("/opt"), &member, &mut &b"ok"[..])
+        op.write_member(&sys, Path::new("/opt"), &member, 2, &mut &b"ok"[..])
             .unwrap();
         assert_eq!(fake.content("/opt/big").unwrap(), "ok");
     }
