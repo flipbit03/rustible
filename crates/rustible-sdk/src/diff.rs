@@ -196,6 +196,14 @@ impl Diff {
     }
 
     /// One-line hint for the step list, e.g. "+2 -1 lines".
+    ///
+    /// A [`Diff::summary`] contributes only its first line with something on
+    /// it, followed by ` …` when more such lines follow. So a summary can
+    /// carry detail on the lines after it (a request's body, the rest of a
+    /// script) that [`Diff::render`] shows at `-v`, and the step line,
+    /// printed in every run, marks it as cut rather than spreading over
+    /// several lines. The other shapes are one line too, unless an
+    /// attribute's value itself holds a newline: it is shown as given.
     pub fn short(&self) -> String {
         match &self.0 {
             Repr::Text { before, after, .. } => {
@@ -215,7 +223,15 @@ impl Diff {
                 .map(|c| format!("{}={}", c.name, c.to))
                 .collect::<Vec<_>>()
                 .join(" "),
-            Repr::Summary(s) => s.clone(),
+            Repr::Summary(s) => {
+                let mut lines = s.lines().filter(|l| !l.trim().is_empty());
+                let first = lines.next().unwrap_or_default();
+                if lines.next().is_some() {
+                    format!("{first} …")
+                } else {
+                    first.to_string()
+                }
+            }
             Repr::Many(parts) => parts
                 .iter()
                 .map(Diff::short)
@@ -258,6 +274,31 @@ mod tests {
     fn short_skips_parts_with_nothing_to_say() {
         let d = Diff::many([Diff::summary(""), attrs("/tmp/x", "mode", "0600")]).unwrap();
         assert_eq!(d.short(), "mode=0600");
+    }
+
+    /// The step line is one line whatever a summary holds: the lines after
+    /// the first are for `render`, which `-v` prints, and a multi-line
+    /// `short` would break the step line in every run. A cut is marked, so
+    /// the step line does not read as the whole of it.
+    #[test]
+    fn short_of_a_summary_is_its_first_line() {
+        let d = Diff::summary("PATCH http://h/x\n{\n  \"a\": 1\n}");
+        assert_eq!(d.short(), "PATCH http://h/x …", "marked as cut");
+        assert_eq!(d.render(), "PATCH http://h/x\n{\n  \"a\": 1\n}");
+        assert_eq!(Diff::summary("one").short(), "one");
+        assert_eq!(Diff::summary("one\n").short(), "one", "nothing was cut");
+        assert_eq!(Diff::summary("one\n \n").short(), "one", "nor here");
+        assert_eq!(Diff::summary("").short(), "");
+        // A blank first line is not the one shown.
+        assert_eq!(Diff::summary("\nx").short(), "x");
+        assert_eq!(Diff::summary("\n  \nx\n\ny").short(), "x …");
+        assert_eq!(Diff::summary(" \n").short(), "");
+        let many = Diff::many([
+            attrs("/tmp/x", "mode", "0600"),
+            Diff::summary("waits for x\nmore"),
+        ])
+        .unwrap();
+        assert_eq!(many.short(), "mode=0600 waits for x …");
     }
 
     /// The constructor is what keeps the recursive variant from carrying

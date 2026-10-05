@@ -121,10 +121,12 @@ pub enum Event {
         status: Status,
         /// What `check` planned. Absent when the step was already satisfied
         /// and when `check` itself failed; present for `Changed`,
-        /// `WouldChange`, a failed `apply`, and the `ran, unchanged` case.
+        /// `WouldChange`, a failed `apply`, a step cancelled between `check`
+        /// and `apply` (a `Failed` one), and the `ran, unchanged` case.
         /// Reporters put [`Diff::short`](crate::diff::Diff::short) on the
-        /// step line and the full [`Diff::render`](crate::diff::Diff::render)
-        /// underneath at `-v`.
+        /// step line and, at `-v`, the full
+        /// [`Diff::render`](crate::diff::Diff::render) underneath, unless it
+        /// is the one line the step line already shows.
         diff: Option<Diff>,
         /// A short suffix for the step line, except on `Failed` where it
         /// carries the whole rendered error chain instead. `Ctx::step` sets
@@ -429,8 +431,9 @@ pub struct Compact<W: Write + Send> {
 impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
     /// per step and warning, a step inside a block prefixed with its path.
-    /// At 1 it adds `debug` logs, the full diff under a changed step, and
-    /// the failing command's stderr. At 2 it adds a `$` line per
+    /// At 1 it adds `debug` logs, the full diff under any step that carries
+    /// one unless the step line already shows all of it (one line), and the
+    /// failing command's stderr. At 2 it adds a `$` line per
     /// [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
@@ -478,9 +481,11 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     tail.push_str(&format!("  as {identity}"));
                 }
                 let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
+                // Whatever the status (a satisfied step carries no diff),
+                // unless the step line already shows all of it.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(status, Status::Changed | Status::WouldChange)
+                    && !on_the_step_line(&d)
                 {
                     for line in d.render().lines() {
                         let _ = writeln!(w, "    | {line}");
@@ -539,6 +544,18 @@ impl<W: Write + Send> EventSink for Compact<W> {
             ),
         };
     }
+}
+
+/// Whether `d`'s full render says no more than the step line does: one line
+/// with something on it, the one `short()` shows. Blank lines do not count,
+/// as they do not for `short()`. `rustible`'s renderer has its own copy.
+fn on_the_step_line(d: &Diff) -> bool {
+    let full = d.render();
+    let mut lines = full.lines().filter(|l| !l.trim().is_empty());
+    matches!(
+        (lines.next(), lines.next()),
+        (Some(l), None) if l.trim() == d.short().trim()
+    )
 }
 
 /// [`block_prefix`] plus the space that separates it from a step name, or
@@ -653,6 +670,94 @@ mod tests {
             out,
             "FAILED at [outer][inner] `boom`: step `boom`: nope\n\
              ok=2 changed=0 would_change=0 skipped=0 failed=1 recovered=3 warnings=0\n"
+        );
+    }
+
+    /// A failed step's diff is what it attempted; the step line keeps its
+    /// first line, and `-v` prints the whole of it under the step, as for
+    /// a changed one.
+    #[test]
+    fn compact_prints_a_failed_steps_full_diff_at_v() {
+        let print = |verbosity| {
+            let printer = Compact::new(Vec::new(), verbosity);
+            printer.emit(Event::StepFinished {
+                id: 1,
+                blocks: vec![],
+                name: "patch".into(),
+                identity: "self".into(),
+                status: Status::Failed,
+                diff: Some(Diff::summary("PATCH http://h/x\n{\n  \"a\": 1\n}")),
+                note: Some("returned 409".into()),
+                elapsed_ms: 0,
+            });
+            String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
+        };
+        assert_eq!(
+            print(0),
+            "FAILED: patch  PATCH http://h/x …  returned 409\n"
+        );
+        assert_eq!(
+            print(1),
+            "FAILED: patch  PATCH http://h/x …  returned 409\n    \
+             | PATCH http://h/x\n    | {\n    |   \"a\": 1\n    | }\n"
+        );
+    }
+
+    /// A step that ran and changed nothing is `ok` with a diff; `-v` prints
+    /// it whole as well.
+    #[test]
+    fn compact_prints_an_ok_steps_full_diff_at_v() {
+        let print = |verbosity| {
+            let printer = Compact::new(Vec::new(), verbosity);
+            printer.emit(Event::StepFinished {
+                id: 1,
+                blocks: vec![],
+                name: "query".into(),
+                identity: "self".into(),
+                status: Status::Ok,
+                diff: Some(Diff::summary("GET http://h/x\nq=1")),
+                note: Some("ran, unchanged".into()),
+                elapsed_ms: 0,
+            });
+            String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
+        };
+        assert_eq!(print(0), "ok: query  GET http://h/x …  ran, unchanged\n");
+        assert_eq!(
+            print(1),
+            "ok: query  GET http://h/x …  ran, unchanged\n    | GET http://h/x\n    | q=1\n"
+        );
+    }
+
+    /// A diff of one line is already whole on the step line; `-v` does not
+    /// repeat it.
+    #[test]
+    fn compact_does_not_repeat_a_one_line_diff_at_v() {
+        let printer = Compact::new(Vec::new(), 1);
+        printer.emit(Event::StepFinished {
+            id: 1,
+            blocks: vec![],
+            name: "restart".into(),
+            identity: "self".into(),
+            status: Status::Changed,
+            diff: Some(Diff::summary("systemctl restart nginx")),
+            note: None,
+            elapsed_ms: 0,
+        });
+        // Lines with nothing on them do not count, as for `short()`.
+        printer.emit(Event::StepFinished {
+            id: 2,
+            blocks: vec![],
+            name: "spaced".into(),
+            identity: "self".into(),
+            status: Status::Changed,
+            diff: Some(Diff::summary("one\n \n")),
+            note: None,
+            elapsed_ms: 0,
+        });
+        let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "changed: restart  systemctl restart nginx\nchanged: spaced  one\n"
         );
     }
 

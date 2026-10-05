@@ -229,9 +229,14 @@ impl<W: Write> Renderer<W> {
                 let text = step_line(blocks, name, status_word(*status), &tail);
                 let buffered = self.state(host).open.take().unwrap_or_default();
                 self.line(host, &text);
+                // Whatever the status: a step carries a diff only when its
+                // `check` planned something (changed, would change, failed
+                // in `apply`, cancelled between `check` and `apply`, or ran
+                // and changed nothing), and the step line shows only the
+                // diff's first line. One line is already whole there.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(status, Status::Changed | Status::WouldChange)
+                    && !on_the_step_line(d)
                 {
                     for l in d.render().lines() {
                         self.line(host, &format!("    | {l}"));
@@ -422,6 +427,18 @@ fn failed_at(blocks: &[String], step: &str) -> String {
     } else {
         format!("{} `{step}`", block_prefix(blocks))
     }
+}
+
+/// Whether `d`'s full render says no more than the step line does: one line
+/// with something on it, the one `short()` shows. Blank lines do not count,
+/// as they do not for `short()`. The SDK's `Compact` has its own copy.
+fn on_the_step_line(d: &rustible_sdk::Diff) -> bool {
+    let full = d.render();
+    let mut lines = full.lines().filter(|l| !l.trim().is_empty());
+    matches!(
+        (lines.next(), lines.next()),
+        (Some(l), None) if l.trim() == d.short().trim()
+    )
 }
 
 fn status_word(s: Status) -> &'static str {
@@ -1506,6 +1523,123 @@ web1    4        1             0        0       0          2         0
         for l in &lines[1..] {
             assert!(l.starts_with("[local]      | "), "{out}");
         }
+    }
+
+    /// A failed step's diff is what it attempted, and the step line shows
+    /// only its first line: `-v` prints the rest under it, as it does for a
+    /// changed step, and the default verbosity does not.
+    #[test]
+    fn a_failed_steps_full_diff_prints_at_v() {
+        let mut ev = failing(1, "patch folder", "PATCH http://h/x returned 409 Conflict");
+        if let Event::StepFinished { diff, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary(
+                "PATCH http://h/x\n{\n  \"type\": \"receiveonly\"\n}",
+            ));
+        }
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "patch folder"));
+            r.event("local", &ev);
+            r.event(
+                "local",
+                &failed_frame(
+                    Some("patch folder"),
+                    Some(1),
+                    "step `patch folder`: PATCH http://h/x returned 409 Conflict",
+                ),
+            );
+        };
+        let quiet = render(0, feed);
+        let lines: Vec<&str> = quiet.lines().collect();
+        assert_eq!(lines.len(), 2, "{quiet}");
+        assert!(
+            lines[0].ends_with(" FAILED          PATCH http://h/x …"),
+            "the step line keeps the first line, marked as cut: {quiet}"
+        );
+        assert_eq!(
+            lines[1],
+            "[local]  FAILED at `patch folder`: PATCH http://h/x returned 409 Conflict"
+        );
+        let verbose = render(1, feed);
+        assert_eq!(
+            verbose,
+            format!(
+                "{}\n\
+                 [local]      | PATCH http://h/x\n\
+                 [local]      | {{\n\
+                 [local]      |   \"type\": \"receiveonly\"\n\
+                 [local]      | }}\n\
+                 {}\n",
+                lines[0], lines[1]
+            )
+        );
+    }
+
+    /// A request that ran and changed nothing (a GET with a body, or
+    /// `.changed_when` saying no) is `ok` with a diff: `-v` prints it whole
+    /// too, and the default verbosity only its cut first line.
+    #[test]
+    fn an_ok_steps_full_diff_prints_at_v() {
+        let mut ev = step_finished(1, "query", Status::Ok);
+        if let Event::StepFinished { diff, note, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary(
+                "GET http://h/x\n{\n  \"q\": 1\n}",
+            ));
+            *note = Some("ran, unchanged".into());
+        }
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "query"));
+            r.event("local", &ev);
+        };
+        let quiet = render(0, feed);
+        assert_eq!(quiet.lines().count(), 1, "{quiet}");
+        assert!(
+            quiet.ends_with(" ok              GET http://h/x …   ran, unchanged\n"),
+            "{quiet}"
+        );
+        let verbose = render(1, feed);
+        assert_eq!(
+            verbose,
+            format!(
+                "{quiet}\
+                 [local]      | GET http://h/x\n\
+                 [local]      | {{\n\
+                 [local]      |   \"q\": 1\n\
+                 [local]      | }}\n"
+            )
+        );
+    }
+
+    /// A diff of one line is already whole on the step line: `-v` does not
+    /// repeat it underneath, whatever the status.
+    #[test]
+    fn a_one_line_diff_is_not_repeated_at_v() {
+        for status in [
+            Status::Ok,
+            Status::Changed,
+            Status::WouldChange,
+            Status::Failed,
+        ] {
+            let mut ev = step_finished(1, "query", status);
+            if let Event::StepFinished { diff, .. } = &mut ev {
+                *diff = Some(rustible_sdk::Diff::summary("GET http://h/x\n"));
+            }
+            let out = render(1, |r| {
+                r.event("local", &step_started(1, "query"));
+                r.event("local", &ev);
+            });
+            assert_eq!(out.lines().count(), 1, "{status:?}: {out}");
+            assert!(out.contains("GET http://h/x"), "{out}");
+        }
+        // Lines with nothing on them do not count, as for `short()`.
+        let mut ev = step_finished(1, "query", Status::Changed);
+        if let Event::StepFinished { diff, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary("one\n \n"));
+        }
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "query"));
+            r.event("local", &ev);
+        });
+        assert_eq!(out.lines().count(), 1, "{out}");
     }
 
     #[test]

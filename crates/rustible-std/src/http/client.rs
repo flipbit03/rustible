@@ -510,7 +510,7 @@ pub(crate) fn scrub(text: &str, secrets: &[String]) -> String {
 /// and, for a value with a scheme in front (`Bearer x`, `Basic x`), the part
 /// after it; the `extra` secrets; a secret body; and the URL's userinfo
 /// whole, its password, and a lone user part (often the token itself).
-fn scrub_list(
+pub(crate) fn scrub_list(
     url: &str,
     headers: &[HeaderSpec],
     body: Option<(&[u8], bool)>,
@@ -586,7 +586,7 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
 // ---- pure ----
 
 /// The URL's `user:pass` (or `user`), if it has one.
-fn userinfo(url: &str) -> Option<&str> {
+pub(crate) fn userinfo(url: &str) -> Option<&str> {
     let (_, rest) = url.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (info, _) = rest[..end].rsplit_once('@')?;
