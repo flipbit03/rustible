@@ -197,11 +197,13 @@ impl Diff {
 
     /// One-line hint for the step list, e.g. "+2 -1 lines".
     ///
-    /// Always one line: a [`Diff::summary`] contributes its first line with
-    /// something on it, followed by ` …` when more such lines follow, so a summary can carry detail on
-    /// the lines after it (a request's body, the rest of a script) that
-    /// [`Diff::render`] shows at `-v` and the step line, printed in every
-    /// run, marks as cut rather than spreading over several lines.
+    /// A [`Diff::summary`] contributes only its first line with something on
+    /// it, followed by ` …` when more such lines follow. So a summary can
+    /// carry detail on the lines after it (a request's body, the rest of a
+    /// script) that [`Diff::render`] shows at `-v`, and the step line,
+    /// printed in every run, marks it as cut rather than spreading over
+    /// several lines. The other shapes are one line too, unless an
+    /// attribute's value itself holds a newline: it is shown as given.
     pub fn short(&self) -> String {
         match &self.0 {
             Repr::Text { before, after, .. } => {
