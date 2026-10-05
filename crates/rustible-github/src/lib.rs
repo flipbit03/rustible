@@ -55,15 +55,24 @@
 //!     // Two steps in the run output, in one block: the fetch (`ok` in a real
 //!     // run) and the install.
 //!     let installed = github::github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
-//!     if installed.changed {
-//!         ctx.log(format!("installed {} GitHub key(s)", installed.added.len()));
-//!     }
+//!     // Under --check nothing is fetched, so `installed` has no value; code
+//!     // that reads it goes in a block of its own, and only that block ends.
+//!     ctx.block("report", |ctx| {
+//!         if installed.changed {
+//!             ctx.log(format!("installed {} GitHub key(s)", installed.added.len()));
+//!         }
+//!         Ok(())
+//!     })?;
 //!
-//!     // Or take the keys and do something else with them.
-//!     let keys = ctx.step("Fetch keys", github::UserKeys::of("flipbit03"))?;
-//!     for k in keys.iter() {
-//!         ctx.log(format!("{} {}...", k.key_type, &k.key[..16]));
-//!     }
+//!     // Or take the keys and do something else with them, in a block for
+//!     // the same reason.
+//!     ctx.block("list keys", |ctx| {
+//!         let keys = ctx.step("Fetch keys", github::UserKeys::of("flipbit03"))?;
+//!         for k in keys.iter() {
+//!             ctx.log(format!("{} {}...", k.key_type, &k.key[..16]));
+//!         }
+//!         Ok(())
+//!     })?;
 //!     Ok(())
 //! }
 //! # fn main() {}

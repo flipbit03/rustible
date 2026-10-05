@@ -43,7 +43,7 @@ fn latest_does_not_refresh_the_cache_under_check(ctx: &mut Ctx) -> Result<()> {
     let rendered = change.diff().render();
     assert!(
         rendered.starts_with("apt packages sl: candidate versions unknown; ")
-            && rendered.ends_with("and they are not refreshed under --check"),
+            && rendered.ends_with("and the lists are not refreshed under --check"),
         "{rendered:?}"
     );
 

@@ -1,8 +1,16 @@
 //! Homebrew formulae. Ansible's `community.general.homebrew`.
 //!
 //! Shaped like [`crate::apt`]: one type per desired state, `check` decides
-//! from `brew list` and returns the decision as a typed intent, `apply` executes
-//! exactly that.
+//! from what is installed and returns the decision as a typed intent, `apply`
+//! executes exactly that.
+//!
+//! **`check` runs no `brew` at all.** It reads the Cellar through `sys`, as
+//! `brew list --formula --versions` does: a formula is a directory
+//! `<Cellar>/<name>/`, and its installed versions are the directories in it.
+//! Running `brew` itself, even `brew list`, starts Homebrew's Ruby, which may
+//! first download a vendored Ruby from `ghcr.io` into the prefix; a dry run
+//! contacts nothing outside the target and changes nothing (vision 12). Only
+//! `apply` runs `brew install` and `brew uninstall`.
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -30,6 +38,9 @@
 //! # }
 //! ```
 
+use std::path::{Component, Path, PathBuf};
+
+use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 
 /// Every path Homebrew installs its binary at, most specific first: Apple
@@ -72,22 +83,65 @@ pub struct RemoveReport {
     pub already_absent: Vec<String>,
 }
 
-/// Pure: parse `brew list --formula --versions`, whose lines are a name then
-/// one or more versions separated by spaces (`nethack 3.6.7`). Later versions
-/// of the same formula are ignored; the first is what `brew` considers
-/// linked. A blank or malformed line is skipped rather than failing the step.
-pub fn parse_list_versions(stdout: &str) -> Vec<Formula> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let name = parts.next()?;
-            Some(Formula {
-                name: name.to_string(),
-                version: parts.next().unwrap_or_default().to_string(),
-            })
-        })
-        .collect()
+/// Pure: the formula one Cellar rack stands for, given the rack's name and
+/// the names of the version directories in it, by the rule
+/// `brew list --formula --versions` follows (`Formula.racks`): a name
+/// starting with `.` is not a formula, and neither is a rack with no version
+/// in it. The version is the directory's name exactly, revision suffix and
+/// all (`3.6.7_1`). With several installed, the first in byte order is
+/// reported; `brew list` prints them in the directory's own order, so which
+/// one it named first was never specified.
+pub fn rack_formula(name: &str, mut versions: Vec<String>) -> Option<Formula> {
+    if name.starts_with('.') {
+        return None;
+    }
+    versions.sort();
+    let version = versions.into_iter().next()?;
+    Some(Formula {
+        name: name.to_string(),
+        version,
+    })
+}
+
+/// Pure: `p` with `.` and `..` resolved by name, as a shell's `cd` does
+/// before `pwd`. A symlink's relative target is joined onto the link's
+/// directory, and the repository two directories up from it must be a real
+/// path rather than one that climbs back out of `bin`.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Pure: where the Cellar may be for the `brew` at `brew`, in the order
+/// Homebrew's `bin/brew` and `brew.sh` try them. The prefix is two
+/// directories up from the binary; the repository is the prefix too, unless
+/// the binary is a symlink, when it is two directories up from its target
+/// (`/usr/local/bin/brew -> ../Homebrew/bin/brew` puts it at
+/// `/usr/local/Homebrew`). The Cellar is `<repository>/Cellar` when that is
+/// a directory, else `<prefix>/Cellar`.
+fn cellar_candidates(brew: &Path, link_target: Option<&Path>) -> Vec<PathBuf> {
+    let bin = brew.parent().unwrap_or(Path::new("/"));
+    let prefix = bin.parent().unwrap_or(Path::new("/"));
+    let mut out = vec![];
+    if let Some(target) = link_target {
+        let target = normalize(&bin.join(target));
+        if let Some(repository) = target.parent().and_then(Path::parent)
+            && repository != prefix
+        {
+            out.push(repository.join("Cellar"));
+        }
+    }
+    out.push(prefix.join("Cellar"));
+    out
 }
 
 /// Pure: validate a formula name before it reaches a command line. Homebrew
@@ -104,7 +158,8 @@ pub fn validate_formula(name: &str) -> std::result::Result<(), String> {
     }
     if name.contains('/') {
         return Err(format!(
-            "`{name}` names a tap or a cask; brew::Present and brew::Absent manage formulae by              their bare name, because `brew list --formula` reports nothing else"
+            "`{name}` names a tap or a cask; brew::Present and brew::Absent manage formulae by \
+             their bare name, because that is all the Cellar keeps them under"
         ));
     }
     if let Some(bad) = name
@@ -161,13 +216,58 @@ fn require_brew_not_root(sys: &System, op: &str) -> Result<String> {
     brew_bin(sys)
 }
 
-/// Every formula brew currently has installed.
+/// Whether `p` is a directory, following symlinks, as Ruby's `directory?`.
+fn is_dir(sys: &System, p: &Path) -> Result<bool> {
+    Ok(matches!(sys.stat_follow(p)?, Some(s) if s.kind == FileKind::Dir))
+}
+
+/// The Cellar of the `brew` at `brew`: the first of [`cellar_candidates`]
+/// that is a directory. `None` when none is, which is a Homebrew with
+/// nothing installed yet.
+fn cellar(sys: &System, brew: &str) -> Result<Option<PathBuf>> {
+    let path = Path::new(brew);
+    let target = match sys.stat(path)? {
+        Some(s) if s.kind == FileKind::Symlink => Some(sys.read_link(path)?),
+        _ => None,
+    };
+    for candidate in cellar_candidates(path, target.as_deref()) {
+        if is_dir(sys, &candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Every formula brew currently has installed, read from the Cellar through
+/// `sys` exactly as `brew list --formula --versions` reads it, and without
+/// running `brew` (see the module docs). A rack is a directory in the Cellar
+/// that is not itself a symlink; its versions are the directories in it.
 fn installed(sys: &System, brew: &str) -> Result<Vec<Formula>> {
-    let out = sys
-        .cmd(brew)
-        .args(["list", "--formula", "--versions"])
-        .run()?;
-    Ok(parse_list_versions(&out.stdout_str()))
+    let Some(cellar) = cellar(sys, brew)? else {
+        return Ok(vec![]);
+    };
+    let mut racks = sys.read_dir(&cellar)?;
+    racks.sort();
+    let mut formulae = vec![];
+    for rack in racks {
+        let Some(name) = rack.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let linked = matches!(sys.stat(&rack)?, Some(s) if s.kind == FileKind::Symlink);
+        if linked || !is_dir(sys, &rack)? {
+            continue;
+        }
+        let mut versions = vec![];
+        for entry in sys.read_dir(&rack)? {
+            if is_dir(sys, &entry)?
+                && let Some(v) = entry.file_name().and_then(|n| n.to_str())
+            {
+                versions.push(v.to_string());
+            }
+        }
+        formulae.extend(rack_formula(name, versions));
+    }
+    Ok(formulae)
 }
 
 // ---------------------------------------------------------------- Present
@@ -301,7 +401,7 @@ impl Absent {
 }
 
 /// What [`Absent`]'s `check` decided: uninstall these formulae, each with
-/// the version `brew list` showed, using the `brew` it found.
+/// the version the Cellar showed, using the `brew` it found.
 #[derive(Debug)]
 pub struct Uninstall {
     brew: String,
@@ -383,11 +483,14 @@ impl Op for Absent {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, Fake};
     use rustible_sdk::event::Collect;
     use rustible_sdk::facts::{Distro, Facts, Os, Pm};
 
     use super::*;
+
+    const BREW: &str = "/opt/homebrew/bin/brew";
+    const CELLAR: &str = "/opt/homebrew/Cellar";
 
     /// A mac with Homebrew, running as the login user. Homebrew's ops are the
     /// only ones here that need `is_root: false`.
@@ -408,48 +511,91 @@ mod tests {
         }
     }
 
-    /// A `Fake` carrying the brew binary, plus whatever `brew list` should say.
-    fn mac_sys(list_stdout: &str) -> System {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/opt/homebrew/bin/brew", "")
-                .with_cmd("/opt/homebrew/bin/brew", None, 0, list_stdout),
-        );
-        System::fake(fake, Arc::new(Collect::default())).with_facts(mac_facts())
+    /// Plant `<cellar>/<name>/<version>/` for each formula and version, with
+    /// the directories above them.
+    fn plant(fake: &Fake, cellar: &str, formulae: &[(&str, &[&str])]) {
+        fake.mkdir_all(Path::new(cellar)).unwrap();
+        for (name, versions) in formulae {
+            let rack = Path::new(cellar).join(name);
+            fake.mkdir_all(&rack).unwrap();
+            for v in *versions {
+                fake.mkdir_all(&rack.join(v)).unwrap();
+            }
+        }
+    }
+
+    /// An Apple-silicon Homebrew with these formulae in its Cellar. `brew`
+    /// answers anything with success, for `apply`; `check` must not ask it.
+    fn mac_fake(formulae: &[(&str, &[&str])]) -> Arc<Fake> {
+        let fake = Fake::new().with_file(BREW, "").with_cmd(BREW, None, 0, "");
+        plant(&fake, CELLAR, formulae);
+        Arc::new(fake)
+    }
+
+    fn mac_sys(fake: &Arc<Fake>) -> System {
+        System::fake(fake.clone(), Arc::new(Collect::default())).with_facts(mac_facts())
     }
 
     // ---- pure ----
 
     #[test]
-    fn list_versions_parses_name_and_first_version() {
-        let out = parse_list_versions("agg 1.7.0\nnethack 3.6.7\nopenssl@3 3.6.1 3.5.0\n\n");
+    fn a_rack_is_its_name_and_its_version_directory_verbatim() {
         assert_eq!(
-            out,
-            vec![
-                Formula {
-                    name: "agg".into(),
-                    version: "1.7.0".into()
-                },
-                Formula {
-                    name: "nethack".into(),
-                    version: "3.6.7".into()
-                },
-                Formula {
-                    name: "openssl@3".into(),
-                    version: "3.6.1".into()
-                },
-            ]
+            rack_formula("nethack", vec!["3.6.7".into()]),
+            Some(Formula {
+                name: "nethack".into(),
+                version: "3.6.7".into()
+            })
+        );
+        // The revision suffix is part of the version, as `brew list` prints it.
+        assert_eq!(
+            rack_formula("openssl@3", vec!["3.6.1_1".into()])
+                .unwrap()
+                .version,
+            "3.6.1_1"
+        );
+        // Several versions: the first in byte order, whatever order they came in.
+        assert_eq!(
+            rack_formula("openssl@3", vec!["3.6.1".into(), "3.5.0".into()])
+                .unwrap()
+                .version,
+            "3.5.0"
         );
     }
 
+    /// The two racks `brew list` does not list.
     #[test]
-    fn a_formula_with_no_version_column_is_still_a_formula() {
+    fn a_hidden_rack_or_one_with_no_version_is_not_a_formula() {
+        assert_eq!(rack_formula(".DS_Store", vec!["x".into()]), None);
+        assert_eq!(rack_formula("cowsay", vec![]), None);
+    }
+
+    #[test]
+    fn the_cellar_is_found_where_homebrew_looks_for_it() {
+        // Apple silicon: brew is not a link, the repository is the prefix.
         assert_eq!(
-            parse_list_versions("cowsay\n"),
-            vec![Formula {
-                name: "cowsay".into(),
-                version: String::new()
-            }]
+            cellar_candidates(Path::new(BREW), None),
+            vec![PathBuf::from(CELLAR)]
+        );
+        // Intel: `/usr/local/bin/brew -> ../Homebrew/bin/brew`, so the
+        // repository's Cellar is tried first and the prefix's after it.
+        assert_eq!(
+            cellar_candidates(
+                Path::new("/usr/local/bin/brew"),
+                Some(Path::new("../Homebrew/bin/brew"))
+            ),
+            vec![
+                PathBuf::from("/usr/local/Homebrew/Cellar"),
+                PathBuf::from("/usr/local/Cellar"),
+            ]
+        );
+        // An absolute target is taken as it is.
+        assert_eq!(
+            cellar_candidates(
+                Path::new("/home/linuxbrew/.linuxbrew/bin/brew"),
+                Some(Path::new("/home/linuxbrew/.linuxbrew/Homebrew/bin/brew"))
+            )[1],
+            PathBuf::from("/home/linuxbrew/.linuxbrew/Cellar")
         );
     }
 
@@ -459,6 +605,7 @@ mod tests {
         assert!(validate_formula("openssl@3").is_ok());
         let err = validate_formula("homebrew/cask/firefox").unwrap_err();
         assert!(err.contains("tap or a cask"), "{err}");
+        assert!(err.contains("by their bare name"), "{err}");
         assert!(validate_formula("").unwrap_err().contains("empty"));
         assert!(validate_formula("--force").unwrap_err().contains("dash"));
         assert!(validate_formula("a b").unwrap_err().contains("not legal"));
@@ -466,67 +613,141 @@ mod tests {
 
     // ---- Fake ----
 
+    /// `check` reads the Cellar and runs no `brew` at all: even `brew list`
+    /// starts Homebrew's Ruby, which may fetch one first (vision 12).
     #[test]
-    fn satisfied_when_the_formula_is_already_installed() {
-        let s = mac_sys("nethack 3.6.7\n");
+    fn satisfied_from_the_cellar_without_running_brew() {
+        let fake = mac_fake(&[("nethack", &["3.6.7"])]);
         let op = Present::new(["nethack"]);
-        let Plan::Satisfied(report) = op.check(&s).unwrap() else {
+        let Plan::Satisfied(report) = op.check(&mac_sys(&fake)).unwrap() else {
             panic!("expected satisfied")
         };
         assert!(report.installed.is_empty());
         assert_eq!(report.already_present[0].version, "3.6.7");
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
 
-    /// The plan names only what is missing, and `apply` installs exactly
-    /// that — not everything the op was given.
-    ///
-    /// Note what this test cannot do: `Present` reads its state with a
-    /// command, and the `Fake` answers every `brew` invocation with the same
-    /// canned stdout, so changed-then-ok is not expressible against the `Fake`
-    /// (CLAUDE.md, "the Fake models files well and commands badly"). The
-    /// second run is proved against a real mac instead.
+    /// What the Cellar holds that is not a formula: a symlinked rack, a
+    /// stray file, a rack with nothing in it, a hidden directory, and a
+    /// file where a version would be.
+    #[test]
+    fn only_real_racks_with_a_version_directory_are_installed() {
+        let fake = mac_fake(&[
+            ("agg", &["1.7.0"]),
+            ("empty", &[]),
+            (".hidden", &["1.0"]),
+            ("onlyfile", &[]),
+        ]);
+        fake.mkdir_all(Path::new("/elsewhere/linked/1.0")).unwrap();
+        fake.symlink(
+            Path::new("/elsewhere/linked"),
+            Path::new("/opt/homebrew/Cellar/linked"),
+        )
+        .unwrap();
+        fake.write(Path::new("/opt/homebrew/Cellar/stray"), b"")
+            .unwrap();
+        fake.write(Path::new("/opt/homebrew/Cellar/onlyfile/1.0"), b"")
+            .unwrap();
+        let installed = installed(&mac_sys(&fake), BREW).unwrap();
+        assert_eq!(
+            installed,
+            vec![Formula {
+                name: "agg".into(),
+                version: "1.7.0".into()
+            }]
+        );
+    }
+
+    /// No Cellar at all: a Homebrew that has installed nothing yet.
+    #[test]
+    fn no_cellar_means_nothing_is_installed() {
+        let fake = Arc::new(Fake::new().with_file(BREW, ""));
+        let s = mac_sys(&fake);
+        assert!(Present::new(["nethack"]).check(&s).unwrap().is_change());
+        assert!(matches!(
+            Absent::new(["nethack"]).check(&s).unwrap(),
+            Plan::Satisfied(_)
+        ));
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// The plan names only what is missing, `apply` installs exactly that,
+    /// and once the formula's directory is in the Cellar the op is
+    /// satisfied: changed-then-ok, which reading state from files makes
+    /// expressible against the `Fake` (CLAUDE.md).
     #[test]
     fn change_names_the_missing_formula_and_apply_installs_exactly_that() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/opt/homebrew/bin/brew", "")
-                .with_cmd("/opt/homebrew/bin/brew", None, 0, "agg 1.7.0\n"),
-        );
-        let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_facts(mac_facts());
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        let s = mac_sys(&fake);
         let op = Present::new(["ninvaders", "agg"]);
 
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        // Only the missing one is in the plan, and the intent is what `apply`
-        // reads its work from.
         assert_eq!(
             c.diff().render(),
             "brew formulae:\n  ninvaders: absent -> installed\n"
         );
+        assert!(fake.argvs().is_empty(), "check ran {:?}", fake.argvs());
 
+        op.apply(&s, c).unwrap();
+        assert_eq!(fake.argvs(), vec![vec![BREW, "install", "ninvaders"]]);
+
+        // What `brew install` would have left behind.
+        plant(&fake, CELLAR, &[("ninvaders", &["0.1.1_1"])]);
+        let Plan::Satisfied(r) = op.check(&s).unwrap() else {
+            panic!("expected satisfied once installed")
+        };
+        assert_eq!(r.already_present.len(), 2);
+        assert_eq!(r.already_present[0].version, "0.1.1_1");
+    }
+
+    /// `apply` reports the version that landed, read back from the Cellar.
+    #[test]
+    fn apply_reports_the_installed_version_from_the_cellar() {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        // Planted before `apply`, so the read-back after `brew install`
+        // finds it: the Fake's `brew` writes nothing.
+        let s = mac_sys(&fake);
+        let op = Present::new(["ninvaders"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        plant(&fake, CELLAR, &[("ninvaders", &["0.1.1_1"])]);
         let report = op.apply(&s, c).unwrap();
-        let argvs = fake.argvs();
-        assert!(
-            argvs.contains(&vec![
-                "/opt/homebrew/bin/brew".to_string(),
-                "install".to_string(),
-                "ninvaders".to_string(),
-            ]),
-            "{argvs:?}"
-        );
-        // `agg` was already there and is reported as such, never installed.
-        assert_eq!(report.already_present[0].name, "agg");
         assert_eq!(report.installed[0].name, "ninvaders");
+        assert_eq!(report.installed[0].version, "0.1.1_1");
+    }
+
+    /// Under `--check` a missing formula is `would change` and nothing runs.
+    #[test]
+    fn check_mode_would_change_and_runs_nothing() {
+        let fake = mac_fake(&[]);
+        let s = mac_sys(&fake).with_check_mode(true);
+        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let r = ctx.step("nethack", Present::new(["nethack"])).unwrap();
+        assert!(r.changed && !r.is_available());
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// Intel: `/usr/local/bin/brew` links into `/usr/local/Homebrew`, and the
+    /// Cellar is the prefix's, because the repository has none.
+    #[test]
+    fn an_intel_homebrew_reads_the_prefix_cellar() {
+        let fake = Fake::new()
+            .with_dir("/usr/local/bin")
+            .with_symlink("/usr/local/bin/brew", "../Homebrew/bin/brew");
+        plant(&fake, "/usr/local/Cellar", &[("nethack", &["3.6.7"])]);
+        let fake = Arc::new(fake);
+        let Plan::Satisfied(r) = Present::new(["nethack"]).check(&mac_sys(&fake)).unwrap() else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(r.already_present[0].version, "3.6.7");
     }
 
     #[test]
     fn refuses_as_root_naming_homebrews_own_reason() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/opt/homebrew/bin/brew", "")
-                .with_cmd("/opt/homebrew/bin/brew", None, 0, ""),
-        );
+        let fake = mac_fake(&[]);
         let mut facts = mac_facts();
         facts.is_root = true;
         facts.user = "root".into();
@@ -553,15 +774,16 @@ mod tests {
     /// is why these gate on `Pm::Brew` and not on `Os::Macos`.
     #[test]
     fn linuxbrew_is_served_too() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/home/linuxbrew/.linuxbrew/bin/brew", "")
-                .with_cmd(
-                    "/home/linuxbrew/.linuxbrew/bin/brew",
-                    None,
-                    0,
-                    "nethack 3.6.7\n",
-                ),
+        let fake = Fake::new()
+            .with_dir("/home/linuxbrew/.linuxbrew/bin")
+            .with_symlink(
+                "/home/linuxbrew/.linuxbrew/bin/brew",
+                "../Homebrew/bin/brew",
+            );
+        plant(
+            &fake,
+            "/home/linuxbrew/.linuxbrew/Cellar",
+            &[("nethack", &["3.6.7"])],
         );
         let facts = Facts {
             os: Os::Linux,
@@ -571,7 +793,7 @@ mod tests {
             user: "cadu".into(),
             ..mac_facts()
         };
-        let s = System::fake(fake, Arc::new(Collect::default())).with_facts(facts);
+        let s = System::fake(Arc::new(fake), Arc::new(Collect::default())).with_facts(facts);
         assert!(matches!(
             Present::new(["nethack"]).check(&s).unwrap(),
             Plan::Satisfied(_)
@@ -580,12 +802,8 @@ mod tests {
 
     #[test]
     fn absent_diff_names_the_version_and_apply_reports_what_went() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/opt/homebrew/bin/brew", "")
-                .with_cmd("/opt/homebrew/bin/brew", None, 0, "nethack 3.6.7\n"),
-        );
-        let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_facts(mac_facts());
+        let fake = mac_fake(&[("nethack", &["3.6.7"])]);
+        let s = mac_sys(&fake);
         let op = Absent::new(["nethack", "agg"]);
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
@@ -594,23 +812,22 @@ mod tests {
             c.diff().render(),
             "brew formulae:\n  nethack: installed 3.6.7 -> absent\n"
         );
-        // The version is the one `check` read from `brew list`, carried in the intent;
-        // a name that was never there is reported as already absent.
+        assert!(fake.argvs().is_empty(), "check ran {:?}", fake.argvs());
+        // The version is the one `check` read from the Cellar, carried in the
+        // intent; a name that was never there is reported as already absent.
         let r = op.apply(&s, c).unwrap();
         assert_eq!(r.removed[0].name, "nethack");
         assert_eq!(r.removed[0].version, "3.6.7");
         assert_eq!(r.already_absent, vec!["agg".to_string()]);
         // Only what `check` planned is uninstalled, never the absent `agg`.
-        assert_eq!(
-            fake.argvs().last().unwrap(),
-            &vec!["/opt/homebrew/bin/brew", "uninstall", "nethack"]
-        );
+        assert_eq!(fake.argvs(), vec![vec![BREW, "uninstall", "nethack"]]);
     }
 
     #[test]
     fn absent_is_satisfied_when_nothing_is_installed() {
-        let s = mac_sys("agg 1.7.0\n");
-        let Plan::Satisfied(report) = Absent::new(["nethack"]).check(&s).unwrap() else {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        let Plan::Satisfied(report) = Absent::new(["nethack"]).check(&mac_sys(&fake)).unwrap()
+        else {
             panic!("expected satisfied")
         };
         assert_eq!(report.already_absent, vec!["nethack".to_string()]);

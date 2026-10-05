@@ -177,11 +177,11 @@ pub struct KeysLookup {
 }
 
 impl Intent for KeysLookup {
-    /// The request, worded to be true in both modes: under `--check` it is
-    /// what the step would send, and in a real run (shown at `-v`) what it
-    /// sent.
+    /// The request and nothing else, because the step line shows it in
+    /// both modes: under `--check` it is what the step would send, and in a
+    /// real run, next to `ran, unchanged`, what it sent.
     fn diff(&self) -> Diff {
-        Diff::summary(format!("GET {} (not sent under --check)", self.url))
+        Diff::summary(format!("GET {}", self.url))
     }
 }
 
@@ -584,12 +584,32 @@ pub(crate) mod tests {
         assert!(keys.changed && !keys.is_available());
         assert_eq!(
             keys.diff.as_ref().unwrap().render(),
-            "GET https://github.com/flipbit03.keys (not sent under --check)"
+            "GET https://github.com/flipbit03.keys"
         );
         assert_eq!(
             finished(&sink),
             vec![("Fetch keys".to_string(), Status::WouldChange)]
         );
+        // A lookup, not an action: no `action` note (`always_changes` is
+        // false).
+        let note = sink.events().into_iter().find_map(|e| match e {
+            Event::StepFinished { note, .. } => Some(note),
+            _ => None,
+        });
+        assert_eq!(note, Some(None));
+    }
+
+    /// `base_url` reaches the request `apply` sends, not just `url()`.
+    #[test]
+    fn base_url_is_the_host_apply_asks() {
+        let url = "https://ghe.example.com/cadu.keys";
+        let canned = Canned::answering(url, Ok(Response::ok(body())));
+        let (sys, _) = sys();
+        let op = UserKeys::of("cadu")
+            .base_url("https://ghe.example.com/")
+            .fetch_with(canned.clone());
+        assert_eq!(look_up(&op, &sys).unwrap().len(), 3);
+        assert_eq!(canned.asked(), vec![url]);
     }
 
     /// Real HTTPS through `ring` against GitHub. Not part of

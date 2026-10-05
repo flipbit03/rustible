@@ -19,8 +19,8 @@ use crate::user_keys::UserKeys;
 /// ```
 ///
 /// Two steps run through `ctx.step` and show in the run output, inside a
-/// block named `GitHub keys of <gh_login> for <sys_user>`: `Fetch from
-/// GitHub` (a lookup: `ok` in a real run) and `Install in authorized_keys`
+/// block named `GitHub keys of <gh_login> for <sys_user>`: `Fetch keys of
+/// <gh_login>` (a lookup: `ok` in a real run) and `Install for <sys_user>`
 /// (`changed` when a key was appended). The second step is
 /// `ssh::authorized_keys::Present::for_user_name`, so its rules apply:
 /// `sys_user` must exist in `/etc/passwd`, and `~/.ssh` is created (0700,
@@ -32,8 +32,12 @@ use crate::user_keys::UserKeys;
 /// **Under `--check`** the fetch sends no request (vision 12), so it reports
 /// `would change` and has no keys to install: the block ends after it with a
 /// warning, the install step does not appear, and the playbook carries on
-/// after the block. Reading the returned value then ends the enclosing block
-/// the same way, or, at the top level, that host's dry run.
+/// after the block. Because the install never runs, a dry run does not
+/// refuse a `sys_user` that does not exist; the real run refuses it at the
+/// install step. The returned block has no value then: reading `r.changed`
+/// or `r.added` ends the enclosing block the same way, or, at the top level,
+/// that host's dry run, so put code that depends on it in a block of its own,
+/// as below.
 ///
 /// **Additive**: keys already in the file that GitHub does not list are
 /// left alone. This is the default because it can never lock anyone out;
@@ -47,9 +51,13 @@ use crate::user_keys::UserKeys;
 ///
 /// fn role(ctx: &mut Ctx) -> Result<()> {
 ///     let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
-///     if r.changed {
-///         ctx.log(format!("added {} key(s) to {}", r.added.len(), r.path.display()));
-///     }
+///     // Under --check `r` has no value, and this read ends only this block.
+///     ctx.block("report new keys", |ctx| {
+///         if r.changed {
+///             ctx.log(format!("added {} key(s) to {}", r.added.len(), r.path.display()));
+///         }
+///         Ok(())
+///     })?;
 ///     Ok(())
 /// }
 /// ```
@@ -138,7 +146,7 @@ impl GithubSshKeysToUser {
             if let Some(f) = &self.fetch {
                 lookup = lookup.fetch_with(f.clone());
             }
-            let keys = ctx.step("Fetch from GitHub", lookup)?;
+            let keys = ctx.step(format!("Fetch keys of {}", self.gh_login), lookup)?;
 
             // Under `--check` the fetch sent nothing and has no output, so
             // this read ends the block here with a warning, and the playbook
@@ -171,7 +179,7 @@ impl GithubSshKeysToUser {
                 .collect();
 
             ctx.step(
-                "Install in authorized_keys",
+                format!("Install for {}", self.sys_user),
                 Present::for_user_name(&self.sys_user)
                     .exclusive(self.exclusive)
                     .keys(lines),
@@ -269,8 +277,8 @@ mod tests {
         assert_eq!(
             finished(&sink),
             vec![
-                ("Fetch from GitHub".to_string(), Status::Ok),
-                ("Install in authorized_keys".to_string(), Status::Changed),
+                ("Fetch keys of flipbit03".to_string(), Status::Ok),
+                ("Install for cadu".to_string(), Status::Changed),
             ]
         );
 
@@ -398,7 +406,7 @@ mod tests {
         // The fetch step ran and passed; the install step never started.
         assert_eq!(
             finished(&sink),
-            vec![("Fetch from GitHub".to_string(), Status::Ok)]
+            vec![("Fetch keys of flipbit03".to_string(), Status::Ok)]
         );
     }
 
@@ -504,7 +512,7 @@ mod tests {
         assert!(fake.file(AK).is_none());
         assert_eq!(
             finished(&sink),
-            vec![("Fetch from GitHub".to_string(), Status::Failed)]
+            vec![("Fetch keys of nobody-here".to_string(), Status::Failed)]
         );
     }
 
@@ -524,8 +532,8 @@ mod tests {
         assert_eq!(
             finished(&sink),
             vec![
-                ("Fetch from GitHub".to_string(), Status::Ok),
-                ("Install in authorized_keys".to_string(), Status::Failed),
+                ("Fetch keys of flipbit03".to_string(), Status::Ok),
+                ("Install for nobody".to_string(), Status::Failed),
             ]
         );
     }
@@ -551,7 +559,7 @@ mod tests {
         assert!(fake.file(AK).is_none());
         assert_eq!(
             finished(&sink),
-            vec![("Fetch from GitHub".to_string(), Status::WouldChange)]
+            vec![("Fetch keys of flipbit03".to_string(), Status::WouldChange)]
         );
         let w = warnings(&sink);
         assert_eq!(w.len(), 1, "{w:?}");
@@ -559,7 +567,7 @@ mod tests {
             w[0].starts_with("[GitHub keys of flipbit03 for cadu] not evaluated further"),
             "{w:?}"
         );
-        assert!(w[0].contains("`Fetch from GitHub`"), "{w:?}");
+        assert!(w[0].contains("`Fetch keys of flipbit03`"), "{w:?}");
     }
 
     /// Both steps run inside one block named for the pair, and in a real
@@ -590,12 +598,12 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                (block.clone(), "Fetch from GitHub".to_string(), Status::Ok),
                 (
-                    block,
-                    "Install in authorized_keys".to_string(),
-                    Status::Changed
+                    block.clone(),
+                    "Fetch keys of flipbit03".to_string(),
+                    Status::Ok
                 ),
+                (block, "Install for cadu".to_string(), Status::Changed),
             ]
         );
     }
