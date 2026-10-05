@@ -197,8 +197,8 @@ impl Diff {
 
     /// One-line hint for the step list, e.g. "+2 -1 lines".
     ///
-    /// Always one line: a [`Diff::summary`] contributes its first line only,
-    /// followed by ` …` when it has more, so a summary can carry detail on
+    /// Always one line: a [`Diff::summary`] contributes its first line with
+    /// something on it, followed by ` …` when more such lines follow, so a summary can carry detail on
     /// the lines after it (a request's body, the rest of a script) that
     /// [`Diff::render`] shows at `-v` and the step line, printed in every
     /// run, marks as cut rather than spreading over several lines.
@@ -222,9 +222,9 @@ impl Diff {
                 .collect::<Vec<_>>()
                 .join(" "),
             Repr::Summary(s) => {
-                let mut lines = s.lines();
+                let mut lines = s.lines().filter(|l| !l.trim().is_empty());
                 let first = lines.next().unwrap_or_default();
-                if lines.any(|l| !l.trim().is_empty()) {
+                if lines.next().is_some() {
                     format!("{first} …")
                 } else {
                     first.to_string()
@@ -287,6 +287,10 @@ mod tests {
         assert_eq!(Diff::summary("one\n").short(), "one", "nothing was cut");
         assert_eq!(Diff::summary("one\n \n").short(), "one", "nor here");
         assert_eq!(Diff::summary("").short(), "");
+        // A blank first line is not the one shown.
+        assert_eq!(Diff::summary("\nx").short(), "x");
+        assert_eq!(Diff::summary("\n  \nx\n\ny").short(), "x …");
+        assert_eq!(Diff::summary(" \n").short(), "");
         let many = Diff::many([
             attrs("/tmp/x", "mode", "0600"),
             Diff::summary("waits for x\nmore"),
