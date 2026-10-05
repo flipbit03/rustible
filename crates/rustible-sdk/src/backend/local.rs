@@ -36,6 +36,79 @@ impl Local {
     }
 }
 
+/// Give the replacement file at `tmp` the owner and mode of the file it
+/// replaces (`old`), setuid and setgid included.
+///
+/// Three steps, in this order, each for a reason:
+///
+/// 1. The mode **without** setuid and setgid, while this process still owns
+///    the file: `chmod` of a file someone else owns takes `CAP_FOWNER`, which
+///    a root without it (a container that drops it) lacks, so a `chmod`
+///    after the `chown` alone would fail there. Leaving the two bits out
+///    means the replacement is never setuid to the writer, even for a moment,
+///    when it is about to belong to someone else.
+/// 2. The owner, best effort: only root can give a file away, and an
+///    unprivileged rewrite of another user's file goes on as before, the
+///    file now the writer's.
+/// 3. Setuid and setgid, when the old mode has them. On Linux every
+///    successful `chown` of a non-directory clears setuid, and setgid when
+///    group execute is set, even to the ids the file already has
+///    (`[FAKE-CHOWN]` in `docs/plan/DECISIONS.md` has the measurements), so
+///    they are set after it. Copying the whole mode before the `chown`
+///    rewrote a 4755 file as 0755 and reported success (issue #51). This
+///    `chmod` fails only for a root without `CAP_FOWNER` whose `chown`
+///    succeeded, and then the write fails saying so, rather than leaving
+///    the file without its bits.
+///
+/// Then the mode the replacement ended up with is read back. A `chmod`
+/// that asks for setgid does not fail when the caller is neither in the
+/// file's group nor holds `CAP_FSETID`: the kernel drops the bit and
+/// reports success (a root without `CAP_FSETID` rewriting a `2755` file
+/// another group owns got `0755`). That too fails the write, before the
+/// rename, so the old file stays as it was.
+///
+/// Step 1 sets the old group bits while the file still has the writer's
+/// group, so for that moment members of the writer's group could open the
+/// new content as the old file's group could. That is accepted rather than
+/// masked: masking them means a `chmod` after the `chown` for nearly every
+/// rewrite, which is exactly what a root without `CAP_FOWNER` cannot do.
+/// For root the writer's group is gid 0, already privileged; unprivileged,
+/// it is the writer's own group, and the content is the writer's.
+fn keep_owner_and_mode(tmp: &Path, old: &std::fs::Metadata) -> io::Result<()> {
+    let mode = old.permissions().mode() & 0o7777;
+    let special = mode & 0o6000;
+    std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode & !0o6000))?;
+    let _ = std::os::unix::fs::chown(tmp, Some(old.uid()), Some(old.gid()));
+    if special != 0 {
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "gave the replacement file owner {}:{} but could not set its mode back \
+                     to {mode:04o} ({e}); setting setuid or setgid on a file this process \
+                     does not own takes CAP_FOWNER",
+                    old.uid(),
+                    old.gid()
+                ),
+            )
+        })?;
+    }
+    let got = std::fs::metadata(tmp)?;
+    let got_mode = got.permissions().mode() & 0o7777;
+    if got_mode != mode {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "set mode {mode:04o} on the replacement file but the kernel left {got_mode:04o} \
+                 (group {}); setting setgid on a file whose group this process is not in \
+                 takes CAP_FSETID. The file was not replaced",
+                got.gid()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Backend for Local {
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(p)
@@ -43,22 +116,23 @@ impl Backend for Local {
 
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
         let dir = p.parent().unwrap_or(Path::new("."));
+        // Followed: writing at a symlink's path takes the target's mode and
+        // owner, and the rename then replaces the link itself.
         let existing = std::fs::metadata(p).ok();
         // A new file gets the mode any newly created file would (0666 minus
         // the umask); tempfile's own default is 0600, which is not what an
-        // op that creates a config file expects. An existing file's mode and
-        // owner are copied below.
+        // op that creates a config file expects. A rewrite starts at 0600
+        // instead, so the new content is never readable by more than the
+        // writer until the old file's own mode is copied onto it below.
+        let create = if existing.is_some() { 0o600 } else { 0o666 };
         let mut tmp = tempfile::Builder::new()
             .prefix(".rustible-")
-            .permissions(std::fs::Permissions::from_mode(0o666))
+            .permissions(std::fs::Permissions::from_mode(create))
             .tempfile_in(dir)?;
         tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         if let Some(meta) = existing {
-            std::fs::set_permissions(tmp.path(), meta.permissions())?;
-            // Best effort: only root can chown; ignore EPERM so unprivileged
-            // rewrites of own files still work.
-            let _ = std::os::unix::fs::chown(tmp.path(), Some(meta.uid()), Some(meta.gid()));
+            keep_owner_and_mode(tmp.path(), &meta)?;
         }
         tmp.persist(p).map_err(|e| e.error)?;
         Ok(())
@@ -195,6 +269,57 @@ mod tests {
         Local.remove(&link).unwrap();
         assert!(Local.stat(&link).unwrap().is_none());
         assert!(Local.stat(&target).unwrap().is_some());
+    }
+
+    /// A rewrite keeps the old file's whole mode, setuid and setgid
+    /// included, and its owner. Runs unprivileged on the real filesystem:
+    /// Linux clears setuid on any successful `chown`, even an unprivileged
+    /// one to the ids the file already has, so copying the mode before the
+    /// `chown` fails here as it did in a container as root (issue #51).
+    /// Linux only: macOS documents that clearing for non-root callers too,
+    /// but nobody has measured it here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rewrite_keeps_setuid_and_setgid() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o4755, 0o2755, 0o6755, 0o2745, 0o1755, 0o640] {
+            let f = dir.path().join(format!("f{mode:o}"));
+            std::fs::write(&f, "v1").unwrap();
+            Local.set_mode(&f, mode).unwrap();
+            let before = Local.stat(&f).unwrap().unwrap();
+            // Planted as asked, or the assertion below proves nothing (a
+            // kernel drops setgid for an owner outside the file's group).
+            assert_eq!(before.mode, mode, "planting {mode:o}");
+
+            Local.write(&f, b"v2").unwrap();
+            let after = Local.stat(&f).unwrap().unwrap();
+            assert_eq!(std::fs::read(&f).unwrap(), b"v2");
+            assert_eq!(
+                (after.mode, after.uid, after.gid),
+                (mode, before.uid, before.gid),
+                "{mode:o}"
+            );
+        }
+        // Nothing left behind: the temporary files were all renamed.
+        assert_eq!(Local.read_dir(dir.path()).unwrap().len(), 6);
+    }
+
+    /// Writing at a symlink's path replaces the link with a regular file
+    /// carrying the target's mode, and leaves the target alone. The `Fake`
+    /// mirrors this (`a_write_at_a_symlink_takes_the_targets_mode`).
+    #[test]
+    fn a_write_at_a_symlink_takes_the_targets_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, "t").unwrap();
+        Local.set_mode(&target, 0o640).unwrap();
+        Local.symlink(&target, &link).unwrap();
+
+        Local.write(&link, b"new").unwrap();
+        let st = Local.stat(&link).unwrap().unwrap();
+        assert_eq!((st.kind, st.mode), (FileKind::File, 0o640));
+        assert_eq!(std::fs::read(&target).unwrap(), b"t");
     }
 
     fn spec(program: &str, args: &[&str], stdin: Option<Vec<u8>>) -> CmdSpec {

@@ -269,7 +269,9 @@ impl Download {
         self
     }
 
-    /// Numeric owner (`chown uid:gid`).
+    /// Numeric owner (`chown uid:gid`). Changing the owner clears setuid,
+    /// and setgid with group execute, as `chown` does; give `.mode(..)` too
+    /// to keep them.
     pub fn owner(mut self, uid: u32, gid: u32) -> Self {
         self.owner = Some(Owner { uid, gid });
         self
@@ -563,7 +565,7 @@ impl Op for Download {
         let Some(Fetch { url, .. }) = fetch else {
             // The content already matched: no fetch. The report reads the
             // file as it is rather than carrying a copy of what `check` saw.
-            attrs.apply(sys, &dest)?;
+            attrs.apply_differing(sys, &dest)?;
             let (stat, state) = self.content_state(sys, checksum.as_ref())?;
             let sha256 = match state {
                 ContentState::Current { sha256 } => sha256,
@@ -595,8 +597,11 @@ impl Op for Download {
             );
         }
         let backup_path = write_with_backup(sys, &dest, self.backup, &bytes)?;
-        // The rewrite replaced the file: every wanted attribute is set again.
-        attrs.apply(sys, &dest)?;
+        // Only what is wrong: the rewrite kept the old owner and mode, and a
+        // `chown` to the owner the file already has would clear setuid with
+        // nothing to set it back when no mode was asked for. The owner is
+        // read again, because a rewrite that could not keep it does not fail.
+        attrs.apply_after_rewrite(sys, &dest)?;
         Ok(DownloadReport {
             url,
             path: dest,
@@ -1074,6 +1079,90 @@ mod tests {
         assert_eq!((f.mode, f.bytes.as_slice()), (0o600, HELLO));
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "check never fetched");
+    }
+
+    /// Without `.mode()`, a download over a setuid file keeps `4755`, and
+    /// the next `check` is `Satisfied`: nothing in `apply` sets a mode, so
+    /// this is the rewrite keeping the one the file had (issue #51).
+    #[test]
+    fn a_download_over_a_setuid_file_without_mode_keeps_the_bit() {
+        let (base, _) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
+            "/opt/hello.txt",
+            "old",
+            0o4755,
+        ));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"));
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!((f.mode, f.bytes.as_slice()), (0o4755, HELLO));
+        assert!(fake.attr_calls().is_empty(), "no mode was asked for");
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// A rewrite that could not keep the owner does not fail, so `apply`
+    /// reads the owner again and `chown`s back, which on a real machine
+    /// fails the step as the rewrite's `chown` failed. The lost owner is
+    /// planted between `check` and `apply`, since the `Fake`'s rewrite keeps
+    /// it (`file::copy`'s `a_rewrite_that_did_not_keep_the_owner_is_chowned_back`).
+    #[test]
+    fn a_download_that_did_not_keep_the_owner_is_chowned_back() {
+        let (base, _) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
+            "/opt/hello.txt",
+            "old",
+            0o640,
+        ));
+        let sys = fake_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"))
+            .owner(0, 0);
+        let c = expect_change(&op, &sys);
+        rustible_sdk::backend::Backend::set_owner(
+            &*fake,
+            std::path::Path::new("/opt/hello.txt"),
+            1000,
+            1000,
+        )
+        .unwrap();
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o640, 0, 0));
+        assert_eq!(fake.chowns().len(), 2, "{:?}", fake.attr_calls());
+    }
+
+    /// With `.owner()` already right and no `.mode()`, a download over a
+    /// setuid or setgid file keeps the bit: `apply` issues no `chown`, which
+    /// would clear it with nothing to set it back (found by review of #74).
+    #[test]
+    fn a_download_with_owner_already_right_keeps_setuid() {
+        let (base, _) = hello_server();
+        for mode in [0o4755, 0o2755] {
+            let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
+                "/opt/hello.txt",
+                "old",
+                mode,
+            ));
+            let sys = fake_sys(&fake);
+            let op = Download::get(format!("{base}/hello.txt"))
+                .to("/opt/hello.txt")
+                .checksum(format!("sha256:{HELLO_SHA256}"))
+                .owner(0, 0);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/opt/hello.txt").unwrap();
+            assert_eq!(
+                (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+                (mode, 0, 0, HELLO)
+            );
+            assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
+            assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        }
     }
 
     #[test]

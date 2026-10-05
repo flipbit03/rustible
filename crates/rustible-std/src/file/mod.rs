@@ -154,10 +154,14 @@ impl AttrPlan {
         changes
     }
 
-    /// Set every attribute the op was given, differing or not: an op calls
-    /// this when its step changes, and `chmod`/`chown` are idempotent. Also
-    /// what keeps a wanted mode correct across the other half of the change
-    /// (a rewrite, an owner change).
+    /// Set every attribute the op was given, differing or not: `file::Attrs`
+    /// and `file::Directory` call this when their step changes. `chmod` is
+    /// idempotent; `chown` is not, even to the owner the file already has,
+    /// because it clears setuid (and setgid with group execute) on anything
+    /// but a directory. A wanted mode is set after it, so it comes back; a
+    /// mode nobody asked for does not. An op that rewrote the file, whose
+    /// replacement already has the old owner and mode, calls
+    /// [`AttrPlan::apply_differing`] instead.
     ///
     /// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on
     /// anything that is not a directory, so the owner is set *first* and the
@@ -175,15 +179,20 @@ impl AttrPlan {
 
     /// Set only the attributes that differ: what an op uses when `check`
     /// found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it. A `chown` that changes the owner
-    /// needs root and is issued only when the owner is wrong; one to the
-    /// owner the file already has would be a needless call that also clears
-    /// setuid.
+    /// `ssh::authorized_keys` relies on it, and so do `file::Copy` and
+    /// `http::Download`: a rewrite keeps the old owner and mode (as root;
+    /// see `System::write_atomic`), so what `check` found right is still
+    /// right after it. A `chown` that changes the owner needs root and is
+    /// issued only when the owner is wrong; one to the owner the file
+    /// already has would be a needless call that also clears setuid.
     ///
     /// When it does `chown`, it sets a wanted mode afterwards even if the
     /// mode already matched, because the `chown` just cleared setuid (and
     /// setgid with group execute): owner first, then mode, as
-    /// [`AttrPlan::changes`]' rows promise.
+    /// [`AttrPlan::changes`]' rows promise. With no mode wanted, a `chown`
+    /// that changes the owner leaves the file without those bits: that is
+    /// the kernel's rule, and Ansible's `owner:` does the same. An op that
+    /// wants them kept asks for the mode too.
     pub(crate) fn apply_differing(&self, sys: &System, path: &Path) -> Result<()> {
         let chowned = match self.owner_to_set() {
             Some(o) => {
@@ -196,6 +205,33 @@ impl AttrPlan {
             sys.set_mode(path, m.want)?;
         }
         Ok(())
+    }
+
+    /// [`AttrPlan::apply_differing`] for an op that has just rewritten the
+    /// path, with the owner read again when one is wanted. The rewrite keeps
+    /// the old owner only when its `chown` succeeds, and it ignores a
+    /// failure (`System::write_atomic`): an unprivileged identity, or a
+    /// root without `CAP_CHOWN`, leaves the replacement with its own user or
+    /// group. Planning from what `check` saw would then issue no `chown`
+    /// and report the step changed with the wrong owner; read again, the
+    /// owner differs, the `chown` is issued, and it fails the step as it
+    /// failed in the rewrite. This is `apply` checking its own effect, not
+    /// planning again: the wanted values are the intent's. Without a wanted
+    /// owner there is nothing to verify, and no extra `stat`.
+    ///
+    /// That `chown` runs as the same identity as the rewrite's own, so it
+    /// fails as that one did, and the step fails there, before any mode.
+    pub(crate) fn apply_after_rewrite(&self, sys: &System, path: &Path) -> Result<()> {
+        if self.owner.is_none() {
+            return self.apply_differing(sys, path);
+        }
+        let now = sys.stat(path)?;
+        plan_attrs(
+            now.as_ref(),
+            self.mode.map(|m| m.want),
+            self.owner.map(|o| o.want),
+        )
+        .apply_differing(sys, path)
     }
 
     /// The owner this plan changes the path to, when it changes it.

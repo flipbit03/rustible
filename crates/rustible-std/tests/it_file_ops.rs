@@ -58,12 +58,11 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(!third.content_changed);
     assert_eq!(mode(ctx, conf)?, 0o600);
 
-    // Setuid survives a rewrite. The mode already matched when `check`
-    // planned the second write, but replacing the file chowns its new inode,
-    // which clears setuid on a real kernel: every wanted attribute has to be
-    // set again after a rewrite, not only those that differed. The `Fake`
-    // models the clearing too (`copy_rewrite_of_a_setuid_file_keeps_the_bit`);
-    // this is the same property on a real kernel.
+    // Setuid survives a rewrite. On a real kernel every `chown` of a file
+    // clears setuid, and setgid with group execute, even to the ids it
+    // already has. With `.mode().owner()`, `apply` sets both again after the
+    // rewrite, owner first (`copy_rewrite_of_a_setuid_file_keeps_the_bit` is
+    // the `Fake`'s half).
     let suid = "/etc/rustible-test/files/suid";
     changed_then_ok(ctx, "suid v1", || {
         file::Copy::from_str("v1\n")
@@ -78,6 +77,38 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
             .owner(65534, 65534)
     })?;
     assert_eq!(mode(ctx, suid)? & 0o7777, 0o4755);
+
+    // Without `.mode()`, and in `Line` and `Block`, which set none, nothing
+    // in the op sets the mode again: the rewrite itself has to keep it, by
+    // giving the replacement the old owner before the old mode (issue #51).
+    // A rewrite that `chown`ed after copying the mode left 0755, and the
+    // second run was `ok` all the same, because no mode was asked for.
+    changed_then_ok(ctx, "suid v3 without mode", || {
+        file::Copy::from_str("v3\n").to(suid)
+    })?;
+    let st = ctx.sys().stat(suid)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
+    // With `.owner()` already right and still no `.mode()`: no `chown` is
+    // issued after the rewrite, because one to the same owner clears setuid
+    // on this kernel with nothing to set it back.
+    changed_then_ok(ctx, "suid v4 owner only", || {
+        file::Copy::from_str("v4\n").to(suid).owner(65534, 65534)
+    })?;
+    let st = ctx.sys().stat(suid)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
+    changed_then_ok(ctx, "suid line", || file::Line::in_path(suid).set("exit 0"))?;
+    assert_eq!(ctx.sys().read_to_string(suid)?, "v4\nexit 0\n");
+    let st = ctx.sys().stat(suid)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
+    let sgid = "/etc/rustible-test/files/sgid";
+    changed_then_ok(ctx, "sgid v1", || {
+        file::Copy::from_str("#!/bin/sh\n").to(sgid).mode(0o2755)
+    })?;
+    changed_then_ok(ctx, "sgid block", || {
+        file::Block::in_path(sgid).set("exit 0")
+    })?;
+    assert!(ctx.sys().read_to_string(sgid)?.contains("exit 0\n"));
+    assert_eq!(mode(ctx, sgid)?, 0o2755);
 
     // Attrs: mode and owner on the existing file (uid 1 = daemon everywhere).
     changed_then_ok(ctx, "attrs", || {

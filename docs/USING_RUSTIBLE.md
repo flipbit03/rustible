@@ -1037,7 +1037,9 @@ reports `ok` for the directory step while it happens.
 with `not found`. Put a `systemd::DaemonReload::new()` between them.
 
 **`owner` takes numeric ids**, never names: `.owner(uid: u32, gid: u32)`. Read
-them off a `user::Account` returned by an earlier step.
+them off a `user::Account` returned by an earlier step. Changing the owner
+clears setuid, and setgid with group execute, as `chown` does: give `.mode(..)`
+too to keep them.
 
 **`user::Present` has two different group settings.** `.gid(..)` is the
 **primary** group and takes a gid, a group name, or a `group::Group` from an
