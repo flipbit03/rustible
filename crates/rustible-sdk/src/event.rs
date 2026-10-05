@@ -429,8 +429,8 @@ pub struct Compact<W: Write + Send> {
 impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
     /// per step and warning, a step inside a block prefixed with its path.
-    /// At 1 it adds `debug` logs, the full diff under a changed or failed
-    /// step, and the failing command's stderr. At 2 it adds a `$` line per
+    /// At 1 it adds `debug` logs, the full diff under any step that carries
+    /// one, and the failing command's stderr. At 2 it adds a `$` line per
     /// [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
@@ -478,12 +478,9 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     tail.push_str(&format!("  as {identity}"));
                 }
                 let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
+                // Whatever the status: a satisfied step carries no diff.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(
-                        status,
-                        Status::Changed | Status::WouldChange | Status::Failed
-                    )
                 {
                     for line in d.render().lines() {
                         let _ = writeln!(w, "    | {line}");
@@ -686,6 +683,31 @@ mod tests {
             print(1),
             "FAILED: patch  PATCH http://h/x …  returned 409\n    \
              | PATCH http://h/x\n    | {\n    |   \"a\": 1\n    | }\n"
+        );
+    }
+
+    /// A step that ran and changed nothing is `ok` with a diff; `-v` prints
+    /// it whole as well.
+    #[test]
+    fn compact_prints_an_ok_steps_full_diff_at_v() {
+        let print = |verbosity| {
+            let printer = Compact::new(Vec::new(), verbosity);
+            printer.emit(Event::StepFinished {
+                id: 1,
+                blocks: vec![],
+                name: "query".into(),
+                identity: "self".into(),
+                status: Status::Ok,
+                diff: Some(Diff::summary("GET http://h/x\nq=1")),
+                note: Some("ran, unchanged".into()),
+                elapsed_ms: 0,
+            });
+            String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
+        };
+        assert_eq!(print(0), "ok: query  GET http://h/x …  ran, unchanged\n");
+        assert_eq!(
+            print(1),
+            "ok: query  GET http://h/x …  ran, unchanged\n    | GET http://h/x\n    | q=1\n"
         );
     }
 

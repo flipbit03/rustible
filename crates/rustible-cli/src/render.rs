@@ -229,15 +229,12 @@ impl<W: Write> Renderer<W> {
                 let text = step_line(blocks, name, status_word(*status), &tail);
                 let buffered = self.state(host).open.take().unwrap_or_default();
                 self.line(host, &text);
-                // A failed step carries the diff its `check` produced: what
-                // it attempted, of which the step line shows only the first
-                // line.
+                // Whatever the status: a step carries a diff only when its
+                // `check` planned something (changed, would change, failed
+                // in `apply`, or ran and changed nothing), and the step line
+                // shows only the diff's first line.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(
-                        status,
-                        Status::Changed | Status::WouldChange | Status::Failed
-                    )
                 {
                     for l in d.render().lines() {
                         self.line(host, &format!("    | {l}"));
@@ -1559,6 +1556,41 @@ web1    4        1             0        0       0          2         0
                  [local]      | }}\n\
                  {}\n",
                 lines[0], lines[1]
+            )
+        );
+    }
+
+    /// A request that ran and changed nothing (a GET with a body, or
+    /// `.changed_when` saying no) is `ok` with a diff: `-v` prints it whole
+    /// too, and the default verbosity only its cut first line.
+    #[test]
+    fn an_ok_steps_full_diff_prints_at_v() {
+        let mut ev = step_finished(1, "query", Status::Ok);
+        if let Event::StepFinished { diff, note, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary(
+                "GET http://h/x\n{\n  \"q\": 1\n}",
+            ));
+            *note = Some("ran, unchanged".into());
+        }
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "query"));
+            r.event("local", &ev);
+        };
+        let quiet = render(0, feed);
+        assert_eq!(quiet.lines().count(), 1, "{quiet}");
+        assert!(
+            quiet.ends_with(" ok              GET http://h/x …   ran, unchanged\n"),
+            "{quiet}"
+        );
+        let verbose = render(1, feed);
+        assert_eq!(
+            verbose,
+            format!(
+                "{quiet}\
+                 [local]      | GET http://h/x\n\
+                 [local]      | {{\n\
+                 [local]      |   \"q\": 1\n\
+                 [local]      | }}\n"
             )
         );
     }
