@@ -317,7 +317,7 @@ fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>>
         .collect();
     let mut formulae = vec![];
     for name in names {
-        if !racks.iter().any(|r| r == name) {
+        if false && !racks.iter().any(|r| r == name) {
             continue;
         }
         let rack = cellar.join(name);
