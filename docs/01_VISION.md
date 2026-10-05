@@ -1091,9 +1091,12 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    systemd as pid 1 only in `systemd_images` mode, privileged, on the host's
    kernel and cgroups). By the harness's choice: every body runs as root, so
    no non-root login escalates through the host's sudoers, and nothing
-   connects over SSH. In CI the machine is a Linux VM over SSH (Vagrant) or
-   the macOS runner itself over a local connection, which converges `hello`,
-   `mac` and `macbrew`; only the VM exercises the SSH transport.
+   connects over SSH. And a target no container can be, macOS (there is no
+   macOS container), which only the macOS runner covers: the Darwin probe,
+   the Mach-O build through zig, launchd and brew. In CI the machine is a
+   Linux VM over SSH (Vagrant) or the macOS runner itself over a local
+   connection, which runs `hello` once, `mac` twice, and `macbrew` installing
+   twice and then removing twice; only the VM exercises the SSH transport.
    `dev/vagrant/` holds a Debian 12 guest per architecture, x86_64 and
    aarch64, driven by vagrant-libvirt on Linux and vagrant-qemu on macOS.
    `make vm-test` converges the `vagrant`, `vagrant_login` and

@@ -111,12 +111,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # A mac is a supported controller and, since M8, a supported target.
-      # Nothing but Rust is installed here: the C toolchain is the zig that
-      # `rustible` fetches into its own cache on first use, and the cache
-      # step below is what keeps that from being a 50 MB download per run.
-      # The runner's own clang serves `cargo test` and the CLI build, as a
-      # developer's would.
+      # Nothing but Rust is installed here; the runner's own clang serves
+      # `cargo test`, as a developer's would. `cargo test` never fetches zig.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -129,12 +125,6 @@ jobs:
             target
           key: ci-macos-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ci-macos-unit-cargo-
-
-      - name: Cache the zig rustible fetches
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/rustible/zig
-          key: ci-macos-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - run: cargo test --workspace
 
@@ -153,8 +143,7 @@ jobs:
       # Nothing but Rust is installed here: the C toolchain is the zig that
       # `rustible` fetches into its own cache on first use, and the cache
       # step below is what keeps that from being a 50 MB download per run.
-      # The runner's own clang serves `cargo test` and the CLI build, as a
-      # developer's would.
+      # The runner's own clang serves the CLI build, as a developer's would.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -178,11 +167,12 @@ jobs:
       # transport, which builds `aarch64-apple-darwin` through zig, ships the
       # binary to itself, and gathers Darwin facts. There is no macOS
       # container, so this is the only automated check of that path
-      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks, each run
-      # twice because the second run is the test: `hello` (facts), `mac`
+      # (docs/plan/reports/MACOS-TARGET-SPIKE.md). Three playbooks: `hello`
+      # once (facts); `mac` twice, because the second run is the test
       # (escalation through the runner's sudo, files as root, TLS from the
-      # target), and `macbrew` (Homebrew, which the runner ships, as the
-      # login user because brew refuses root) — installed, then removed.
+      # target); and `macbrew` (Homebrew, which the runner ships, as the
+      # login user because brew refuses root) installing twice and then
+      # removing twice.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
@@ -233,10 +223,11 @@ jobs:
         env:
           RUSTIBLE_INTEGRATION: "1"
 
-  # T3, the machine tier: a real virtual machine over a real SSH transport,
-  # with a real init system, a real sudo, and a live /proc/sys. A container has
-  # none of those -- it shares the host kernel, so `it_sysctl_present.rs` has to
-  # run with `.apply_now(false)` and assert only on the drop-in file.
+  # T3 on a Linux VM: a real machine over a real SSH transport, with a real
+  # boot, a real sudo setup, and a live /proc/sys. The container harness gives
+  # none of those -- a container shares the host kernel, so
+  # `it_sysctl_present.rs` has to run with `.apply_now(false)` and assert only
+  # on the drop-in file.
   #
   # GitHub's Linux runners expose /dev/kvm, so the x86_64 guest is genuinely
   # accelerated (`<domain type='kvm'>`); the aarch64 guest is interpreted by

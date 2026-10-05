@@ -179,7 +179,7 @@ against:
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
 | `Test (T1): unit & fake (macOS)` | T1 on macOS: the `#[cfg(target_os = "macos")]` tests, and the launch scripts under bash 3.2 and the BSD tools |
-| `Test (T3): macOS runner (local connection)` | T3 on the runner itself: `hello`, `mac` and `macbrew`, each converged twice, over a local connection |
+| `Test (T3): macOS runner (local connection)` | T3 on the runner itself, over a local connection: `hello` once (facts), `mac` twice (escalated), and `macbrew` installing twice and then removing twice (as the login user) |
 | `Test (T2): Docker (Debian/Ubuntu/Alpine)` | T2 |
 | `Test (T3): VM (Debian 12/x86_64)` | T3, on a KVM-accelerated guest |
 | `Test (T3): VM (Debian 12/aarch64)` | T3, on an emulated guest |
@@ -326,13 +326,13 @@ below it:
 |---|---|---|---|---|
 | T1. in-process | everything a plain `cargo test` runs with nothing installed: chiefly pure functions and ops against the `Fake` backend (below) | — | `cargo test` | free |
 | T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
-| T3. machine | playbooks against a real machine, with its own kernel, init and `sudo`, all real, and no harness: a Linux VM over SSH, or in CI also the macOS runner itself over a local connection | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH. Only the VM exercises the SSH transport | `make vm-test`, and CI | minutes, needs vagrant for the VM |
+| T3. machine | playbooks against a real machine, with its own kernel, init and `sudo`, all real, and no harness: a Linux VM over SSH, or in CI also the macOS runner itself over a local connection | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH. Only the VM exercises the SSH transport. And a target no container can be, macOS (there is no macOS container), which only the macOS runner covers: the Darwin probe, the Mach-O build through zig, launchd and brew | `make vm-test`, and CI; on a mac, by hand, the steps of `ci.yml`'s "Run playbooks against this mac" | minutes, needs vagrant for the VM |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`. In the machine tier,
 the VM converges three playbooks and has one refused at launch, on each of
-two architectures, and the macOS runner converges `hello`, `mac` and
-`macbrew` against itself.
+two architectures, and the macOS runner runs `hello` once, `mac` twice, and
+`macbrew` installing twice and then removing twice, against itself.
 
 **What "in-process" means.** T1 is a plain `cargo test` with nothing
 installed beyond the Rust toolchain: no docker, no VM, no network beyond
@@ -387,7 +387,7 @@ while the thing is broken.
   all real, with no harness in between. In CI that is a Linux VM over SSH
   (`make vm-test`) or the macOS runner itself over a local connection; only
   the VM exercises the SSH transport. What it gives that the container
-  harness cannot is short and specific, and comes in two kinds. Structural,
+  harness cannot is short and specific, and comes in three kinds. Structural,
   because a container is not a machine: its own kernel and `/proc/sys` (a
   container shares the host kernel, so a write is refused or hits the
   *host*), and a real boot (`systemd_images` runs systemd as pid 1 in a
@@ -397,7 +397,10 @@ while the thing is broken.
   install `sudo` and use it, as `it_systemd.rs` does), and nothing connects
   over SSH. For the `/proc/sys` item, `it_sysctl_present.rs` says so in its
   own header — it runs with `.apply_now(false)` and asserts only on the
-  drop-in file, because the live write is not available to it.
+  drop-in file, because the live write is not available to it. And a target
+  no container can be, macOS (there is no macOS container), which only the
+  macOS runner covers: the Darwin probe, the Mach-O build through zig,
+  launchd and brew.
 
 If a new op needs nothing from T3, it does not need a T3 test. Say so
 in the pull request rather than adding a step to the playbook for symmetry.
@@ -533,7 +536,9 @@ system.
   is a 600-second timeout per body.
 
 **T3 is a step in `examples/workspace/playbooks/vagrant.rs`**, the
-playbook `make vm-test` runs. There is no separate test file: the assertion is
+playbook `make vm-test` runs, or, for a macOS target, a step in `mac.rs`
+(escalated) or `macbrew.rs` (as the login user), which the macOS runner job
+runs twice with the recap grepped. There is no separate test file: the assertion is
 that the step is in that playbook and the second run reports `ok`. What a
 single playbook cannot show is a login chosen per playbook and a launch as
 another `escalate_user`, so `vagrant_login.rs` runs after it, logging in as an
@@ -606,7 +611,7 @@ VM's CI jobs name their distribution — `Test (T3): VM (Debian 12/x86_64)` —
 because the VM is distribution-specific where the container tier is not: one
 guest is one distro. A second distribution means a second pair of jobs, and
 the distro is matrix data so the name cannot go stale. CI's other T3 machine,
-the macOS runner, converges `hello`, `mac` and `macbrew` against itself over a
+the macOS runner, runs `hello`, `mac` and `macbrew` against itself over a
 local connection, so it does not exercise SSH; the rest of this section is the
 VM. `docs/DEVELOPING.md` is the per-platform setup. The loop:
 

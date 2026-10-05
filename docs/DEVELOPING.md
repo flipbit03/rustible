@@ -39,7 +39,11 @@ reason (`CLAUDE.md`, "Choosing a tier").
   boot (a harness container runs systemd as pid 1 only in `systemd_images`
   mode, privileged, on the host's kernel and cgroups). By the harness's
   choice: every body runs as root, so no non-root login escalates through the
-  host's sudoers, and nothing connects over SSH.
+  host's sudoers, and nothing connects over SSH. And a target no container
+  can be, macOS (there is no macOS container), which only the macOS runner
+  covers: the Darwin probe, the Mach-O build through zig, launchd and brew.
+  On a mac, the steps of `ci.yml`'s "Run playbooks against this mac" are the
+  way to repeat that half by hand.
 
 A CI job that runs a tier names it, so a red `Test (T2): Docker
 (Debian/Ubuntu/Alpine)` is the container tier failing.
