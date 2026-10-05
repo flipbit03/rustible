@@ -180,8 +180,46 @@ impl Backend for Local {
         std::os::unix::fs::chown(p, Some(uid), Some(gid))
     }
 
+    // Not `std::fs::copy`: it opens `to` with create and truncate, which
+    // follows a symlink planted there and writes through it, and `fchmod`s
+    // the copy to the source's whole mode, so root copying another user's
+    // setuid file made a root-owned setuid copy (issue #75).
+    //
+    // `create_new` is `O_CREAT | O_EXCL`, and POSIX makes that fail with
+    // `EEXIST` when `to` is a symlink, "regardless of the contents of the
+    // symbolic link", so it never follows one, dangling or not; that is what
+    // stands in for `O_NOFOLLOW`, which `std` has no constant for. The copy
+    // is created `0600`, so its content is never readable by anyone else
+    // while it is being written, and gets its mode, without `0o7000`, by
+    // `fchmod` once the data is in. `EEXIST` keeps its errno, so the
+    // `Elevated` helper hands `AlreadyExists` back intact.
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::copy(from, to).map(|_| ())
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut src = std::fs::File::open(from)?;
+        let meta = src.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: not a regular file, so not copied", from.display()),
+            ));
+        }
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)?;
+        let mode = meta.permissions().mode() & 0o777;
+        let filled = io::copy(&mut src, &mut dst)
+            .and_then(|_| dst.set_permissions(std::fs::Permissions::from_mode(mode)));
+        if let Err(e) = filled {
+            drop(dst);
+            // `create_new` succeeded, so the path is ours to remove; unlink
+            // does not follow a link either.
+            let _ = std::fs::remove_file(to);
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
@@ -269,6 +307,97 @@ mod tests {
         Local.remove(&link).unwrap();
         assert!(Local.stat(&link).unwrap().is_none());
         assert!(Local.stat(&target).unwrap().is_some());
+    }
+
+    /// `copy` creates a new file or nothing: a symlink at `to`, to a file
+    /// or dangling, and a file already there, are refused with
+    /// `AlreadyExists` and left exactly as they were (issue #75).
+    /// `std::fs::copy` wrote through the link into its target.
+    #[test]
+    fn copy_never_writes_through_a_link_or_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name);
+        std::fs::write(at("src"), "new").unwrap();
+        std::fs::write(at("victim"), "victim").unwrap();
+        Local.set_mode(&at("victim"), 0o600).unwrap();
+        std::fs::write(at("taken"), "taken").unwrap();
+        Local.symlink(&at("victim"), &at("link")).unwrap();
+        Local.symlink(&at("nowhere"), &at("dangling")).unwrap();
+
+        for to in ["link", "dangling", "taken"] {
+            let err = Local.copy(&at("src"), &at(to)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{to}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(at("victim")).unwrap(), "victim");
+        assert_eq!(Local.stat(&at("victim")).unwrap().unwrap().mode, 0o600);
+        assert_eq!(std::fs::read_to_string(at("taken")).unwrap(), "taken");
+        assert!(
+            Local.stat(&at("nowhere")).unwrap().is_none(),
+            "not created through the link"
+        );
+        for link in ["link", "dangling"] {
+            assert_eq!(
+                Local.stat(&at(link)).unwrap().unwrap().kind,
+                FileKind::Symlink
+            );
+        }
+
+        // A directory is not copied, and nothing is created for it.
+        let err = Local.copy(dir.path(), &at("of-a-dir")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(Local.stat(&at("of-a-dir")).unwrap().is_none());
+    }
+
+    /// The copy has the source's mode without setuid, setgid and sticky.
+    /// Linux only: a mac refuses an unprivileged sticky `chmod` on a file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_drops_setuid_setgid_and_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o4755, 0o2755, 0o6755, 0o2745, 0o1755, 0o640, 0o600] {
+            let (from, to) = (
+                dir.path().join(format!("f{mode:o}")),
+                dir.path().join(format!("c{mode:o}")),
+            );
+            std::fs::write(&from, "data").unwrap();
+            Local.set_mode(&from, mode).unwrap();
+            assert_eq!(
+                Local.stat(&from).unwrap().unwrap().mode,
+                mode,
+                "planting {mode:o}"
+            );
+            Local.copy(&from, &to).unwrap();
+            let st = Local.stat(&to).unwrap().unwrap();
+            assert_eq!(
+                (st.mode, st.kind),
+                (mode & 0o777, FileKind::File),
+                "{mode:o}"
+            );
+            assert_eq!(std::fs::read_to_string(&to).unwrap(), "data");
+        }
+    }
+
+    /// A copy that fails part-way removes what it created. `/proc/self/mem`
+    /// is a regular file that opens and then fails to read at offset 0,
+    /// which nothing is mapped at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_copy_that_fails_part_way_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("half");
+        let mem = Path::new("/proc/self/mem");
+        let meta = std::fs::metadata(mem).unwrap();
+        assert!(
+            meta.is_file(),
+            "the failure has to come after the copy is created"
+        );
+        std::fs::File::open(mem).expect("opening /proc/self/mem, or the test proves nothing");
+        let err = Local.copy(mem, &to).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(
+            Local.stat(&to).unwrap().is_none(),
+            "a half-written copy was left"
+        );
     }
 
     /// A rewrite keeps the old file's whole mode, setuid and setgid

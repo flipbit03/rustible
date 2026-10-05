@@ -175,9 +175,17 @@ pub trait Backend: Send + Sync {
     /// file to another user needs root, which is the usual reason an op asks
     /// for `as_root`.
     fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()>;
-    /// Copy the contents of `from` onto `to`, creating or truncating it.
-    /// Unlike [`write`](Backend::write) this is not atomic, so a reader can
-    /// see a half-written `to`.
+    /// Copy the contents of the regular file `from` (symlinks followed) to a
+    /// **new** file `to`, which must not exist in any form: an existing
+    /// path, a symlink included (dangling or not), fails with
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) and is left as it
+    /// was, so nothing is ever written through a link planted at `to`. The
+    /// copy gets `from`'s permission bits **without** setuid, setgid and
+    /// sticky (`0o7000`), and the owner of whoever runs it: it never
+    /// `chown`s. Unlike [`write`](Backend::write) this is not atomic, but a
+    /// failure part-way removes the `to` it created, so it never leaves a
+    /// half-written copy behind. [`System::backup`](crate::System::backup)
+    /// is its one caller, and these rules are its safety (issue #75).
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()>;
     /// Create the symbolic link `link` pointing at `target`. Fails if `link` exists.
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;

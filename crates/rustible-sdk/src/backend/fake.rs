@@ -437,13 +437,43 @@ impl Backend for Fake {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
-        // The real `copy` (`std::fs::copy`) never `chown`s, and gives the
-        // destination the source's mode. Going through `write` gives a new
-        // destination 0644 and an existing one its own mode and owner; the
-        // one caller, `System::backup`, always copies to a new path, and no
-        // test reads a backup's mode.
-        let bytes = self.read(from)?;
-        Backend::write(self, to, &bytes)
+        // `Local::copy`'s rules (issue #75): the source is followed and must
+        // be a regular file; anything at `to`, a symlink included, refuses
+        // with `AlreadyExists` and stays as it was; the copy is new, owned by
+        // whoever runs it (root, as everywhere in the fake), and carries the
+        // source's mode without setuid, setgid and sticky.
+        let mut files = self.files.lock().unwrap();
+        let real = Self::resolve(&files, from);
+        let (bytes, mode) = match files.get(&real) {
+            Some(f) if f.kind == FileKind::File => (f.bytes.clone(), f.mode),
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{}: not a regular file, so not copied (fake)",
+                        from.display()
+                    ),
+                ));
+            }
+            None => return Err(not_found(from)),
+        };
+        if files.contains_key(to) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{}: already exists (fake)", to.display()),
+            ));
+        }
+        files.insert(
+            to.to_path_buf(),
+            FakeFile {
+                bytes,
+                mode: mode & 0o777,
+                uid: 0,
+                gid: 0,
+                kind: FileKind::File,
+            },
+        );
+        Ok(())
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
