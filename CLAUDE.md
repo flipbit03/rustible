@@ -166,7 +166,7 @@ harder to reverse than the operation that motivated it. Raising it separately
 costs one message. Not raising it costs an architecture nobody chose.
 
 Every change goes through a branch and a pull request, even a one-line doc
-fix. CI runs eight jobs on each, and all eight must be green:
+fix, and every CI job must be green on it.
 
 A job that runs tests is named for the **tier** it runs (see "Testing
 tiers"), then the **mechanism** it runs the code with, then what it ran
@@ -175,26 +175,26 @@ against:
 | job | what it protects |
 |---|---|
 | `Lint: fmt, clippy, docs` | the code is well-formed and documented |
-| `Test (T1): unit & fake` | T1: everything a plain `cargo test` runs, chiefly pure functions and ops against the `Fake` |
+| `Test (T1): unit & fake (Linux)` | T1: everything a plain `cargo test` runs, chiefly pure functions and ops against the `Fake` |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
-| `Test (T1, real mac): macOS (controller and target)` | T1 on macOS, and three playbooks run against the runner itself as a target, over a local connection |
+| `Test (T1): unit & fake (macOS)` | T1 on macOS: the `#[cfg(target_os = "macos")]` tests, and the launch scripts under bash 3.2 and the BSD tools |
+| `Test (T3): macOS runner (local connection)` | T3 on the runner itself: `hello`, `mac` and `macbrew`, each converged twice, over a local connection |
 | `Test (T2): Docker (Debian/Ubuntu/Alpine)` | T2 |
 | `Test (T3): VM (Debian 12/x86_64)` | T3, on a KVM-accelerated guest |
 | `Test (T3): VM (Debian 12/aarch64)` | T3, on an emulated guest |
 
-Keep that shape when adding a job: `<verb> (<tier>[, <qualifier>]):
-<mechanism> (<what it ran against>)`, and `<verb>: <mechanism>` for a job
-that runs no tests. The tier is added to the mechanism, never put in its
-place, because the two answer different readers. The tier tells a
-contributor which kind of test broke, in the words this file and every test
-header use, and so where the fix goes. The mechanism tells someone who has
-never opened this file what broke and where it ran. The optional qualifier
-names what the job also runs against outside the three tiers: the mac job's
-`real mac` is the runner itself as a target, over a local connection, which
-its `hello`, `mac` and `macbrew` playbooks converge. Lint and tests are
-deliberately separate jobs, because one says the code is malformed and the
-other says it is wrong, and a single red tick covering both is ambiguous.
+Keep that shape when adding a job: `<verb> (<tier>): <mechanism> (<what it
+ran against>)`, and `<verb>: <mechanism>` for a job that runs no tests. A job
+runs one tier; one that would run two is two jobs. The tier is added to the
+mechanism, never put in its place, because the two answer different
+readers. The tier tells a contributor which kind of test broke, in the words
+this file and every test header use, and so where the fix goes. The
+mechanism tells someone who has never opened this file what broke and where
+it ran. Lint and tests are deliberately separate jobs, because one says the
+code is malformed and the other says it is wrong, and a single red tick
+covering both is ambiguous. The table lists the jobs; nothing here states
+how many there are, because a count goes stale the moment CI changes.
 
 To work against your checkout rather than the published crates — which is what
 you want when changing Rustible itself — build the CLI from the tree and point
@@ -326,12 +326,13 @@ below it:
 |---|---|---|---|---|
 | T1. in-process | everything a plain `cargo test` runs with nothing installed: chiefly pure functions and ops against the `Fake` backend (below) | — | `cargo test` | free |
 | T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
-| T3. machine | a playbook against a real VM over SSH | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH | `make vm-test`, and CI | minutes, needs vagrant |
+| T3. machine | playbooks against a real machine, with its own kernel, init and `sudo`, all real, and no harness: a Linux VM over SSH, or in CI also the macOS runner itself over a local connection | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH. Only the VM exercises the SSH transport | `make vm-test`, and CI | minutes, needs vagrant for the VM |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
-`jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
-three playbooks converged, and one refused at launch, on each of two
-architectures.
+`jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`. In the machine tier,
+the VM converges three playbooks and has one refused at launch, on each of
+two architectures, and the macOS runner converges `hello`, `mac` and
+`macbrew` against itself.
 
 **What "in-process" means.** T1 is a plain `cargo test` with nothing
 installed beyond the Rust toolchain: no docker, no VM, no network beyond
@@ -353,11 +354,11 @@ themselves, without `RUSTIBLE_INTEGRATION=1`. What T1 cannot see:
   time, and `argvs()` drops stdin. See "Traps that make a test pass while
   proving nothing".
 
-**All three tiers run in CI**, the machine tier on both architectures.
-GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
-accelerated and the aarch64 one is interpreted by qemu. Run T3 locally
-anyway while writing an op: iterating against a machine you already have up
-beats waiting on a runner.
+**All three tiers run in CI**, the machine tier as a VM on both architectures
+and as the macOS runner. GitHub's Linux runners expose `/dev/kvm`, so the
+x86_64 guest is genuinely accelerated and the aarch64 one is interpreted by
+qemu. Run T3 locally anyway while writing an op: iterating against a machine
+you already have up beats waiting on a runner.
 
 ### Choosing a tier
 
@@ -382,18 +383,21 @@ while the thing is broken.
   has earned it: it caught that `useradd` refuses to create a private group
   when one already carries the name, and that `chown` clears setuid. A fake
   models what you *believe*; a container shows what is.
-- **T3, for what the container harness cannot give.** That list is short
-  and specific, and comes in two kinds. Structural, because a container is
-  not a machine: its own kernel and `/proc/sys` (a container shares the
-  host kernel, so a write is refused or hits the *host*), and a real boot
-  (`systemd_images` runs systemd as pid 1 in a privileged container, enough
-  for the systemd ops, but on the host's kernel and cgroups). The harness's
-  choice: every body runs as root, so no non-root login escalates through
-  the host's sudoers (a body can still install `sudo` and use it, as
-  `it_systemd.rs` does), and nothing connects over SSH. For the `/proc/sys`
-  item, `it_sysctl_present.rs` says so in its own header — it runs with
-  `.apply_now(false)` and asserts only on the drop-in file, because the live
-  write is not available to it.
+- **T3, for what needs a real machine**: its own kernel, init and `sudo`,
+  all real, with no harness in between. In CI that is a Linux VM over SSH
+  (`make vm-test`) or the macOS runner itself over a local connection; only
+  the VM exercises the SSH transport. What it gives that the container
+  harness cannot is short and specific, and comes in two kinds. Structural,
+  because a container is not a machine: its own kernel and `/proc/sys` (a
+  container shares the host kernel, so a write is refused or hits the
+  *host*), and a real boot (`systemd_images` runs systemd as pid 1 in a
+  privileged container, enough for the systemd ops, but on the host's
+  kernel and cgroups). The harness's choice: every body runs as root, so no
+  non-root login escalates through the host's sudoers (a body can still
+  install `sudo` and use it, as `it_systemd.rs` does), and nothing connects
+  over SSH. For the `/proc/sys` item, `it_sysctl_present.rs` says so in its
+  own header — it runs with `.apply_now(false)` and asserts only on the
+  drop-in file, because the live write is not available to it.
 
 If a new op needs nothing from T3, it does not need a T3 test. Say so
 in the pull request rather than adding a step to the playbook for symmetry.
@@ -598,11 +602,13 @@ Each of these has already produced a test that could not fail.
 
 `dev/vagrant/` holds two Debian 12 guests, `x86` and `arm`, from one
 multi-architecture box: vagrant-libvirt on Linux, vagrant-qemu on macOS. The
-CI jobs name their distribution — `Test (T3): VM (Debian 12/x86_64)` — because
-this tier is distribution-specific where the container tier is not: one guest
-is one distro. A second distribution means a second pair of jobs, and the
-distro is matrix data so the name cannot go stale.
-`docs/DEVELOPING.md` is the per-platform setup. The loop:
+VM's CI jobs name their distribution — `Test (T3): VM (Debian 12/x86_64)` —
+because the VM is distribution-specific where the container tier is not: one
+guest is one distro. A second distribution means a second pair of jobs, and
+the distro is matrix data so the name cannot go stale. CI's other T3 machine,
+the macOS runner, converges `hello`, `mac` and `macbrew` against itself over a
+local connection, so it does not exercise SSH; the rest of this section is the
+VM. `docs/DEVELOPING.md` is the per-platform setup. The loop:
 
 ```sh
 make vm-up          # the guest whose architecture matches this host

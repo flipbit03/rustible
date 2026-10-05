@@ -1084,23 +1084,26 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    each container. A typical test applies an op twice: first run `changed`,
    second run `ok`, and the system looks right. Static binaries drop into any
    image with no setup.
-3. **T3, VMs (Vagrant)** for what the container harness cannot give.
-   Structurally: its own kernel and `/proc/sys` (a container shares the host
-   kernel, so a write is refused or reaches the host), and a real boot (a
-   harness container runs systemd as pid 1 only in `systemd_images` mode,
-   privileged, on the host's kernel and cgroups). By the harness's choice:
-   every body runs as root, so no non-root login escalates through the host's
-   sudoers, and nothing connects over SSH. `dev/vagrant/`
-   holds a Debian 12 guest per architecture, x86_64 and aarch64, driven by
-   vagrant-libvirt on Linux and vagrant-qemu on macOS. `make vm-test` converges
-   the `vagrant`, `vagrant_login` and `vagrant_escalate_user` playbooks in
-   `examples/workspace/playbooks/` against whichever are up, failing unless
-   each second run reports nothing changed, then requires
-   `vagrant_login_escalate` to be refused at launch. CI runs both architectures:
-   GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is accelerated
-   and the aarch64 one is interpreted by qemu. This tier is
-   distribution-specific in a way T2 is not — one guest is one distro — so a CI
-   job names the distribution it covers.
+3. **T3, a real machine**: its own kernel, init and `sudo`, all real, with
+   no harness. It gives what the container harness cannot. Structurally: its
+   own kernel and `/proc/sys` (a container shares the host kernel, so a write
+   is refused or reaches the host), and a real boot (a harness container runs
+   systemd as pid 1 only in `systemd_images` mode, privileged, on the host's
+   kernel and cgroups). By the harness's choice: every body runs as root, so
+   no non-root login escalates through the host's sudoers, and nothing
+   connects over SSH. In CI the machine is a Linux VM over SSH (Vagrant) or
+   the macOS runner itself over a local connection, which converges `hello`,
+   `mac` and `macbrew`; only the VM exercises the SSH transport.
+   `dev/vagrant/` holds a Debian 12 guest per architecture, x86_64 and
+   aarch64, driven by vagrant-libvirt on Linux and vagrant-qemu on macOS.
+   `make vm-test` converges the `vagrant`, `vagrant_login` and
+   `vagrant_escalate_user` playbooks in `examples/workspace/playbooks/`
+   against whichever are up, failing unless each second run reports nothing
+   changed, then requires `vagrant_login_escalate` to be refused at launch.
+   CI runs the VM on both architectures: GitHub's Linux runners expose
+   `/dev/kvm`, so the x86_64 guest is accelerated and the aarch64 one is
+   interpreted by qemu. The VM is distribution-specific in a way T2 is not —
+   one guest is one distro — so its CI job names the distribution it covers.
 
 ## 9. Project layout and ecosystem
 

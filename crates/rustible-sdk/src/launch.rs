@@ -724,7 +724,7 @@ mod tests {
     //
     // The scripts run as the test's own user with `HOME` and `TMPDIR`
     // pointed into a temp directory, which is what they see behind sudo.
-    // These run on the macOS job too, so bash 3.2 and BSD `wc` see them.
+    // These run on the macOS T1 job too, so bash 3.2 and BSD `wc` see them.
 
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;

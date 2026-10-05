@@ -30,23 +30,26 @@ reason (`CLAUDE.md`, "Choosing a tier").
   managers, real `useradd`. They caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
   setuid.
-- **T3, machines** (`make vm-test`). What the container harness cannot
-  give. Structurally: its own kernel and `/proc/sys` (a container shares the
-  host kernel, so `sysctl` writes are refused or leak to the host), and a
-  real boot (a harness container runs systemd as pid 1 only in
-  `systemd_images` mode, privileged, on the host's kernel and cgroups). By
-  the harness's choice: every body runs as root, so no non-root login
-  escalates through the host's sudoers, and nothing connects over SSH.
+- **T3, machines** (`make vm-test`). A real machine: its own kernel, init and
+  `sudo`, all real, with no harness. In CI that is a Linux VM over SSH, which
+  `make vm-test` drives, or the macOS runner itself over a local connection;
+  only the VM exercises the SSH transport. It gives what the container harness
+  cannot. Structurally: its own kernel and `/proc/sys` (a container shares the
+  host kernel, so `sysctl` writes are refused or leak to the host), and a real
+  boot (a harness container runs systemd as pid 1 only in `systemd_images`
+  mode, privileged, on the host's kernel and cgroups). By the harness's
+  choice: every body runs as root, so no non-root login escalates through the
+  host's sudoers, and nothing connects over SSH.
 
 A CI job that runs a tier names it, so a red `Test (T2): Docker
 (Debian/Ubuntu/Alpine)` is the container tier failing.
 
-**All three run in CI**, the machine tier on both architectures. So why run it
-locally at all? Two reasons. Iterating against a machine you already have up
-is far faster than waiting for a runner. And a real machine in front of you is
-the only way to find out what an operation *should* do before you have written
-the assertion — which is the tier's actual value, and not something a green
-tick provides.
+**All three run in CI**, the machine tier as a VM on both architectures and as
+the macOS runner. So why run the VM locally at all? Two reasons. Iterating
+against a machine you already have up is far faster than waiting for a runner.
+And a real machine in front of you is the only way to find out what an
+operation *should* do before you have written the assertion — which is the
+tier's actual value, and not something a green tick provides.
 
 ## What it costs
 
