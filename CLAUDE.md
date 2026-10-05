@@ -492,7 +492,10 @@ playbook `make vm-test` runs. There is no separate test file: the assertion is
 that the step is in that playbook and the second run reports `ok`. What a
 single playbook cannot show is a login chosen per playbook and a launch as
 another `escalate_user`, so `vagrant_login.rs` runs after it, logging in as an
-account it creates, and `vagrant_escalate_user.rs` last, escalating to two.
+account it creates, and `vagrant_escalate_user.rs` after that, escalating to
+two. A step that must fail is caught, which the recap counts `recovered`, and
+its count goes in `vm-test.sh`'s `recovered_per_run`; a playbook whose launch
+must fail is run once on its own, as `vagrant_login_escalate.rs` is.
 
 ### Traps that make a test pass while proving nothing
 
@@ -577,10 +580,13 @@ emulated one is slow to *work in*, not slow to start.
 
 `make vm-test` runs `examples/workspace/playbooks/vagrant.rs` **twice**, then
 `vagrant_login.rs` and `vagrant_escalate_user.rs` twice each, and fails unless
-each second run reports nothing changed and nothing failed. The
+each second run reports nothing changed and nothing failed, and every run
+recovered exactly the failures its playbook catches on purpose. The
 second run is the test. A first run reporting `changed` proves only that the
 op did something; an op that rewrites a correct file every pass reports
-`changed` too. Limit it with `make vm-test HOSTS=vagrant-arm`.
+`changed` too. Last, `vagrant_login_escalate.rs` runs once and must be refused
+at launch, saying the login came from its `ssh_user`. Limit it with
+`make vm-test HOSTS=vagrant-arm`.
 
 To drive the machines yourself — a dry run, more verbosity, a playbook of your
 own — use the inventory `vagrant up` generates. Do not paste it into a tracked

@@ -3,7 +3,8 @@
 # Run examples/workspace/playbooks/vagrant.rs, then vagrant_login.rs, then
 # vagrant_escalate_user.rs, against whichever Vagrant machines are up, and
 # prove each is idempotent. The last two log in as, or escalate to, accounts
-# vagrant.rs creates, so the order is fixed.
+# vagrant.rs creates, so the order is fixed. Then run
+# vagrant_login_escalate.rs once, whose launch must be refused.
 #
 # A playbook run that reports `changed` proves the operation did something. It
 # does not prove the operation was right: an op that rewrites a correct file
@@ -27,6 +28,26 @@ inventory="$root/dev/vagrant/hosts.vagrant.kdl"
 # The name form; a path would resolve against the cwd. In order: the second
 # logs in as an account the first creates, and the third escalates to two.
 playbooks=(vagrant vagrant_login vagrant_escalate_user)
+
+# How many steps each run of a playbook fails and catches on purpose, per
+# host: the `recovered` column (#44). Exact, not a ceiling, and on both runs:
+# a caught failure does not fail the host, so one more than this is a step
+# that failed and was hidden, and one fewer is a deliberate failure that
+# stopped happening. vagrant_login catches its step as root, which its login
+# cannot escalate to. A `case` rather than an associative array: macOS's
+# bash 3.2 has none.
+recovered_per_run() {
+    case $1 in
+        vagrant_login) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Launched with escalate = true as an ssh_user that has no sudo, so the
+# orchestrator's `sudo -n` refuses it, and every host must fail saying so:
+# run.rs's launch_escalation_failure, around LoginOverride::note.
+refused_playbook=vagrant_login_escalate
+refused_line='escalating to `root` with `sudo -n` failed before the playbook started; the login user `rustible-login` comes from the playbook'"'"'s `ssh_user` attribute, which overrides the inventory'"'"'s `vagrant` (from host)'
 
 # The `--limit` for each playbook, empty for none. vagrant_escalate_user
 # targets the inventory's `vagrant-escalate-user` group, which names each
@@ -127,6 +148,16 @@ run() {
         playbook run ${limit[@]+"${limit[@]}"} "$1"
 }
 
+# `run`'s stdout, both shown on stderr as it arrives and returned for the
+# assertions. Not `tee /dev/stderr`: on Linux that opens /proc/self/fd/2
+# afresh, which truncates a log file stderr is redirected to
+# (`make vm-test > log 2>&1`), so everything before it was lost. fd 3 is the
+# command substitution's pipe; tee writes there and its own stdout goes to
+# the stderr already open. Under pipefail, `run`'s status is the function's.
+capture() {
+    { run "$1" | tee /dev/fd/3 >&2; } 3>&1
+}
+
 # The summary table has more than one row shape (render.rs). A host that ran
 # gets eight columns,
 # `host ok changed would-change skipped failed recovered warnings`,
@@ -151,10 +182,8 @@ assert_no_change() {
         }
         # Columns: host ok changed would-change skipped failed recovered
         # warnings. `skipped` is deliberately not checked: ctx.skip() is
-        # legitimate playbook logic, not a failure. `recovered` is: a caught
-        # failure does not fail the host, but none of the three playbooks
-        # catches anything, so a recovered step there is a step that failed
-        # and was hidden.
+        # legitimate playbook logic, not a failure. `recovered` is, by
+        # assert_recovered, on both runs.
         # `would-change` is only ever nonzero under --check, which this script
         # does not pass, but it is asserted anyway so that adding a --check
         # pass later cannot pass vacuously.
@@ -163,14 +192,72 @@ assert_no_change() {
             if ($3 != 0) { printf "%s: %s changed on the second run\n", $1, $3 > "/dev/stderr"; bad = 1 }
             if ($4 != 0) { printf "%s: %s would still change\n", $1, $4 > "/dev/stderr"; bad = 1 }
             if ($6 != 0) { printf "%s: %s failed\n", $1, $6 > "/dev/stderr"; bad = 1 }
-            if ($7 != 0) {
-                printf "%s: %s recovered: a step failed and the playbook hid it\n",
-                    $1, $7 > "/dev/stderr"
+        }
+        END {
+            # No rows at all means nothing ran, which is not a pass.
+            if (!seen) { print "no hosts in the summary: nothing ran" > "/dev/stderr"; bad = 1 }
+            exit bad ? 1 : 0
+        }
+    '
+}
+
+# Every host that ran recovered exactly `$1` steps (recovered_per_run). A run
+# that exits 0 can still hide a failure, since a caught failure does not fail
+# the host, so this reads the first run too: a step that fails on a fresh
+# guest and is caught may well succeed on the second. Rows of hosts that
+# never ran are left to the other checks and to `set -e`.
+assert_recovered() {
+    awk -v want="$1" '
+        /^host  *ok  *changed/ { in_table = 1; next }
+        in_table && NF >= 8 && $2 != "failed:" {
+            seen++
+            if ($7 != want) {
+                if (want == 0)
+                    printf "%s: %s recovered: a step failed and the playbook hid it\n",
+                        $1, $7 > "/dev/stderr"
+                else
+                    printf "%s: %s recovered, not the %s this playbook catches on purpose\n",
+                        $1, $7, want > "/dev/stderr"
                 bad = 1
             }
         }
         END {
-            # No rows at all means nothing ran, which is not a pass.
+            if (!seen) { print "no hosts in the summary: nothing ran" > "/dev/stderr"; bad = 1 }
+            exit bad ? 1 : 0
+        }
+    '
+}
+
+# The negative case: every host in the summary failed before the playbook
+# started, and its `FAILED:` line gives `$1` as the reason. The line is
+# matched rather than the summary row, which truncates the reason. A row
+# with counts means the binary ran, which is what must not happen.
+assert_refused_at_launch() {
+    awk -v want="$1" '
+        BEGIN { s = "]  FAILED: " want }
+        /^host  *ok  *changed/ { in_table = 1; next }
+        # `[<host, padded to the widest>]  FAILED: <reason>`, the reason
+        # starting right after the first `]`: anywhere later in the line, it
+        # could be the text of a stderr line (`[h]    stderr: [x]  FAILED: ...`).
+        !in_table && /^\[/ && substr($0, index($0, "]"), length(s)) == s {
+            h = substr($0, 2, index($0, "]") - 2)
+            sub(/ +$/, "", h)
+            refused[h] = 1
+            next
+        }
+        in_table && NF >= 2 {
+            seen++
+            if ($2 != "failed:") {
+                printf "%s: the binary started; its launch should have been refused: %s\n",
+                    $1, $0 > "/dev/stderr"
+                bad = 1
+            } else if (!($1 in refused)) {
+                printf "%s: failed, but not with the launch refusal naming the ssh_user override\n",
+                    $1 > "/dev/stderr"
+                bad = 1
+            }
+        }
+        END {
             if (!seen) { print "no hosts in the summary: nothing ran" > "/dev/stderr"; bad = 1 }
             exit bad ? 1 : 0
         }
@@ -200,8 +287,10 @@ assert_changed_something() {
 }
 
 for playbook in "${playbooks[@]}"; do
+    want=$(recovered_per_run "$playbook")
+
     echo "==> $playbook, first run: converging"
-    first=$(run "$playbook" | tee /dev/stderr)
+    first=$(capture "$playbook")
 
     if [ "$quick" != 1 ] && ! printf '%s\n' "$first" | assert_changed_something; then
         echo >&2
@@ -216,17 +305,43 @@ not take, or the playbook has a step that is satisfied on a fresh guest.
 MSG
         exit 1
     fi
+    if ! printf '%s\n' "$first" | assert_recovered "$want"; then
+        echo >&2
+        echo "vm-test failed: the first run of $playbook did not recover exactly $want step(s) per host." >&2
+        exit 1
+    fi
 
     echo
     echo "==> $playbook, second run: must change nothing"
-    second=$(run "$playbook" | tee /dev/stderr)
+    second=$(capture "$playbook")
 
     if ! printf '%s\n' "$second" | assert_no_change; then
         echo >&2
         echo "vm-test failed: $playbook is not idempotent on these machines." >&2
         exit 1
     fi
+    if ! printf '%s\n' "$second" | assert_recovered "$want"; then
+        echo >&2
+        echo "vm-test failed: the second run of $playbook did not recover exactly $want step(s) per host." >&2
+        exit 1
+    fi
     echo
 done
 
-echo "vm-test passed: converged, and every second run changed nothing."
+# Once: it converges nothing, so there is no second run. An `if` rather than
+# `set -e`, because the run failing is the pass.
+echo "==> $refused_playbook: the launch must be refused"
+if refused=$(capture "$refused_playbook"); then
+    echo >&2
+    echo "vm-test failed: $refused_playbook succeeded; its launch should have been refused." >&2
+    exit 1
+fi
+if ! printf '%s\n' "$refused" | assert_refused_at_launch "$refused_line"; then
+    echo >&2
+    echo "vm-test failed: $refused_playbook was not refused at launch with the ssh_user note." >&2
+    exit 1
+fi
+echo
+
+echo "vm-test passed: every second run changed nothing, every run recovered exactly the"
+echo "failures its playbook catches, and the refused launch said why."
