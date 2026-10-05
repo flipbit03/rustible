@@ -175,7 +175,7 @@ against:
 | job | what it protects |
 |---|---|
 | `Lint: fmt, clippy, docs` | the code is well-formed and documented |
-| `Test (T1): unit & fake` | T1: pure functions and ops against the `Fake` |
+| `Test (T1): unit & fake` | T1: everything a plain `cargo test` runs, chiefly pure functions and ops against the `Fake` |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
 | `Test (T1, real mac): macOS (controller and target)` | T1 on macOS, and three playbooks run against the runner itself as a target, over a local connection |
@@ -183,19 +183,18 @@ against:
 | `Test (T3): VM (Debian 12/x86_64)` | T3, on a KVM-accelerated guest |
 | `Test (T3): VM (Debian 12/aarch64)` | T3, on an emulated guest |
 
-Keep that shape when adding a job: `<verb> (<tier>): <mechanism> (<what it
-ran against>)`, and `<verb>: <mechanism>` for a job that runs no tests. The
-tier is added to the mechanism, never put in its place, because the two
-answer different readers. The tier tells a contributor which kind of test
-broke, in the words this file and every test header use, and so where the
-fix goes. The mechanism tells someone who has never opened this file what
-broke and where it ran. A qualifier after the tier marks a job that also
-runs something outside the three tiers: the mac job's `real mac` is its
-`hello`, `mac` and `macbrew` playbooks, converged against the runner itself
-over a local connection, which is neither in-process, nor a container, nor a
-VM over SSH. Lint and tests are deliberately separate jobs, because one says
-the code is malformed and the other says it is wrong, and a single red tick
-covering both is ambiguous.
+Keep that shape when adding a job: `<verb> (<tier>[, <qualifier>]):
+<mechanism> (<what it ran against>)`, and `<verb>: <mechanism>` for a job
+that runs no tests. The tier is added to the mechanism, never put in its
+place, because the two answer different readers. The tier tells a
+contributor which kind of test broke, in the words this file and every test
+header use, and so where the fix goes. The mechanism tells someone who has
+never opened this file what broke and where it ran. The optional qualifier
+names what the job also runs against outside the three tiers: the mac job's
+`real mac` is the runner itself as a target, over a local connection, which
+its `hello`, `mac` and `macbrew` playbooks converge. Lint and tests are
+deliberately separate jobs, because one says the code is malformed and the
+other says it is wrong, and a single red tick covering both is ambiguous.
 
 To work against your checkout rather than the published crates — which is what
 you want when changing Rustible itself — build the CLI from the tree and point
@@ -325,13 +324,14 @@ below it:
 
 | tier | what it is | sees what the tier below cannot | where it runs | cost |
 |---|---|---|---|---|
-| T1. in-process | everything `cargo test` runs: chiefly pure functions and ops against the `Fake` backend, plus the CLI's tests of its built binary and the macros' trybuild UI tests | — | `cargo test` | free |
+| T1. in-process | everything a plain `cargo test` runs with nothing installed: chiefly pure functions and ops against the `Fake` backend, plus the CLI's tests of its built binary and the macros' trybuild UI tests. The T2 tests in `crates/rustible-std/tests/` skip themselves there, without `RUSTIBLE_INTEGRATION=1` | — | `cargo test` | free |
 | T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
-| T3. machine | a playbook against a real VM over SSH | what a container structurally cannot give: a live `/proc/sys` (its own kernel), a real init system on a real boot, a real `sudo` setup on a real host, and the SSH transport | `make vm-test`, and CI | minutes, needs vagrant |
+| T3. machine | a playbook against a real VM over SSH | what the container harness cannot give. Structurally: its own kernel and `/proc/sys`, and a real boot. By the harness's choice: every body runs as root, so no non-root login escalates through the host's sudoers, and nothing connects over SSH | `make vm-test`, and CI | minutes, needs vagrant |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
-three playbooks on each of two architectures.
+three playbooks converged, and one refused at launch, on each of two
+architectures.
 
 **All three tiers run in CI**, the machine tier on both architectures.
 GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is genuinely
@@ -362,15 +362,18 @@ while the thing is broken.
   has earned it: it caught that `useradd` refuses to create a private group
   when one already carries the name, and that `chown` clears setuid. A fake
   models what you *believe*; a container shows what is.
-- **T3, for what a container structurally cannot do.** That list is short
-  and specific: a live `/proc/sys` (a container shares the host kernel, so
-  the write is refused or hits the *host*); a real init system on a real
-  boot (`systemd_images` runs systemd as pid 1 in a privileged container,
-  enough for the systemd ops, but on the host's kernel and cgroups, not a
-  machine of its own); a real `sudo` setup on a real host (a T2 body can
-  install `sudo` and use it, as `it_systemd.rs` does, but it already runs as
-  root, so no login escalates through it); and the SSH transport itself. `it_sysctl_present.rs` says so in its own header — it runs with `.apply_now(false)` and asserts only on the
-  drop-in file, because the live write is not available to it.
+- **T3, for what the container harness cannot give.** That list is short
+  and specific, and comes in two kinds. Structural, because a container is
+  not a machine: its own kernel and `/proc/sys` (a container shares the
+  host kernel, so a write is refused or hits the *host*), and a real boot
+  (`systemd_images` runs systemd as pid 1 in a privileged container, enough
+  for the systemd ops, but on the host's kernel and cgroups). The harness's
+  choice: every body runs as root, so no non-root login escalates through
+  the host's sudoers (a body can still install `sudo` and use it, as
+  `it_systemd.rs` does), and nothing connects over SSH. For the `/proc/sys`
+  item, `it_sysctl_present.rs` says so in its own header — it runs with
+  `.apply_now(false)` and asserts only on the drop-in file, because the live
+  write is not available to it.
 
 If a new op needs nothing from T3, it does not need a T3 test. Say so
 in the pull request rather than adding a step to the playbook for symmetry.
@@ -379,8 +382,8 @@ in the pull request rather than adding a step to the playbook for symmetry.
 
 Choosing the tier is the judgement; this is the mechanism.
 
-**T1 lives in the op's own file**, in a `#[cfg(test)] mod tests` at
-the bottom. Every module in `rustible-std` that has tests does this — all
+**An op's T1 tests live in its own file**, in a `#[cfg(test)] mod tests`
+at the bottom. Every module in `rustible-std` that has tests does this — all
 twenty of them; `lib.rs` and `ssh/mod.rs` only re-export — and none has a
 separate unit-test file. Inside it, separate the two kinds of test with a
 banner comment — `sysctl.rs` and `hostname.rs` use `// ---- pure ----` and

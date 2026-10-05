@@ -24,7 +24,9 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
-# T1, in-process: chiefly pure functions and ops against the `Fake`.
+# T1, in-process: everything a plain `cargo test` runs with nothing installed,
+# chiefly pure functions and ops against the `Fake`. The T2 tests skip
+# themselves here, without RUSTIBLE_INTEGRATION=1.
 test:
 	$(CARGO) test --workspace
 

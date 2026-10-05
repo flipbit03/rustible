@@ -1054,10 +1054,12 @@ costs more to run (free, seconds, minutes), so a test goes in the lowest tier
 that can fail for the right reason. CI job names carry the tier, beside the
 mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 
-1. **T1, in-process**: everything `cargo test` runs, which needs nothing
-   installed. That includes the CLI's tests of its built binary and the
-   macros' trybuild UI tests, but it is chiefly two kinds of test, and
-   choosing between them is an authoring choice, not a tier:
+1. **T1, in-process**: everything a plain `cargo test` runs with nothing
+   installed. The T2 tests in `crates/rustible-std/tests/` skip themselves
+   there, without `RUSTIBLE_INTEGRATION=1`. T1 includes the CLI's tests of
+   its built binary and the macros' trybuild UI tests, but it is chiefly two
+   kinds of test, and choosing between them is an authoring choice, not a
+   tier:
    - **Pure functions** for the interesting logic (line replacement and diff,
      `/etc/passwd` parsing, authorized_keys deltas, version comparison).
      Tested with strings, no fakes.
@@ -1075,11 +1077,13 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    each container. A typical test applies an op twice: first run `changed`,
    second run `ok`, and the system looks right. Static binaries drop into any
    image with no setup.
-3. **T3, VMs (Vagrant)** for what a container cannot give: a live `/proc/sys`
-   (a container shares the host kernel, so a write is refused or reaches the
-   host), a real init system on a real boot (a container runs systemd as pid 1
-   only in the harness's `systemd_images` mode, on the host's kernel), a real
-   `sudo` setup on a real host, and the SSH transport itself. `dev/vagrant/`
+3. **T3, VMs (Vagrant)** for what the container harness cannot give.
+   Structurally: its own kernel and `/proc/sys` (a container shares the host
+   kernel, so a write is refused or reaches the host), and a real boot (a
+   harness container runs systemd as pid 1 only in `systemd_images` mode,
+   privileged, on the host's kernel and cgroups). By the harness's choice:
+   every body runs as root, so no non-root login escalates through the host's
+   sudoers, and nothing connects over SSH. `dev/vagrant/`
    holds a Debian 12 guest per architecture, x86_64 and aarch64, driven by
    vagrant-libvirt on Linux and vagrant-qemu on macOS. `make vm-test` converges
    the `vagrant`, `vagrant_login` and `vagrant_escalate_user` playbooks in

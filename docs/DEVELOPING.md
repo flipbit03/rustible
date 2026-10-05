@@ -16,21 +16,23 @@ Each sees something the tier below it cannot, and costs more to run: free,
 seconds, minutes. A test goes in the lowest one that can fail for the right
 reason (`CLAUDE.md`, "Choosing a tier").
 
-- **T1, in-process**: everything `cargo test` runs, chiefly **pure
-  functions** and the **`Fake` backend** (parsers, planners, and an op's own
-  behaviour), plus the CLI's tests of its built binary and the macros'
-  trybuild UI tests. Always.
+- **T1, in-process**: everything a plain `cargo test` runs with nothing
+  installed, chiefly **pure functions** and the **`Fake` backend** (parsers,
+  planners, and an op's own behaviour), plus the CLI's tests of its built
+  binary and the macros' trybuild UI tests. The T2 tests in
+  `crates/rustible-std/tests/` skip themselves there, without
+  `RUSTIBLE_INTEGRATION=1`. Always.
 - **T2, containers** (`make integration`). Real distributions, real package
   managers, real `useradd`. They caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
   setuid.
-- **T3, machines** (`make vm-test`). A real SSH transport, a real `sudo`
-  setup on a real host, a live `/proc/sys`, and a real init system on a real
-  boot. A container cannot give those: it shares the host kernel, so `sysctl`
-  writes are refused or leak to the host; it runs systemd as pid 1 only in
-  the harness's `systemd_images` mode, on the host's kernel and cgroups; its
-  body already runs as root, so no login escalates through `sudo`; and
-  nothing reaches it over SSH.
+- **T3, machines** (`make vm-test`). What the container harness cannot
+  give. Structurally: its own kernel and `/proc/sys` (a container shares the
+  host kernel, so `sysctl` writes are refused or leak to the host), and a
+  real boot (a harness container runs systemd as pid 1 only in
+  `systemd_images` mode, privileged, on the host's kernel and cgroups). By
+  the harness's choice: every body runs as root, so no non-root login
+  escalates through the host's sudoers, and nothing connects over SSH.
 
 A CI job that runs a tier names it, so a red `Test (T2): Docker
 (Debian/Ubuntu/Alpine)` is the container tier failing.
