@@ -80,7 +80,7 @@ impl UserKeys {
         }
     }
 
-    /// Connect and read timeout for the default HTTPS client (20 seconds
+    /// Timeout of the default HTTPS client, body included (20 seconds
     /// when not set). Ignored when [`fetch_with`](Self::fetch_with) is used.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

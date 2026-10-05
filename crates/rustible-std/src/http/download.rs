@@ -1,19 +1,5 @@
-//! Downloads over HTTP(S). Ansible's `ansible.builtin.get_url`.
-//!
-//! [`Download`] fetches a URL into a file on the target with `ureq` over
-//! `rustls`, with `ring` as the crypto provider, taken from [`crate::tls`] so
-//! this op and `rustible-github` share one crypto path. Certificates are
-//! checked against Mozilla's bundled roots (`webpki-roots`); there is no
-//! `validate_certs: no`.
-//!
-//! `ring` detects CPU features at runtime and falls back to baseline code, so
-//! there is no instruction-set floor and no pre-flight: the binary this op
-//! ships in runs on any x86-64 or aarch64 target. It does compile a little C,
-//! which zig does on the operator's machine (vision 5.3, M8); the target host
-//! still needs nothing at all.
-//!
-//! `check` never touches the network. It decides from the file on disk
-//! whether a download is due, so a dry run is fast and honest (vision 12).
+//! [`Download`]: a URL into a file on the target. Ansible's
+//! `ansible.builtin.get_url`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,9 +8,16 @@ use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 use sha2::Digest;
 
+use ureq::http::Method;
+
+use super::client::{self, Field, HeaderSpec, Outgoing, Timeout, mask_url};
+use super::validate_url;
 use crate::file::{AttrPlan, Owner, plan_attrs, write_with_backup};
 
-/// Default connect and response-header timeout. Ansible's `timeout` is 10s.
+/// The default timeout of both ops. For [`Download`] it bounds connecting
+/// and the response head, and the body has none (Ansible's `get_url`
+/// default is 10 seconds); for [`Request`](super::Request) it bounds the
+/// whole exchange, body included (Ansible's `uri` default is 30 seconds).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default ceiling on a response body, raised or lowered with
@@ -131,33 +124,6 @@ pub fn digest(algorithm: Algorithm, bytes: &[u8]) -> String {
     }
 }
 
-/// Why a URL cannot be downloaded. Pure. Only `http://` and `https://`.
-pub fn validate_url(url: &str) -> std::result::Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    // Measure against the scheme that actually matched: using the longer
-    // one for both refuses `http://x`, and a single-label host is real
-    // (an `/etc/hosts` name, a container alias, a service on a LAN).
-    let scheme = if lower.starts_with("https://") {
-        Some("https://")
-    } else if lower.starts_with("http://") {
-        Some("http://")
-    } else {
-        None
-    };
-    if let Some(scheme) = scheme {
-        if url.len() <= scheme.len() || url.contains(char::is_whitespace) {
-            return Err(format!("`{url}` is not a valid http(s) URL"));
-        }
-        return Ok(());
-    }
-    if lower.starts_with("file:") {
-        return Err(format!(
-            "`{url}`: file:// URLs are not supported; use file::Copy::from_local_path"
-        ));
-    }
-    Err(format!("`{url}` is not an http:// or https:// URL"))
-}
-
 /// Ensure a URL's content is at `dest`. Ansible's `get_url` with `url`,
 /// `dest`, `checksum`, `mode`, `owner`/`group`, `force`, `backup`,
 /// `timeout`, `headers`.
@@ -189,7 +155,11 @@ pub fn validate_url(url: &str) -> std::result::Result<(), String> {
 /// **Honesty.** The write is atomic (`sys.write_atomic`): the old file
 /// stays untouched until the new bytes are complete. A checksum mismatch
 /// after the download fails the step and writes nothing. A non-2xx status
-/// fails the step naming the status and the URL. Redirects are followed.
+/// fails the step naming the status and the URL. Redirects are followed, up
+/// to ten, and a header given with [`Download::header_secret`] is dropped
+/// when one leaves the scheme, host and port it was meant for (the
+/// [module docs](super) have the policy). A URL's `user:pass@` is masked in
+/// every message and diff.
 /// `check` never opens the connection: a dry run reports what would be
 /// fetched and why, and a step that would change has no output there
 /// (vision 12).
@@ -200,7 +170,7 @@ pub fn validate_url(url: &str) -> std::result::Result<(), String> {
 /// Raise or lower that with [`Download::max_bytes`]. Fails if `dest` exists
 /// and is not a regular file, or if its parent directory does not exist
 /// (vision 6.7: create it with [`crate::file::Directory`]).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Download {
     url: String,
     dest: PathBuf,
@@ -211,13 +181,39 @@ pub struct Download {
     backup: bool,
     timeout: Duration,
     max_bytes: u64,
-    headers: Vec<(String, String)>,
+    headers: Vec<HeaderSpec>,
+}
+
+/// `{:?}` masks the URL's userinfo and shows a secret header as its size.
+impl std::fmt::Debug for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Download")
+            .field("url", &mask_url(&self.url))
+            .field("dest", &self.dest)
+            .field("checksum", &self.checksum)
+            .field("mode", &self.mode)
+            .field("owner", &self.owner)
+            .field("force", &self.force)
+            .field("backup", &self.backup)
+            .field("timeout", &self.timeout)
+            .field("max_bytes", &self.max_bytes)
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 /// A `Download` with a URL but no destination yet; `.to(dest)` finishes it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DownloadBuilder {
     url: String,
+}
+
+impl std::fmt::Debug for DownloadBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadBuilder")
+            .field("url", &mask_url(&self.url))
+            .finish()
+    }
 }
 
 /// Output of [`Download`].
@@ -309,9 +305,28 @@ impl Download {
         self
     }
 
-    /// An extra request header, e.g. `("Authorization", "Bearer ...")`.
+    /// An extra request header, e.g. `("Accept", "application/octet-stream")`.
+    /// For a token or a key, use [`Download::header_secret`].
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+        self.headers.push(HeaderSpec {
+            name: name.into(),
+            value: Field::Plain(value.into()),
+        });
+        self
+    }
+
+    /// A request header whose value is secret, e.g. `("Authorization",
+    /// &token)` with the token read by `ctx.local_secret` or from a file on
+    /// the target into a [`Secret`]. A trailing newline is stripped. It
+    /// shows as `<secret, N bytes>` in `Debug` and never in a diff or a
+    /// message, and it is dropped when a redirect leaves the scheme, host
+    /// and port it was sent to; a redirect from `https://` to `http://` is
+    /// refused while it is attached.
+    pub fn header_secret(mut self, name: impl Into<String>, value: &Secret) -> Self {
+        self.headers.push(HeaderSpec {
+            name: name.into(),
+            value: Field::Secret(value.clone()),
+        });
         self
     }
 
@@ -384,56 +399,19 @@ impl Download {
     }
 
     fn fetch(&self, url: &str) -> Result<Vec<u8>> {
-        let agent = agent(self.timeout);
-        let mut req = agent.get(url);
-        for (k, v) in &self.headers {
-            req = req.header(k.as_str(), v.as_str());
+        let resp = client::send(Outgoing {
+            method: Method::GET,
+            url: url.to_string(),
+            headers: self.headers.clone(),
+            body: None,
+            follow: true,
+            timeout: Timeout::Head(self.timeout),
+        })?;
+        if !(200..300).contains(&resp.status) {
+            let status = format!("{} {}", resp.status, resp.reason());
+            bail!("GET {} returned {}", mask_url(url), status.trim_end());
         }
-        let mut resp = req
-            .call()
-            .map_err(|e| Error::msg(format!("GET {url}: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("GET {url} returned {status}");
-        }
-        // Refuse before reading when the server declares a size over the
-        // ceiling. A missing or lying `Content-Length` is caught below.
-        if let Some(len) = resp
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            && len > self.max_bytes
-        {
-            bail!(
-                "GET {}: Content-Length {len} exceeds the {} byte limit; raise it with .max_bytes()",
-                url,
-                self.max_bytes
-            );
-        }
-        // `limit` is the real guard: ureq stops the read past it and errors,
-        // so a chunked or mislabelled body cannot grow without bound. Read
-        // one byte past the ceiling to tell "exactly at the limit" from
-        // "over it".
-        let body = resp
-            .body_mut()
-            .with_config()
-            .limit(self.max_bytes.saturating_add(1))
-            .read_to_vec()
-            .map_err(|e| {
-                Error::msg(format!(
-                    "GET {}: reading the body (limit {} bytes, raise it with .max_bytes()): {e}",
-                    url, self.max_bytes
-                ))
-            })?;
-        if body.len() as u64 > self.max_bytes {
-            bail!(
-                "GET {}: the body is larger than the {} byte limit; raise it with .max_bytes()",
-                url,
-                self.max_bytes
-            );
-        }
-        Ok(body)
+        resp.read(self.max_bytes)
     }
 }
 
@@ -466,20 +444,6 @@ enum ContentState {
     Stale(String),
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder()
-        .unversioned_rustls_crypto_provider(crate::tls::provider())
-        .build();
-    ureq::Agent::config_builder()
-        .tls_config(tls)
-        .http_status_as_error(false)
-        .timeout_connect(Some(timeout))
-        .timeout_recv_response(Some(timeout))
-        .user_agent(concat!("rustible/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
-}
-
 /// What [`Download`]'s `check` decided: fetch the URL and write it, or only
 /// set the attributes of a file whose content is already right. The body is
 /// fetched by `apply` and never held here; the headers stay on the op.
@@ -491,7 +455,6 @@ pub struct DownloadIntent {
     attrs: AttrPlan,
 }
 
-#[derive(Debug)]
 struct Fetch {
     url: String,
     /// Why the file is fetched, for the report: `missing`, or what made the
@@ -499,14 +462,25 @@ struct Fetch {
     reason: String,
 }
 
+impl std::fmt::Debug for Fetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fetch")
+            .field("url", &mask_url(&self.url))
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
 impl Intent for DownloadIntent {
     fn diff(&self) -> Diff {
         match &self.fetch {
             // Size and digest are unknown until fetched; the diff says what
             // would be fetched and why.
-            Some(Fetch { url, reason }) => {
-                Diff::summary(format!("GET {url} -> {} ({reason})", self.dest.display()))
-            }
+            Some(Fetch { url, reason }) => Diff::summary(format!(
+                "GET {} -> {} ({reason})",
+                mask_url(url),
+                self.dest.display()
+            )),
             None => Diff::attrs(self.dest.display().to_string(), self.attrs.changes()),
         }
     }
@@ -525,6 +499,10 @@ impl Op for Download {
             ref other => bail!("http::Download has no implementation for {}", other.name()),
         }
         validate_url(&self.url).map_err(Error::msg)?;
+        for h in &self.headers {
+            h.to_wire()
+                .map_err(|e| Error::msg(format!("GET {}: {e}", mask_url(&self.url))))?;
+        }
         let checksum = self.parsed_checksum()?;
         let (stat, state) = self.content_state(sys, checksum.as_ref())?;
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
@@ -590,7 +568,8 @@ impl Op for Download {
             };
             ensure!(
                 actual == c.hex,
-                "GET {url}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
+                "GET {}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
+                mask_url(&url),
                 c.algorithm.name(),
                 c.hex,
                 dest.display()
@@ -615,7 +594,6 @@ impl Op for Download {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -623,6 +601,7 @@ mod tests {
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::Collect;
 
+    use super::super::test_server::Route;
     use super::*;
     use crate::file::testing::{expect_change, fake_sys};
 
@@ -668,73 +647,10 @@ mod tests {
     const HELLO: &[u8] = b"hello from rustible\n";
     const HELLO_SHA256: &str = "86a9660ed95754054a62f1dbc68e53ab443dd67c84fa77362a699dbf8604da3d";
 
-    /// `(path, status, extra headers, body)` the test server answers with.
-    type Route = (&'static str, u16, Vec<(&'static str, String)>, Vec<u8>);
-
-    /// A one-thread HTTP/1.1 server on 127.0.0.1 serving a fixed table of
-    /// paths. Returns its base URL and a hit counter. Each response closes
-    /// the connection, so ureq cannot pool.
+    /// The shared loopback server, as its base URL and hit counter.
     fn serve(routes: Vec<Route>) -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(AtomicUsize::new(0));
-        let counter = hits.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut s) = stream else { continue };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match s.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
-                }
-                let head = String::from_utf8_lossy(&buf).into_owned();
-                let path = head
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("/")
-                    .to_string();
-                counter.fetch_add(1, Ordering::SeqCst);
-                let (status, headers, body) = routes
-                    .iter()
-                    .find(|(p, ..)| *p == path)
-                    .map(|(_, st, h, b)| (*st, h.clone(), b.clone()))
-                    .unwrap_or((404, vec![], b"no such route".to_vec()));
-                let reason = match status {
-                    200 => "OK",
-                    302 => "Found",
-                    404 => "Not Found",
-                    500 => "Internal Server Error",
-                    _ => "Whatever",
-                };
-                // A route carrying `X-Omit-Length` answers without a
-                // `Content-Length`, so the body's size is unknown until it
-                // is read: that is the case `.max_bytes` has to catch at
-                // the read rather than from the header.
-                let omit_length = headers.iter().any(|(k, _)| *k == "X-Omit-Length");
-                let mut out = if omit_length {
-                    format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
-                } else {
-                    format!(
-                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        body.len()
-                    )
-                };
-                for (k, v) in headers {
-                    if k == "X-Omit-Length" {
-                        continue;
-                    }
-                    out.push_str(&format!("{k}: {v}\r\n"));
-                }
-                out.push_str("\r\n");
-                let _ = s.write_all(out.as_bytes());
-                let _ = s.write_all(&body);
-            }
-        });
-        (base, hits)
+        let s = super::super::test_server::serve(routes);
+        (s.base, s.hits)
     }
 
     fn hello_server() -> (String, Arc<AtomicUsize>) {
@@ -1177,6 +1093,44 @@ mod tests {
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
         assert_eq!(hits.load(Ordering::SeqCst), 2, "redirect then target");
+    }
+
+    /// `header_secret` shows as its size, the URL's userinfo is masked in
+    /// `Debug` and the diff, and a redirect to another origin arrives
+    /// without the secret (the policy `http::Request` follows too).
+    #[test]
+    fn a_secret_header_is_hidden_and_dropped_on_a_redirect_to_another_origin() {
+        use super::super::test_server::serve as serve_full;
+        let target = serve_full(vec![("/x", 200, vec![], HELLO.to_vec())]);
+        let first = serve_full(vec![(
+            "/away",
+            302,
+            vec![("Location", target.url("/x"))],
+            vec![],
+        )]);
+        let url = first.url("/away").replace("http://", "http://bob:u5er-pw@");
+        let op = Download::get(&url)
+            .to("/opt/hello.txt")
+            .header_secret("Authorization", &Secret::new("Bearer t0k3n\n"))
+            .header("Accept", "*/*");
+        let dbg = format!("{op:?}");
+        assert!(!dbg.contains("t0k3n") && !dbg.contains("u5er-pw"), "{dbg}");
+        assert!(dbg.contains("<secret, 13 bytes>"), "{dbg}");
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let c = expect_change(&op, &sys);
+        let diff = c.diff().render();
+        assert!(diff.contains("http://bob:********@127.0.0.1"), "{diff}");
+        assert!(!format!("{c:?}").contains("u5er-pw"));
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
+        assert_eq!(
+            first.seen()[0].header("authorization"),
+            Some("Bearer t0k3n")
+        );
+        let arrived = &target.seen()[0];
+        assert_eq!(arrived.header("authorization"), None, "{arrived:?}");
+        assert_eq!(arrived.header("accept"), Some("*/*"));
     }
 
     #[test]
