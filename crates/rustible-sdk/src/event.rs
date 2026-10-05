@@ -432,7 +432,8 @@ impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
     /// per step and warning, a step inside a block prefixed with its path.
     /// At 1 it adds `debug` logs, the full diff under any step that carries
-    /// one, and the failing command's stderr. At 2 it adds a `$` line per
+    /// one unless the step line already shows all of it (one line), and the
+    /// failing command's stderr. At 2 it adds a `$` line per
     /// [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
@@ -484,10 +485,9 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 // unless the step line already shows all of it.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && let full = d.render()
-                    && full.trim_end_matches('\n') != d.short()
+                    && !on_the_step_line(&d)
                 {
-                    for line in full.lines() {
+                    for line in d.render().lines() {
                         let _ = writeln!(w, "    | {line}");
                     }
                 }
@@ -544,6 +544,18 @@ impl<W: Write + Send> EventSink for Compact<W> {
             ),
         };
     }
+}
+
+/// Whether `d`'s full render says no more than the step line does: one line
+/// with something on it, the one `short()` shows. Blank lines do not count,
+/// as they do not for `short()`. `rustible`'s renderer has its own copy.
+fn on_the_step_line(d: &Diff) -> bool {
+    let full = d.render();
+    let mut lines = full.lines().filter(|l| !l.trim().is_empty());
+    matches!(
+        (lines.next(), lines.next()),
+        (Some(l), None) if l.trim() == d.short().trim()
+    )
 }
 
 /// [`block_prefix`] plus the space that separates it from a step name, or
@@ -731,8 +743,22 @@ mod tests {
             note: None,
             elapsed_ms: 0,
         });
+        // Lines with nothing on them do not count, as for `short()`.
+        printer.emit(Event::StepFinished {
+            id: 2,
+            blocks: vec![],
+            name: "spaced".into(),
+            identity: "self".into(),
+            status: Status::Changed,
+            diff: Some(Diff::summary("one\n \n")),
+            note: None,
+            elapsed_ms: 0,
+        });
         let out = String::from_utf8(printer.w.into_inner().unwrap()).unwrap();
-        assert_eq!(out, "changed: restart  systemctl restart nginx\n");
+        assert_eq!(
+            out,
+            "changed: restart  systemctl restart nginx\nchanged: spaced  one\n"
+        );
     }
 
     #[test]

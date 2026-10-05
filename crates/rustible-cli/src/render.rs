@@ -236,10 +236,9 @@ impl<W: Write> Renderer<W> {
                 // diff's first line. One line is already whole there.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && let full = d.render()
-                    && full.trim_end_matches('\n') != d.short()
+                    && !on_the_step_line(d)
                 {
-                    for l in full.lines() {
+                    for l in d.render().lines() {
                         self.line(host, &format!("    | {l}"));
                     }
                 }
@@ -428,6 +427,18 @@ fn failed_at(blocks: &[String], step: &str) -> String {
     } else {
         format!("{} `{step}`", block_prefix(blocks))
     }
+}
+
+/// Whether `d`'s full render says no more than the step line does: one line
+/// with something on it, the one `short()` shows. Blank lines do not count,
+/// as they do not for `short()`. The SDK's `Compact` has its own copy.
+fn on_the_step_line(d: &rustible_sdk::Diff) -> bool {
+    let full = d.render();
+    let mut lines = full.lines().filter(|l| !l.trim().is_empty());
+    matches!(
+        (lines.next(), lines.next()),
+        (Some(l), None) if l.trim() == d.short().trim()
+    )
 }
 
 fn status_word(s: Status) -> &'static str {
@@ -1619,6 +1630,16 @@ web1    4        1             0        0       0          2         0
             assert_eq!(out.lines().count(), 1, "{status:?}: {out}");
             assert!(out.contains("GET http://h/x"), "{out}");
         }
+        // Lines with nothing on them do not count, as for `short()`.
+        let mut ev = step_finished(1, "query", Status::Changed);
+        if let Event::StepFinished { diff, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary("one\n \n"));
+        }
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "query"));
+            r.event("local", &ev);
+        });
+        assert_eq!(out.lines().count(), 1, "{out}");
     }
 
     #[test]
