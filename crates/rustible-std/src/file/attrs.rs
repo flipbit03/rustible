@@ -57,7 +57,9 @@ impl Attrs {
         self
     }
 
-    /// Numeric owner (`chown uid:gid`).
+    /// Numeric owner (`chown uid:gid`). Changing the owner of a setuid or
+    /// setgid file clears those bits, as `chown` does; give `.mode(..)` too
+    /// to keep them.
     pub fn owner(mut self, uid: u32, gid: u32) -> Self {
         self.owner = Some(Owner { uid, gid });
         self

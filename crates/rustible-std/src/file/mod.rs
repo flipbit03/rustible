@@ -154,10 +154,14 @@ impl AttrPlan {
         changes
     }
 
-    /// Set every attribute the op was given, differing or not: an op calls
-    /// this when its step changes, and `chmod`/`chown` are idempotent. Also
-    /// what keeps a wanted mode correct across the other half of the change
-    /// (a rewrite, an owner change).
+    /// Set every attribute the op was given, differing or not: `file::Attrs`
+    /// and `file::Directory` call this when their step changes. `chmod` is
+    /// idempotent; `chown` is not, even to the owner the file already has,
+    /// because it clears setuid (and setgid with group execute) on anything
+    /// but a directory. A wanted mode is set after it, so it comes back; a
+    /// mode nobody asked for does not. An op that rewrote the file, whose
+    /// replacement already has the old owner and mode, calls
+    /// [`AttrPlan::apply_differing`] instead.
     ///
     /// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on
     /// anything that is not a directory, so the owner is set *first* and the
@@ -175,15 +179,20 @@ impl AttrPlan {
 
     /// Set only the attributes that differ: what an op uses when `check`
     /// found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it. A `chown` that changes the owner
-    /// needs root and is issued only when the owner is wrong; one to the
-    /// owner the file already has would be a needless call that also clears
-    /// setuid.
+    /// `ssh::authorized_keys` relies on it, and so do `file::Copy` and
+    /// `http::Download`: a rewrite keeps the old owner and mode (as root;
+    /// see `System::write_atomic`), so what `check` found right is still
+    /// right after it. A `chown` that changes the owner needs root and is
+    /// issued only when the owner is wrong; one to the owner the file
+    /// already has would be a needless call that also clears setuid.
     ///
     /// When it does `chown`, it sets a wanted mode afterwards even if the
     /// mode already matched, because the `chown` just cleared setuid (and
     /// setgid with group execute): owner first, then mode, as
-    /// [`AttrPlan::changes`]' rows promise.
+    /// [`AttrPlan::changes`]' rows promise. With no mode wanted, a `chown`
+    /// that changes the owner leaves the file without those bits: that is
+    /// the kernel's rule, and Ansible's `owner:` does the same. An op that
+    /// wants them kept asks for the mode too.
     pub(crate) fn apply_differing(&self, sys: &System, path: &Path) -> Result<()> {
         let chowned = match self.owner_to_set() {
             Some(o) => {

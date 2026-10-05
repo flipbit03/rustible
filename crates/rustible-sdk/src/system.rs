@@ -410,16 +410,22 @@ impl System {
     /// directory and a rename, so a concurrent reader sees either the old
     /// file or the new one and a failure part way leaves the old one intact.
     ///
-    /// An existing file keeps its owner and its whole mode, setuid and setgid
-    /// included: the replacement is given the old owner first and the old
-    /// mode after, because a `chown` clears those bits. That takes root: an
-    /// unprivileged rewrite of a file another user owns leaves it owned by
-    /// this identity, since the `chown` back fails and is ignored. A new
-    /// file is created with the mode any newly created file gets, 0666 minus
-    /// the umask. Refused
-    /// with [`MutationDuringCheck`] inside `check`, and errors as [`IoAt`]
-    /// if the directory is not writable or the rename fails. Logs the path
-    /// and byte count at debug level.
+    /// An existing file keeps its whole mode, setuid and setgid included,
+    /// and its owner. Keeping the mode needs no privilege, and an
+    /// unprivileged rewrite of this identity's own setuid file stays setuid.
+    /// Keeping an owner other than this identity takes root: an unprivileged
+    /// rewrite of another user's file leaves it owned by this identity with
+    /// the same mode, so another user's `4755` file becomes this identity's
+    /// `4755` file. `p` is followed if it is a symlink for the mode and owner
+    /// to keep, and the link itself is replaced by the new file. A new file
+    /// is created with the mode any newly created file gets, 0666 minus the
+    /// umask.
+    ///
+    /// Refused with [`MutationDuringCheck`] inside `check`, and errors as
+    /// [`IoAt`] if the directory is not writable or the rename fails, or if
+    /// a root without `CAP_FOWNER` rewrites another user's setuid or setgid
+    /// file (the bits cannot be set again after the `chown`, and the old
+    /// file is left as it was). Logs the path and byte count at debug level.
     pub fn write_atomic(&self, p: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         let p = p.as_ref();
         self.guard_mutation(p)?;

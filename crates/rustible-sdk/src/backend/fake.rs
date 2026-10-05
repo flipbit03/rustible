@@ -287,37 +287,36 @@ impl Backend for Fake {
     }
 
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
-        // Mirrors `Local::write` (tempfile + rename): writing at a symlink's
-        // path replaces the link itself with a regular file; the target is
-        // untouched. New files get 0644. An existing file keeps its owner and
-        // its whole mode, setuid and setgid included, as `Local::write` leaves
-        // it: that `chown`s the temporary file to the old owner first and
-        // copies the old mode onto it after, so the bits the `chown` clears
-        // (`mode_after_chown`) are set again.
+        // Mirrors `Local::write` (tempfile + rename). An existing file keeps
+        // its owner and its whole mode, setuid and setgid included: `Local`
+        // sets setuid and setgid again after its `chown`, which cleared them
+        // (`mode_after_chown`). Writing at a symlink's path replaces the link
+        // itself with a regular file carrying the *target's* mode and owner,
+        // because `Local` reads them with a `stat` that follows the link; the
+        // target is untouched. A new file, or one at a dangling link, is
+        // 0644 root.
         let mut files = self.files.lock().unwrap();
-        match files.get_mut(p) {
-            Some(f) if f.kind == FileKind::File => {
-                f.bytes = bytes.to_vec();
-            }
-            Some(f) if f.kind == FileKind::Dir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::IsADirectory,
-                    format!("{}: is a directory (fake)", p.display()),
-                ));
-            }
-            _ => {
-                files.insert(
-                    p.to_path_buf(),
-                    FakeFile {
-                        bytes: bytes.to_vec(),
-                        mode: 0o644,
-                        uid: 0,
-                        gid: 0,
-                        kind: FileKind::File,
-                    },
-                );
-            }
+        if files.get(p).is_some_and(|f| f.kind == FileKind::Dir) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("{}: is a directory (fake)", p.display()),
+            ));
         }
+        let real = Self::resolve(&files, p);
+        let (mode, uid, gid) = match files.get(&real) {
+            Some(f) if f.kind != FileKind::Symlink => (f.mode, f.uid, f.gid),
+            _ => (0o644, 0, 0),
+        };
+        files.insert(
+            p.to_path_buf(),
+            FakeFile {
+                bytes: bytes.to_vec(),
+                mode,
+                uid,
+                gid,
+                kind: FileKind::File,
+            },
+        );
         Ok(())
     }
 
@@ -649,6 +648,33 @@ mod tests {
             );
             assert_eq!(fake.attr_calls().len(), planted, "the backend's own calls");
         }
+    }
+
+    /// Writing at a symlink's path replaces the link with a regular file
+    /// that has the target's mode and owner, as `Local::write` does (its
+    /// `a_write_at_a_symlink_takes_the_targets_mode`); the target keeps its
+    /// content. A dangling link gives a new file's 0644.
+    #[test]
+    fn a_write_at_a_symlink_takes_the_targets_mode() {
+        let fake = Fake::new()
+            .with_file("/opt/real", "t")
+            .with_symlink("/opt/link", "/opt/real")
+            .with_symlink("/opt/dangling", "/opt/gone");
+        fake.set_owner(Path::new("/opt/real"), 5, 6).unwrap();
+        fake.set_mode(Path::new("/opt/real"), 0o4750).unwrap();
+
+        fake.write(Path::new("/opt/link"), b"new").unwrap();
+        let f = fake.file("/opt/link").unwrap();
+        assert_eq!(
+            (f.kind, f.mode, f.uid, f.gid, f.bytes.as_slice()),
+            (FileKind::File, 0o4750, 5, 6, b"new".as_slice())
+        );
+        assert_eq!(fake.content("/opt/real").unwrap(), "t");
+
+        fake.write(Path::new("/opt/dangling"), b"x").unwrap();
+        let f = fake.file("/opt/dangling").unwrap();
+        assert_eq!((f.kind, f.mode, f.uid), (FileKind::File, 0o644, 0));
+        assert!(fake.file("/opt/gone").is_none());
     }
 
     /// `chmod` and `chown` follow symlinks, and `System::set_mode` and

@@ -88,8 +88,16 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     })?;
     let st = ctx.sys().stat(suid)?.expect("exists");
     assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
+    // With `.owner()` already right and still no `.mode()`: no `chown` is
+    // issued after the rewrite, because one to the same owner clears setuid
+    // on this kernel with nothing to set it back.
+    changed_then_ok(ctx, "suid v4 owner only", || {
+        file::Copy::from_str("v4\n").to(suid).owner(65534, 65534)
+    })?;
+    let st = ctx.sys().stat(suid)?.expect("exists");
+    assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
     changed_then_ok(ctx, "suid line", || file::Line::in_path(suid).set("exit 0"))?;
-    assert_eq!(ctx.sys().read_to_string(suid)?, "v3\nexit 0\n");
+    assert_eq!(ctx.sys().read_to_string(suid)?, "v4\nexit 0\n");
     let st = ctx.sys().stat(suid)?.expect("exists");
     assert_eq!((st.mode, st.uid, st.gid), (0o4755, 65534, 65534));
     let sgid = "/etc/rustible-test/files/sgid";

@@ -105,7 +105,9 @@ impl Copy {
         self
     }
 
-    /// Numeric owner (`chown uid:gid`).
+    /// Numeric owner (`chown uid:gid`). Changing the owner of a setuid or
+    /// setgid file clears those bits, as `chown` does; give `.mode(..)` too
+    /// to keep them.
     pub fn owner(mut self, uid: u32, gid: u32) -> Self {
         self.owner = Some(Owner { uid, gid });
         self
@@ -260,7 +262,10 @@ impl Op for Copy {
             Some(_) => super::write_with_backup(sys, &intent.dest, self.backup, &bytes)?,
             None => None,
         };
-        intent.attrs.apply(sys, &intent.dest)?;
+        // Only what `check` found wrong: a rewrite keeps the old owner and
+        // mode, and a `chown` to the owner the file already has would clear
+        // setuid with nothing to set it back when no mode was asked for.
+        intent.attrs.apply_differing(sys, &intent.dest)?;
         Ok(CopyReport {
             content_changed: intent.rewrite.is_some(),
             path: intent.dest,
@@ -407,11 +412,9 @@ mod tests {
         assert_eq!(d.short(), "+1 -0 lines");
     }
 
-    /// A rewrite of a setuid file with `.mode()` and `.owner()` keeps the
-    /// bit. The rewrite keeps it (the backend gives the replacement the old
-    /// owner before the old mode), and `apply` then sets every wanted
-    /// attribute again, owner first: its own `chown` clears setuid on Linux
-    /// (and in the `Fake`, which models it), so the mode has to come after.
+    /// A rewrite of a setuid file with `.mode()` and `.owner()`, both
+    /// already right, keeps the bit: the rewrite keeps the old owner and
+    /// mode, and `apply` sets only what `check` found wrong, here nothing.
     #[test]
     fn copy_rewrite_of_a_setuid_file_keeps_the_bit() {
         let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
@@ -451,6 +454,53 @@ mod tests {
             assert!(fake.attr_calls().is_empty(), "no mode was asked for");
             assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         }
+    }
+
+    /// With `.owner()` already right and no `.mode()`, a rewrite keeps
+    /// setuid and setgid. `apply` issues no `chown`: one to the owner the
+    /// file already has clears those bits, and with no mode asked for
+    /// nothing would set them back while the next `check`, which compares
+    /// no mode, reported `Satisfied` (found by review of #74).
+    #[test]
+    fn copy_rewrite_with_owner_already_right_keeps_setuid() {
+        for mode in [0o4755, 0o2755] {
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", mode));
+            let sys = fake_sys(&fake);
+            let op = Copy::from_str("v2\n").to("/usr/local/bin/x").owner(0, 0);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (mode, 0, 0), "{mode:o}");
+            assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
+            assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+        }
+    }
+
+    /// A `chown` that changes the owner, with no `.mode()`, leaves a setuid
+    /// file without the bit: the kernel clears it, as Ansible's `owner:`
+    /// leaves it cleared, and nothing was asked to set it back. Pinned so a
+    /// change to that is a decision; `.mode(0o4755)` is how to keep it.
+    #[test]
+    fn copy_changing_the_owner_without_mode_clears_setuid_as_the_kernel_does() {
+        let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
+        let sys = fake_sys(&fake);
+        let op = Copy::from_str("v2\n").to("/usr/local/bin/x").owner(5, 6);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/usr/local/bin/x").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o755, 5, 6));
+
+        let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
+        let sys = fake_sys(&fake);
+        let op = Copy::from_str("v2\n")
+            .to("/usr/local/bin/x")
+            .owner(5, 6)
+            .mode(0o4755);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        let f = fake.file("/usr/local/bin/x").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
     #[test]
