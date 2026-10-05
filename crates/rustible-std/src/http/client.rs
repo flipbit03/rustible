@@ -586,7 +586,7 @@ pub(crate) fn one_line(text: &str, max: usize) -> String {
 // ---- pure ----
 
 /// The URL's `user:pass` (or `user`), if it has one.
-fn userinfo(url: &str) -> Option<&str> {
+pub(crate) fn userinfo(url: &str) -> Option<&str> {
     let (_, rest) = url.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (info, _) = rest[..end].rsplit_once('@')?;

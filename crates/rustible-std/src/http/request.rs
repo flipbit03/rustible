@@ -20,9 +20,12 @@ use super::{DEFAULT_TIMEOUT, validate_url};
 /// with [`Request::max_bytes`]. The body is held in memory.
 pub const REQUEST_MAX_BYTES: u64 = 16 << 20;
 
-/// How much of a request body a diff shows before it says how much more
-/// there is.
+/// How much of a request body a diff shows before it says it was cut.
 const SHOWN_BODY_BYTES: usize = 2048;
+
+/// The largest request body a diff reads whole: reindented when it is JSON,
+/// scrubbed throughout. Above it, only the start that is shown is read.
+const WHOLE_BODY_BYTES: usize = 64 << 10;
 
 /// How much of an unexpected response's body a status failure quotes.
 const QUOTED_BODY_BYTES: usize = 512;
@@ -91,12 +94,15 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// **Secrets.** A header given with [`Request::header_secret`], the
 /// credentials of [`Request::bearer`] and [`Request::basic_auth`], and a
 /// body given with [`Request::body_secret`] show as `<secret, N bytes>` in
-/// `Debug` and in the diff, and are scrubbed from every message, including
-/// a server's answer quoted in a status failure, and from the body the diff
-/// shows, so they never reach `--json` output. A URL's `user:pass@` is
-/// masked everywhere too. A body given with `.json`, `.form` or `.body` is
-/// not a secret, and the diff shows it: to send a password in a JSON body,
-/// use `.body_secret(&s).content_type("application/json")`.
+/// `Debug`, and are scrubbed from every message, including a server's
+/// answer quoted in a status failure, so they never reach `--json` output.
+/// The diff never names a header or a credential; a `body_secret` shows
+/// there as `<secret, N bytes>`. A URL's `user:pass@` is masked everywhere
+/// too. A body given with `.json`, `.form` or `.body` is not a secret, and
+/// the diff shows it; a value given as a `Secret` anywhere on the request
+/// (a header, the bearer token, the basic-auth password, the URL's
+/// password) shows inside it as `<secret>`. To send a password in a JSON
+/// body, use `.body_secret(&s).content_type("application/json")`.
 ///
 /// **Redirects** are followed for `GET` and `HEAD` and not for anything
 /// else (Ansible's `safe`); [`Request::follow_redirects`] changes that. At
@@ -530,14 +536,16 @@ impl Request {
         Ok(match &self.body {
             Body::None | Body::Invalid(_) => Shown::None,
             Body::Plain { bytes, .. } if bytes.is_empty() => Shown::None,
-            Body::Plain { bytes, .. } => {
-                let scrubs =
-                    client::scrub_list(&self.url, &self.wire_headers()?, None, &self.raw_secrets());
-                Shown::Text(body_summary(
-                    bytes,
-                    self.content_type_to_send().as_deref(),
-                    &scrubs,
-                ))
+            Body::Plain { bytes, kind } => {
+                let content_type = self.content_type_to_send();
+                let ct = content_type.as_deref();
+                let scrubs = body_scrubs(
+                    client::scrub_list(&self.url, &self.wire_headers()?, None, &self.raw_secrets()),
+                    &self.url,
+                    *kind == Kind::Json || ct.is_some_and(is_json_content_type),
+                    *kind == Kind::Form || ct.is_some_and(is_form_content_type),
+                );
+                Shown::Text(body_summary(bytes, ct, &scrubs))
             }
             Body::Secret(s) => Shown::Secret(s.len()),
         })
@@ -943,76 +951,234 @@ fn is_json_content_type(ct: &str) -> bool {
     sub == "json" || sub.ends_with("+json")
 }
 
-/// A request body as a diff shows it: pretty-printed when it is JSON, as
-/// text when it is text, as a size when it is neither, and cut at about
-/// 2 KiB with a note of how much more there was. Pretty-printed JSON is
-/// marked as reformatted: keys come out sorted and a number may be printed
-/// differently, so it is what is sent, not the bytes that are sent. Every
-/// one of `secrets` is scrubbed before the cut, so none is left half shown,
-/// and from JSON in its escaped form too (a `"` in it shows as `\"`).
+/// Whether a `Content-Type` is `application/x-www-form-urlencoded`.
+fn is_form_content_type(ct: &str) -> bool {
+    let media = ct.split(';').next().unwrap_or_default().trim();
+    media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+}
+
+/// What to scrub from a shown body: the client's list, plus each secret in
+/// the forms a body carries it in. The URL's userinfo percent-decoded, as
+/// the server reads it; for a JSON body each one JSON-escaped (a `"` in it
+/// is `\"` there); for a form each one form-encoded (`p@ss` is `p%40ss`).
+fn body_scrubs(mut list: Vec<String>, url: &str, json: bool, form: bool) -> Vec<String> {
+    let add = |list: &mut Vec<String>, s: String| {
+        if !s.is_empty() && !list.contains(&s) {
+            list.push(s);
+        }
+    };
+    if let Some(info) = client::userinfo(url) {
+        for part in [Some(info), info.split_once(':').map(|(_, pw)| pw)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(decoded) = percent_decode(part) {
+                add(&mut list, decoded);
+            }
+        }
+    }
+    for s in list.clone() {
+        if json && let Ok(quoted) = serde_json::to_string(&s) {
+            add(&mut list, quoted[1..quoted.len() - 1].to_string());
+        }
+        if form {
+            add(&mut list, form_component(&s));
+        }
+    }
+    list
+}
+
+/// `%XX` decoded, everything else as it is; `None` when the result is not
+/// UTF-8 (and so cannot appear in a body shown as text).
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// A request body as a diff shows it: reindented when it is JSON, as text
+/// when it is text, as a size when it is neither. Every one of `secrets` is
+/// scrubbed, control characters but a newline and a tab are escaped
+/// (`\u{1b}`), and the result is cut at about 2 KiB. A note on the last line
+/// says when it was reindented or cut, and how many bytes are sent.
+///
+/// Reindenting changes only the whitespace between JSON's tokens: keys,
+/// their order, duplicates and every value are shown as they are sent. A
+/// body over [`WHOLE_BODY_BYTES`] is not reindented, and only the start of
+/// it that is shown is scrubbed, ending where no secret is cut in two.
 fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) -> String {
-    let mut secrets = secrets.to_vec();
-    let (text, note) = if content_type.is_some_and(is_json_content_type)
-        && let Ok(v) = serde_json::from_slice::<Value>(bytes)
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return format!("<{} bytes of binary data>", bytes.len());
+    };
+    let large = text.len() > WHOLE_BODY_BYTES;
+    let pretty = (!large && content_type.is_some_and(is_json_content_type))
+        .then(|| reindent_json(text))
+        .flatten();
+    let reformatted = pretty.as_deref().is_some_and(|p| p != text);
+    let source = match &pretty {
+        Some(p) => p.as_str(),
+        None if large => clean_prefix(text, secrets),
+        None => text,
+    };
+    let mut shown = escape_controls(&client::scrub(source, secrets));
+    let mut end = shown.floor_char_boundary(SHOWN_BODY_BYTES);
+    // A `<secret>` the cut would split is kept whole.
+    if let Some(at) =
+        (end.saturating_sub(7)..end).find(|&i| shown.as_bytes()[i..].starts_with(b"<secret>"))
     {
-        let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
-        let note = (pretty.as_bytes() != bytes)
-            .then(|| format!("(reformatted for display; {} bytes are sent)", bytes.len()));
-        let escaped: Vec<String> = secrets
+        end = at + "<secret>".len();
+    }
+    let cut = large || end < shown.len();
+    shown.truncate(end);
+    let note = match (reformatted, cut) {
+        (false, false) => return shown,
+        (true, false) => "(reformatted",
+        (false, true) => "... (cut",
+        (true, true) => "... (reformatted and cut",
+    };
+    format!(
+        "{shown}\n{note} for display; {} bytes are sent)",
+        bytes.len()
+    )
+}
+
+/// The start of `text` a large body's diff shows: [`SHOWN_BODY_BYTES`] of
+/// it, or more where a secret would otherwise be cut in two, so the scrub
+/// sees each secret it shows whole.
+fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
+    let mut end = text.floor_char_boundary(SHOWN_BODY_BYTES);
+    loop {
+        let past = secrets
             .iter()
-            .filter_map(|s| serde_json::to_string(s).ok())
-            .map(|quoted| quoted[1..quoted.len() - 1].to_string())
-            .collect();
-        secrets.extend(escaped);
-        (pretty, note)
-    } else {
-        match std::str::from_utf8(bytes) {
-            Ok(t) => (t.to_string(), None),
-            Err(_) => return format!("<{} bytes of binary data>", bytes.len()),
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                (end.saturating_sub(s.len() - 1)..end)
+                    .filter(|&i| text.is_char_boundary(i) && text[i..].starts_with(s.as_str()))
+                    .map(|i| i + s.len())
+                    .max()
+            })
+            .max();
+        match past {
+            Some(p) => end = p,
+            None => return &text[..end],
         }
-    };
-    let text = client::scrub(&text, &secrets);
-    let mut out = if text.len() <= SHOWN_BODY_BYTES {
-        text
-    } else {
-        let mut cut = SHOWN_BODY_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
+    }
+}
+
+/// `text` with every control character escaped (`\u{1b}`, `\r`) except a
+/// newline, a tab, and the `\r` of a `\r\n`, so a body cannot move the
+/// cursor or recolour the terminal it is shown on.
+fn escape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' if chars.peek() == Some(&'\n') => out.push(c),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
         }
-        format!(
-            "{}\n... ({} more bytes not shown)",
-            &text[..cut],
-            text.len() - cut
-        )
-    };
-    if let Some(note) = note {
-        out.push('\n');
-        out.push_str(&note);
     }
     out
+}
+
+/// Valid JSON laid out as `serde_json` pretty-prints it (two-space indent,
+/// `"key": value`, `{}` and `[]` when empty) by changing only the whitespace
+/// between tokens. `None` when `text` is not valid JSON.
+fn reindent_json(text: &str) -> Option<String> {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    let is_ws = |c: &char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    };
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut depth = 0;
+    let (mut in_string, mut escaped) = (false, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            _ if is_ws(&c) => {}
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                while chars.next_if(is_ws).is_some() {}
+                match chars.next_if(|n| matches!(n, '}' | ']')) {
+                    Some(close) => out.push(close),
+                    None => {
+                        depth += 1;
+                        newline(&mut out, depth);
+                    }
+                }
+            }
+            '}' | ']' => {
+                depth -= 1;
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            _ => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// `application/x-www-form-urlencoded`: unreserved characters as they are,
 /// a space as `+`, everything else `%XX`.
 fn form_encode(pairs: &[(String, String)]) -> String {
-    fn enc(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
-                    out.push(b as char)
-                }
-                b' ' => out.push('+'),
-                _ => out.push_str(&format!("%{b:02X}")),
-            }
-        }
-        out
-    }
     pairs
         .iter()
-        .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+        .map(|(k, v)| format!("{}={}", form_component(k), form_component(v)))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// One key or value of a form, encoded as [`form_encode`] encodes it.
+fn form_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1155,11 +1321,10 @@ mod tests {
             body_summary(br#"{"type":"receiveonly"}"#, Some("application/json"), &[]),
             "{\n  \"type\": \"receiveonly\"\n}\n(reformatted for display; 22 bytes are sent)"
         );
-        // Keys come out sorted, so even a pretty body is marked unless it
-        // is byte for byte what is sent.
+        // Keys keep the order they are sent in.
         assert!(
-            body_summary(b"{\"b\":1,\"a\":2}", Some("application/json"), &[])
-                .starts_with("{\n  \"a\": 2,\n  \"b\": 1\n}\n(reformatted")
+            body_summary(b"{\"b\":1,\"a\":[]}", Some("application/json"), &[])
+                .starts_with("{\n  \"b\": 1,\n  \"a\": []\n}\n(reformatted")
         );
         let as_sent = "{\n  \"a\": 1\n}";
         assert_eq!(
@@ -1177,11 +1342,109 @@ mod tests {
         let shown = body_summary(long.as_bytes(), None, &[]);
         let (head, note) = shown.split_once("\n... (").unwrap();
         assert_eq!(head.len(), SHOWN_BODY_BYTES);
-        assert_eq!(note, "3952 more bytes not shown)");
+        assert_eq!(note, "cut for display; 6000 bytes are sent)");
         // Cut on a character boundary.
         let odd = format!("a{}", "é".repeat(3000));
         let shown = body_summary(odd.as_bytes(), None, &[]);
-        assert!(shown.starts_with('a') && shown.contains("more bytes not shown"));
+        let (head, note) = shown.split_once("\n... (").unwrap();
+        assert_eq!(head.len(), SHOWN_BODY_BYTES - 1);
+        assert_eq!(note, "cut for display; 6001 bytes are sent)");
+    }
+
+    /// Reindenting changes only whitespace: what `serde_json::Value` would
+    /// lose or alter (a repeated key, an integer past `u64`, a float's
+    /// spelling, key order) is shown as it is sent.
+    #[test]
+    fn reindenting_json_never_changes_its_data() {
+        assert_eq!(
+            body_summary(
+                br#"{"a":1,"a":2,"n":340282366920938463463374607431768211455}"#,
+                Some("application/json"),
+                &[]
+            ),
+            "{\n  \"a\": 1,\n  \"a\": 2,\n  \"n\": 340282366920938463463374607431768211455\n}\n\
+             (reformatted for display; 57 bytes are sent)"
+        );
+        assert_eq!(
+            body_summary(
+                br#" [1.50, {"s": "a,b:{\"c\"}[]"}, {}, [ ] ]"#,
+                Some("application/json"),
+                &[]
+            ),
+            "[\n  1.50,\n  {\n    \"s\": \"a,b:{\\\"c\\\"}[]\"\n  },\n  {},\n  []\n]\n\
+             (reformatted for display; 41 bytes are sent)"
+        );
+        // Not JSON after all: the text as it is, with no note.
+        assert_eq!(
+            body_summary(b"{\"a\":", Some("application/json"), &[]),
+            "{\"a\":"
+        );
+        // A struct's fields stay in their declared order.
+        #[derive(Serialize)]
+        struct Folder {
+            id: &'static str,
+            kind: &'static str,
+        }
+        let op = Request::post("http://h/x").json(&Folder {
+            id: "dcim",
+            kind: "receiveonly",
+        });
+        let Body::Plain { bytes, .. } = &op.body else {
+            panic!()
+        };
+        assert!(
+            body_summary(bytes, Some("application/json"), &[])
+                .starts_with("{\n  \"id\": \"dcim\",\n  \"kind\": \"receiveonly\"\n}")
+        );
+    }
+
+    /// A body cannot move the cursor or recolour the terminal: control
+    /// characters but a newline and a tab are escaped.
+    #[test]
+    fn control_characters_in_a_shown_body_are_escaped() {
+        let (s, _) = sys(false);
+        let op = Request::post("http://h/x").body("a\x1b[31mRED\rOVER\nb\tc\u{9b}d\r\ne");
+        let Plan::Change(i) = op.check(&s).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            i.diff().render(),
+            "POST http://h/x\na\\u{1b}[31mRED\\rOVER\nb\tc\\u{9b}d\r\ne"
+        );
+    }
+
+    /// Above `WHOLE_BODY_BYTES` only the start that is shown is read: it is
+    /// not reindented, the note counts the bytes sent, and a secret across
+    /// the cut is still scrubbed whole.
+    #[test]
+    fn a_large_body_is_shown_from_its_start_only() {
+        let big = format!("{{\"k\":\"{}\"}}", "v".repeat(300 << 10));
+        let shown = body_summary(big.as_bytes(), Some("application/json"), &[]);
+        let (head, note) = shown.split_once("\n... (").unwrap();
+        assert_eq!(head, &big[..SHOWN_BODY_BYTES], "as sent, not reindented");
+        assert_eq!(
+            note,
+            format!("cut for display; {} bytes are sent)", big.len())
+        );
+        let secrets = ["t0k3n-across-the-cut".to_string()];
+        let big = format!(
+            "{}t0k3n-across-the-cut{}",
+            "x".repeat(SHOWN_BODY_BYTES - 5),
+            "y".repeat(300 << 10)
+        );
+        let shown = body_summary(big.as_bytes(), None, &secrets);
+        assert!(!shown.contains("t0k"), "{shown}");
+        assert!(
+            shown.starts_with(&format!("{}<secret>", "x".repeat(SHOWN_BODY_BYTES - 5))),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with(&format!(
+                "\n... (cut for display; {} bytes are sent)",
+                big.len()
+            )),
+            "{shown}"
+        );
     }
 
     /// A body that is not text shows as its size, whatever it claims to be.
@@ -1201,7 +1464,7 @@ mod tests {
     /// left half shown; in JSON, in its escaped form too.
     #[test]
     fn a_shown_body_is_scrubbed_of_every_secret() {
-        let secrets = ["t0k\"en".to_string()];
+        let secrets = body_scrubs(vec!["t0k\"en".to_string()], "http://h/", true, false);
         assert_eq!(
             body_summary(b"x t0k\"en y", Some("text/plain"), &secrets),
             "x <secret> y"
@@ -1210,10 +1473,18 @@ mod tests {
             body_summary(br#"{"t":"t0k\"en"}"#, Some("application/json"), &secrets),
             "{\n  \"t\": \"<secret>\"\n}\n(reformatted for display; 15 bytes are sent)"
         );
-        let straddling = format!("{}t0k\"en", "x".repeat(SHOWN_BODY_BYTES - 3));
+        // Across the cut: scrubbed whole, and the `<secret>` kept whole.
+        let straddling = format!(
+            "{}t0k\"en{}",
+            "x".repeat(SHOWN_BODY_BYTES - 3),
+            "z".repeat(10)
+        );
         let shown = body_summary(straddling.as_bytes(), None, &secrets);
         assert!(!shown.contains("t0k"), "{shown}");
-        assert!(shown.ends_with("more bytes not shown)"), "{shown}");
+        assert!(
+            shown.ends_with("x<secret>\n... (cut for display; 2061 bytes are sent)"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -1280,7 +1551,7 @@ mod tests {
             "PUT http://h/x\n<3 bytes of binary data>"
         );
 
-        // Big JSON: pretty, cut at 2 KiB, and still marked as reformatted.
+        // Big JSON: reindented, cut at 2 KiB, and marked as both.
         let big = Request::post("http://h/x").json(&json!({ "k": "v".repeat(4000) }));
         let Plan::Change(i) = big.check(&s).unwrap() else {
             panic!()
@@ -1295,7 +1566,7 @@ mod tests {
         assert!(shown.starts_with("{\n  \"k\": \"vvv"), "{shown}");
         assert_eq!(
             rest,
-            "1965 more bytes not shown)\n(reformatted for display; 4008 bytes are sent)"
+            "reformatted and cut for display; 4008 bytes are sent)"
         );
         assert_eq!(i.diff().short(), "POST http://h/x …");
 
@@ -1335,7 +1606,12 @@ mod tests {
                  (reformatted for display; {sent} bytes are sent)"
             )
         );
-        assert_no_secret(&format!("{i:?}"));
+        // `Debug` shows the URL, masked, and the body only as its size, by
+        // construction: these cover the URL, and that no body text is there.
+        let dbg = format!("{i:?}");
+        assert_no_secret(&dbg);
+        assert!(dbg.contains("bytes shown"), "{dbg}");
+        assert!(!dbg.contains("token") && !dbg.contains("<secret>"), "{dbg}");
         let Plan::Change(i) = basic.check(&s).unwrap() else {
             panic!()
         };
@@ -1371,6 +1647,35 @@ mod tests {
                 .contains("\"pw\": \"<secret>\""),
             "{steps:?}"
         );
+    }
+
+    /// A secret is scrubbed in whatever form the body carries it: form-
+    /// encoded in a form, JSON-escaped in JSON (whatever the content type
+    /// says), and the URL's password as the server decodes it.
+    #[test]
+    fn a_secret_is_scrubbed_in_the_form_the_body_carries_it() {
+        let (s, _) = sys(false);
+        let render = |op: Request| {
+            let Plan::Change(i) = op.check(&s).unwrap() else {
+                panic!()
+            };
+            i.diff().render()
+        };
+        let form = Request::post("http://h/token")
+            .basic_auth("client", &Secret::new("p@ss/w0rd="))
+            .form([("client_secret", "p@ss/w0rd=")]);
+        assert_eq!(render(form), "POST http://h/token\nclient_secret=<secret>");
+
+        let json = Request::post("http://h/x")
+            .bearer(&Secret::new("t0k\"en"))
+            .json(&json!({ "t": "t0k\"en" }))
+            .content_type("application/vnd.foo");
+        assert_eq!(render(json), "POST http://h/x\n{\"t\":\"<secret>\"}");
+
+        let url = Request::post("http://bob:p%40ss@h/x").body("pw=p@ss");
+        assert_eq!(render(url), "POST http://bob:********@h/x\npw=<secret>");
+        let lone = Request::post("http://t%2Fk@h/x").body("t/k");
+        assert_eq!(render(lone), "POST http://********@h/x\n<secret>");
     }
 
     #[test]
