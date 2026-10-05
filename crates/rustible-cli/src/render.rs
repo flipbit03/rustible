@@ -229,9 +229,15 @@ impl<W: Write> Renderer<W> {
                 let text = step_line(blocks, name, status_word(*status), &tail);
                 let buffered = self.state(host).open.take().unwrap_or_default();
                 self.line(host, &text);
+                // A failed step carries the diff its `check` produced: what
+                // it attempted, of which the step line shows only the first
+                // line.
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(status, Status::Changed | Status::WouldChange)
+                    && matches!(
+                        status,
+                        Status::Changed | Status::WouldChange | Status::Failed
+                    )
                 {
                     for l in d.render().lines() {
                         self.line(host, &format!("    | {l}"));
@@ -1506,6 +1512,55 @@ web1    4        1             0        0       0          2         0
         for l in &lines[1..] {
             assert!(l.starts_with("[local]      | "), "{out}");
         }
+    }
+
+    /// A failed step's diff is what it attempted, and the step line shows
+    /// only its first line: `-v` prints the rest under it, as it does for a
+    /// changed step, and the default verbosity does not.
+    #[test]
+    fn a_failed_steps_full_diff_prints_at_v() {
+        let mut ev = failing(1, "patch folder", "PATCH http://h/x returned 409 Conflict");
+        if let Event::StepFinished { diff, .. } = &mut ev {
+            *diff = Some(rustible_sdk::Diff::summary(
+                "PATCH http://h/x\n{\n  \"type\": \"receiveonly\"\n}",
+            ));
+        }
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "patch folder"));
+            r.event("local", &ev);
+            r.event(
+                "local",
+                &failed_frame(
+                    Some("patch folder"),
+                    Some(1),
+                    "step `patch folder`: PATCH http://h/x returned 409 Conflict",
+                ),
+            );
+        };
+        let quiet = render(0, feed);
+        let lines: Vec<&str> = quiet.lines().collect();
+        assert_eq!(lines.len(), 2, "{quiet}");
+        assert!(
+            lines[0].ends_with(" FAILED          PATCH http://h/x …"),
+            "the step line keeps the first line, marked as cut: {quiet}"
+        );
+        assert_eq!(
+            lines[1],
+            "[local]  FAILED at `patch folder`: PATCH http://h/x returned 409 Conflict"
+        );
+        let verbose = render(1, feed);
+        assert_eq!(
+            verbose,
+            format!(
+                "{}\n\
+                 [local]      | PATCH http://h/x\n\
+                 [local]      | {{\n\
+                 [local]      |   \"type\": \"receiveonly\"\n\
+                 [local]      | }}\n\
+                 {}\n",
+                lines[0], lines[1]
+            )
+        );
     }
 
     #[test]

@@ -429,8 +429,8 @@ pub struct Compact<W: Write + Send> {
 impl<W: Write + Send> Compact<W> {
     /// `verbosity` is the binary's count of `-v`. At 0 it prints one line
     /// per step and warning, a step inside a block prefixed with its path.
-    /// At 1 it adds `debug` logs, the full diff under a changed step, and
-    /// the failing command's stderr. At 2 it adds a `$` line per
+    /// At 1 it adds `debug` logs, the full diff under a changed or failed
+    /// step, and the failing command's stderr. At 2 it adds a `$` line per
     /// [`Event::CmdRan`]. Higher values behave like 2.
     pub fn new(w: W, verbosity: u8) -> Self {
         Compact {
@@ -480,7 +480,10 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
                 if self.verbosity >= 1
                     && let Some(d) = diff
-                    && matches!(status, Status::Changed | Status::WouldChange)
+                    && matches!(
+                        status,
+                        Status::Changed | Status::WouldChange | Status::Failed
+                    )
                 {
                     for line in d.render().lines() {
                         let _ = writeln!(w, "    | {line}");
@@ -653,6 +656,36 @@ mod tests {
             out,
             "FAILED at [outer][inner] `boom`: step `boom`: nope\n\
              ok=2 changed=0 would_change=0 skipped=0 failed=1 recovered=3 warnings=0\n"
+        );
+    }
+
+    /// A failed step's diff is what it attempted; the step line keeps its
+    /// first line, and `-v` prints the whole of it under the step, as for
+    /// a changed one.
+    #[test]
+    fn compact_prints_a_failed_steps_full_diff_at_v() {
+        let print = |verbosity| {
+            let printer = Compact::new(Vec::new(), verbosity);
+            printer.emit(Event::StepFinished {
+                id: 1,
+                blocks: vec![],
+                name: "patch".into(),
+                identity: "self".into(),
+                status: Status::Failed,
+                diff: Some(Diff::summary("PATCH http://h/x\n{\n  \"a\": 1\n}")),
+                note: Some("returned 409".into()),
+                elapsed_ms: 0,
+            });
+            String::from_utf8(printer.w.into_inner().unwrap()).unwrap()
+        };
+        assert_eq!(
+            print(0),
+            "FAILED: patch  PATCH http://h/x …  returned 409\n"
+        );
+        assert_eq!(
+            print(1),
+            "FAILED: patch  PATCH http://h/x …  returned 409\n    \
+             | PATCH http://h/x\n    | {\n    |   \"a\": 1\n    | }\n"
         );
     }
 
