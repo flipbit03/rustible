@@ -1049,23 +1049,30 @@ Networking and anything async are also off `System` for now.
 ## 8. Testing strategy (DECIDED)
 
 Three tiers, numbered by what a test needs in order to run: the test process,
-a container, a machine. CI job names carry the tier, beside the mechanism and
-what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
+a container, a machine. Each sees something the tier below it cannot and
+costs more to run (free, seconds, minutes), so a test goes in the lowest tier
+that can fail for the right reason. CI job names carry the tier, beside the
+mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 
-1. **T1, in-process**, as two kinds of test. They differ in what they are
-   written against, not in what they need to run, so they share a tier.
+1. **T1, in-process**, as two kinds of test. Choosing between them is an
+   authoring choice, not a tier: both run in `cargo test` and need nothing.
    - **Pure functions** for the interesting logic (line replacement and diff,
      `/etc/passwd` parsing, authorized_keys deltas, version comparison).
      Tested with strings, no fakes.
    - **`Fake` backend unit tests** for op behavior: canned files, canned
      command responses, assert planned diff and exact commands run. Hundreds
      run in a second.
-2. **T2, Docker integration tests** per distro, the source of truth. The SDK
-   ships a harness (`#[rustible::integration_test(images = ["debian:12",
-   "alpine:3.20", "fedora:41"])]`) that builds the test as a static musl binary
-   and runs it in each container. A typical test applies an op twice: first run
-   `changed`, second run `ok`, and the system looks right. Static binaries drop
-   into any image with no setup.
+
+   The split shapes the op: `check` does all the thinking and `apply`
+   executes its intent without inspecting again (section 6.2), so the logic
+   is pure and the `Fake` can plant a tool's effect between the two.
+2. **T2, Docker integration tests** per distro, the source of truth for how a
+   real tool behaves, which the `Fake` only models. The SDK ships a harness
+   (`#[rustible::integration_test(images = ["debian:12", "alpine:3.20",
+   "fedora:41"])]`) that builds the test as a static musl binary and runs it in
+   each container. A typical test applies an op twice: first run `changed`,
+   second run `ok`, and the system looks right. Static binaries drop into any
+   image with no setup.
 3. **T3, VMs (Vagrant)** for what Docker does badly, because a container shares
    the host kernel and has no pid 1: writes to `/proc/sys`, a real init system,
    a real `sudo`, and the SSH transport itself. `dev/vagrant/` holds a Debian

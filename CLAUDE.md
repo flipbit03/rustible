@@ -315,19 +315,15 @@ the amendment; do not edit `docs/01_VISION.md` yourself.
 
 ## Testing tiers
 
-Three, numbered by what a test needs in order to run. They are not redundant:
-each one can see something the tier below it cannot, and each costs more to
-run than the tier below it.
+Three, numbered by what a test needs in order to run. Each one sees
+something the tier below it cannot, and each costs more to run than the tier
+below it:
 
-| tier | what it is | where it runs | cost |
-|---|---|---|---|
-| T1. in-process | pure functions, and ops against the `Fake` backend | `cargo test` | free |
-| T2. container | ops against real distributions | `make integration`, and CI | seconds, needs docker |
-| T3. machine | a playbook against a real VM over SSH | `make vm-test`, and CI | minutes, needs vagrant |
-
-T1 holds two kinds of test, a pure-function test and a `Fake` test. They
-differ in what they are written against, not in what they need to run, so
-they share a tier; "Choosing a tier" says which one a test should be.
+| tier | what it is | sees what the tier below cannot | where it runs | cost |
+|---|---|---|---|---|
+| T1. in-process | pure functions, and ops against the `Fake` backend | — | `cargo test` | free |
+| T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
+| T3. machine | a playbook against a real VM over SSH | what a container structurally lacks: its own kernel, pid 1, `sudo`, SSH | `make vm-test`, and CI | minutes, needs vagrant |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
@@ -343,25 +339,30 @@ beats waiting on a runner.
 
 Put a test in the *lowest* tier that can actually fail for the right reason.
 A test in too high a tier is slow and flaky; a test in too low a tier passes
-while the thing is broken. Within T1, the same rule picks the kind of test:
-a pure function where the logic can be one.
+while the thing is broken.
 
-- **Parsing, planning, diffing, any decision made from data** → T1, a pure
-  function test: strings in, strings out, no `Fake`.
-- **An op's behaviour**: satisfied, change, apply, failure, refusal → T1, a
-  `Fake` test. The `Fake` lets you plant a tool's output and assert on the
-  op's reaction, which is why `check` must do all the thinking and `apply`
-  must execute the intent rather than re-inspecting.
-- **Anything where the answer comes from a real tool** → T2. This is the
-  source of truth for how `useradd`, `apt-get`, `systemctl` and friends
-  behave, and it has earned it: it caught that `useradd` refuses to create a
-  private group when one already carries the name, and that `chown` clears
-  setuid. A fake models what you *believe*; a container shows what is.
-- **Anything a container structurally cannot do** → T3. That list is
-  short and specific: writes to `/proc/sys` (a container shares the host
-  kernel, so the write is refused or hits the *host*), a real init system, a
-  real `sudo`, and the SSH transport itself. `it_sysctl_present.rs` says so in
-  its own header — it runs with `.apply_now(false)` and asserts only on the
+- **T1, for everything the code decides by itself.** It holds two kinds of
+  test, and choosing between them is an authoring choice, not a tier:
+  - **A decision made from data** (parsing, planning, diffing) goes in a
+    pure function and is tested with strings in, strings out: no `Fake`, no
+    `System`.
+  - **An op's behaviour** (satisfied, change, apply, failure, refusal) is
+    tested against the `Fake`, which lets you plant a tool's output and
+    assert on the op's reaction.
+
+  The split shapes the op. `check` does all the thinking and `apply`
+  executes the intent rather than re-inspecting, so the logic can live in
+  pure functions and the `Fake` can plant a tool's effect between the two.
+- **T2, when the answer comes from a real tool.** This is the source of
+  truth for how `useradd`, `apt-get`, `systemctl` and friends behave, and it
+  has earned it: it caught that `useradd` refuses to create a private group
+  when one already carries the name, and that `chown` clears setuid. A fake
+  models what you *believe*; a container shows what is.
+- **T3, for what a container structurally cannot do.** That list is short
+  and specific: writes to `/proc/sys` (a container shares the host kernel, so
+  the write is refused or hits the *host*), a real init system, a real
+  `sudo`, and the SSH transport itself. `it_sysctl_present.rs` says so in its
+  own header — it runs with `.apply_now(false)` and asserts only on the
   drop-in file, because the live write is not available to it.
 
 If a new op needs nothing from T3, it does not need a T3 test. Say so

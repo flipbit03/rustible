@@ -12,6 +12,10 @@ make vm-test        # the machine tier, T3: needs vagrant
 
 ## The three tiers, and when to reach for the machine one
 
+Each sees something the tier below it cannot, and costs more to run: free,
+seconds, minutes. A test goes in the lowest one that can fail for the right
+reason (`CLAUDE.md`, "Choosing a tier").
+
 - **T1, in-process: pure functions** and the **`Fake` backend**. Parsers,
   planners, and an op's own behaviour. `cargo test`, always.
 - **T2, containers** (`make integration`). Real distributions, real package
