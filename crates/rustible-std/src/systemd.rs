@@ -547,10 +547,14 @@ impl Unit {
         }
     }
 
-    /// An intent's summary line, followed by what it waits for, if anything.
+    /// An intent's summary line, followed by what it waits for, if anything,
+    /// on the same line: the step line shows it, as it does for [`noted`]'s
+    /// attribute diffs (`Diff::short` keeps only a summary's first line).
+    ///
+    /// [`noted`]: Self::noted
     fn noted_summary(&self, line: String) -> Diff {
         Diff::summary(match self.waits_for() {
-            Some(w) => format!("{line}\n{w}"),
+            Some(w) => format!("{line}; {w}"),
             None => line,
         })
     }
@@ -2983,13 +2987,13 @@ mod tests {
             )
             .diff()
             .render(),
-            format!("systemctl --user daemon-reload && systemctl --user restart nginx\n{waits}")
+            format!("systemctl --user daemon-reload && systemctl --user restart nginx; {waits}")
         );
         assert_eq!(
             change(DaemonReload::new().user(true).check(&s).unwrap())
                 .diff()
                 .render(),
-            format!("systemctl --user daemon-reload\n{waits}")
+            format!("systemctl --user daemon-reload; {waits}")
         );
         assert!(
             fake.argvs().iter().all(|a| a[4..] == ["id", "-u"]),
