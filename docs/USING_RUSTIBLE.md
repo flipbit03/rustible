@@ -1121,8 +1121,9 @@ lists the codes. Read the response into a struct with `json_as`;
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 `.basic_auth(user, &s)` — and show as `<secret, N bytes>` in diffs and errors.
 
-⚠️ A `.json(..)` body is shown in the diff (`-v`, `--json`). To send a secret
-in a JSON body, build the JSON yourself and send it with
+⚠️ A `.json(..)` body is not a secret, so a server that echoes it into an
+error puts it in the step's error and `--json`. To send a secret in a JSON
+body, build the JSON yourself and send it with
 `.body_secret(&s).content_type("application/json")`.
 
 The structs need serde in your workspace: `cargo add serde --features derive`.

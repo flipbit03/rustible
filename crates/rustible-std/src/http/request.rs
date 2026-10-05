@@ -20,10 +20,6 @@ use super::{DEFAULT_TIMEOUT, validate_url};
 /// with [`Request::max_bytes`]. The body is held in memory.
 pub const REQUEST_MAX_BYTES: u64 = 16 << 20;
 
-/// How much of a request body a diff shows before it says how much more
-/// there is.
-const SHOWN_BODY_BYTES: usize = 2048;
-
 /// How much of an unexpected response's body a status failure quotes.
 const QUOTED_BODY_BYTES: usize = 512;
 
@@ -70,8 +66,9 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// dry run touches nothing outside the target, and even a `GET` can be
 /// logged, rate-limited or billed. `check` contacts nothing in either mode;
 /// it validates the request and plans it, so a dry run reports the step
-/// `would change` with no output, its diff the method and URL and, on the
-/// lines after them (shown at `-v`), the body it would send. A later read
+/// `would change` with no output, its diff one line: the method, the URL
+/// and, for a body, its size and type (`PATCH <url> (22 bytes,
+/// application/json)`); never the body's content. A later read
 /// of the response ends the enclosing `ctx.block` with a warning, so put
 /// the code that reads it in a block.
 ///
@@ -91,8 +88,11 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// **Secrets.** A header given with [`Request::header_secret`], the
 /// credentials of [`Request::bearer`] and [`Request::basic_auth`], and a
 /// body given with [`Request::body_secret`] show as `<secret, N bytes>` in
-/// `Debug`, in the diff and in every message, and so never reach `--json`
-/// output. A URL's `user:pass@` is masked everywhere too.
+/// `Debug`, and are scrubbed from every message, including a server's
+/// answer quoted in a status failure, so they never reach `--json` output.
+/// A URL's `user:pass@` is masked everywhere too. A body given with `.json`,
+/// `.form` or `.body` is not a secret: to send a password in a JSON body,
+/// use `.body_secret(&s).content_type("application/json")`.
 ///
 /// **Redirects** are followed for `GET` and `HEAD` and not for anything
 /// else (Ansible's `safe`); [`Request::follow_redirects`] changes that. At
@@ -322,9 +322,10 @@ impl Request {
         self
     }
 
-    /// A body that is secret, sent as it is: shown as `<secret, N bytes>`
-    /// in the diff and never resent to another origin by a redirect. Set
-    /// its type with [`Request::content_type`].
+    /// A body that is secret, sent as it is: `(secret body, N bytes)` in
+    /// the diff, scrubbed from any message that would quote it, and never
+    /// resent to another origin by a redirect. Set its type with
+    /// [`Request::content_type`].
     pub fn body_secret(mut self, body: &Secret) -> Self {
         self.body = Body::Secret(body.clone());
         self
@@ -518,14 +519,15 @@ impl Request {
         })
     }
 
-    /// The body as a diff shows it.
+    /// The body as a diff shows it: its size and type, never its content.
     fn shown_body(&self) -> Shown {
         match &self.body {
             Body::None | Body::Invalid(_) => Shown::None,
             Body::Plain { bytes, .. } if bytes.is_empty() => Shown::None,
-            Body::Plain { bytes, .. } => {
-                Shown::Text(body_summary(bytes, self.content_type_to_send().as_deref()))
-            }
+            Body::Plain { bytes, .. } => Shown::Plain {
+                len: bytes.len(),
+                content_type: self.content_type_to_send(),
+            },
             Body::Secret(s) => Shown::Secret(s.len()),
         }
     }
@@ -584,48 +586,52 @@ impl Request {
 }
 
 /// What [`Request`]'s `check` decided: send this method to this URL. The
-/// body and the headers stay on the op; the intent holds the summary of the
-/// body its diff shows.
+/// body and the headers stay on the op; the intent holds the body's size and
+/// type, which its diff shows.
 pub struct RequestIntent {
     method: Method,
     url: String,
     body: Shown,
 }
 
+#[derive(Debug)]
 enum Shown {
     None,
     Secret(usize),
-    Text(String),
+    Plain {
+        len: usize,
+        content_type: Option<String>,
+    },
 }
 
 impl fmt::Debug for RequestIntent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let body = match &self.body {
-            Shown::None => None,
-            Shown::Secret(n) => Some(format!("<secret, {n} bytes>")),
-            Shown::Text(t) => Some(format!("{} bytes shown", t.len())),
-        };
         f.debug_struct("RequestIntent")
             .field("method", &self.method)
             .field("url", &mask_url(&self.url))
-            .field("body", &body)
+            .field("body", &self.body)
             .finish()
     }
 }
 
 impl Intent for RequestIntent {
-    /// `<METHOD> <masked url>` on the first line, the step line's; the body
-    /// it sends on the lines after it, shown at `-v`. Nothing about
-    /// `--check`, because the step line prints this in a real run too.
+    /// One line, because the step line prints it in every run: `<METHOD>
+    /// <masked url>`, and for a body its size and type, `(22 bytes,
+    /// application/json)`, or `(secret body, 17 bytes)`. Never the body's
+    /// content, and nothing about `--check`.
     fn diff(&self) -> Diff {
         let mut s = format!("{} {}", self.method, mask_url(&self.url));
         match &self.body {
             Shown::None => {}
-            Shown::Secret(n) => s.push_str(&format!("\n<secret, {n} bytes>")),
-            Shown::Text(t) => {
-                s.push('\n');
-                s.push_str(t);
-            }
+            Shown::Secret(n) => s.push_str(&format!(" (secret body, {n} bytes)")),
+            Shown::Plain {
+                len,
+                content_type: Some(ct),
+            } => s.push_str(&format!(" ({len} bytes, {ct})")),
+            Shown::Plain {
+                len,
+                content_type: None,
+            } => s.push_str(&format!(" ({len} bytes)")),
         }
         Diff::summary(s)
     }
@@ -919,56 +925,6 @@ fn unexpected_kind(rest: &str) -> &'static str {
         .unwrap_or("a value")
 }
 
-/// Whether a `Content-Type` is JSON: `application/json`, or any type with a
-/// `+json` suffix (RFC 6839), such as `application/merge-patch+json`.
-fn is_json_content_type(ct: &str) -> bool {
-    let media = ct.split(';').next().unwrap_or_default().trim();
-    let Some((_, sub)) = media.split_once('/') else {
-        return false;
-    };
-    let sub = sub.to_ascii_lowercase();
-    sub == "json" || sub.ends_with("+json")
-}
-
-/// A request body as a diff shows it: pretty-printed when it is JSON, as
-/// text when it is text, as a size when it is neither, and cut at about
-/// 2 KiB with a note of how much more there was. Pretty-printed JSON is
-/// marked as reformatted: keys come out sorted and a number may be printed
-/// differently, so it is what is sent, not the bytes that are sent.
-fn body_summary(bytes: &[u8], content_type: Option<&str>) -> String {
-    let (text, note) = if content_type.is_some_and(is_json_content_type)
-        && let Ok(v) = serde_json::from_slice::<Value>(bytes)
-    {
-        let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
-        let note = (pretty.as_bytes() != bytes)
-            .then(|| format!("(reformatted for display; {} bytes are sent)", bytes.len()));
-        (pretty, note)
-    } else {
-        match std::str::from_utf8(bytes) {
-            Ok(t) => (t.to_string(), None),
-            Err(_) => return format!("<{} bytes of binary data>", bytes.len()),
-        }
-    };
-    let mut out = if text.len() <= SHOWN_BODY_BYTES {
-        text
-    } else {
-        let mut cut = SHOWN_BODY_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!(
-            "{}\n... ({} more bytes not shown)",
-            &text[..cut],
-            text.len() - cut
-        )
-    };
-    if let Some(note) = note {
-        out.push('\n');
-        out.push_str(&note);
-    }
-    out
-}
-
 /// `application/x-www-form-urlencoded`: unreserved characters as they are,
 /// a space as `+`, everything else `%XX`.
 fn form_encode(pairs: &[(String, String)]) -> String {
@@ -1105,67 +1061,6 @@ mod tests {
     }
 
     #[test]
-    fn json_content_types_include_the_plus_json_suffix() {
-        for yes in [
-            "application/json",
-            "Application/JSON; charset=utf-8",
-            "application/merge-patch+json",
-            "application/vnd.github+json",
-            "application/problem+json ; q=1",
-        ] {
-            assert!(is_json_content_type(yes), "{yes}");
-        }
-        for no in [
-            "text/plain",
-            "application/jsonx",
-            "json",
-            "",
-            "application/x-json-ish",
-        ] {
-            assert!(!is_json_content_type(no), "{no}");
-        }
-    }
-
-    #[test]
-    fn a_body_is_shown_pretty_and_cut_at_about_2_kib() {
-        assert_eq!(
-            body_summary(br#"{"type":"receiveonly"}"#, Some("application/json")),
-            "{\n  \"type\": \"receiveonly\"\n}\n(reformatted for display; 22 bytes are sent)"
-        );
-        // Keys come out sorted, so even a pretty body is marked unless it
-        // is byte for byte what is sent.
-        assert!(
-            body_summary(b"{\"b\":1,\"a\":2}", Some("application/json"))
-                .starts_with("{\n  \"a\": 2,\n  \"b\": 1\n}\n(reformatted")
-        );
-        let as_sent = "{\n  \"a\": 1\n}";
-        assert_eq!(
-            body_summary(as_sent.as_bytes(), Some("application/json")),
-            as_sent,
-            "already as it would be shown: no note"
-        );
-        // Not declared JSON: shown as the text it is.
-        assert_eq!(
-            body_summary(br#"{"a":1}"#, Some("text/plain")),
-            r#"{"a":1}"#
-        );
-        assert_eq!(body_summary(b"a=1&b=2", None), "a=1&b=2");
-        assert_eq!(
-            body_summary(&[0xff, 0xfe, 0], None),
-            "<3 bytes of binary data>"
-        );
-        let long = "é".repeat(3000); // 6000 bytes, two per character
-        let shown = body_summary(long.as_bytes(), None);
-        let (head, note) = shown.split_once("\n... (").unwrap();
-        assert_eq!(head.len(), SHOWN_BODY_BYTES);
-        assert_eq!(note, "3952 more bytes not shown)");
-        // Cut on a character boundary.
-        let odd = format!("a{}", "é".repeat(3000));
-        let shown = body_summary(odd.as_bytes(), None);
-        assert!(shown.starts_with('a') && shown.contains("more bytes not shown"));
-    }
-
-    #[test]
     fn forms_are_url_encoded() {
         assert_eq!(
             form_encode(&[
@@ -1177,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn the_diff_is_the_method_and_masked_url_then_the_body() {
+    fn the_diff_is_one_line_naming_the_body_by_size_and_type() {
         let (s, _) = sys(false);
         let get = Request::get("http://bob:u5er-pw@127.0.0.1:8384/rest/x");
         let Plan::Change(i) = get.check(&s).unwrap() else {
@@ -1195,23 +1090,41 @@ mod tests {
         let d = i.diff();
         assert_eq!(
             d.render(),
-            "PATCH http://h/rest/x\n{\n  \"type\": \"receiveonly\"\n}\n\
-             (reformatted for display; 22 bytes are sent)"
+            "PATCH http://h/rest/x (22 bytes, application/json)"
         );
+        assert_eq!(d.short(), d.render(), "one line, and the step line's");
+        assert!(!d.render().contains("receiveonly"), "never the content");
+
+        let raw = Request::put("http://h/x").body("a=b");
+        let Plan::Change(i) = raw.check(&s).unwrap() else {
+            panic!()
+        };
+        assert_eq!(i.diff().render(), "PUT http://h/x (3 bytes)");
+        let empty = Request::post("http://h/x").body("");
+        let Plan::Change(i) = empty.check(&s).unwrap() else {
+            panic!()
+        };
+        assert_eq!(i.diff().render(), "POST http://h/x", "no body to name");
+        let form = Request::post("http://h/x").form([("a", "b")]);
+        let Plan::Change(i) = form.check(&s).unwrap() else {
+            panic!()
+        };
         assert_eq!(
-            d.short(),
-            "PATCH http://h/rest/x …",
-            "one line on the step line"
+            i.diff().render(),
+            "POST http://h/x (3 bytes, application/x-www-form-urlencoded)"
         );
 
-        let secret = Request::post("http://h/x").body_secret(&Secret::new(BODY_SECRET));
+        let secret = Request::post("http://h/x")
+            .body_secret(&Secret::new(BODY_SECRET))
+            .content_type("application/json");
         let Plan::Change(i) = secret.check(&s).unwrap() else {
             panic!()
         };
         assert_eq!(
             i.diff().render(),
-            format!("POST http://h/x\n<secret, {} bytes>", BODY_SECRET.len())
+            format!("POST http://h/x (secret body, {} bytes)", BODY_SECRET.len())
         );
+        assert_no_secret(&format!("{i:?}"));
     }
 
     #[test]
@@ -1317,13 +1230,7 @@ mod tests {
         assert_eq!(steps[1].1.as_deref(), Some("action"));
         assert_eq!(
             steps[1].2.as_deref(),
-            Some(
-                format!(
-                    "PATCH {url}\n{{\n  \"type\": \"receiveonly\"\n}}\n\
-                     (reformatted for display; 22 bytes are sent)"
-                )
-                .as_str()
-            )
+            Some(format!("PATCH {url} (22 bytes, application/json)").as_str())
         );
     }
 
@@ -1462,7 +1369,7 @@ mod tests {
             assert_no_secret(&serde_json::to_string(&ev).unwrap());
         }
         let diff = finished(&sink)[0].2.clone().unwrap();
-        assert!(diff.contains("<secret, 17 bytes>"), "{diff}");
+        assert!(diff.ends_with("(secret body, 17 bytes)"), "{diff}");
         // Every one of them did reach the server.
         let seen = &server.seen()[0];
         assert_eq!(seen.header("x-api-key"), Some(KEY));
