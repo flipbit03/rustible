@@ -1051,18 +1051,18 @@ fn percent_decode(s: &str) -> Option<String> {
 
 /// A request body as a diff shows it: reindented when it is JSON, as text
 /// when it is text, as a size when it is neither. Every one of `secrets` is
-/// scrubbed, control and format characters but a newline and a tab are
-/// escaped (`\u{1b}`, `\u{202e}`), and the result is cut at about 2 KiB. A
-/// note on the last line says when it was reindented or cut, and how many
-/// bytes are sent.
+/// scrubbed, control characters but a newline and a tab and the characters
+/// [`escape_controls`] lists are escaped (`\u{1b}`, `\u{202e}`), and the
+/// result is cut at about 2 KiB. A note on the last line says when it was
+/// reindented or cut, and how many bytes are sent.
 ///
 /// Reindenting changes only the whitespace between JSON's tokens: keys,
 /// their order, duplicates and every value are shown as they are sent. A
 /// body over [`WHOLE_BODY_BYTES`], or nested deeper than
 /// [`MAX_REINDENT_DEPTH`], is shown as it is sent. Past validation the work
-/// is bounded by what is shown, not by the body: only the start that is
-/// shown is reindented, scrubbed and escaped, and that start ends where no
-/// secret is cut in two.
+/// is bounded by what is shown and by the longest secret, not by the body:
+/// only the start that is shown is reindented, scrubbed and escaped, and
+/// that start ends where no secret is cut in two.
 fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) -> String {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return format!("<{} bytes of binary data>", bytes.len());
@@ -1099,7 +1099,8 @@ fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) ->
 /// where no secret is cut in two, so the scrub sees each secret it shows
 /// whole. It extends past a secret on the cut, at most by the longest
 /// secret; where overlapping secrets would carry it further, it ends
-/// before them instead.
+/// before them instead, at worst at the start. The work is bounded by what
+/// is shown and by the longest secret, not by the body.
 fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
     // The first start and the last end of the secrets that span `end`.
     let spanning = |end: usize| {
@@ -1131,13 +1132,29 @@ fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
 
 /// `text` with every control character escaped (`\u{1b}`, `\r`) except a
 /// newline, a tab, and the `\r` of a `\r\n`, so a body cannot move the
-/// cursor or recolour the terminal it is shown on; and every format
-/// character that reorders or hides text (bidi overrides and isolates,
-/// zero-width characters, a byte-order mark). Stops once `budget` bytes are
-/// written, never inside an escape or a `<secret>`; the flag says whether
-/// all of `text` was.
+/// cursor or recolour the terminal it is shown on; and these characters
+/// that reorder, hide or break text: the soft hyphen U+00AD, the Arabic
+/// letter mark U+061C, the Mongolian vowel separator U+180E, U+200B–U+200F
+/// (zero-width characters, left-to-right and right-to-left marks), the
+/// line and paragraph separators U+2028 and U+2029, the bidi embeddings and
+/// overrides U+202A–U+202E, the word joiner and invisible operators
+/// U+2060–U+2064, the bidi isolates U+2066–U+2069, and the byte-order mark
+/// U+FEFF. Stops once `budget` bytes are written, never inside an escape or
+/// a `<secret>`; the flag says whether all of `text` was.
 fn escape_controls(text: &str, budget: usize) -> (String, bool) {
-    let format = |c: char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+    let format = |c: char| {
+        matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
+    };
     let mut out = String::with_capacity(text.len().min(budget) + 16);
     let mut rest = text;
     while let Some(c) = rest.chars().next() {
@@ -1565,9 +1582,7 @@ mod tests {
         );
     }
 
-    /// However secrets overlap, the start a large body shows stays about
-    /// 2 KiB: the extension past a secret on the cut is capped.
-    /// Reindenting stops once it has written what can be shown: 128 levels
+    /// Reindenting stops once it has written what can be shown: 127 levels
     /// of a 64 KiB array would otherwise be 8 MB.
     #[test]
     fn reindenting_stops_past_its_limit() {
@@ -1585,11 +1600,40 @@ mod tests {
         assert_eq!(out, "[\n  1,\n  2\n]");
     }
 
+    /// However secrets overlap, the start a large body shows stays about
+    /// 2 KiB: the extension past a secret on the cut is capped, and where
+    /// overlapping secrets would carry it further it ends before them. It
+    /// is as long as it can be without showing part of a secret.
     #[test]
     fn the_shown_start_of_a_body_is_bounded() {
+        let aa = ["aa".to_string()];
+        // No secret near the cut: exactly 2 KiB.
+        let plain = "x".repeat(300 << 10);
+        assert_eq!(clean_prefix(&plain, &aa).len(), SHOWN_BODY_BYTES);
+        // One on the cut: past it, by no more than its length.
+        let one = format!("{}aa{}", "x".repeat(SHOWN_BODY_BYTES - 1), plain);
+        assert_eq!(clean_prefix(&one, &aa).len(), SHOWN_BODY_BYTES + 1);
+        // A run of overlapping ones across the cut: before the run.
+        let run = format!("{}{}", "x".repeat(1000), "a".repeat(300 << 10));
+        assert_eq!(clean_prefix(&run, &aa), "x".repeat(1000));
+        let shown = body_summary(run.as_bytes(), None, &aa);
+        assert_eq!(
+            shown,
+            format!(
+                "{}\n... (cut for display; {} bytes are sent)",
+                "x".repeat(1000),
+                run.len()
+            ),
+            "no part of a secret"
+        );
+        // All of it one run: nothing, rather than part of a secret.
         let all = "a".repeat(300 << 10);
-        let start = clean_prefix(&all, &["aa".to_string()]);
-        assert!(start.len() <= SHOWN_BODY_BYTES + 2, "{} bytes", start.len());
+        assert_eq!(clean_prefix(&all, &aa), "");
+        let shown = body_summary(all.as_bytes(), None, &aa);
+        assert_eq!(
+            shown,
+            format!("\n... (cut for display; {} bytes are sent)", all.len())
+        );
     }
 
     /// Format characters reorder or hide text (`safe\u{202e}txt.exe` reads
@@ -1605,6 +1649,17 @@ mod tests {
             ),
             "safe\\u{202e}txt.exe\\u{2066}\\u{200b}\\u{feff}"
         );
+        for c in [
+            '\u{61c}', '\u{ad}', '\u{180e}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}',
+        ] {
+            assert_eq!(
+                body_summary(format!("a{c}b").as_bytes(), None, &[]),
+                format!("a{}b", c.escape_default()),
+                "{:?}",
+                c
+            );
+        }
+        assert_eq!(body_summary("é ü 日本".as_bytes(), None, &[]), "é ü 日本");
         let body = format!("{}\x1byyyy", "x".repeat(SHOWN_BODY_BYTES - 2));
         assert_eq!(
             body_summary(body.as_bytes(), None, &[]),
