@@ -234,7 +234,9 @@ pub enum Event {
         /// [`StepFinished`](Event::StepFinished)'s `cmd` to fit a frame.
         /// Reporters print it at `-v` unless the failed step's chain was
         /// already printed before this frame: the step's own `cmd` printed
-        /// with it, and the stderr would show twice. It is the only carrier
+        /// with it, and the stderr would show twice. Without an `id`, the
+        /// step is named only by name, so it counts as printed only when
+        /// that step's command was this one. It is the only carrier
         /// for a command that failed outside any step, such as the
         /// playbook's own `ctx.sys()` call with `?`.
         #[serde(default)]
@@ -441,11 +443,20 @@ impl Collect {
 pub struct Compact<W: Write + Send> {
     w: Mutex<W>,
     verbosity: u8,
-    /// The failed steps printed so far, by id, block path and name. Their
-    /// chain is on their own line, with their command under it at `-v`, so
-    /// a `Failed` frame that names one (by all three, or by name and blocks
-    /// when it has no id) does not print the command again.
-    failed: Mutex<Vec<(u32, Vec<String>, String)>>,
+    /// The failed steps printed so far, by id, block path and name, with
+    /// the command each carried. Their chain is on their own line, with
+    /// their command under it at `-v`, so a `Failed` frame that names one
+    /// does not print the command again: by all three, or, when it has no
+    /// id, by name and blocks and the same command.
+    failed: Mutex<Vec<PrintedFailure>>,
+}
+
+/// A failed step `Compact` printed: who it was, and the command under it.
+struct PrintedFailure {
+    id: u32,
+    blocks: Vec<String>,
+    name: String,
+    cmd: Option<CmdFailed>,
 }
 
 impl<W: Write + Send> Compact<W> {
@@ -530,7 +541,12 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     {
                         cmd_block(&mut *w, c);
                     }
-                    self.failed.lock().unwrap().push((id, blocks, name));
+                    self.failed.lock().unwrap().push(PrintedFailure {
+                        id,
+                        blocks,
+                        name,
+                        cmd,
+                    });
                 }
                 r
             }
@@ -569,14 +585,22 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     None => writeln!(w, "FAILED: {error}"),
                 };
                 // A step's chain is on its own line, so a step printed
-                // already printed its command too. Without an id, the name
-                // and blocks are all there is to go on.
-                let printed =
-                    step.is_some_and(|step| {
-                        self.failed.lock().unwrap().iter().any(|(i, b, n)| {
-                            id.is_none_or(|id| *i == id) && *b == blocks && *n == step
-                        })
-                    });
+                // already printed its command too. Without an id, a name
+                // can be borrowed: the command has to be the same as well.
+                let printed = step.is_some_and(|step| {
+                    self.failed.lock().unwrap().iter().any(|p| {
+                        p.blocks == blocks
+                            && p.name == step
+                            && match id {
+                                Some(id) => p.id == id,
+                                None => p
+                                    .cmd
+                                    .as_ref()
+                                    .zip(cmd.as_ref())
+                                    .is_some_and(|(a, b)| same_command(a, b)),
+                            }
+                    })
+                });
                 if self.verbosity >= 1
                     && !printed
                     && let Some(c) = cmd
@@ -592,6 +616,28 @@ impl<W: Write + Send> EventSink for Compact<W> {
             ),
         };
     }
+}
+
+/// Whether `a` and `b` are one failed command: the same argv and status,
+/// and stderr the same once a frame's cut (a marker line, then the tail) is
+/// allowed for, so one is the end of the other. `rustible`'s renderer has
+/// its own copy.
+fn same_command(a: &CmdFailed, b: &CmdFailed) -> bool {
+    fn tail(stderr: &str) -> &str {
+        match stderr.split_once('\n') {
+            Some((first, rest))
+                if first.starts_with("… (")
+                    && first.ends_with(
+                        " earlier bytes of stderr not shown: more than one frame carries)",
+                    ) =>
+            {
+                rest
+            }
+            _ => stderr,
+        }
+    }
+    let (x, y) = (tail(&a.stderr), tail(&b.stderr));
+    a.argv == b.argv && a.status == b.status && (x.ends_with(y) || y.ends_with(x))
 }
 
 /// Whether `d`'s full render says no more than the step line does: one line
@@ -931,6 +977,37 @@ mod tests {
             out.ends_with("\nFAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n"),
             "{out}"
         );
+    }
+
+    /// A frame naming a step only by name is not that step's failure when
+    /// its command is another (a command outside any step, returned under
+    /// the caught step's name): both print, once each. The same command,
+    /// its stderr cut to fit the frame, is not repeated.
+    #[test]
+    fn compact_prints_a_different_command_for_a_frame_without_an_id() {
+        let other = CmdFailed {
+            argv: vec!["false".into()],
+            status: 1,
+            signal: None,
+            stderr: "BBB\n".into(),
+        };
+        let feed = |frame_cmd: CmdFailed| {
+            let mut frame = failed_frame(None, Some("x"));
+            if let Event::Failed { cmd, .. } = &mut frame {
+                *cmd = Some(frame_cmd);
+            }
+            print(1, vec![failed_step(1, "x"), frame])
+        };
+        let out = feed(other);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(out.ends_with("  $ false (exit 1)\n    BBB\n"), "{out}");
+        let mut cut = sh_failed();
+        cut.stderr = "… (5 earlier bytes of stderr not shown: more than one frame carries)\n\
+                      still nope\n"
+            .into();
+        let out = feed(cut);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(!out.contains("earlier bytes"), "{out}");
     }
 
     #[test]

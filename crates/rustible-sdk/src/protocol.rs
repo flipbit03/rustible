@@ -355,7 +355,7 @@ fn fit_stderr(up: &mut Up, limit: usize) {
     // What the frame costs with no stderr at all, and so the room left for
     // the marker and the tail, escaped.
     let bare = encoded_len(up);
-    if bare >= limit {
+    if bare > limit {
         *stderr_mut(up).expect("taken above") = full;
         return;
     }
@@ -384,7 +384,7 @@ fn fit_stderr(up: &mut Up, limit: usize) {
         }
         if start == full.len() {
             // Not even the marker fits. Empty, the frame is `bare` bytes,
-            // which is under the limit.
+            // which is within the limit.
             stderr_mut(up).expect("taken above").clear();
             return;
         }
@@ -859,6 +859,22 @@ mod tests {
         fit_stderr(&mut up, limit);
         assert!(encoded_len(&up) <= limit, "{} bytes", encoded_len(&up));
         assert_eq!(stderr_of(&up), "");
+    }
+
+    /// A frame exactly at the limit with no stderr fits: the stderr goes.
+    /// One byte less, and nothing would save it: it is left alone.
+    #[test]
+    fn stderr_is_dropped_when_the_bare_frame_fits_exactly() {
+        let full = "x".repeat(10_000);
+        let bare = encoded_len(&Up::Event(failed_step(Some(cmd("")))));
+        let mut up = Up::Event(failed_step(Some(cmd(&full))));
+        fit_stderr(&mut up, bare);
+        assert_eq!(encoded_len(&up), bare);
+        assert_eq!(stderr_of(&up), "");
+
+        let mut up = Up::Event(failed_step(Some(cmd(&full))));
+        fit_stderr(&mut up, bare - 1);
+        assert_eq!(stderr_of(&up), full);
     }
 
     /// The channel itself trims: an event sent through `FrameSink` comes
