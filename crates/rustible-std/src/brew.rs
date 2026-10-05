@@ -873,11 +873,42 @@ mod tests {
         s.symlink(root.join("Cellar/loop"), root.join("Cellar/loop2"))
             .unwrap();
 
+        // The precondition, checked rather than assumed: does `python` reach
+        // the `Python` rack on this volume? Only where it does can this test
+        // catch a dropped exact-name compare.
+        let case_insensitive = s.exists(root.join("Cellar/python")).unwrap();
         let names = ["agg", "loop", "python"].map(String::from).to_vec();
         let found = installed(&s, brew.to_str().unwrap(), &names);
         let _ = s.remove_all(&root);
+        if cfg!(target_os = "macos") {
+            assert!(
+                case_insensitive,
+                "the macOS runner's temp volume is expected to be case-insensitive (APFS \
+                 default); without that, this test cannot catch a dropped exact-name compare"
+            );
+        }
+        eprintln!(
+            "temp volume is case-{}: the exact-name half of this test is {}",
+            if case_insensitive {
+                "insensitive"
+            } else {
+                "sensitive"
+            },
+            if case_insensitive {
+                "live"
+            } else {
+                "trivially true"
+            }
+        );
+        let found = found.unwrap();
+        assert!(
+            !found.iter().any(|f| f.name == "python"),
+            "`python` was reported installed from the `Python` rack (case-insensitive \
+             volume: {case_insensitive}); the rack's name must match the request exactly: \
+             {found:?}"
+        );
         assert_eq!(
-            found.unwrap(),
+            found,
             vec![Formula {
                 name: "agg".into(),
                 version: "1.7.0".into()
