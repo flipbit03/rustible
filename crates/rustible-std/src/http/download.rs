@@ -216,8 +216,8 @@ impl std::fmt::Debug for DownloadBuilder {
     }
 }
 
-/// Output of [`Download`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Output of [`Download`]. Its `{:?}` masks the URL's userinfo.
+#[derive(Clone, PartialEq, Eq)]
 pub struct DownloadReport {
     /// The URL as given to [`Download::get`]. Redirects are followed, but the
     /// address they land on is not reported here.
@@ -240,6 +240,19 @@ pub struct DownloadReport {
     pub sha256: Option<String>,
     /// Set only when `.backup(true)` and a previous version was saved.
     pub backup_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for DownloadReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadReport")
+            .field("url", &mask_url(&self.url))
+            .field("path", &self.path)
+            .field("downloaded", &self.downloaded)
+            .field("bytes", &self.bytes)
+            .field("sha256", &self.sha256)
+            .field("backup_path", &self.backup_path)
+            .finish()
+    }
 }
 
 impl Download {
@@ -1122,7 +1135,13 @@ mod tests {
         let diff = c.diff().render();
         assert!(diff.contains("http://bob:********@127.0.0.1"), "{diff}");
         assert!(!format!("{c:?}").contains("u5er-pw"));
-        op.apply(&sys, c).unwrap();
+        let report = op.apply(&sys, c).unwrap();
+        let dbg = format!("{report:?}");
+        assert!(
+            dbg.contains("bob:********@") && !dbg.contains("u5er-pw"),
+            "{dbg}"
+        );
+        assert_eq!(report.url, url, "the output itself keeps the URL as given");
         assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
         assert_eq!(
             first.seen()[0].header("authorization"),
