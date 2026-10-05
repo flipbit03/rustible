@@ -1054,8 +1054,10 @@ costs more to run (free, seconds, minutes), so a test goes in the lowest tier
 that can fail for the right reason. CI job names carry the tier, beside the
 mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 
-1. **T1, in-process**, as two kinds of test. Choosing between them is an
-   authoring choice, not a tier: both run in `cargo test` and need nothing.
+1. **T1, in-process**: everything `cargo test` runs, which needs nothing
+   installed. That includes the CLI's tests of its built binary and the
+   macros' trybuild UI tests, but it is chiefly two kinds of test, and
+   choosing between them is an authoring choice, not a tier:
    - **Pure functions** for the interesting logic (line replacement and diff,
      `/etc/passwd` parsing, authorized_keys deltas, version comparison).
      Tested with strings, no fakes.
@@ -1073,13 +1075,17 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    each container. A typical test applies an op twice: first run `changed`,
    second run `ok`, and the system looks right. Static binaries drop into any
    image with no setup.
-3. **T3, VMs (Vagrant)** for what Docker does badly, because a container shares
-   the host kernel and has no pid 1: writes to `/proc/sys`, a real init system,
-   a real `sudo`, and the SSH transport itself. `dev/vagrant/` holds a Debian
-   12 guest per architecture, x86_64 and aarch64, driven by vagrant-libvirt on
-   Linux and vagrant-qemu on macOS. `make vm-test` converges
-   `examples/workspace/playbooks/vagrant.rs` against whichever are up and fails
-   unless a second run reports nothing changed. CI runs both architectures:
+3. **T3, VMs (Vagrant)** for what a container cannot give: a live `/proc/sys`
+   (a container shares the host kernel, so a write is refused or reaches the
+   host), a real init system on a real boot (a container runs systemd as pid 1
+   only in the harness's `systemd_images` mode, on the host's kernel), a real
+   `sudo` setup on a real host, and the SSH transport itself. `dev/vagrant/`
+   holds a Debian 12 guest per architecture, x86_64 and aarch64, driven by
+   vagrant-libvirt on Linux and vagrant-qemu on macOS. `make vm-test` converges
+   the `vagrant`, `vagrant_login` and `vagrant_escalate_user` playbooks in
+   `examples/workspace/playbooks/` against whichever are up, failing unless
+   each second run reports nothing changed, then requires
+   `vagrant_login_escalate` to be refused at launch. CI runs both architectures:
    GitHub's Linux runners expose `/dev/kvm`, so the x86_64 guest is accelerated
    and the aarch64 one is interpreted by qemu. This tier is
    distribution-specific in a way T2 is not — one guest is one distro — so a CI

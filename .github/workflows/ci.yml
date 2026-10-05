@@ -48,7 +48,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # T1, in-process: pure functions and ops against the `Fake` backend.
+  # T1, in-process: everything `cargo test` runs, chiefly pure functions and
+  # ops against the `Fake` backend.
   check:
     name: "Test (T1): unit & fake"
     runs-on: ubuntu-latest
@@ -102,7 +103,9 @@ jobs:
 
   macos:
     # T1 on a real mac, then real playbooks against the runner itself over a
-    # local connection: no VM and no SSH, so this is not T3.
+    # local connection. That second half is in no tier (not in-process, not
+    # a container, not a VM over SSH), which is what the `real mac`
+    # qualifier after the tier says (CLAUDE.md, the job naming rule).
     name: "Test (T1, real mac): macOS (controller and target)"
     runs-on: macos-latest
     steps:

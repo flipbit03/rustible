@@ -1909,6 +1909,8 @@ mod tests {
         assert_eq!(classify(&cancelled, Some(1), true), (2, 0));
     }
 
+    // ---- the run's system ----
+
     /// The run's system carries the login's origin into every escalation
     /// failure when the orchestrator says the playbook's `ssh_user` chose
     /// it, and nothing when the inventory did.

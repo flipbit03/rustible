@@ -24,7 +24,7 @@ fmt:
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
-# T1: pure functions and ops against the `Fake`, in-process.
+# T1, in-process: chiefly pure functions and ops against the `Fake`.
 test:
 	$(CARGO) test --workspace
 

@@ -16,16 +16,21 @@ Each sees something the tier below it cannot, and costs more to run: free,
 seconds, minutes. A test goes in the lowest one that can fail for the right
 reason (`CLAUDE.md`, "Choosing a tier").
 
-- **T1, in-process: pure functions** and the **`Fake` backend**. Parsers,
-  planners, and an op's own behaviour. `cargo test`, always.
+- **T1, in-process**: everything `cargo test` runs, chiefly **pure
+  functions** and the **`Fake` backend** (parsers, planners, and an op's own
+  behaviour), plus the CLI's tests of its built binary and the macros'
+  trybuild UI tests. Always.
 - **T2, containers** (`make integration`). Real distributions, real package
   managers, real `useradd`. They caught that `useradd` refuses to create a
   private group when one already carries the name, and that `chown` clears
   setuid.
-- **T3, machines** (`make vm-test`). A real SSH transport, a real `sudo`, a
-  live `/proc/sys`, and a real init system. A container has none of those: it
-  shares the host kernel, so `sysctl` writes are refused or leak to the host,
-  and it has no pid 1 to ask about a unit.
+- **T3, machines** (`make vm-test`). A real SSH transport, a real `sudo`
+  setup on a real host, a live `/proc/sys`, and a real init system on a real
+  boot. A container cannot give those: it shares the host kernel, so `sysctl`
+  writes are refused or leak to the host; it runs systemd as pid 1 only in
+  the harness's `systemd_images` mode, on the host's kernel and cgroups; its
+  body already runs as root, so no login escalates through `sudo`; and
+  nothing reaches it over SSH.
 
 A CI job that runs a tier names it, so a red `Test (T2): Docker
 (Debian/Ubuntu/Alpine)` is the container tier failing.

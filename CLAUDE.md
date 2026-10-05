@@ -189,9 +189,13 @@ tier is added to the mechanism, never put in its place, because the two
 answer different readers. The tier tells a contributor which kind of test
 broke, in the words this file and every test header use, and so where the
 fix goes. The mechanism tells someone who has never opened this file what
-broke and where it ran. Lint and tests are deliberately separate jobs,
-because one says the code is malformed and the other says it is wrong, and a
-single red tick covering both is ambiguous.
+broke and where it ran. A qualifier after the tier marks a job that also
+runs something outside the three tiers: the mac job's `real mac` is its
+`hello`, `mac` and `macbrew` playbooks, converged against the runner itself
+over a local connection, which is neither in-process, nor a container, nor a
+VM over SSH. Lint and tests are deliberately separate jobs, because one says
+the code is malformed and the other says it is wrong, and a single red tick
+covering both is ambiguous.
 
 To work against your checkout rather than the published crates — which is what
 you want when changing Rustible itself — build the CLI from the tree and point
@@ -321,9 +325,9 @@ below it:
 
 | tier | what it is | sees what the tier below cannot | where it runs | cost |
 |---|---|---|---|---|
-| T1. in-process | pure functions, and ops against the `Fake` backend | — | `cargo test` | free |
+| T1. in-process | everything `cargo test` runs: chiefly pure functions and ops against the `Fake` backend, plus the CLI's tests of its built binary and the macros' trybuild UI tests | — | `cargo test` | free |
 | T2. container | ops against real distributions | how a real tool behaves, rather than what the `Fake` believes | `make integration`, and CI | seconds, needs docker |
-| T3. machine | a playbook against a real VM over SSH | what a container structurally lacks: its own kernel, pid 1, `sudo`, SSH | `make vm-test`, and CI | minutes, needs vagrant |
+| T3. machine | a playbook against a real VM over SSH | what a container structurally cannot give: a live `/proc/sys` (its own kernel), a real init system on a real boot, a real `sudo` setup on a real host, and the SSH transport | `make vm-test`, and CI | minutes, needs vagrant |
 
 The container images in use are `debian:12`, `ubuntu:24.04`, `alpine:3.20`,
 `jrei/systemd-debian:12` and `jrei/systemd-ubuntu:24.04`; the machine tier is
@@ -359,10 +363,13 @@ while the thing is broken.
   when one already carries the name, and that `chown` clears setuid. A fake
   models what you *believe*; a container shows what is.
 - **T3, for what a container structurally cannot do.** That list is short
-  and specific: writes to `/proc/sys` (a container shares the host kernel, so
-  the write is refused or hits the *host*), a real init system, a real
-  `sudo`, and the SSH transport itself. `it_sysctl_present.rs` says so in its
-  own header — it runs with `.apply_now(false)` and asserts only on the
+  and specific: a live `/proc/sys` (a container shares the host kernel, so
+  the write is refused or hits the *host*); a real init system on a real
+  boot (`systemd_images` runs systemd as pid 1 in a privileged container,
+  enough for the systemd ops, but on the host's kernel and cgroups, not a
+  machine of its own); a real `sudo` setup on a real host (a T2 body can
+  install `sudo` and use it, as `it_systemd.rs` does, but it already runs as
+  root, so no login escalates through it); and the SSH transport itself. `it_sysctl_present.rs` says so in its own header — it runs with `.apply_now(false)` and asserts only on the
   drop-in file, because the live write is not available to it.
 
 If a new op needs nothing from T3, it does not need a T3 test. Say so
