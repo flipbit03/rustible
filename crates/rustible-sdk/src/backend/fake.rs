@@ -173,10 +173,11 @@ impl Fake {
     /// and the write goes on. A refused call changes nothing and is still
     /// recorded in [`Fake::attr_calls`]: it was asked for.
     ///
-    /// Not modelled: an unprivileged `Local` rewrite whose `chown` back to
-    /// the old owner is refused leaves the file the writer's. The fake has
-    /// no writer's identity, so its rewrites, with or without attributes,
-    /// keep the old owner.
+    /// A staged rewrite whose `chown` to the kept owner is refused ends with
+    /// the staged file's owner, 0:0, the fake's stand-in for the writer, as
+    /// an unprivileged `Local` rewrite leaves the file the writer's. A plain
+    /// [`Backend::write`] has no staged file in the fake and keeps the old
+    /// owner, which a refused `Local` rewrite would not.
     pub fn with_chown_refused(mut self) -> Self {
         self.chown_refused = true;
         self
@@ -1162,14 +1163,17 @@ mod tests {
 
     /// With `chown` refused, a rewrite given only a mode still succeeds: the
     /// owner it keeps is best effort, as `Local` keeps it, so the refused
-    /// `chown` to it is ignored. The file keeps its old owner, which is what
-    /// the fake can show; an unprivileged `Local` leaves it the writer's.
+    /// `chown` to it is ignored. The file ends with the staged file's owner,
+    /// 0:0, the fake's stand-in for the writer, as an unprivileged `Local`
+    /// leaves it the writer's. A plain `write` keeps the old owner.
     #[test]
     fn a_kept_owner_that_cannot_be_given_does_not_fail_a_staged_write() {
         let fake = Fake::new()
             .with_dir("/d")
-            .with_file_mode("/d/f", "before", 0o640);
+            .with_file_mode("/d/f", "before", 0o640)
+            .with_file_mode("/d/g", "v1", 0o640);
         fake.set_owner(Path::new("/d/f"), 7, 8).unwrap();
+        fake.set_owner(Path::new("/d/g"), 7, 8).unwrap();
         let fake = Fake {
             chown_refused: true,
             ..fake
@@ -1181,10 +1185,17 @@ mod tests {
         fake.write_from(Path::new("/d/f"), &mut &b"after"[..], Some(only_mode))
             .unwrap();
         let f = fake.file("/d/f").unwrap();
-        assert_eq!((f.mode, f.bytes.as_slice()), (0o600, &b"after"[..]));
+        assert_eq!(
+            (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+            (0o600, 0, 0, &b"after"[..])
+        );
+        // A plain write keeps the owner the file had.
+        fake.write(Path::new("/d/g"), b"v2").unwrap();
+        let g = fake.file("/d/g").unwrap();
+        assert_eq!((g.uid, g.gid, g.bytes.as_slice()), (7, 8, &b"v2"[..]));
         assert_eq!(
             fake.read_dir(Path::new("/d")).unwrap(),
-            [PathBuf::from("/d/f")]
+            [PathBuf::from("/d/f"), PathBuf::from("/d/g")]
         );
     }
 
