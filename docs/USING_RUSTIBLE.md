@@ -1023,6 +1023,10 @@ ctx.step("app extracted", archive::Extracted::from_path(TARBALL)
     .owner(svc.uid, svc.gid))?;
 ```
 
+An extraction that fails partway leaves the members before the failure in
+place, so pick a marker the archive lists last: one it lists early makes the
+next run `ok` over a partial tree.
+
 ⚠️ Note the order. `.to()` is the finisher that turns the builder into the
 operation, and `.creates()` and `.owner()` are on the operation, so they come
 **after** it. The same is true of `http::Download`.
