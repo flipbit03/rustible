@@ -167,9 +167,16 @@ impl Fake {
     /// login or a root without `CAP_CHOWN`; the fake otherwise models root,
     /// whose `chown` always succeeds. That includes the owner a
     /// [`Backend::write_from`] is given, so a test can show that a refused
-    /// owner fails the write and leaves the target as it was. A refused call
-    /// changes nothing and is still recorded in [`Fake::attr_calls`]: it was
-    /// asked for.
+    /// owner fails the write and leaves the target as it was. An owner the
+    /// write only keeps from the file it replaces (a rewrite given just a
+    /// mode) is best effort, as on `Local`: its refused `chown` is ignored
+    /// and the write goes on. A refused call changes nothing and is still
+    /// recorded in [`Fake::attr_calls`]: it was asked for.
+    ///
+    /// Not modelled: an unprivileged `Local` rewrite whose `chown` back to
+    /// the old owner is refused leaves the file the writer's. The fake has
+    /// no writer's identity, so its rewrites, with or without attributes,
+    /// keep the old owner.
     pub fn with_chown_refused(mut self) -> Self {
         self.chown_refused = true;
         self
@@ -386,11 +393,17 @@ impl Fake {
                 kind: FileKind::File,
             },
         );
+        // An owner asked for must be given; one kept from the file being
+        // replaced is best effort, as `Local` keeps it.
+        let required = attrs.owner.is_some();
         let attributed = attr_steps(mode, owner)
             .into_iter()
             .try_for_each(|step| match step {
                 AttrStep::Mode(m) => self.set_mode(&tmp, m),
-                AttrStep::Owner(uid, gid) => self.set_owner(&tmp, uid, gid),
+                AttrStep::Owner(uid, gid) => match self.set_owner(&tmp, uid, gid) {
+                    Err(e) if required => Err(e),
+                    _ => Ok(()),
+                },
             });
         match attributed.and_then(|()| self.rename(&tmp, p)) {
             Ok(()) => Ok(()),
@@ -1145,6 +1158,34 @@ mod tests {
             [PathBuf::from("/d/f")]
         );
         assert!(fake.set_owner(Path::new("/d/f"), 1, 1).is_err());
+    }
+
+    /// With `chown` refused, a rewrite given only a mode still succeeds: the
+    /// owner it keeps is best effort, as `Local` keeps it, so the refused
+    /// `chown` to it is ignored. The file keeps its old owner, which is what
+    /// the fake can show; an unprivileged `Local` leaves it the writer's.
+    #[test]
+    fn a_kept_owner_that_cannot_be_given_does_not_fail_a_staged_write() {
+        let fake = Fake::new()
+            .with_dir("/d")
+            .with_file_mode("/d/f", "before", 0o640);
+        fake.set_owner(Path::new("/d/f"), 7, 8).unwrap();
+        let fake = Fake {
+            chown_refused: true,
+            ..fake
+        };
+        let only_mode = WriteAttrs {
+            mode: Some(0o600),
+            owner: None,
+        };
+        fake.write_from(Path::new("/d/f"), &mut &b"after"[..], Some(only_mode))
+            .unwrap();
+        let f = fake.file("/d/f").unwrap();
+        assert_eq!((f.mode, f.bytes.as_slice()), (0o600, &b"after"[..]));
+        assert_eq!(
+            fake.read_dir(Path::new("/d")).unwrap(),
+            [PathBuf::from("/d/f")]
+        );
     }
 
     #[test]
