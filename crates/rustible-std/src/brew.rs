@@ -410,7 +410,6 @@ fn read_rack(sys: &System, cellar: &Path, entries: &[String], name: &str) -> Res
 fn receipt_lists_alias(sys: &System, keg: &Path, name: &str) -> Result<bool> {
     #[derive(serde::Deserialize)]
     struct Receipt {
-        #[serde(default)]
         aliases: Option<Vec<String>>,
     }
     let path = keg.join("INSTALL_RECEIPT.json");
@@ -1945,10 +1944,10 @@ mod tests {
     /// `openssl@3`.
     #[test]
     fn a_stale_opt_link_not_in_the_kegs_receipt_is_not_installed() {
-        let fake = mac_fake(&[("openssl@3", &["3.6.3"])]);
-        opt_link(&fake, "openssl@3.5", "../Cellar/openssl@3/3.6.3");
-        opt_link(&fake, "openssl@3.6", "../Cellar/openssl@3/3.6.3");
-        receipt(&fake, "openssl@3", "3.6.3", &["openssl", "openssl@3.6"]);
+        let fake = mac_fake(&[("openssl@3", &["3.9.0"])]);
+        opt_link(&fake, "openssl@3.5", "../Cellar/openssl@3/3.9.0");
+        opt_link(&fake, "openssl@3.8", "../Cellar/openssl@3/3.9.0");
+        receipt(&fake, "openssl@3", "3.9.0", &["openssl@3.8"]);
         let s = mac_sys(&fake);
         assert!(Present::new(["openssl@3.5"]).check(&s).unwrap().is_change());
         assert!(matches!(
@@ -1957,7 +1956,7 @@ mod tests {
         ));
         // The alias the receipt does list still resolves.
         assert!(matches!(
-            Present::new(["openssl@3.6"]).check(&s).unwrap(),
+            Present::new(["openssl@3.8"]).check(&s).unwrap(),
             Plan::Satisfied(_)
         ));
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
