@@ -1444,12 +1444,12 @@ impl Started {
                         t.push(line.clone());
                     }
                     if echo.load(Ordering::SeqCst) {
-                        // One write, not `eprintln!`'s one per piece: a
-                        // process that exits between the pieces leaves a
-                        // bare `[` behind (#90).
-                        let _ = io::stderr()
-                            .lock()
-                            .write_all(format!("[{label}] {line}\n").as_bytes());
+                        // One string, so one write, where `eprintln!` with
+                        // the pieces writes each: a process that exits
+                        // between them leaves a bare `[` behind (#90). The
+                        // macro, not `io::stderr()`, so tests capture it.
+                        let msg = format!("[{label}] {line}\n");
+                        eprint!("{msg}");
                     }
                     // Nobody listens once the handshake is over.
                     let _ = events_tx.send(Event::Line(line));
@@ -1718,6 +1718,10 @@ impl Connection {
     /// Close stdin so the helper's loop ends, wait briefly, then kill. Its
     /// last lines of stderr are echoed before this returns, so a run that
     /// ends next does not cut them off.
+    ///
+    /// Its stdout is closed too before the wait for stderr: a helper killed
+    /// under `sudo` may leave a process blocked writing to it, which keeps
+    /// stderr open until it gets `EPIPE`.
     fn shutdown(mut self) {
         self.tx = Box::new(io::sink());
         if let Some(mut child) = self.child.take() {
@@ -1736,6 +1740,7 @@ impl Connection {
                 let _ = child.wait();
             }
         }
+        self.rx = Box::new(io::empty());
         settle(&mut self.stderr_reader);
     }
 }
@@ -4106,7 +4111,7 @@ mod tests {
     /// of hanging.
     #[test]
     fn a_helper_that_exits_at_once_reports_its_stderr_every_time() {
-        const RUNS: usize = 1000;
+        const RUNS: usize = 3000;
         let (done, finished) = mpsc::channel();
         std::thread::spawn(move || {
             let mut lost = Vec::new();
@@ -4151,6 +4156,47 @@ mod tests {
             .expect("a helper whose stderr stayed open was not reported within 20s");
         assert!(err.starts_with("helper exited 7: boom"), "{err}");
         assert!(took < Duration::from_secs(10), "took {took:?}");
+    }
+
+    /// Shutting a helper down waits for its stderr reader without adding
+    /// to the wait: one that exits at EOF on stdin is gone in a moment, and
+    /// one that has to be killed is not held up a further [`SETTLE`] by
+    /// what it left writing to its stdout, which keeps its stderr open
+    /// until that stdout is closed.
+    #[test]
+    fn a_shutdown_waits_for_stderr_only_as_long_as_the_helper() {
+        let spawner = Spawner {
+            method: "sudo".into(),
+            exe: PathBuf::from("/nonexistent/rustible-bin"),
+            password: None,
+            note: None,
+        };
+        let shutdown = move |script: &str| {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let conn = spawner.connection("root", child);
+            let t0 = Instant::now();
+            conn.shutdown();
+            t0.elapsed()
+        };
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let healthy = shutdown("cat > /dev/null");
+            let killed = shutdown("yes < /dev/null & wait");
+            let _ = done.send((healthy, killed));
+        });
+        let (healthy, killed) = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the shutdowns did not finish within 20s");
+        assert!(healthy < Duration::from_secs(1), "took {healthy:?}");
+        // Two seconds for the helper to go before it is killed, and none
+        // waiting for stderr after.
+        assert!(killed < Duration::from_secs(3), "took {killed:?}");
     }
 
     /// A playbook whose `ssh_user` attribute chose the login has the
