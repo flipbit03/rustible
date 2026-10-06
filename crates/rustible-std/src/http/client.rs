@@ -292,7 +292,8 @@ const BODY_BUF: usize = 64 << 10;
 /// [`Incoming::read`]'s, a timeout named for its deadline and every secret
 /// of the request scrubbed.
 pub(crate) struct Body {
-    /// `None` for a `HEAD`, which has no body.
+    /// `None` for an answer that has no body: to a `HEAD`, or a `1xx`, `204`
+    /// or `304`.
     reader: Option<ureq::BodyReader<'static>>,
     what: String,
     max_bytes: Option<u64>,
@@ -605,35 +606,42 @@ pub(crate) fn scrub_list(
     out
 }
 
-/// `text` as one line of at most `max` bytes: control characters escaped
-/// (`\u{1b}`), every run of whitespace a single space, a cut marked `...`.
+/// `text` as one line: control characters escaped (`\u{1b}`), every run of
+/// whitespace a single space. Only the first `max` bytes of that, then
+/// `...` when it was cut, so the result is at most `max + 3` bytes. The cut
+/// falls before a character or an escape that would not fit whole, and
+/// `text` is read only as far as the cut.
+///
 /// How a message quotes something a server sent, so that a body of any
 /// size makes a short message.
 pub fn one_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut space = false;
+    let mut escape = String::new();
+    let mut utf8 = [0; 4];
     for c in text.chars() {
         if c.is_whitespace() {
             space = !out.is_empty();
             continue;
         }
         if space {
+            if out.len() + 1 > max {
+                return out + "...";
+            }
             out.push(' ');
             space = false;
         }
-        if c.is_control() {
-            out.extend(c.escape_default());
+        let piece = if c.is_control() {
+            escape.clear();
+            escape.extend(c.escape_default());
+            escape.as_str()
         } else {
-            out.push(c);
+            &*c.encode_utf8(&mut utf8)
+        };
+        if out.len() + piece.len() > max {
+            return out + "...";
         }
-    }
-    if out.len() > max {
-        let mut cut = max;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-        out.push_str("...");
+        out.push_str(piece);
     }
     out
 }
@@ -1097,6 +1105,26 @@ mod tests {
         assert_eq!(one_line("abcdef", 3), "abc...");
         assert_eq!(one_line("ééé", 3), "é...", "cut on a character boundary");
         assert_eq!(one_line("", 3), "");
+        assert_eq!(one_line("ab cd", 3), "ab ...");
+        assert_eq!(one_line("abc   ", 3), "abc", "trailing space is no cut");
+    }
+
+    /// An escape goes in whole or not at all, and a huge input is read only
+    /// as far as the cut: the result is at most `max + 3` bytes.
+    #[test]
+    fn one_line_never_halves_an_escape_and_stops_at_the_cut() {
+        assert_eq!(one_line("ab\x1b", 8), "ab\\u{1b}");
+        assert_eq!(one_line("ab\x1bc", 8), "ab\\u{1b}...");
+        for max in 2..8 {
+            assert_eq!(one_line("ab\x1b", max), "ab...", "{max}");
+        }
+        let huge = format!("{}\x1b", "x".repeat(5 << 20));
+        let line = one_line(&huge, 160);
+        assert_eq!(line, format!("{}...", "x".repeat(160)));
+        let huge = "\x1b".repeat(1 << 20);
+        let line = one_line(&huge, 160);
+        assert!(line.len() <= 163, "{}", line.len());
+        assert!(line.ends_with("}..."), "{line}");
     }
 
     /// What a message must never quote, every form of it.
