@@ -13,10 +13,19 @@
 //! target and changes nothing (vision 12). Only `apply` runs `brew install`
 //! and `brew uninstall`.
 //!
-//! Known gaps, both older than the Cellar read: an alias or an old name of a
+//! [`Absent`] removes every installed version of a formula, with `brew
+//! uninstall --force --formula`, so a rack holding two versions is gone after
+//! one run and the second run is `ok`. It refuses a pinned formula, which
+//! `--force` would otherwise remove and unpin without a word: the pin is a
+//! symlink at `<prefix>/var/homebrew/pinned/<name>`, read like the Cellar,
+//! without running `brew`.
+//!
+//! Known gap, older than the Cellar read: an alias or an old name of a
 //! formula never matches its rack, so [`Present`] installs it on every run
-//! (#72); and [`Absent`] runs `brew uninstall` without `--force`, which
-//! leaves a formula with several versions installed (#71).
+//! (#72). The pin check shares it: Homebrew pins under the formula's current
+//! name (`formula_pin.rb` L15), and [`Absent`] looks under the rack's, so a
+//! formula installed under an old name and pinned under its new one is not
+//! seen as pinned.
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -86,36 +95,64 @@ pub struct InstallReport {
 /// Output of [`Absent`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoveReport {
-    /// Formulae this step uninstalled, with the version they had.
+    /// Formulae this step uninstalled, one entry per version removed: a
+    /// formula that had two versions installed appears twice.
     pub removed: Vec<Formula>,
     /// Names that were not installed to begin with.
     pub already_absent: Vec<String>,
 }
 
-/// Pure: the formula one Cellar rack stands for, given the rack's name, the
-/// names of the version directories in it, and the version
-/// `<prefix>/opt/<name>` points at, if it is a link into one. The rule is
-/// `brew list --formula --versions`' (`Formula.racks`): a name starting with
-/// `.` is not a formula, and neither is a rack with no version in it. The
-/// version is a directory's name exactly, revision suffix and all
-/// (`3.6.7_1`). With several installed, it is the one the opt link points
-/// at, which is Homebrew's current version (`list.sh`'s `optlinked_version`,
-/// the first choice of `resolve_default_keg`); an opt link to a version not
-/// in this rack is ignored. Without one, the first in byte order, which is
-/// not version order (`10.0` sorts before `9.1`) but is at least stable.
-fn rack_formula(name: &str, mut versions: Vec<String>, opt: Option<&str>) -> Option<Formula> {
-    if name.starts_with('.') {
-        return None;
+/// One installed formula as the Cellar holds it: the rack's name and every
+/// version directory in it, in byte order. Each version is a directory's name
+/// exactly, revision suffix and all (`3.6.7_1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rack {
+    name: String,
+    versions: Vec<String>,
+}
+
+impl Rack {
+    /// Pure: the rack named `name` with these version directories, if it is
+    /// one. The rule is `brew list --formula --versions`' (`Formula.racks`):
+    /// a name starting with `.` is not a formula, and neither is a rack with
+    /// no version in it.
+    fn new(name: &str, mut versions: Vec<String>) -> Option<Rack> {
+        if name.starts_with('.') || versions.is_empty() {
+            return None;
+        }
+        versions.sort();
+        Some(Rack {
+            name: name.to_string(),
+            versions,
+        })
     }
-    versions.sort();
-    let version = match opt {
-        Some(v) if versions.iter().any(|have| have == v) => v.to_string(),
-        _ => versions.into_iter().next()?,
-    };
-    Some(Formula {
-        name: name.to_string(),
-        version,
-    })
+
+    /// Pure: the formula this rack stands for, given the version
+    /// `<prefix>/opt/<name>` points at, if it is a link into one. With
+    /// several installed, it is the one the opt link points at, which is
+    /// Homebrew's current version (`list.sh`'s `optlinked_version`, the first
+    /// choice of `resolve_default_keg`); an opt link to a version not in this
+    /// rack is ignored. Without one, the first in byte order, which is not
+    /// version order (`10.0` sorts before `9.1`) but is at least stable.
+    fn current(&self, opt: Option<&str>) -> Formula {
+        let version = match opt {
+            Some(v) if self.versions.iter().any(|have| have == v) => v,
+            _ => &self.versions[0],
+        };
+        Formula {
+            name: self.name.clone(),
+            version: version.to_string(),
+        }
+    }
+}
+
+/// Pure: where Homebrew records a pin on `name`, for the `brew` at `brew`:
+/// `HOMEBREW_PINNED_KEGS/<name>`, which is `<prefix>/var/homebrew/pinned`
+/// (`startup/config.rb` L49, `formula_pin.rb` L14-16). The formula is pinned
+/// when that path is a symlink, whether or not it resolves
+/// (`formula_pin.rb` L40-42: `path.symlink?`).
+fn pin_link(brew: &Path, name: &str) -> PathBuf {
+    prefix_of(brew).join("var/homebrew/pinned").join(name)
 }
 
 /// Pure: `p` with `.` and `..` resolved by name, as a shell's `cd` does
@@ -296,28 +333,28 @@ fn opt_version(sys: &System, prefix: &Path, name: &str) -> Result<Option<String>
     Ok(None)
 }
 
-/// Which of `names` brew has installed, read from the Cellar through `sys`
-/// as `brew list --formula --versions` reads it, and without running `brew`
-/// (see the module docs). Only the named racks are read, not the whole
-/// Cellar, which matters when every read is a round trip to a helper under
-/// `ctx.as_user`. A rack is a directory in the Cellar, not itself a symlink,
-/// whose name is the requested name exactly: the Cellar is listed once and
-/// compared by name, because on a case-insensitive volume (APFS by default)
-/// `<Cellar>/Python` answers for `python`. Its versions are the directories
-/// in it, symlinks to directories included (`Pathname#subdirs`).
-fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>> {
-    let brew = Path::new(brew);
+/// The racks of those of `names` brew has installed, every version in each,
+/// read from the Cellar through `sys` as `brew list --formula --versions`
+/// reads it, and without running `brew` (see the module docs). Only the
+/// named racks are read, not the whole Cellar, which matters when every read
+/// is a round trip to a helper under `ctx.as_user`. A rack is a directory in
+/// the Cellar, not itself a symlink, whose name is the requested name
+/// exactly: the Cellar is listed once and compared by name, because on a
+/// case-insensitive volume (APFS by default) `<Cellar>/Python` answers for
+/// `python`. Its versions are the directories in it, symlinks to directories
+/// included (`Pathname#subdirs`).
+fn racks(sys: &System, brew: &Path, names: &[String]) -> Result<Vec<Rack>> {
     let Some(cellar) = cellar(sys, brew)? else {
         return Ok(vec![]);
     };
-    let racks: Vec<String> = sys
+    let entries: Vec<String> = sys
         .read_dir(&cellar)?
         .iter()
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .collect();
-    let mut formulae = vec![];
+    let mut racks = vec![];
     for name in names {
-        if !racks.iter().any(|r| r == name) {
+        if !entries.iter().any(|r| r == name) {
             continue;
         }
         let rack = cellar.join(name);
@@ -332,14 +369,26 @@ fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>>
                 versions.push(v.to_string());
             }
         }
+        racks.extend(Rack::new(name, versions));
+    }
+    Ok(racks)
+}
+
+/// Which of `names` brew has installed, each with its current version: the
+/// [`racks`], and for a rack with several versions the opt link's choice
+/// between them ([`Rack::current`]).
+fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>> {
+    let brew = Path::new(brew);
+    let mut formulae = vec![];
+    for rack in racks(sys, brew, names)? {
         // The opt link only decides between several versions; with one,
         // the answer is the same either way and the reads are saved.
-        let opt = if versions.len() > 1 {
-            opt_version(sys, prefix_of(brew), name)?
+        let opt = if rack.versions.len() > 1 {
+            opt_version(sys, prefix_of(brew), &rack.name)?
         } else {
             None
         };
-        formulae.extend(rack_formula(name, versions, opt.as_deref()));
+        formulae.push(rack.current(opt.as_deref()));
     }
     Ok(formulae)
 }
@@ -456,6 +505,10 @@ impl Op for Present {
 // ---------------------------------------------------------------- Absent
 
 /// Ensure formulae are not installed. `homebrew: state=absent`.
+///
+/// Every installed version of a formula goes, not only the current one. A
+/// pinned formula is refused, in a dry run too, naming the `brew unpin` to
+/// run.
 #[derive(Debug, Clone)]
 pub struct Absent {
     names: Vec<String>,
@@ -463,41 +516,59 @@ pub struct Absent {
 
 impl Absent {
     /// Ensure none of `names` is installed. A name that is not there is `ok`.
+    /// A name given twice counts once.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Absent {
-            names: names.into_iter().map(Into::into).collect(),
+        let mut unique: Vec<String> = vec![];
+        for name in names.into_iter().map(Into::into) {
+            if !unique.contains(&name) {
+                unique.push(name);
+            }
         }
+        Absent { names: unique }
     }
 }
 
 /// What [`Absent`]'s `check` decided: uninstall these formulae, each with
-/// the version the Cellar showed, using the `brew` it found.
+/// every version the Cellar showed, using the `brew` it found.
 #[derive(Debug)]
 pub struct Uninstall {
     brew: String,
-    formulae: Vec<Formula>,
+    racks: Vec<Rack>,
 }
 
 impl Intent for Uninstall {
     fn diff(&self) -> Diff {
         Diff::attrs(
             "brew formulae",
-            self.formulae
+            self.racks
                 .iter()
-                .map(|f| {
+                .map(|rack| {
                     AttrChange::new(
-                        f.name.as_str(),
-                        format!("installed {}", f.version),
+                        rack.name.as_str(),
+                        format!("installed {}", rack.versions.join(", ")),
                         "absent",
                     )
                 })
                 .collect(),
         )
     }
+}
+
+/// One [`Formula`] per version in each rack, in the order `check` read them.
+fn each_version(racks: &[Rack]) -> Vec<Formula> {
+    racks
+        .iter()
+        .flat_map(|rack| {
+            rack.versions.iter().map(|v| Formula {
+                name: rack.name.clone(),
+                version: v.clone(),
+            })
+        })
+        .collect()
 }
 
 impl Op for Absent {
@@ -515,39 +586,68 @@ impl Op for Absent {
                 bail!("brew::Absent: {why}");
             }
         }
-        let have = installed(sys, &brew, &self.names)?;
+        let have = racks(sys, Path::new(&brew), &self.names)?;
+        // `brew uninstall --force` removes a pinned formula and its pin
+        // without a word (`uninstall.rb` L32-43 never asks `pinned?`), so the
+        // refusal brew gives without `--force` is made here instead, in a
+        // dry run too: the pin is the operator's, set on purpose.
+        let mut pinned = vec![];
+        for rack in &have {
+            if is_symlink(sys, &pin_link(Path::new(&brew), &rack.name))? {
+                pinned.push(rack.name.as_str());
+            }
+        }
+        match pinned.as_slice() {
+            [] => {}
+            [name] => bail!(
+                "`{name}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
+                 formula. Run `brew unpin {name}` first, or drop it from the step."
+            ),
+            names => bail!(
+                "{} are pinned (`brew pin`); `brew::Absent` will not remove a pinned formula. \
+                 Run `brew unpin {}` first, or drop them from the step.",
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                names.join(" ")
+            ),
+        }
         let mut report = RemoveReport::default();
+        let mut gone = vec![];
         for name in &self.names {
-            match have.iter().find(|f| &f.name == name) {
-                Some(f) => report.removed.push(f.clone()),
+            match have.iter().find(|rack| &rack.name == name) {
+                Some(rack) => gone.push(rack.clone()),
                 None => report.already_absent.push(name.clone()),
             }
         }
-        if report.removed.is_empty() {
+        if gone.is_empty() {
             return Ok(Plan::Satisfied(report));
         }
-        Ok(Plan::Change(Uninstall {
-            brew,
-            formulae: report.removed,
-        }))
+        Ok(Plan::Change(Uninstall { brew, racks: gone }))
     }
 
     fn apply(&self, sys: &System, intent: Uninstall) -> Result<RemoveReport> {
-        let Uninstall { brew, formulae } = intent;
+        let Uninstall { brew, racks } = intent;
+        // `--force` removes every installed version, not only the current
+        // one (`cmd/uninstall.rb` L45: `:kegs` rather than `:default_kegs`),
+        // which is what `check` read and the diff named. `--formula` keeps a
+        // cask of the same name out of it.
         sys.cmd(&brew)
-            .arg("uninstall")
-            .args(formulae.iter().map(|f| f.name.clone()))
+            .args(["uninstall", "--force", "--formula"])
+            .args(racks.iter().map(|rack| rack.name.clone()))
             .run()?;
         // What went, with the versions `check` read before the uninstall
         // took them.
         let already_absent = self
             .names
             .iter()
-            .filter(|name| !formulae.iter().any(|f| &f.name == *name))
+            .filter(|name| !racks.iter().any(|rack| &rack.name == *name))
             .cloned()
             .collect();
         Ok(RemoveReport {
-            removed: formulae,
+            removed: each_version(&racks),
             already_absent,
         })
     }
@@ -611,6 +711,12 @@ mod tests {
     }
 
     // ---- pure ----
+
+    /// [`Rack::new`] then [`Rack::current`]: the formula one Cellar rack
+    /// stands for.
+    fn rack_formula(name: &str, versions: Vec<String>, opt: Option<&str>) -> Option<Formula> {
+        Rack::new(name, versions).map(|rack| rack.current(opt))
+    }
 
     #[test]
     fn a_rack_is_its_name_and_its_version_directory_verbatim() {
@@ -676,6 +782,28 @@ mod tests {
                 Some(Path::new("/home/linuxbrew/.linuxbrew/Homebrew/bin/brew"))
             )[1],
             PathBuf::from("/home/linuxbrew/.linuxbrew/Cellar")
+        );
+    }
+
+    /// `HOMEBREW_PINNED_KEGS` is under the prefix, which is two directories
+    /// up from `brew` whether or not it is a link (Intel's
+    /// `/usr/local/bin/brew` is one, into `/usr/local/Homebrew`).
+    #[test]
+    fn the_pin_is_under_the_prefix() {
+        assert_eq!(
+            pin_link(Path::new(BREW), "ninvaders"),
+            PathBuf::from("/opt/homebrew/var/homebrew/pinned/ninvaders")
+        );
+        assert_eq!(
+            pin_link(Path::new("/usr/local/bin/brew"), "ninvaders"),
+            PathBuf::from("/usr/local/var/homebrew/pinned/ninvaders")
+        );
+        assert_eq!(
+            pin_link(
+                Path::new("/home/linuxbrew/.linuxbrew/bin/brew"),
+                "ninvaders"
+            ),
+            PathBuf::from("/home/linuxbrew/.linuxbrew/var/homebrew/pinned/ninvaders")
         );
     }
 
@@ -1078,7 +1206,158 @@ mod tests {
         assert_eq!(r.removed[0].version, "3.6.7");
         assert_eq!(r.already_absent, vec!["agg".to_string()]);
         // Only what `check` planned is uninstalled, never the absent `agg`.
-        assert_eq!(fake.argvs(), vec![vec![BREW, "uninstall", "nethack"]]);
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![BREW, "uninstall", "--force", "--formula", "nethack"]]
+        );
+    }
+
+    /// Two versions in one rack: the diff names both, `apply` removes them
+    /// all with `--force` and reports each, and once the rack is gone the op
+    /// is satisfied. Without `--force` brew leaves the older one behind and
+    /// every run reports `changed` (#71).
+    #[test]
+    fn absent_removes_every_installed_version() {
+        let fake = mac_fake(&[("ninvaders", &["0.1.2", "0.1.1"]), ("agg", &["1.7.0"])]);
+        let s = mac_sys(&fake);
+        let op = Absent::new(["ninvaders"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  ninvaders: installed 0.1.1, 0.1.2 -> absent\n"
+        );
+        assert!(fake.argvs().is_empty(), "check ran {:?}", fake.argvs());
+
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![BREW, "uninstall", "--force", "--formula", "ninvaders"]]
+        );
+        let formula = |version: &str| Formula {
+            name: "ninvaders".into(),
+            version: version.into(),
+        };
+        assert_eq!(r.removed, vec![formula("0.1.1"), formula("0.1.2")]);
+        assert!(r.already_absent.is_empty());
+
+        // What `brew uninstall --force` would have left behind.
+        fake.remove_all(Path::new("/opt/homebrew/Cellar/ninvaders"))
+            .unwrap();
+        let Plan::Satisfied(r) = op.check(&s).unwrap() else {
+            panic!("expected satisfied once the rack is gone")
+        };
+        assert_eq!(r.already_absent, vec!["ninvaders".to_string()]);
+    }
+
+    /// A pin is a symlink at `<prefix>/var/homebrew/pinned/<name>`, and
+    /// `--force` would remove the formula through it, so `check` refuses,
+    /// in a real run and a dry run alike, without running `brew`. Brew
+    /// asks `symlink?`, so a pin that no longer resolves still counts.
+    #[test]
+    fn absent_refuses_a_pinned_formula_in_both_modes() {
+        let fake = mac_fake(&[("ninvaders", &["0.1.1"]), ("agg", &["1.7.0"])]);
+        fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
+            .unwrap();
+        fake.symlink(
+            Path::new("../../../Cellar/ninvaders/0.1.1"),
+            Path::new("/opt/homebrew/var/homebrew/pinned/ninvaders"),
+        )
+        .unwrap();
+        fake.symlink(
+            Path::new("../../../Cellar/agg/0.9"),
+            Path::new("/opt/homebrew/var/homebrew/pinned/agg"),
+        )
+        .unwrap();
+        for check_mode in [false, true] {
+            let s = mac_sys(&fake).with_check_mode(check_mode);
+            for name in ["ninvaders", "agg"] {
+                let err = Absent::new([name]).check(&s).unwrap_err().chain();
+                assert!(
+                    err.contains(&format!(
+                        "`{name}` is pinned (`brew pin`); `brew::Absent` will not remove a \
+                         pinned formula. Run `brew unpin {name}` first, or drop it from the step."
+                    )),
+                    "check mode {check_mode}: {err}"
+                );
+            }
+        }
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// Several pinned formulae in one step are refused together, every one
+    /// named, with the one `brew unpin` that clears them all; a formula in
+    /// the step that is not pinned is not named.
+    #[test]
+    fn absent_names_every_pinned_formula_in_one_refusal() {
+        let fake = mac_fake(&[
+            ("ninvaders", &["0.1.1"]),
+            ("agg", &["1.7.0"]),
+            ("cowsay", &["3.04"]),
+        ]);
+        fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
+            .unwrap();
+        for name in ["ninvaders", "agg"] {
+            fake.symlink(
+                &Path::new("../../../Cellar").join(name),
+                &Path::new("/opt/homebrew/var/homebrew/pinned").join(name),
+            )
+            .unwrap();
+        }
+        let err = Absent::new(["ninvaders", "cowsay", "agg"])
+            .check(&mac_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "`ninvaders`, `agg` are pinned (`brew pin`); `brew::Absent` will not remove a \
+                 pinned formula. Run `brew unpin ninvaders agg` first, or drop them from the step."
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("cowsay"), "{err}");
+    }
+
+    /// A name given twice is one formula: once in the diff, once on
+    /// `brew uninstall`'s command line, and once per version in the report.
+    #[test]
+    fn absent_counts_a_repeated_name_once() {
+        let fake = mac_fake(&[("ninvaders", &["0.1.1"])]);
+        let s = mac_sys(&fake);
+        let op = Absent::new(["ninvaders", "agg", "ninvaders", "agg"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  ninvaders: installed 0.1.1 -> absent\n"
+        );
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![BREW, "uninstall", "--force", "--formula", "ninvaders"]]
+        );
+        assert_eq!(r.removed.len(), 1);
+        assert_eq!(r.already_absent, vec!["agg".to_string()]);
+    }
+
+    /// A pin left on a formula that is not installed refuses nothing: there
+    /// is nothing for the step to remove.
+    #[test]
+    fn a_pin_on_a_formula_not_installed_is_satisfied() {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
+            .unwrap();
+        fake.symlink(
+            Path::new("../../../Cellar/ninvaders/0.1.1"),
+            Path::new("/opt/homebrew/var/homebrew/pinned/ninvaders"),
+        )
+        .unwrap();
+        assert!(matches!(
+            Absent::new(["ninvaders"]).check(&mac_sys(&fake)).unwrap(),
+            Plan::Satisfied(_)
+        ));
     }
 
     #[test]
