@@ -65,12 +65,27 @@ pub const QUOTED_LINE_BYTES: usize = 160;
 /// API's `/users/<user>/keys`. The plain-text endpoint needs no token, no JSON
 /// parsing, and is not subject to the API's 60-requests-per-hour anonymous
 /// limit; the API adds only key ids, which nothing here needs.
-#[derive(Debug, Clone)]
+///
+/// A `user:token@` in a [`base_url`](Self::base_url) is masked wherever the
+/// URL is shown: messages, the diff and `{:?}`.
+#[derive(Clone)]
 pub struct UserKeys {
     login: String,
     base: String,
     timeout: Option<Duration>,
     fetch: Option<Arc<dyn Fetch>>,
+}
+
+/// `{:?}` masks the base URL's userinfo.
+impl std::fmt::Debug for UserKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserKeys")
+            .field("login", &self.login)
+            .field("base", &http::mask_url(&self.base))
+            .field("timeout", &self.timeout)
+            .field("fetch", &self.fetch)
+            .finish()
+    }
 }
 
 impl UserKeys {
@@ -180,10 +195,18 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
 
 /// What [`UserKeys`]'s `check` decided: send `GET <url>`. It holds no keys,
 /// because `check` reads none: they are remote state, and `check` contacts
-/// nothing outside the target (vision 12).
-#[derive(Debug)]
+/// nothing outside the target (vision 12). Its `{:?}` masks the URL's
+/// userinfo.
 pub struct KeysLookup {
     url: String,
+}
+
+impl std::fmt::Debug for KeysLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeysLookup")
+            .field("url", &http::mask_url(&self.url))
+            .finish()
+    }
 }
 
 impl Intent for KeysLookup {
@@ -191,7 +214,7 @@ impl Intent for KeysLookup {
     /// both modes: under `--check` it is what the step would send, and in a
     /// real run, next to `ran, unchanged`, what it sent.
     fn diff(&self) -> Diff {
-        Diff::summary(format!("GET {}", self.url))
+        Diff::summary(format!("GET {}", http::mask_url(&self.url)))
     }
 }
 
@@ -225,14 +248,15 @@ impl Op for UserKeys {
     fn apply(&self, _: &System, intent: KeysLookup) -> Result<Vec<PublicKey>> {
         let KeysLookup { url } = intent;
         let resp = self.fetcher().get(&url)?;
+        let shown = http::mask_url(&url);
         match resp.status {
             200 => parse_keys_body(&self.login, &resp.body),
             404 => bail!(
-                "GitHub user `{}` does not exist (404 from {url}); an existing user with no keys \
-                 would return an empty list, not an error",
+                "GitHub user `{}` does not exist (404 from {shown}); an existing user with no \
+                 keys would return an empty list, not an error",
                 self.login
             ),
-            s => bail!("GET {url} returned HTTP {s}"),
+            s => bail!("GET {shown} returned HTTP {s}"),
         }
     }
 
@@ -569,6 +593,50 @@ pub(crate) mod tests {
             .chain();
         assert!(e.contains("HTTP 503"), "{e}");
         assert!(e.contains("https://github.com/flipbit03.keys"), "{e}");
+    }
+
+    /// A `.base_url` with a token in its userinfo, as a GitHub Enterprise
+    /// mirror behind basic auth might take, never shows the token: not in a
+    /// status failure, a diff or a `{:?}`. The request itself still carries
+    /// it.
+    #[test]
+    fn a_token_in_the_base_url_is_masked_everywhere_it_is_shown() {
+        let url = "https://bob:t0ken@ghe.example/flipbit03.keys";
+        for (status, says) in [(404, "does not exist"), (500, "returned HTTP 500")] {
+            let canned = Canned::answering(url, Ok(Response::with_status(status, "")));
+            let op = UserKeys::of("flipbit03")
+                .base_url("https://bob:t0ken@ghe.example/")
+                .fetch_with(canned.clone());
+            let (sys, _) = sys();
+            let Plan::Change(intent) = op.check(&sys).unwrap() else {
+                panic!("UserKeys::check always plans the request")
+            };
+            let shown = [
+                intent.diff().render(),
+                format!("{intent:?}"),
+                // Without the canned fetcher, whose own `{:?}` lists its URLs.
+                format!(
+                    "{:?}",
+                    UserKeys::of("flipbit03").base_url("https://bob:t0ken@ghe.example/")
+                ),
+                op.apply(&sys, intent).unwrap_err().chain(),
+            ];
+            for text in &shown {
+                assert!(!text.contains("t0ken"), "{text}");
+            }
+            assert!(
+                shown[0].contains("GET https://bob:********@ghe.example/flipbit03.keys"),
+                "{}",
+                shown[0]
+            );
+            assert!(shown[3].contains(says), "{}", shown[3]);
+            assert!(
+                shown[3].contains("https://bob:********@ghe.example/flipbit03.keys"),
+                "{}",
+                shown[3]
+            );
+            assert_eq!(canned.asked(), [url]);
+        }
     }
 
     #[test]
