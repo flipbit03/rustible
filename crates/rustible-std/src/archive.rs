@@ -255,7 +255,10 @@ pub struct ExtractReport {
 /// - sits under an earlier symlink member (a write through it would land
 ///   elsewhere);
 /// - is a hard link to something not extracted before it;
-/// - is a device, fifo or other special file.
+/// - is a device, fifo or other special file;
+/// - is a pax sparse member (GNU tar's `--format=posix -S`, or any sparse
+///   file in an archive from macOS's `tar`), which it cannot expand. An
+///   old-GNU sparse member (`--format=gnu -S`) extracts.
 ///
 /// It also refuses when `dest` is missing (vision 6.7: create it with
 /// [`crate::file::Directory`]) or not a directory, when a member's path is
@@ -269,8 +272,10 @@ pub struct ExtractReport {
 /// data from the archive once more (an archive changed since `check` is
 /// refused at the first member that differs), through `sys`: files with
 /// `write_atomic` and the archive's permission
-/// bits, directories with `mkdir_all`, symlinks replaced if present, hard
-/// links as copies of the already-extracted file. Ownership from the
+/// bits, directories with `mkdir_all`, symlinks made under a temporary name
+/// beside their path and renamed over the file or link already there (a
+/// directory there is refused at `check`), hard links as copies of the
+/// already-extracted file. Ownership from the
 /// archive is ignored; `.owner(uid, gid)` sets one owner on every file and
 /// directory (not on symlinks). Modification times are not restored.
 ///
@@ -286,7 +291,9 @@ pub struct ExtractReport {
 /// written; this is for release tarballs, not backups. Under
 /// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
 /// helper in one frame of just under 48 MiB, so the archive and each
-/// member are limited to that size there.
+/// member are limited to that size there. A sparse member's holes are
+/// written as data, not kept as holes, so it takes its full real size on
+/// disk (and in memory while it is written).
 /// Files already in `dest` that the archive does not mention are left
 /// alone.
 #[derive(Debug, Clone)]
@@ -478,13 +485,16 @@ impl Extracted {
                 // The capacity is a hint from the archive's header, as
                 // `check` walked it. A base-256 `size` of 2^62 would ask for
                 // an allocation the process cannot survive (Rust aborts on
-                // allocation failure). `check` already refuses a member
-                // whose claim the stream cannot back, so through `apply`
-                // the size is bounded by the archive `check` read; the clamp
-                // stays as the guard that does not depend on that, pinned by
-                // `write_member_clamps_the_capacity_hint`. Reserve a small
-                // floor and let `read_to_end` grow it against the real
-                // stream.
+                // allocation failure). `check` reads no member data, so
+                // nothing bounds the size here: a plain member whose claim
+                // the stream cannot back is refused at `check`, but a GNU
+                // sparse member's real size comes from its sparse map, and
+                // its reader fills the holes with zeros up to that size
+                // whatever the archive holds. So the clamp is the guard,
+                // pinned by `write_member_clamps_the_capacity_hint`: reserve
+                // a small floor and let `read_to_end` grow it against the
+                // real stream. The whole member is still buffered, holes
+                // included; streaming it is #88.
                 let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
                 let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
@@ -521,10 +531,29 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                if sys.stat(&full)?.is_some() {
-                    sys.remove(&full)?;
-                }
-                sys.symlink(target, &full)?;
+                // Made beside `full` under a temporary name and renamed over
+                // it, so whatever was at `full` stays there until the new link
+                // replaces it: a failed `symlink` leaves it as it was, and a
+                // failed `rename` takes the temporary link away again. The
+                // name is short and random, not `full`'s with a suffix: a
+                // member's name may already be near `NAME_MAX`, and a link
+                // left by a killed run never collides with the next.
+                let tmp = full.with_file_name(format!(".rustible-{}", random_hex()));
+                let link = || -> Result<()> {
+                    sys.symlink(target, &tmp)?;
+                    if let Err(e) = sys.rename(&tmp, &full) {
+                        let _ = sys.remove(&tmp);
+                        return Err(e);
+                    }
+                    Ok(())
+                };
+                link().with_context(|| {
+                    format!(
+                        "linking member `{}` at {}",
+                        m.path.display(),
+                        full.display()
+                    )
+                })?;
                 // `set_mode` and `set_owner` follow links; neither is
                 // applied to a symlink member.
                 chown = false;
@@ -607,6 +636,16 @@ fn zstd_decompress_all(mut input: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Sixteen hex digits nobody can predict, for a temporary name. Each
+/// `RandomState` is keyed from the OS's randomness (per thread, then stepped
+/// for every new one), so hashing nothing with a fresh one is enough and
+/// needs no dependency, as the SDK's backup names do.
+fn random_hex() -> String {
+    use std::hash::BuildHasher;
+    let h = std::collections::hash_map::RandomState::new().hash_one(());
+    format!("{h:016x}")
+}
+
 /// What a member is, for a collision message.
 fn kind_label(kind: &Kind) -> &'static str {
     match kind {
@@ -615,6 +654,99 @@ fn kind_label(kind: &Kind) -> &'static str {
         Kind::Symlink(_) => "symlink",
         Kind::Hardlink(_) => "hard link",
     }
+}
+
+/// What the refusal names when `entry` carries pax sparse records, `None`
+/// when it carries none. GNU tar's `--format=posix -S` writes a sparse
+/// member in three formats (0.0, 0.1, 1.0), each marked by `GNU.sparse.*`
+/// records, and macOS's `tar` (bsdtar) writes 1.0 for any sparse file
+/// unless given `--no-read-sparse`. The `tar` crate expands none of them:
+/// 0.0 lands at the right path with its holes squeezed out, 0.1 and 1.0
+/// under `GNUSparseFile.<pid>/`, and 1.0 with the sparse map as text ahead
+/// of the data. 0.1 and 1.0 put a placeholder in the header and the real name in a
+/// `GNU.sparse.name` record, so that record is the name when there is one,
+/// and `raw`, the member's path, otherwise. A global header (`g`) is no
+/// member, and is named as what it is.
+///
+/// The `tar` crate returns a global header as an entry of its own, so its
+/// records are read as bytes and scanned for `GNU.sparse.`, without
+/// parsing; an `x` header ahead of it, which the crate attaches to it, is
+/// checked parsed, as a member's. A member's own records the crate has already read and offers
+/// only parsed, so a record it cannot parse is skipped, as the crate's own
+/// xattr extraction skips it, unlike GNU tar, which reads some of those
+/// (a sparse record there can go unseen; `[ISSUE-80]` has the shapes).
+/// The crate splits records on newlines, so a value holding one (a binary
+/// xattr, a multi-line `comment`) reads as malformed, and refusing the
+/// archive over it would refuse legal archives.
+fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Option<String>> {
+    if entry.header().entry_type().is_pax_global_extensions() {
+        let mut records = vec![];
+        entry
+            .read_to_end(&mut records)
+            .context("reading the archive's pax global header")?;
+        if records.windows(11).any(|w| w == b"GNU.sparse.") {
+            return Ok(Some(
+                "the archive's pax global header declares GNU sparse records".to_string(),
+            ));
+        }
+        // A held `x` header is attached to the next entry the crate
+        // returns, and a global header counts; GNU tar applies it to the
+        // member after. Read after the global header's own data, which
+        // `pax_extensions` would otherwise read in its place.
+        let attached = entry
+            .pax_extensions()
+            .context("reading the pax header ahead of the archive's global header")?
+            .is_some_and(|r| {
+                r.flatten()
+                    .any(|r| r.key_bytes().starts_with(b"GNU.sparse."))
+            });
+        return Ok(attached.then(|| {
+            "a pax header ahead of the archive's global header declares GNU sparse records"
+                .to_string()
+        }));
+    }
+    let Some(records) = entry
+        .pax_extensions()
+        .with_context(|| format!("member `{}`: reading its pax records", raw.display()))?
+    else {
+        return Ok(None);
+    };
+    let mut sparse = false;
+    let mut name = None;
+    for record in records.flatten() {
+        let key = record.key_bytes();
+        if key.starts_with(b"GNU.sparse.") {
+            sparse = true;
+            if key == b"GNU.sparse.name" {
+                name = Some(String::from_utf8_lossy(record.value_bytes()).into_owned());
+            }
+        }
+    }
+    Ok(sparse.then(|| {
+        let name = name.unwrap_or_else(|| raw.to_string_lossy().into_owned());
+        format!("`{}` is a pax sparse member", quoted(&name))
+    }))
+}
+
+/// `name`, from the archive, made safe to print: control characters
+/// escaped, so it cannot drive the operator's terminal, and cut at 256
+/// bytes with `…` after it.
+fn quoted(name: &str) -> String {
+    const CAP: usize = 256;
+    let mut out = String::new();
+    for c in name.chars() {
+        let piece: String = if c.is_control() {
+            c.escape_default().collect()
+        } else {
+            c.to_string()
+        };
+        if out.len() + piece.len() > CAP {
+            out.push('…');
+            break;
+        }
+        out.push_str(&piece);
+    }
+    out
 }
 
 /// Walk every member in order, validating paths and link targets, without
@@ -629,11 +761,18 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
     let mut claimed: std::collections::BTreeMap<PathBuf, &'static str> =
         std::collections::BTreeMap::new();
     for entry in archive.entries().context("reading tar members")? {
-        let entry = entry.context("reading tar member")?;
+        let mut entry = entry.context("reading tar member")?;
         let raw = entry
             .path()
             .context("a member has a path that is not valid UTF-8")?
             .into_owned();
+        if let Some(what) = pax_sparse(&mut entry, &raw)? {
+            bail!(
+                "{what}, which `archive::Extracted` cannot expand; recreate the archive without \
+                 sparse handling (GNU tar: drop `-S`, or use `--format=gnu`; bsdtar: \
+                 `--no-read-sparse`)"
+            );
+        }
         let normalised = validate_entry_path(&raw).map_err(Error::msg)?;
         let Some(path) = strip_components(&normalised, strip) else {
             out.push(PlannedEntry { raw, member: None });
@@ -914,7 +1053,7 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -1668,11 +1807,415 @@ mod tests {
         assert_eq!(fake.file("/opt/sparse").unwrap().bytes, want);
     }
 
+    // `fixtures/archive/pax-sparse-*.tar` and `gnu-sparse.tar`: one sparse
+    // file, `sparse`, in GNU tar's three pax sparse formats and as an
+    // old-GNU sparse member. 65536 bytes, `hello, sparse\n` at 32768 in a
+    // 4096-byte data block, holes around it. The README beside them has
+    // the commands.
+    const PAX_SPARSE: [(&str, &[u8]); 3] = [
+        (
+            "0.0",
+            include_bytes!("../fixtures/archive/pax-sparse-0.0.tar"),
+        ),
+        (
+            "0.1",
+            include_bytes!("../fixtures/archive/pax-sparse-0.1.tar"),
+        ),
+        (
+            "1.0",
+            include_bytes!("../fixtures/archive/pax-sparse-1.0.tar"),
+        ),
+    ];
+    const GNU_SPARSE: &[u8] = include_bytes!("../fixtures/archive/gnu-sparse.tar");
+
+    /// `tar` cannot expand a pax sparse member, and what it does instead is
+    /// silent: 0.0 lands at the right path with the holes squeezed out,
+    /// 0.1 and 1.0 under `GNUSparseFile.<pid>/`. Each is refused by
+    /// `check`, under `--check` too, naming the member by its real name and
+    /// not the header's `GNUSparseFile.<pid>/sparse` placeholder.
+    #[test]
+    fn pax_sparse_members_are_refused_at_check_naming_the_member() {
+        for (version, archive) in PAX_SPARSE {
+            let (_, sys) = sys_with(archive);
+            for sys in [sys.clone(), sys.with_check_mode(true)] {
+                let err = Extracted::from_path("/tmp/a.tar")
+                    .to("/opt")
+                    .check(&sys)
+                    .unwrap_err()
+                    .chain();
+                assert!(
+                    err.contains(&format!(
+                        "/tmp/a.tar: refusing to extract: `sparse` is a pax sparse member{UNSPARSE}"
+                    )),
+                    "pax sparse {version}: {err}"
+                );
+            }
+        }
+    }
+
+    /// The refusal's tail, after what it names.
+    const UNSPARSE: &str = ", which `archive::Extracted` cannot expand; recreate the archive \
+        without sparse handling (GNU tar: drop `-S`, or use `--format=gnu`; bsdtar: \
+        `--no-read-sparse`)";
+
+    /// One pax record, `"<len> <key>=<value>\n"`, its length counting itself.
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body = key.len() + value.len() + 3;
+        let len = (1..)
+            .map(|digits| digits + body)
+            .find(|n| n.to_string().len() + body == *n)
+            .unwrap();
+        let mut out = format!("{len} {key}=").into_bytes();
+        out.extend_from_slice(value);
+        out.push(b'\n');
+        out
+    }
+
+    /// `records` as a pax header (`x`, or `g` for a global one) ahead of a
+    /// four-byte file `f`.
+    fn tar_with_pax(ty: u8, records: &[Vec<u8>]) -> Vec<u8> {
+        raw_tar(&[
+            ("PaxHeaders/f", ty, &records.concat(), ""),
+            ("f", b'0', b"data", ""),
+        ])
+    }
+
+    /// A pax value may hold a newline (a binary xattr, a multi-line
+    /// `comment`), and `tar`'s record parser splits on newlines, so the
+    /// record reads as malformed. That is not a sparse record and does not
+    /// refuse the archive; `tar` skips it the same way.
+    #[test]
+    fn a_pax_record_whose_value_holds_a_newline_does_not_refuse_the_archive() {
+        let archive = tar_with_pax(
+            b'x',
+            &[
+                pax_record("SCHILY.xattr.security.capability", b"\x01\0\0\x02\n \0\0"),
+                pax_record("comment", b"two\nlines"),
+            ],
+        );
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.content("/opt/f").unwrap(), "data");
+    }
+
+    /// A sparse record after one the parser cannot read is still seen.
+    #[test]
+    fn a_sparse_record_after_a_malformed_one_is_still_refused() {
+        let err = check_err(&tar_with_pax(
+            b'x',
+            &[
+                pax_record("comment", b"two\nlines"),
+                pax_record("GNU.sparse.major", b"1"),
+                pax_record("GNU.sparse.name", b"real/name"),
+            ],
+        ));
+        assert!(
+            err.contains(&format!("`real/name` is a pax sparse member{UNSPARSE}")),
+            "{err}"
+        );
+    }
+
+    /// Sparse records in a global header (`g`) belong to no member, so the
+    /// refusal says where they are rather than naming the header's own
+    /// path as if it were one.
+    #[test]
+    fn sparse_records_in_a_pax_global_header_are_refused_as_such() {
+        let err = check_err(&tar_with_pax(b'g', &[pax_record("GNU.sparse.major", b"1")]));
+        assert!(
+            err.contains(&format!(
+                "the archive's pax global header declares GNU sparse records{UNSPARSE}"
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("PaxHeaders"), "{err}");
+    }
+
+    /// A global header's records are scanned as bytes, not parsed, so a
+    /// sparse record GNU tar reads and the `tar` crate cannot (whitespace
+    /// before its length, or after a value ending in a newline, which ends
+    /// the crate's iteration) is still seen.
+    #[test]
+    fn sparse_records_the_tar_crate_cannot_parse_in_a_global_header_are_refused() {
+        for records in [
+            b"\t23 GNU.sparse.major=1\n".to_vec(),
+            b" 23 GNU.sparse.major=1\n".to_vec(),
+            [
+                pax_record("comment", b"ends\n"),
+                pax_record("GNU.sparse.major", b"1"),
+            ]
+            .concat(),
+        ] {
+            let err = check_err(&tar_with_pax(b'g', &[records]));
+            assert!(
+                err.contains(&format!(
+                    "the archive's pax global header declares GNU sparse records{UNSPARSE}"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// The `tar` crate attaches a held `x` header to the next entry it
+    /// returns, a global header included, where GNU tar applies it to the
+    /// member after. Sparse records arriving that way are refused too,
+    /// whether or not `.strip_components` drops the global header itself.
+    #[test]
+    fn sparse_records_in_a_pax_header_ahead_of_a_global_header_are_refused() {
+        let archive = raw_tar(&[
+            (
+                "PaxHeaders/f",
+                b'x',
+                &pax_record("GNU.sparse.major", b"1"),
+                "",
+            ),
+            (
+                "pax_global_header",
+                b'g',
+                &pax_record("comment", b"hello"),
+                "",
+            ),
+            ("d/f", b'0', b"data", ""),
+        ]);
+        let (_, sys) = sys_with(&archive);
+        for strip in [0, 1] {
+            let err = Extracted::from_path("/tmp/a.tar")
+                .to("/opt")
+                .strip_components(strip)
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains(&format!(
+                    "a pax header ahead of the archive's global header declares GNU sparse \
+                     records{UNSPARSE}"
+                )),
+                "strip {strip}: {err}"
+            );
+        }
+    }
+
+    /// The name comes from the archive: control characters are escaped, so
+    /// it cannot drive a terminal, and it is cut to 256 bytes.
+    #[test]
+    fn a_sparse_name_from_the_archive_is_escaped_and_capped() {
+        let mut name = b"\x1b[31m".to_vec();
+        name.extend(std::iter::repeat_n(b'x', 1000));
+        let err = check_err(&tar_with_pax(b'x', &[pax_record("GNU.sparse.name", &name)]));
+        assert!(!err.contains('\x1b'), "{err:?}");
+        let shown = format!("\\u{{1b}}[31m{}…", "x".repeat(256 - 10));
+        assert!(
+            err.contains(&format!("`{shown}` is a pax sparse member{UNSPARSE}")),
+            "{err}"
+        );
+    }
+
+    /// The same file as GNU tar writes it with `--format=gnu -S`, a type `S`
+    /// member, extracts in full: the holes come back as zeros.
+    #[test]
+    fn a_gnu_tar_old_gnu_sparse_member_extracts() {
+        let (fake, sys) = sys_with(GNU_SPARSE);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 65536 bytes) into /opt"
+        );
+        op.apply(&sys, c).unwrap();
+        let mut want = vec![0u8; 65536];
+        want[32768..32782].copy_from_slice(b"hello, sparse\n");
+        let got = fake.file("/opt/sparse").unwrap();
+        assert_eq!((got.mode, got.bytes == want), (0o644, true));
+    }
+
+    /// What `/opt` holds, read through the `Fake` itself.
+    fn sys_read_dir(fake: &Arc<Fake>) -> Vec<PathBuf> {
+        fake_sys(fake).read_dir("/opt").unwrap()
+    }
+
+    /// A `Fake` that refuses a path with a component over `NAME_MAX` (255
+    /// bytes) as a real filesystem does, and whose `symlink` or `rename`
+    /// fails on request, as a full disk or a read-only mount would. The
+    /// `Fake` does neither, so this wraps it through [`System::new`];
+    /// everything else passes through.
+    struct Failing {
+        fake: Arc<Fake>,
+        symlink: bool,
+        rename: bool,
+    }
+
+    impl Failing {
+        fn sys(fake: &Arc<Fake>, symlink: bool, rename: bool) -> System {
+            let facts = fake_sys(fake).facts().clone();
+            let backend = Arc::new(Failing {
+                fake: fake.clone(),
+                symlink,
+                rename,
+            });
+            System::new(backend, facts, false, Arc::new(Collect::default()))
+        }
+
+        fn refused(what: &str, p: &Path) -> std::io::Error {
+            std::io::Error::other(format!("{what} {}: refused (test)", p.display()))
+        }
+
+        fn name_max(p: &Path) -> std::io::Result<()> {
+            match p.components().any(|c| c.as_os_str().len() > 255) {
+                true => Err(std::io::Error::other("File name too long (os error 36)")),
+                false => Ok(()),
+            }
+        }
+    }
+
+    impl Backend for Failing {
+        fn read(&self, p: &Path) -> std::io::Result<Vec<u8>> {
+            self.fake.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            Self::name_max(p)?;
+            self.fake.write(p, bytes)
+        }
+        fn stat(&self, p: &Path) -> std::io::Result<Option<Stat>> {
+            self.fake.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> std::io::Result<Option<Stat>> {
+            self.fake.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> std::io::Result<()> {
+            Self::name_max(p)?;
+            self.fake.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> std::io::Result<()> {
+            self.fake.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> std::io::Result<()> {
+            self.fake.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.rename {
+                return Err(Self::refused("rename", to));
+            }
+            Self::name_max(from)?;
+            Self::name_max(to)?;
+            self.fake.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> std::io::Result<()> {
+            self.fake.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+            self.fake.set_owner(p, uid, gid)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.fake.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> std::io::Result<()> {
+            if self.symlink {
+                return Err(Self::refused("symlink", link));
+            }
+            Self::name_max(link)?;
+            self.fake.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> std::io::Result<PathBuf> {
+            self.fake.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.fake.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> std::io::Result<Output> {
+            self.fake.spawn(spec)
+        }
+    }
+
+    /// A symlink member is made under a temporary name and renamed over its
+    /// path, so the entry already there, a link or a file, is replaced
+    /// whole or not at all: a failed `symlink` leaves it untouched, and a
+    /// failed `rename` takes the temporary link away and leaves it too.
+    /// Removing the old entry first, as `apply` once did, loses it on
+    /// either failure.
+    #[test]
+    fn a_symlink_member_replaces_the_entry_there_whole_or_not_at_all() {
+        let archive = raw_tar(&[("link", b'2', b"", "new")]);
+        let planted = |old: &str| {
+            let fake = Fake::new()
+                .with_dir("/opt")
+                .with_file("/tmp/a.tar", &archive);
+            Arc::new(match old {
+                "symlink" => fake.with_symlink("/opt/link", "old"),
+                _ => fake.with_file("/opt/link", "old contents"),
+            })
+        };
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        for old in ["symlink", "file"] {
+            for (symlink, rename, refused) in [(true, false, "symlink"), (false, true, "rename")] {
+                let fake = planted(old);
+                let before = fake.file("/opt/link").unwrap();
+                let sys = Failing::sys(&fake, symlink, rename);
+                let c = expect_change(&op, &sys);
+                let err = op.apply(&sys, c).unwrap_err().chain();
+                assert!(
+                    err.contains("linking member `link` at /opt/link: "),
+                    "{err}"
+                );
+                assert!(err.contains(&format!("{refused} ")), "{err}");
+                assert!(err.contains("refused (test)"), "{err}");
+                let after = fake.file("/opt/link").unwrap();
+                assert_eq!(
+                    (after.kind, after.bytes),
+                    (before.kind, before.bytes),
+                    "{old} after a failed {refused}"
+                );
+                assert_eq!(
+                    sys_read_dir(&fake),
+                    vec![PathBuf::from("/opt/link")],
+                    "no temporary link left behind after a failed {refused}"
+                );
+            }
+            // Nothing failing: the link replaces the entry, and only the
+            // link is left.
+            let fake = planted(old);
+            let sys = fake_sys(&fake);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            assert_eq!(sys.read_link("/opt/link").unwrap(), PathBuf::from("new"));
+            assert_eq!(sys_read_dir(&fake), vec![PathBuf::from("/opt/link")]);
+        }
+    }
+
+    /// A symlink member whose name is near `NAME_MAX` still replaces the
+    /// link there: the temporary link has a short name of its own, not the
+    /// member's with a suffix that would push it over.
+    #[test]
+    fn a_symlink_member_with_a_long_name_replaces_the_link_there() {
+        let name = "l".repeat(240);
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        b.append_link(&mut h, &name, "new").unwrap();
+        let archive = b.into_inner().unwrap();
+        let full = PathBuf::from("/opt").join(&name);
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file("/tmp/a.tar", &archive)
+                .with_symlink(&full, "old"),
+        );
+        let sys = Failing::sys(&fake, false, false);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(sys.read_link(&full).unwrap(), PathBuf::from("new"));
+        assert_eq!(sys_read_dir(&fake), vec![full]);
+    }
+
     /// The reservation `write_member` makes from a member's size is clamped,
-    /// whatever the size says. Through `apply` the size is bounded by what
-    /// `check` read, so this calls `write_member` directly with a claim of
-    /// 2^62. Without the clamp this test does not fail, it aborts the whole
-    /// test binary (Rust aborts on allocation failure).
+    /// whatever the size says. Through `apply` only a GNU sparse member can
+    /// carry a size its stream does not back, so this calls `write_member`
+    /// directly with a claim of 2^62. Without the clamp this test does not
+    /// fail, it aborts the whole test binary (Rust aborts on allocation
+    /// failure).
     #[test]
     fn write_member_clamps_the_capacity_hint() {
         let (fake, sys) = sys_with(&raw_tar(&[]));
