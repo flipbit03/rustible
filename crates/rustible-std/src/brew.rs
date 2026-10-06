@@ -20,12 +20,27 @@
 //! symlink at `<prefix>/var/homebrew/pinned/<name>`, read like the Cellar,
 //! without running `brew`.
 //!
-//! Known gap, older than the Cellar read: an alias or an old name of a
-//! formula never matches its rack, so [`Present`] installs it on every run
-//! (#72). The pin check shares it: Homebrew pins under the formula's current
-//! name (`formula_pin.rb` L15), and [`Absent`] looks under the rack's, so a
-//! formula installed under an old name and pinned under its new one is not
-//! seen as pinned.
+//! An alias or an old name (`python3`, `pkg-config`) has no rack of its own.
+//! When no rack has the name, both ops follow `<prefix>/opt/<name>`, which
+//! brew links to the keg for every alias it recorded at install time and the
+//! migrator for an old name; a link that resolves to `<Cellar>/<rack>/<version>`
+//! means the formula is installed as that rack, at that version. Still no
+//! `brew`. Without such a link the name is not installed: [`Present`] runs
+//! `brew install <name>` and the next run finds the link, and [`Absent`] has
+//! nothing to remove. [`Absent`] uninstalls by the rack's name, never the
+//! alias, and looks for the pin under it, which is the formula's current
+//! name.
+//!
+//! Two consequences of reading the link rather than the tap's alias table:
+//!
+//! - Once an alias moves to a newer formula (`python3` from `python@3.12` to
+//!   `python@3.13`), `Present(["python3"])` stays satisfied by the keg the
+//!   link points at, as any installed version satisfies [`Present`].
+//! - Known gap: a name brew did not link — an alias the tap added after the
+//!   formula was installed, or an old name of a formula installed after the
+//!   rename — reads as not installed, and `brew install` of an installed,
+//!   up-to-date formula only warns and links nothing, so [`Present`] reports
+//!   `changed` on every run. Name the formula itself.
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -71,14 +86,13 @@ const BREW_PATHS: [&str; 3] = [
 /// One formula and the version Homebrew has for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Formula {
-    /// The formula name as the op was given it, which is also the name of
-    /// its rack in the Cellar: the two are compared exactly. A tap-qualified
-    /// name is refused (see [`validate_formula`]), and an alias or an old
-    /// name does not match the rack its formula is installed under, so it
-    /// reads as not installed (#72).
+    /// The formula name as the op was given it. That is the name of its rack
+    /// in the Cellar, compared exactly, or an alias or old name that
+    /// `<prefix>/opt/<name>` links to a rack (see the module docs). A
+    /// tap-qualified name is refused (see [`validate_formula`]).
     pub name: String,
-    /// The installed version. Empty for a formula [`Present`] is about to
-    /// install, since brew has not resolved it yet.
+    /// The installed version. Empty when nothing is installed under the
+    /// name after `brew install` ran.
     pub version: String,
 }
 
@@ -127,21 +141,48 @@ impl Rack {
         })
     }
 
-    /// Pure: the formula this rack stands for, given the version
+    /// Pure: this rack's current version, given the version
     /// `<prefix>/opt/<name>` points at, if it is a link into one. With
     /// several installed, it is the one the opt link points at, which is
     /// Homebrew's current version (`list.sh`'s `optlinked_version`, the first
     /// choice of `resolve_default_keg`); an opt link to a version not in this
     /// rack is ignored. Without one, the first in byte order, which is not
     /// version order (`10.0` sorts before `9.1`) but is at least stable.
-    fn current(&self, opt: Option<&str>) -> Formula {
-        let version = match opt {
+    fn current<'a>(&'a self, opt: Option<&'a str>) -> &'a str {
+        match opt {
             Some(v) if self.versions.iter().any(|have| have == v) => v,
             _ => &self.versions[0],
-        };
+        }
+    }
+
+    /// The name to show for this rack when the step was given `name`: the
+    /// rack's own name, or `name (rack)` when an alias or an old name led to
+    /// it.
+    fn label(&self, name: &str) -> String {
+        if name == self.name {
+            name.to_string()
+        } else {
+            format!("{name} ({})", self.name)
+        }
+    }
+}
+
+/// One name a step was given, as the Cellar has it installed: the rack it
+/// resolved to, which is the name itself or, for an alias or an old name,
+/// the rack `<prefix>/opt/<name>` links to, and its current version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Installed {
+    name: String,
+    rack: Rack,
+    version: String,
+}
+
+impl Installed {
+    /// The formula as a report names it: by the name the step was given.
+    fn formula(&self) -> Formula {
         Formula {
             name: self.name.clone(),
-            version: version.to_string(),
+            version: self.version.clone(),
         }
     }
 }
@@ -308,10 +349,11 @@ fn cellar(sys: &System, brew: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// The version directory `<prefix>/opt/<name>` resolves to, when it is a
-/// symlink to a directory (`list.sh`: `-L` and `-d`), followed hop by hop
-/// through `sys` as `realpath` would. `None` otherwise.
-fn opt_version(sys: &System, prefix: &Path, name: &str) -> Result<Option<String>> {
+/// The directory `<prefix>/opt/<name>` resolves to, when it is a symlink to
+/// a directory (`list.sh`: `-L` and `-d`), followed hop by hop through `sys`
+/// as `realpath` would. `None` otherwise, a link that no longer resolves
+/// included.
+fn opt_target(sys: &System, prefix: &Path, name: &str) -> Result<Option<PathBuf>> {
     let mut cur = prefix.join("opt").join(name);
     if !is_symlink(sys, &cur)? {
         return Ok(None);
@@ -321,10 +363,7 @@ fn opt_version(sys: &System, prefix: &Path, name: &str) -> Result<Option<String>
     // (a loop) is not a directory.
     for _ in 0..40 {
         if !is_symlink(sys, &cur)? {
-            if !is_dir(sys, &cur)? {
-                return Ok(None);
-            }
-            return Ok(cur.file_name().and_then(|n| n.to_str()).map(str::to_string));
+            return Ok(is_dir(sys, &cur)?.then_some(cur));
         }
         let target = sys.read_link(&cur)?;
         let dir = cur.parent().unwrap_or(Path::new("/"));
@@ -333,17 +372,48 @@ fn opt_version(sys: &System, prefix: &Path, name: &str) -> Result<Option<String>
     Ok(None)
 }
 
-/// The racks of those of `names` brew has installed, every version in each,
-/// read from the Cellar through `sys` as `brew list --formula --versions`
-/// reads it, and without running `brew` (see the module docs). Only the
-/// named racks are read, not the whole Cellar, which matters when every read
-/// is a round trip to a helper under `ctx.as_user`. A rack is a directory in
-/// the Cellar, not itself a symlink, whose name is the requested name
-/// exactly: the Cellar is listed once and compared by name, because on a
-/// case-insensitive volume (APFS by default) `<Cellar>/Python` answers for
-/// `python`. Its versions are the directories in it, symlinks to directories
-/// included (`Pathname#subdirs`).
-fn racks(sys: &System, brew: &Path, names: &[String]) -> Result<Vec<Rack>> {
+/// The rack `name` in the Cellar whose entries are `entries`, if it is one:
+/// a directory, not itself a symlink, whose name is `name` exactly. The
+/// Cellar is listed once and compared by name, because on a case-insensitive
+/// volume (APFS by default) `<Cellar>/Python` answers for `python`. Its
+/// versions are the directories in it, symlinks to directories included
+/// (`Pathname#subdirs`).
+fn read_rack(sys: &System, cellar: &Path, entries: &[String], name: &str) -> Result<Option<Rack>> {
+    if !entries.iter().any(|r| r == name) {
+        return Ok(None);
+    }
+    let rack = cellar.join(name);
+    if is_symlink(sys, &rack)? || !is_dir(sys, &rack)? {
+        return Ok(None);
+    }
+    let mut versions = vec![];
+    for entry in sys.read_dir(&rack)? {
+        if is_dir(sys, &entry)?
+            && let Some(v) = entry.file_name().and_then(|n| n.to_str())
+        {
+            versions.push(v.to_string());
+        }
+    }
+    Ok(Rack::new(name, versions))
+}
+
+/// Which of `names` brew has installed, in the order given, each with its
+/// rack, every version in it, and its current version. Read from the Cellar
+/// through `sys` as `brew list --formula --versions` reads it, and without
+/// running `brew` (see the module docs). Only the named racks are read, not
+/// the whole Cellar, which matters when every read is a round trip to a
+/// helper under `ctx.as_user`.
+///
+/// A name is installed when its own rack is ([`read_rack`]); for a rack
+/// with several versions the opt link chooses between them
+/// ([`Rack::current`]). Otherwise, when `<prefix>/opt/<name>` resolves to
+/// `<Cellar>/<rack>/<version>`, a version that rack has, the name is an alias
+/// or an old name installed as that rack at that version: brew links
+/// `opt/<alias>` for every alias in the keg's receipt (`keg.rb` `optlink`)
+/// and `opt/<oldname>` when it migrates a rack (`migrator.rb`
+/// `link_oldname_opt`).
+fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Installed>> {
+    let brew = Path::new(brew);
     let Some(cellar) = cellar(sys, brew)? else {
         return Ok(vec![]);
     };
@@ -352,45 +422,52 @@ fn racks(sys: &System, brew: &Path, names: &[String]) -> Result<Vec<Rack>> {
         .iter()
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .collect();
-    let mut racks = vec![];
+    let prefix = prefix_of(brew);
+    let file_name = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_string);
+    let mut found = vec![];
     for name in names {
-        if !entries.iter().any(|r| r == name) {
+        if let Some(rack) = read_rack(sys, &cellar, &entries, name)? {
+            // The opt link only decides between several versions; with one,
+            // the answer is the same either way and the reads are saved.
+            let opt = if rack.versions.len() > 1 {
+                opt_target(sys, prefix, name)?
+                    .as_deref()
+                    .and_then(file_name)
+            } else {
+                None
+            };
+            let version = rack.current(opt.as_deref()).to_string();
+            found.push(Installed {
+                name: name.clone(),
+                rack,
+                version,
+            });
             continue;
         }
-        let rack = cellar.join(name);
-        if is_symlink(sys, &rack)? || !is_dir(sys, &rack)? {
+        let Some(target) = opt_target(sys, prefix, name)? else {
             continue;
-        }
-        let mut versions = vec![];
-        for entry in sys.read_dir(&rack)? {
-            if is_dir(sys, &entry)?
-                && let Some(v) = entry.file_name().and_then(|n| n.to_str())
-            {
-                versions.push(v.to_string());
-            }
-        }
-        racks.extend(Rack::new(name, versions));
-    }
-    Ok(racks)
-}
-
-/// Which of `names` brew has installed, each with its current version: the
-/// [`racks`], and for a rack with several versions the opt link's choice
-/// between them ([`Rack::current`]).
-fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>> {
-    let brew = Path::new(brew);
-    let mut formulae = vec![];
-    for rack in racks(sys, brew, names)? {
-        // The opt link only decides between several versions; with one,
-        // the answer is the same either way and the reads are saved.
-        let opt = if rack.versions.len() > 1 {
-            opt_version(sys, prefix_of(brew), &rack.name)?
-        } else {
-            None
         };
-        formulae.push(rack.current(opt.as_deref()));
+        let Some(rack_dir) = target.parent() else {
+            continue;
+        };
+        if rack_dir.parent() != Some(cellar.as_path()) {
+            continue;
+        }
+        let (Some(rack_name), Some(version)) = (file_name(rack_dir), file_name(&target)) else {
+            continue;
+        };
+        let Some(rack) = read_rack(sys, &cellar, &entries, &rack_name)? else {
+            continue;
+        };
+        if rack.versions.contains(&version) {
+            found.push(Installed {
+                name: name.clone(),
+                rack,
+                version,
+            });
+        }
     }
-    Ok(formulae)
+    Ok(found)
 }
 
 // ---------------------------------------------------------------- Present
@@ -406,15 +483,31 @@ pub struct Present {
 
 impl Present {
     /// Ensure every one of `names` is installed, leaving the version to brew.
+    /// A name given twice counts once.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         Present {
-            names: names.into_iter().map(Into::into).collect(),
+            names: unique(names),
         }
     }
+}
+
+/// `names` with every repeat after the first dropped, in the order given.
+fn unique<I, S>(names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut unique: Vec<String> = vec![];
+    for name in names.into_iter().map(Into::into) {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
 }
 
 /// What [`Present`]'s `check` decided: install these formulae, which brew
@@ -457,7 +550,7 @@ impl Op for Present {
         let mut missing = vec![];
         for name in &self.names {
             match have.iter().find(|f| &f.name == name) {
-                Some(f) => report.already_present.push(f.clone()),
+                Some(f) => report.already_present.push(f.formula()),
                 None => missing.push(name.clone()),
             }
         }
@@ -480,14 +573,16 @@ impl Op for Present {
             .arg("install")
             .args(missing.iter().cloned())
             .run()?;
-        // Read the versions back so the report names what actually landed.
+        // Read the versions back so the report names what actually landed,
+        // through the same resolution as `check`, so an alias installed by
+        // its alias reads back through the link brew just made.
         let now = installed(sys, &brew, &self.names)?;
         let mut report = InstallReport::default();
         for name in &self.names {
             let f = now
                 .iter()
                 .find(|f| &f.name == name)
-                .cloned()
+                .map(Installed::formula)
                 .unwrap_or_else(|| Formula {
                     name: name.clone(),
                     version: String::new(),
@@ -506,8 +601,9 @@ impl Op for Present {
 
 /// Ensure formulae are not installed. `homebrew: state=absent`.
 ///
-/// Every installed version of a formula goes, not only the current one. A
-/// pinned formula is refused, in a dry run too, naming the `brew unpin` to
+/// Every installed version of a formula goes, not only the current one. An
+/// alias or an old name removes the rack it resolves to, by the rack's name.
+/// A pinned formula is refused, in a dry run too, naming the `brew unpin` to
 /// run.
 #[derive(Debug, Clone)]
 pub struct Absent {
@@ -516,40 +612,47 @@ pub struct Absent {
 
 impl Absent {
     /// Ensure none of `names` is installed. A name that is not there is `ok`.
-    /// A name given twice counts once.
+    /// A name given twice counts once, and so do two names for one formula
+    /// (an alias and the formula's own name): under the first.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut unique: Vec<String> = vec![];
-        for name in names.into_iter().map(Into::into) {
-            if !unique.contains(&name) {
-                unique.push(name);
-            }
+        Absent {
+            names: unique(names),
         }
-        Absent { names: unique }
     }
 }
 
-/// What [`Absent`]'s `check` decided: uninstall these formulae, each with
-/// every version the Cellar showed, using the `brew` it found.
+/// One formula [`Absent`] will remove: the name the step gave it and the
+/// rack that name resolved to, with every version the Cellar showed.
+#[derive(Debug)]
+struct Removal {
+    name: String,
+    rack: Rack,
+}
+
+/// What [`Absent`]'s `check` decided: uninstall these racks, each with every
+/// version the Cellar showed, using the `brew` it found; and which names
+/// were not installed to begin with.
 #[derive(Debug)]
 pub struct Uninstall {
     brew: String,
-    racks: Vec<Rack>,
+    removals: Vec<Removal>,
+    already_absent: Vec<String>,
 }
 
 impl Intent for Uninstall {
     fn diff(&self) -> Diff {
         Diff::attrs(
             "brew formulae",
-            self.racks
+            self.removals
                 .iter()
-                .map(|rack| {
+                .map(|r| {
                     AttrChange::new(
-                        rack.name.as_str(),
-                        format!("installed {}", rack.versions.join(", ")),
+                        r.rack.label(&r.name),
+                        format!("installed {}", r.rack.versions.join(", ")),
                         "absent",
                     )
                 })
@@ -558,13 +661,14 @@ impl Intent for Uninstall {
     }
 }
 
-/// One [`Formula`] per version in each rack, in the order `check` read them.
-fn each_version(racks: &[Rack]) -> Vec<Formula> {
-    racks
+/// One [`Formula`] per version in each rack, named as the step named it, in
+/// the order `check` read them.
+fn each_version(removals: &[Removal]) -> Vec<Formula> {
+    removals
         .iter()
-        .flat_map(|rack| {
-            rack.versions.iter().map(|v| Formula {
-                name: rack.name.clone(),
+        .flat_map(|r| {
+            r.rack.versions.iter().map(|v| Formula {
+                name: r.name.clone(),
                 version: v.clone(),
             })
         })
@@ -586,68 +690,90 @@ impl Op for Absent {
                 bail!("brew::Absent: {why}");
             }
         }
-        let have = racks(sys, Path::new(&brew), &self.names)?;
+        let have = installed(sys, &brew, &self.names)?;
+        let mut removals: Vec<Removal> = vec![];
+        let mut already_absent = vec![];
+        for name in &self.names {
+            match have.iter().find(|f| &f.name == name) {
+                // A second name for a rack already planned is the same
+                // formula; `brew uninstall` is given each rack once.
+                Some(f) if removals.iter().any(|r| r.rack.name == f.rack.name) => {}
+                Some(f) => removals.push(Removal {
+                    name: name.clone(),
+                    rack: f.rack.clone(),
+                }),
+                None => already_absent.push(name.clone()),
+            }
+        }
         // `brew uninstall --force` removes a pinned formula and its pin
         // without a word (`uninstall.rb` L32-43 never asks `pinned?`), so the
         // refusal brew gives without `--force` is made here instead, in a
-        // dry run too: the pin is the operator's, set on purpose.
+        // dry run too: the pin is the operator's, set on purpose. Homebrew
+        // pins under the formula's current name (`formula_pin.rb` L15), which
+        // is the rack's: a pin is made only where `<Cellar>/<name>/<version>`
+        // exists (L22), and the migrator renames the pin with the rack
+        // (`migrator.rb` `repin`). So the pin is looked for under the rack an
+        // alias or an old name resolved to, never under the alias.
         let mut pinned = vec![];
-        for rack in &have {
-            if is_symlink(sys, &pin_link(Path::new(&brew), &rack.name))? {
-                pinned.push(rack.name.as_str());
+        for r in &removals {
+            if is_symlink(sys, &pin_link(Path::new(&brew), &r.rack.name))? {
+                pinned.push(r);
             }
         }
         match pinned.as_slice() {
             [] => {}
-            [name] => bail!(
-                "`{name}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
-                 formula. Run `brew unpin {name}` first, or drop it from the step."
+            [r] => bail!(
+                "`{}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
+                 formula. Run `brew unpin {}` first, or drop it from the step.",
+                r.rack.label(&r.name),
+                r.rack.name
             ),
-            names => bail!(
+            rs => bail!(
                 "{} are pinned (`brew pin`); `brew::Absent` will not remove a pinned formula. \
                  Run `brew unpin {}` first, or drop them from the step.",
-                names
-                    .iter()
-                    .map(|n| format!("`{n}`"))
+                rs.iter()
+                    .map(|r| format!("`{}`", r.rack.label(&r.name)))
                     .collect::<Vec<_>>()
                     .join(", "),
-                names.join(" ")
+                rs.iter()
+                    .map(|r| r.rack.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
         }
-        let mut report = RemoveReport::default();
-        let mut gone = vec![];
-        for name in &self.names {
-            match have.iter().find(|rack| &rack.name == name) {
-                Some(rack) => gone.push(rack.clone()),
-                None => report.already_absent.push(name.clone()),
-            }
+        if removals.is_empty() {
+            return Ok(Plan::Satisfied(RemoveReport {
+                removed: vec![],
+                already_absent,
+            }));
         }
-        if gone.is_empty() {
-            return Ok(Plan::Satisfied(report));
-        }
-        Ok(Plan::Change(Uninstall { brew, racks: gone }))
+        Ok(Plan::Change(Uninstall {
+            brew,
+            removals,
+            already_absent,
+        }))
     }
 
     fn apply(&self, sys: &System, intent: Uninstall) -> Result<RemoveReport> {
-        let Uninstall { brew, racks } = intent;
+        let Uninstall {
+            brew,
+            removals,
+            already_absent,
+        } = intent;
         // `--force` removes every installed version, not only the current
         // one (`cmd/uninstall.rb` L45: `:kegs` rather than `:default_kegs`),
         // which is what `check` read and the diff named. `--formula` keeps a
-        // cask of the same name out of it.
+        // cask of the same name out of it. The rack's name, never an alias:
+        // brew resolves an alias through the tap's current table, which may
+        // name a newer formula that is not installed ("No such keg").
         sys.cmd(&brew)
             .args(["uninstall", "--force", "--formula"])
-            .args(racks.iter().map(|rack| rack.name.clone()))
+            .args(removals.iter().map(|r| r.rack.name.clone()))
             .run()?;
         // What went, with the versions `check` read before the uninstall
         // took them.
-        let already_absent = self
-            .names
-            .iter()
-            .filter(|name| !racks.iter().any(|rack| &rack.name == *name))
-            .cloned()
-            .collect();
         Ok(RemoveReport {
-            removed: each_version(&racks),
+            removed: each_version(&removals),
             already_absent,
         })
     }
@@ -710,12 +836,23 @@ mod tests {
         System::fake(fake.clone(), Arc::new(Collect::default())).with_facts(mac_facts())
     }
 
+    /// [`installed`], as the reports name each formula.
+    fn formulae(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Formula>> {
+        Ok(installed(sys, brew, names)?
+            .iter()
+            .map(Installed::formula)
+            .collect())
+    }
+
     // ---- pure ----
 
     /// [`Rack::new`] then [`Rack::current`]: the formula one Cellar rack
     /// stands for.
     fn rack_formula(name: &str, versions: Vec<String>, opt: Option<&str>) -> Option<Formula> {
-        Rack::new(name, versions).map(|rack| rack.current(opt))
+        Rack::new(name, versions).map(|rack| Formula {
+            name: rack.name.clone(),
+            version: rack.current(opt).to_string(),
+        })
     }
 
     #[test]
@@ -859,7 +996,7 @@ mod tests {
         let names: Vec<String> = ["agg", "empty", ".hidden", "onlyfile", "linked", "stray"]
             .map(String::from)
             .into();
-        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        let installed = formulae(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(
             installed,
             vec![Formula {
@@ -875,7 +1012,7 @@ mod tests {
     fn only_the_named_racks_are_read() {
         let fake = mac_fake(&[("agg", &["1.7.0"]), ("nethack", &["3.6.7"])]);
         let names = vec!["nethack".to_string()];
-        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        let installed = formulae(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].name, "nethack");
     }
@@ -891,7 +1028,7 @@ mod tests {
             Path::new("/opt/homebrew/Cellar/agg/1.7.0"),
         )
         .unwrap();
-        let installed = installed(&mac_sys(&fake), BREW, &["agg".to_string()]).unwrap();
+        let installed = formulae(&mac_sys(&fake), BREW, &["agg".to_string()]).unwrap();
         assert_eq!(installed[0].version, "1.7.0");
     }
 
@@ -915,7 +1052,7 @@ mod tests {
             fake.symlink(Path::new(b), Path::new(a)).unwrap();
         }
         let names = vec!["agg".to_string(), "loop".to_string()];
-        let installed = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        let installed = formulae(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "1.7.0");
     }
@@ -932,12 +1069,12 @@ mod tests {
         )
         .unwrap();
         let names = vec!["python@3".to_string()];
-        let found = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        let found = formulae(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(found[0].version, "3.9.1");
 
         // No opt link: the first in byte order.
         let fake = mac_fake(&[("python@3", &["3.9.1", "3.10.0"])]);
-        let found = installed(&mac_sys(&fake), BREW, &names).unwrap();
+        let found = formulae(&mac_sys(&fake), BREW, &names).unwrap();
         assert_eq!(found[0].version, "3.10.0");
     }
 
@@ -957,8 +1094,7 @@ mod tests {
         );
         plant(&fake, "/usr/local/Cellar", &[("nethack", &["3.6.6"])]);
         let names = vec!["nethack".to_string()];
-        let installed =
-            installed(&mac_sys(&Arc::new(fake)), "/usr/local/bin/brew", &names).unwrap();
+        let installed = formulae(&mac_sys(&Arc::new(fake)), "/usr/local/bin/brew", &names).unwrap();
         assert_eq!(installed[0].version, "3.6.7");
     }
 
@@ -972,7 +1108,7 @@ mod tests {
                 .with_file(CELLAR, "not a directory"),
         );
         let names = vec!["nethack".to_string()];
-        assert!(installed(&mac_sys(&fake), BREW, &names).unwrap().is_empty());
+        assert!(formulae(&mac_sys(&fake), BREW, &names).unwrap().is_empty());
     }
 
     /// The same two rules against the real filesystem, through the `Local`
@@ -1006,7 +1142,7 @@ mod tests {
         // catch a dropped exact-name compare.
         let case_insensitive = s.exists(root.join("Cellar/python")).unwrap();
         let names = ["agg", "loop", "python"].map(String::from).to_vec();
-        let found = installed(&s, brew.to_str().unwrap(), &names);
+        let found = formulae(&s, brew.to_str().unwrap(), &names);
         let _ = s.remove_all(&root);
         if cfg!(target_os = "macos") {
             assert!(
@@ -1379,5 +1515,318 @@ mod tests {
         let err = Present::new(["nethack"]).check(&s).unwrap_err().chain();
         assert!(err.contains("/opt/homebrew/bin/brew"), "{err}");
         assert!(err.contains("/home/linuxbrew"), "{err}");
+    }
+
+    // ---- Fake: aliases and old names (#72) ----
+
+    /// Plant `<prefix>/opt/<name> -> <target>`, as brew writes it: relative.
+    fn opt_link(fake: &Fake, name: &str, target: &str) {
+        fake.mkdir_all(Path::new("/opt/homebrew/opt")).unwrap();
+        fake.symlink(
+            Path::new(target),
+            &Path::new("/opt/homebrew/opt").join(name),
+        )
+        .unwrap();
+    }
+
+    /// Plant a pin on `name`, the way `brew pin` writes it.
+    fn pin(fake: &Fake, name: &str, version: &str) {
+        fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
+            .unwrap();
+        fake.symlink(
+            &Path::new("../../../Cellar").join(name).join(version),
+            &Path::new("/opt/homebrew/var/homebrew/pinned").join(name),
+        )
+        .unwrap();
+    }
+
+    /// An alias has no rack, but brew links `opt/<alias>` to the keg: the
+    /// formula is installed at the version the link resolves to, which need
+    /// not be the first in the rack, and the report names the alias. No
+    /// `brew` runs.
+    #[test]
+    fn an_installed_alias_is_satisfied_through_its_opt_link() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.10", "3.12.4"])]);
+        opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        let Plan::Satisfied(r) = Present::new(["python3"]).check(&mac_sys(&fake)).unwrap() else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(
+            r.already_present,
+            vec![Formula {
+                name: "python3".into(),
+                version: "3.12.4".into()
+            }]
+        );
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// An old name, as the migrator leaves it: `<Cellar>/<old>` a symlink to
+    /// the renamed rack, which is not a rack itself, and `opt/<old>` linked
+    /// to the keg in the new one (`migrator.rb` `link_oldname_cellar`,
+    /// `link_oldname_opt`).
+    #[test]
+    fn an_old_name_with_a_symlinked_rack_and_its_opt_link_is_satisfied() {
+        let fake = mac_fake(&[("libmpdec-new", &["4.0.1"])]);
+        fake.symlink(
+            Path::new("libmpdec-new"),
+            Path::new("/opt/homebrew/Cellar/libmpdec-old"),
+        )
+        .unwrap();
+        opt_link(&fake, "libmpdec-old", "../Cellar/libmpdec-new/4.0.1");
+        let Plan::Satisfied(r) = Present::new(["libmpdec-old"])
+            .check(&mac_sys(&fake))
+            .unwrap()
+        else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(r.already_present[0].name, "libmpdec-old");
+        assert_eq!(r.already_present[0].version, "4.0.1");
+    }
+
+    /// An alias with no link is missing: `brew install <alias>` runs, by the
+    /// name the step was given, and the version read back afterwards comes
+    /// through the link the install made. The next `check` is satisfied.
+    #[test]
+    fn an_uninstalled_alias_installs_by_its_name_and_reads_back_through_the_link() {
+        let fake = mac_fake(&[]);
+        let s = mac_sys(&fake);
+        let op = Present::new(["6tunnel"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  6tunnel: absent -> installed\n"
+        );
+        // What `brew install 6tunnel` leaves behind, planted before `apply`
+        // because the Fake's `brew` writes nothing.
+        plant(&fake, CELLAR, &[("sixtunnel", &["0.14"])]);
+        opt_link(&fake, "6tunnel", "../Cellar/sixtunnel/0.14");
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(fake.argvs(), vec![vec![BREW, "install", "6tunnel"]]);
+        assert_eq!(
+            r.installed,
+            vec![Formula {
+                name: "6tunnel".into(),
+                version: "0.14".into()
+            }]
+        );
+        assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// An opt link that does not resolve to a version directory of a rack in
+    /// this Cellar is no installation: a link left dangling, one to a
+    /// version the rack no longer has, one out of the Cellar altogether, and
+    /// one to a hidden rack.
+    #[test]
+    fn an_opt_link_that_does_not_reach_a_rack_is_not_installed() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.4"]), (".hidden", &["1.0"])]);
+        fake.mkdir_all(Path::new("/elsewhere/python@3.12/3.12.4"))
+            .unwrap();
+        for (name, target) in [
+            ("gone", "../Cellar/gone/1.0"),
+            ("old-version", "../Cellar/python@3.12/3.12.3"),
+            ("outside", "/elsewhere/python@3.12/3.12.4"),
+            ("hidden", "../Cellar/.hidden/1.0"),
+        ] {
+            opt_link(&fake, name, target);
+            let s = mac_sys(&fake);
+            assert!(
+                Present::new([name]).check(&s).unwrap().is_change(),
+                "{name} -> {target}"
+            );
+            assert!(
+                matches!(Absent::new([name]).check(&s).unwrap(), Plan::Satisfied(_)),
+                "{name} -> {target}"
+            );
+        }
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// A rack named exactly as asked wins over an opt link of the same name
+    /// into another rack, for both ops.
+    #[test]
+    fn a_rack_matching_the_name_wins_over_an_opt_link() {
+        let fake = mac_fake(&[("python3", &["1.0"]), ("python@3.12", &["3.12.4"])]);
+        opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        let s = mac_sys(&fake);
+        let Plan::Satisfied(r) = Present::new(["python3"]).check(&s).unwrap() else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(r.already_present[0].version, "1.0");
+        let Plan::Change(c) = Absent::new(["python3"]).check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  python3: installed 1.0 -> absent\n"
+        );
+    }
+
+    /// A name given twice is one formula: once in the diff and once on
+    /// `brew install`'s command line, and once in the report.
+    #[test]
+    fn present_counts_a_repeated_name_once() {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        let s = mac_sys(&fake);
+        let op = Present::new(["ninvaders", "agg", "ninvaders", "agg"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  ninvaders: absent -> installed\n"
+        );
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(fake.argvs(), vec![vec![BREW, "install", "ninvaders"]]);
+        assert_eq!(r.installed.len(), 1);
+        assert_eq!(r.already_present.len(), 1);
+    }
+
+    /// `Absent` of an installed alias plans the rack it resolves to, with
+    /// every version in it, names both in the diff, and uninstalls by the
+    /// rack's name: `brew uninstall <alias>` would resolve the alias through
+    /// the tap's current table, which may name another formula. The report
+    /// names the alias, as the step did. Once the rack and the link are
+    /// gone, the op is satisfied.
+    #[test]
+    fn absent_of_an_installed_alias_removes_its_rack_by_the_racks_name() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.4", "3.12.3"])]);
+        opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        let s = mac_sys(&fake);
+        let op = Absent::new(["python3"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  python3 (python@3.12): installed 3.12.3, 3.12.4 -> absent\n"
+        );
+        assert!(fake.argvs().is_empty(), "check ran {:?}", fake.argvs());
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                BREW,
+                "uninstall",
+                "--force",
+                "--formula",
+                "python@3.12"
+            ]]
+        );
+        let formula = |version: &str| Formula {
+            name: "python3".into(),
+            version: version.into(),
+        };
+        assert_eq!(r.removed, vec![formula("3.12.3"), formula("3.12.4")]);
+        assert!(r.already_absent.is_empty());
+
+        // What `brew uninstall --force` leaves: no rack, and no alias link
+        // (`keg.rb` `remove_old_aliases`).
+        fake.remove_all(Path::new("/opt/homebrew/Cellar/python@3.12"))
+            .unwrap();
+        fake.remove_all(Path::new("/opt/homebrew/opt/python3"))
+            .unwrap();
+        let Plan::Satisfied(r) = op.check(&s).unwrap() else {
+            panic!("expected satisfied once the rack is gone")
+        };
+        assert_eq!(r.already_absent, vec!["python3".to_string()]);
+    }
+
+    /// An alias brew has not linked is not installed, so `Absent` of it has
+    /// nothing to do, even with its formula installed under another name.
+    #[test]
+    fn absent_of_an_alias_that_is_not_installed_is_satisfied() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
+        let Plan::Satisfied(r) = Absent::new(["python3"]).check(&mac_sys(&fake)).unwrap() else {
+            panic!("expected satisfied")
+        };
+        assert_eq!(r.already_absent, vec!["python3".to_string()]);
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// An alias and its formula's own name in one step are one formula: one
+    /// line in the diff, under the first name, and the rack once on `brew
+    /// uninstall`'s command line.
+    #[test]
+    fn absent_counts_an_alias_and_its_formula_once() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
+        opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        let s = mac_sys(&fake);
+        let op = Absent::new(["python3", "python@3.12"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  python3 (python@3.12): installed 3.12.4 -> absent\n"
+        );
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![
+                BREW,
+                "uninstall",
+                "--force",
+                "--formula",
+                "python@3.12"
+            ]]
+        );
+        assert_eq!(r.removed.len(), 1);
+        assert!(r.already_absent.is_empty());
+    }
+
+    /// Homebrew pins under the formula's name, which is its rack's, never an
+    /// alias's (`formula_pin.rb` L15, L22). An alias resolved to a pinned
+    /// rack is refused, naming both and the `brew unpin` of the rack.
+    #[test]
+    fn absent_refuses_an_alias_pinned_under_its_formula() {
+        let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
+        opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        pin(&fake, "python@3.12", "3.12.4");
+        for check_mode in [false, true] {
+            let s = mac_sys(&fake).with_check_mode(check_mode);
+            let err = Absent::new(["python3"]).check(&s).unwrap_err().chain();
+            assert!(
+                err.contains(
+                    "`python3 (python@3.12)` is pinned (`brew pin`); `brew::Absent` will not \
+                     remove a pinned formula. Run `brew unpin python@3.12` first, or drop it \
+                     from the step."
+                ),
+                "check mode {check_mode}: {err}"
+            );
+        }
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// A renamed formula: the migrator moves the rack and the pin to the new
+    /// name and leaves the old one as links (`migrator.rb` `repin`,
+    /// `link_oldname_cellar`, `link_oldname_opt`). `Absent` of the old name
+    /// finds the pin under the new one, rather than missing it and letting
+    /// `--force` remove the formula and the pin.
+    #[test]
+    fn absent_refuses_an_old_name_pinned_under_its_new_name() {
+        let fake = mac_fake(&[("libmpdec-new", &["4.0.1"])]);
+        fake.symlink(
+            Path::new("libmpdec-new"),
+            Path::new("/opt/homebrew/Cellar/libmpdec-old"),
+        )
+        .unwrap();
+        opt_link(&fake, "libmpdec-old", "../Cellar/libmpdec-new/4.0.1");
+        pin(&fake, "libmpdec-new", "4.0.1");
+        let err = Absent::new(["libmpdec-old", "agg"])
+            .check(&mac_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "`libmpdec-old (libmpdec-new)` is pinned (`brew pin`); `brew::Absent` will not \
+                 remove a pinned formula. Run `brew unpin libmpdec-new` first, or drop it from \
+                 the step."
+            ),
+            "{err}"
+        );
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
     }
 }

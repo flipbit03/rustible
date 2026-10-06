@@ -1061,7 +1061,9 @@ cannot use `brew::Present`/`Absent` directly: run it unescalated or use
 `ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
 It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
 `brew::Absent` refuses a pinned formula, under `--check` too: `brew unpin` it
-first.
+first. An alias (`python3`) counts as installed only when brew linked
+`<prefix>/opt/<alias>`; one it did not (an alias added after the install)
+makes `brew::Present` report `changed` every run, so name the formula itself.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
 mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
