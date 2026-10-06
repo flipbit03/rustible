@@ -11,10 +11,10 @@
 //! The second is the lists' age (#70). An `apt-get update` that changes no
 //! index leaves `/var/lib/apt/lists` as old as it was, so a refresh records
 //! itself in `/var/lib/apt/periodic/update-success-stamp`, and the age is
-//! the newest of the stamp, the lists and `pkgcache.bin`. These tests
-//! back-date with `touch -d`, and tell whether `apt-get update` ran from
-//! `/var/lib/apt/lists/partial`, which every update rewrites and nothing
-//! else here touches.
+//! the newer of the stamp and the lists, with `pkgcache.bin` only when
+//! neither can be read. These tests back-date with `touch -d`, and tell
+//! whether `apt-get update` ran from `/var/lib/apt/lists/partial`, which
+//! every update rewrites and nothing else here touches.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -56,19 +56,24 @@ fn back_date(ctx: &mut Ctx, path: &str, ago: u64) -> Result<u64> {
     Ok(at)
 }
 
-/// Make the lists two days old by every source of their age, as a box left
-/// alone for two days is. The images carry no `pkgcache.bin` (their
-/// `docker-clean` turns it off) and no stamp, so those are dated only if
-/// present; the stamp is removed, as on a box no refresh has stamped.
-fn make_lists_stale(ctx: &mut Ctx) -> Result<()> {
+/// Make the lists directory and `pkgcache.bin` two days old, so that what
+/// keeps the lists fresh afterwards can only be the stamp. The images carry
+/// no `pkgcache.bin` (their `docker-clean` turns it off), so it is dated
+/// only if present.
+fn back_date_lists(ctx: &mut Ctx) -> Result<()> {
     back_date(ctx, LISTS, TWO_DAYS)?;
     if ctx.sys().exists(PKGCACHE)? {
         back_date(ctx, PKGCACHE, TWO_DAYS)?;
     }
-    if ctx.sys().exists(STAMP)? {
-        ctx.sys().remove(STAMP)?;
-    }
     Ok(())
+}
+
+/// Make the lists two days old by every source of their age, as a box a
+/// refresh stamped two days ago and then left alone is.
+fn make_lists_stale(ctx: &mut Ctx) -> Result<u64> {
+    back_date_lists(ctx)?;
+    ctx.sys().mkdir_all("/var/lib/apt/periodic")?;
+    back_date(ctx, STAMP, TWO_DAYS)
 }
 
 /// Plain `apt-get update`, outside any op, so the lists exist to go stale.
@@ -167,13 +172,28 @@ fn latest_refresh_that_changes_no_index_counts_as_fresh(ctx: &mut Ctx) -> Result
         "{rendered}"
     );
 
-    let (first, _) = changed_then_ok(ctx, "sl at the latest version", op)?;
-    assert_eq!(first.installed.len(), 1);
+    let first = ctx.step("sl at the latest version", op())?;
+    assert!(first.changed);
+    // The refresh stamped: the stamp is the only source that is fresh now.
+    let stamped = mtime(ctx, STAMP)?.expect("a successful refresh writes the stamp");
+    assert!(now() - stamped < 600, "the stamp is not fresh: {stamped}");
 
     // The refresh usually changes no index, leaving the lists directory two
     // days old; a mirror that published in the last few seconds would have
-    // moved it. Pin the usual case regardless.
-    back_date(ctx, LISTS, TWO_DAYS)?;
+    // moved it. Pin the usual case regardless, and move the stamp back half
+    // an hour, still within the hour, so a second refresh would show.
+    back_date_lists(ctx)?;
+    let stamp = back_date(ctx, STAMP, 1_800)?;
+    let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
+
+    // A second real run trusts the stamp: `ok`, and no refresh.
+    let second = ctx.step("sl at the latest version (again)", op())?;
+    assert!(!second.changed, "the second run changed something");
+    assert_eq!(
+        mtime(ctx, PARTIAL)?,
+        Some(partial),
+        "the second real run ran apt-get update again"
+    );
 
     // The dry run now plans from the lists, as the real run did: `ok`.
     let report = match op().check(dry(ctx).sys())? {
@@ -185,9 +205,7 @@ fn latest_refresh_that_changes_no_index_counts_as_fresh(ctx: &mut Ctx) -> Result
         ),
     };
     assert_eq!(report.current[0].name, "sl");
-    // Because of the stamp, the only source that is fresh.
-    let stamped = mtime(ctx, STAMP)?.expect("a successful refresh writes the stamp");
-    assert!(now() - stamped < 600, "the stamp is not fresh: {stamped}");
+    assert_eq!(mtime(ctx, STAMP)?, Some(stamp), "the stamp moved");
     Ok(())
 }
 
@@ -211,9 +229,14 @@ fn present_does_not_refresh_again_after_a_refresh_that_changed_nothing(
         "the first step should have run apt-get update"
     );
 
-    // As in the `Latest` case: the lists directory two days old, only the
-    // stamp fresh. Then watch `partial` again.
-    back_date(ctx, LISTS, TWO_DAYS)?;
+    let stamped = mtime(ctx, STAMP)?.expect("the refresh wrote no stamp");
+    assert!(now() - stamped < 600, "the stamp is not fresh: {stamped}");
+
+    // As in the `Latest` case: the lists two days old, only the stamp fresh,
+    // and moved back half an hour so a second refresh would show. Then
+    // watch `partial` and the stamp.
+    back_date_lists(ctx)?;
+    let stamp = back_date(ctx, STAMP, 1_800)?;
     let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
     let hello = ctx.step(
         "hello present",
@@ -226,7 +249,7 @@ fn present_does_not_refresh_again_after_a_refresh_that_changed_nothing(
         Some(partial),
         "the second install ran apt-get update again"
     );
-    assert!(mtime(ctx, STAMP)?.is_some(), "the refresh wrote no stamp");
+    assert_eq!(mtime(ctx, STAMP)?, Some(stamp), "the stamp moved");
     Ok(())
 }
 
@@ -283,7 +306,7 @@ fn a_failed_refresh_writes_no_stamp(ctx: &mut Ctx) -> Result<()> {
         )
         .unwrap_err()
         .chain();
-    assert!(err.contains("apt-get"), "{err}");
+    assert!(err.contains("apt-get update"), "{err}");
     let err = ctx
         .step(
             "sl latest, sources broken",
@@ -291,7 +314,7 @@ fn a_failed_refresh_writes_no_stamp(ctx: &mut Ctx) -> Result<()> {
         )
         .unwrap_err()
         .chain();
-    assert!(err.contains("apt-get"), "{err}");
+    assert!(err.contains("apt-get update"), "{err}");
     assert!(
         !ctx.sys().exists(STAMP)?,
         "a failed refresh wrote the stamp"
@@ -314,7 +337,7 @@ fn a_failed_refresh_writes_no_stamp(ctx: &mut Ctx) -> Result<()> {
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn a_dry_run_against_stale_lists_neither_refreshes_nor_stamps(ctx: &mut Ctx) -> Result<()> {
     apt_get_update(ctx)?;
-    make_lists_stale(ctx)?;
+    let stamp = make_lists_stale(ctx)?;
     let lists = mtime(ctx, LISTS)?;
     let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
 
@@ -330,6 +353,107 @@ fn a_dry_run_against_stale_lists_neither_refreshes_nor_stamps(ctx: &mut Ctx) -> 
         "the dry run ran apt-get update"
     );
     assert_eq!(mtime(ctx, LISTS)?, lists);
-    assert!(!ctx.sys().exists(STAMP)?, "the dry run wrote the stamp");
+    assert_eq!(
+        mtime(ctx, STAMP)?,
+        Some(stamp),
+        "the dry run wrote the stamp"
+    );
+    Ok(())
+}
+
+/// `pkgcache.bin` is not a refresh: any `apt-get install` rewrites it
+/// without fetching an index, so lists two days old stay stale after one.
+/// With the images' `docker-clean` removed, apt keeps `pkgcache.bin` as a
+/// stock install does.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn an_install_that_rewrites_pkgcache_does_not_freshen_the_lists(ctx: &mut Ctx) -> Result<()> {
+    const DOCKER_CLEAN: &str = "/etc/apt/apt.conf.d/docker-clean";
+    if ctx.sys().exists(DOCKER_CLEAN)? {
+        ctx.sys().remove(DOCKER_CLEAN)?;
+    }
+    apt_get_update(ctx)?;
+    make_lists_stale(ctx)?;
+    let pkgcache = back_date(ctx, PKGCACHE, TWO_DAYS)?;
+
+    // An install with no update, outside any op.
+    ctx.sys()
+        .cmd("apt-get")
+        .args(["install", "-y", "--no-install-recommends", "hello"])
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .run()?;
+    let rewritten = mtime(ctx, PKGCACHE)?.expect("apt keeps pkgcache.bin without docker-clean");
+    assert_ne!(
+        rewritten, pkgcache,
+        "the install did not rewrite pkgcache.bin; the rest of this test proves nothing"
+    );
+    assert!(
+        now() - rewritten < 600,
+        "pkgcache.bin is not fresh: {rewritten}"
+    );
+
+    // The lists are as stale as they were: the dry run cannot decide.
+    let Plan::Change(c) = apt::Latest::new(["sl"])
+        .update_cache(HOUR)
+        .check(dry(ctx).sys())?
+    else {
+        panic!("expected a change: the lists are two days old");
+    };
+    let rendered = c.diff().render();
+    assert!(
+        rendered.contains("candidate versions unknown") && rendered.contains("2d"),
+        "the dry run took the lists for fresh after an install rewrote pkgcache.bin: {rendered}"
+    );
+    Ok(())
+}
+
+/// An `apt-get update` that cannot reach its mirror exits 0, warning
+/// "Failed to fetch" and "Some index files failed to download". That
+/// refreshed nothing, so it writes no stamp, and the lists stay stale. The
+/// only source is an unreachable one (nothing listens on port 9), and the
+/// op is `Latest` of `apt`, which is installed and whose candidate the
+/// unreachable source cannot change, so the step is `ok` once the refresh
+/// is behind it.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn an_update_that_fetched_nothing_writes_no_stamp(ctx: &mut Ctx) -> Result<()> {
+    apt_get_update(ctx)?;
+    let stamp = make_lists_stale(ctx)?;
+    ctx.sys()
+        .cmd("sh")
+        .args([
+            "-c",
+            "mkdir -p /root/sources.off && \
+             mv /etc/apt/sources.list.d/* /root/sources.off/ && \
+             rm -f /etc/apt/sources.list",
+        ])
+        .run()?;
+    ctx.sys().write_atomic(
+        "/etc/apt/sources.list",
+        b"deb http://127.0.0.1:9/debian bookworm main\n",
+    )?;
+    let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
+
+    let op = || apt::Latest::new(["apt"]).update_cache(HOUR);
+    let r = ctx.step("apt latest, mirror unreachable", op())?;
+    assert!(!r.changed, "the step changed something");
+    assert_ne!(
+        mtime(ctx, PARTIAL)?,
+        Some(partial),
+        "the step should have run apt-get update"
+    );
+    assert_eq!(
+        mtime(ctx, STAMP)?,
+        Some(stamp),
+        "an update that fetched nothing wrote the stamp"
+    );
+
+    // The next dry run still sees the lists two days old.
+    let Plan::Change(c) = op().check(dry(ctx).sys())? else {
+        panic!("expected a change: no refresh happened, so the lists are stale");
+    };
+    let rendered = c.diff().render();
+    assert!(
+        rendered.contains("candidate versions unknown"),
+        "{rendered}"
+    );
     Ok(())
 }
