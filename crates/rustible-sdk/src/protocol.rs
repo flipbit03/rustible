@@ -188,6 +188,20 @@ pub enum Up {
     },
 }
 
+impl Up {
+    /// About what this frame encodes to, for [`encode_frame_sized`]: the
+    /// base64 of a fetched chunk and its envelope, and nothing for the rest,
+    /// which are small or of a size not worth guessing.
+    fn size_hint(&self) -> usize {
+        match self {
+            Up::FetchChunk { dest, bytes, .. } => {
+                bytes.len().div_ceil(3) * 4 + dest.len() * 2 + 128
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// A 1 MiB chunk of base64 plus JSON framing fits with room to spare.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -233,6 +247,20 @@ pub(crate) fn encode_frame<T: Serialize>(
     msg: &T,
     limit: usize,
 ) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    encode_frame_sized(msg, limit, 0)
+}
+
+/// [`encode_frame`], with room for `reserve` bytes made up front: the
+/// encoded size a caller expects, so a frame carrying a chunk is built in one
+/// buffer of about its size instead of one that doubles its way there (each
+/// time copying, and wiping, what it held), the last time at the closing
+/// quote. The reserve is capped at `limit`; an estimate that is short only
+/// costs a growth.
+pub(crate) fn encode_frame_sized<T: Serialize>(
+    msg: &T,
+    limit: usize,
+    reserve: usize,
+) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     struct Capped {
         body: Zeroizing<Vec<u8>>,
         limit: usize,
@@ -252,7 +280,7 @@ pub(crate) fn encode_frame<T: Serialize>(
         }
     }
     let mut out = Capped {
-        body: Zeroizing::new(Vec::new()),
+        body: Zeroizing::new(Vec::with_capacity(reserve.min(limit))),
         limit,
         over: false,
     };
@@ -581,8 +609,10 @@ fn escaped_char_len(c: char) -> usize {
 
 impl<W: Write + Send> UpLink for FrameSink<W> {
     fn send(&self, up: &Up) -> io::Result<()> {
+        let body = encode_frame_sized(up, u32::MAX as usize, up.size_hint())?
+            .ok_or_else(|| io::Error::other("frame too large"))?;
         let mut w = self.0.lock().unwrap();
-        write_frame(&mut *w, up)
+        write_body(&mut *w, &body)
     }
 }
 

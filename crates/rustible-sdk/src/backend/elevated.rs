@@ -93,7 +93,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{Backend, CmdSpec, Local, Output, Staged, Stat, WriteAttrs, coded, errno_of};
 use crate::launch::{self, Answer, Launch, Mode, Next};
-use crate::protocol::{CHUNK_SIZE, FrameTooLarge, MAX_FRAME, encode_frame, read_frame, write_body};
+use crate::protocol::{
+    CHUNK_SIZE, FrameTooLarge, MAX_FRAME, encode_frame, encode_frame_sized, read_frame, write_body,
+};
 use crate::secret::{Secret, extend_wiping};
 
 /// The most streams a helper keeps open at once (`[ISSUE-85]`). When that
@@ -460,6 +462,35 @@ impl HelperOp {
         }
     }
 
+    /// About what a request carrying this encodes to, for
+    /// [`encode_frame_sized`]: the base64 of its bytes and paths, and room
+    /// for the envelope. Nothing for a request without bulk, which is small.
+    fn size_hint(&self) -> usize {
+        let b64 = |n: usize| base64_len(n as u64) as usize;
+        let path = |p: &Path| b64(p.as_os_str().len());
+        match self {
+            HelperOp::WriteBegin { path: p, bytes, .. } => b64(bytes.len()) + path(p) + 256,
+            HelperOp::WriteChunk { bytes, .. }
+            | HelperOp::StdinBegin { bytes }
+            | HelperOp::StdinChunk { bytes, .. } => b64(bytes.len()) + 256,
+            HelperOp::Spawn { cmd, .. } => {
+                let text: usize = cmd
+                    .prefix
+                    .iter()
+                    .chain([&cmd.program])
+                    .chain(&cmd.args)
+                    .chain(cmd.env.iter().flat_map(|(k, v)| [k, v]))
+                    .map(|a| a.len() + 4)
+                    .sum();
+                b64(cmd.stdin.as_ref().map_or(0, |s| s.len()))
+                    + cmd.cwd.as_deref().map_or(0, path)
+                    + text * 2
+                    + 256
+            }
+            _ => 0,
+        }
+    }
+
     /// Mutations are refused by the helper while the main process is in a
     /// step's `check` phase: the guard holds on both sides (vision doc 11.3).
     /// Releasing a stream is never one, so it is always allowed, and neither
@@ -589,6 +620,24 @@ impl HelperResponse {
         }
     }
 
+    /// About what this answer encodes to, for [`encode_frame_sized`]: a
+    /// chunk's base64, a batch of names, a command's output, and room for
+    /// the envelope. Nothing for an answer without bulk.
+    fn size_hint(&self) -> usize {
+        match self {
+            HelperResponse::Data { bytes, .. } => base64_len(bytes.len() as u64) as usize + 128,
+            HelperResponse::Names { names, .. } => {
+                names
+                    .iter()
+                    .map(|n| base64_len(n.0.as_os_str().len() as u64) as usize + 3)
+                    .sum::<usize>()
+                    + 128
+            }
+            HelperResponse::Output(o) => encoded_output_len(o) as usize,
+            _ => 0,
+        }
+    }
+
     /// Wipe the bytes a command printed once they are encoded: the one
     /// answer whose payload is not already in a zeroizing buffer, because
     /// [`Output`] is the public type every backend returns.
@@ -668,7 +717,7 @@ fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, limits: Limits) -> io::Resul
                 .answer(&local, req.op, limits)
                 .unwrap_or_else(HelperResponse::from_io)
         };
-        let encoded = encode_frame(&resp, limits.frame);
+        let encoded = encode_frame_sized(&resp, limits.frame, resp.size_hint());
         resp.wipe();
         let body = match encoded {
             Ok(Some(body)) => body,
@@ -1825,7 +1874,7 @@ impl Elevated {
         // Encoded before anything is written, so a request that cannot be
         // sent is refused with the stream intact: no shutdown, no latch.
         let req = HelperRequest { checking, op };
-        let body = match encode_frame(&req, self.max_frame) {
+        let body = match encode_frame_sized(&req, self.max_frame, req.op.size_hint()) {
             Ok(Some(body)) => body,
             Ok(None) => {
                 return Err(io::Error::other(format!(
@@ -3900,6 +3949,45 @@ mod tests {
                 rate(took)
             );
             std::fs::remove_file(&f).unwrap();
+        }
+    }
+
+    /// A chunk's frame is built in one buffer of about its size, either way:
+    /// without the estimate it doubled its way there, the last time at the
+    /// closing quote, to twice the frame (and copied and wiped each time).
+    #[test]
+    fn a_chunk_frame_is_built_without_growing() {
+        let bytes = Zeroizing::new(data(CHUNK_SIZE));
+        let answer = HelperResponse::Data {
+            handle: Some(3),
+            bytes: bytes.clone(),
+        };
+        let request = HelperRequest {
+            checking: false,
+            op: HelperOp::WriteChunk {
+                handle: 3,
+                offset: 0,
+                bytes,
+                last: false,
+            },
+        };
+        for (what, body) in [
+            (
+                "answer",
+                encode_frame_sized(&answer, MAX_FRAME, answer.size_hint()),
+            ),
+            (
+                "request",
+                encode_frame_sized(&request, MAX_FRAME, request.op.size_hint()),
+            ),
+        ] {
+            let body = body.unwrap().unwrap();
+            assert!(
+                body.capacity() < body.len() + 1024,
+                "{what}: {} bytes in a buffer of {}",
+                body.len(),
+                body.capacity()
+            );
         }
     }
 
