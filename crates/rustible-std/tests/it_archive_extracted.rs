@@ -1,9 +1,10 @@
 //! Docker integration test for `archive::Extracted` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_archive_extracted`.
 //!
-//! The four fixtures under `fixtures/archive/` are the same tree encoded
-//! as tar, tar.gz, tar.xz and tar.zst; each is written into the container
-//! and extracted with the pure-Rust decoders, no `tar` binary involved.
+//! The four `hello.tar*` fixtures under `fixtures/archive/` are the same
+//! tree encoded as tar, tar.gz, tar.xz and tar.zst; each is written into
+//! the container and extracted with the pure-Rust decoders, no `tar`
+//! binary involved.
 
 use rustible::prelude::*;
 use rustible::sdk::testing::changed_then_ok;

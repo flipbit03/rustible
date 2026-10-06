@@ -1033,8 +1033,9 @@ on `Extracted` chowns **every extracted file and directory**. Creating
 leaves a correctly-owned directory full of root-owned files, and the run
 reports `ok` for the directory step while it happens.
 
-A tarball made with `tar --format=posix -S` (pax sparse members) is refused at
-`check`: recreate it with `--format=gnu`, or without `-S`.
+A tarball holding pax sparse members is refused at `check`. GNU tar writes them
+with `--format=posix -S`, and macOS's `tar` (bsdtar) for any sparse file unless
+given `--no-read-sparse`; recreate it without sparse handling.
 
 **A new unit file is invisible until systemd re-reads.** Writing
 `/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
