@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use rustible_sdk::backend::{FileKind, WriteAttrs};
 use rustible_sdk::prelude::*;
 
-use super::{AttrPlan, Owner, cleared_by_chown, plan_attrs};
+use super::{AttrPlan, Owner, plan_attrs};
 
 /// Above this size a content change is reported as a byte-count summary
 /// instead of a unified diff, whatever the encoding.
@@ -210,25 +210,6 @@ impl Copy {
             before: size(before.unwrap_or(0)),
             after,
         })
-    }
-
-    /// The mode and owner new content is written with. `.mode()` and
-    /// `.owner()` as given; without `.mode()`, a write that changes the
-    /// owner gives the content the mode `dest` has less what a `chown`
-    /// clears (setuid, and setgid with group execute), as a `chown` of the
-    /// existing file would leave it, where the write alone would carry them
-    /// over to the new owner.
-    fn write_attrs(&self, attrs: &AttrPlan, existing: Option<u32>) -> Option<WriteAttrs> {
-        let kept = existing
-            .filter(|_| self.mode.is_none() && attrs.owner_to_set().is_some())
-            .map(|m| m & 0o7777)
-            .filter(|m| cleared_by_chown(*m) != 0)
-            .map(|m| m & !cleared_by_chown(m));
-        let w = WriteAttrs {
-            mode: self.mode.map(|m| m & 0o7777).or(kept),
-            owner: self.owner.map(|o| (o.uid, o.gid)),
-        };
-        (w.mode.is_some() || w.owner.is_some()).then_some(w)
     }
 }
 
@@ -445,7 +426,7 @@ impl Op for Copy {
             Some(n) => Content::Same(n),
             None => Content::Rewrite {
                 change: self.content_change(sys, dest_size, src_size.unwrap_or(0))?,
-                attrs: self.write_attrs(&attrs, stat.as_ref().map(|s| s.mode)),
+                attrs: attrs.write_attrs(stat.as_ref().map(|s| s.mode)),
             },
         };
         Ok(Plan::Change(CopyIntent {
@@ -498,10 +479,12 @@ impl Op for Copy {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{AttrCall, Fake, ReadCall};
+    use rustible_sdk::backend::{Fake, ReadCall};
     use rustible_sdk::event::Collect;
 
-    use super::super::testing::{expect_change, fake_sys, not_regular_sys, sizeless_sys};
+    use super::super::testing::{
+        Set, expect_change, fake_sys, not_regular_sys, sizeless_sys, staged,
+    };
     use super::*;
 
     /// The other half of the platform work: a portable op has to keep
@@ -673,52 +656,6 @@ mod tests {
             assert!(fake.attr_calls().is_empty(), "no mode was asked for");
             assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         }
-    }
-
-    /// The `chmod` and `chown` calls since `planted`, and the one path they
-    /// were all made on: the staged file `write_from` renames over `dest`,
-    /// never `dest` itself (decision 24).
-    fn staged_calls(fake: &Fake, planted: usize, dest: &str) -> Vec<AttrCall> {
-        let calls = fake.attr_calls()[planted..].to_vec();
-        let dest = Path::new(dest);
-        for call in &calls {
-            let (AttrCall::Chmod { path, .. } | AttrCall::Chown { path, .. }) = call else {
-                unreachable!()
-            };
-            assert_ne!(
-                path, dest,
-                "set on the final path after the rename: {calls:?}"
-            );
-            assert_eq!(path.parent(), dest.parent(), "{calls:?}");
-            assert!(
-                path.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(".rustible-fake-"),
-                "{calls:?}"
-            );
-        }
-        calls
-    }
-
-    /// One call [`staged`] returns, its path left out.
-    #[derive(Debug, PartialEq)]
-    enum Set {
-        Mode(u32),
-        Owner(u32, u32),
-    }
-
-    /// `staged_calls`, with the staged path left out so a test can compare
-    /// the calls themselves.
-    fn staged(fake: &Fake, planted: usize, dest: &str) -> Vec<Set> {
-        staged_calls(fake, planted, dest)
-            .into_iter()
-            .map(|c| match c {
-                AttrCall::Chmod { mode, .. } => Set::Mode(mode),
-                AttrCall::Chown { uid, gid, .. } => Set::Owner(uid, gid),
-                _ => unreachable!(),
-            })
-            .collect()
     }
 
     /// With `.owner()` already right and no `.mode()`, a rewrite keeps

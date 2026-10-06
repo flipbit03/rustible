@@ -8,8 +8,8 @@
 //! files and processes, with a `Fake` for tests. An HTTP request is neither.
 //! The network primitive is `rustible_std::http`: [`Https`] is a
 //! [`Request::send`](rustible_std::http::Request::send), so this collection
-//! shares its TLS, its redirect and secret policy and its size limits with
-//! the standard ops, and a collection of your own builds on it the same way.
+//! shares its TLS and its redirect and secret policy with the standard ops,
+//! and a collection of your own builds on it the same way.
 //! [`Fetch`] stays as the seam a test or a proxy plugs into.
 
 use std::fmt;
@@ -18,11 +18,6 @@ use std::time::Duration;
 
 use rustible_sdk::prelude::*;
 use rustible_std::http;
-
-/// The most a response body may be. GitHub's `.keys` output for a user with
-/// dozens of keys is a few kilobytes; a megabyte means something other than
-/// keys came back.
-pub const MAX_BODY_BYTES: u64 = 1024 * 1024;
 
 /// The timeout, body included, when none is given.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -74,11 +69,11 @@ impl<F: Fetch + ?Sized> Fetch for Arc<F> {
 /// `rustls` with the `ring` provider from [`rustible_std::tls`] and the
 /// bundled `webpki-roots` trust store (no system certificate lookup), and the
 /// redirect policy of `rustible_std::http`: redirects followed, at most ten,
-/// credentials dropped when one leaves the origin. On top, this client caps
-/// the body at [`MAX_BODY_BYTES`], bounds the whole exchange, body included,
-/// by its timeout, and sends a `rustible-github/<version>` user agent (GitHub
-/// rejects requests without one). Any status is returned, not failed: the op
-/// decides what a `404` means.
+/// credentials dropped when one leaves the origin. On top, this client
+/// bounds the whole exchange, body included, by its timeout, and sends a
+/// `rustible-github/<version>` user agent (GitHub rejects requests without
+/// one). It sets no limit on the size of the body. Any status is returned,
+/// not failed: the op decides what a `404` means.
 ///
 /// `ring` dispatches on the CPU at runtime, so there is no instruction-set
 /// floor to check for and no pre-flight: a request works on any x86-64 or
@@ -116,7 +111,6 @@ impl Fetch for Https {
                 concat!("rustible-github/", env!("CARGO_PKG_VERSION")),
             )
             .timeout(self.timeout)
-            .max_bytes(MAX_BODY_BYTES)
             // Every status is an answer for the op to judge, not a failure.
             .status(100..=599)
             .send()?;
@@ -182,11 +176,13 @@ mod tests {
     }
 
     /// What `Https` promised before it moved onto `Request::send`, held at
-    /// T1 against a loopback server: the user agent, redirects followed, any
-    /// status returned rather than failed, and the body cap.
+    /// T1 against a loopback server: the user agent, redirects followed, and
+    /// any status returned rather than failed. And no cap on the body
+    /// (decision 21 on #87): one over the megabyte it used to refuse comes
+    /// back whole.
     #[test]
     fn https_keeps_its_behaviour_on_request_send() {
-        let big = "k".repeat(MAX_BODY_BYTES as usize + 1);
+        let big = "k".repeat((1 << 20) + 1);
         let (base, heads) = serve(vec![
             ("/flipbit03.keys", ok("ssh-ed25519 AAAA\n")),
             (
@@ -213,11 +209,7 @@ mod tests {
         let r = https.get(&format!("{base}/nobody.keys")).unwrap();
         assert_eq!(r, Response::with_status(404, "Not Found"));
 
-        let e = https.get(&format!("{base}/big.keys")).unwrap_err().chain();
-        assert!(
-            e.contains(&format!("over the {MAX_BODY_BYTES} byte limit"))
-                && !e.contains(".max_bytes()"),
-            "{e}"
-        );
+        let r = https.get(&format!("{base}/big.keys")).unwrap();
+        assert_eq!(r, Response::ok(big));
     }
 }

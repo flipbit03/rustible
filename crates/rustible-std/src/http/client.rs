@@ -210,53 +210,48 @@ impl Incoming {
             .unwrap_or("")
     }
 
-    /// The whole body, at most `max_bytes`. A `Content-Length` above it
-    /// fails before the body is read; a body without one, or one that lies,
-    /// fails as soon as the read passes it, so memory stays bounded.
-    pub(crate) fn read(mut self, max_bytes: u64) -> std::result::Result<Vec<u8>, ReadError> {
-        if self.head {
-            return Ok(vec![]);
+    /// The whole body, in memory, at most `max_bytes` when there is a limit:
+    /// [`Incoming::body`] read to its end.
+    pub(crate) fn read(self, max_bytes: Option<u64>) -> std::result::Result<Vec<u8>, ReadError> {
+        let mut body = self.body(max_bytes)?;
+        let mut out = Vec::new();
+        let mut buf = vec![0; BODY_BUF];
+        loop {
+            match body.read(&mut buf)? {
+                0 => return Ok(out),
+                n => out.extend_from_slice(&buf[..n]),
+            }
         }
-        let what = &self.what;
-        let too_large = || {
-            ReadError::TooLarge(format!(
-                "{what}: the body is larger than the {max_bytes} byte limit"
-            ))
-        };
-        if let Some(len) = self
-            .resp
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    /// The body as it arrives, for a caller that streams it rather than
+    /// holding it. With a limit, a `Content-Length` above it fails here,
+    /// before the body is read, and a body without one, or one that lies,
+    /// fails as soon as a read passes it. Without one, a body is as large as
+    /// the server sends.
+    pub(crate) fn body(self, max_bytes: Option<u64>) -> std::result::Result<Body, ReadError> {
+        let what = self.what;
+        if let Some(max_bytes) = max_bytes
+            && let Some(len) = self
+                .resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
             && len > max_bytes
         {
             return Err(ReadError::TooLarge(format!(
                 "{what}: the server declares a {len} byte body (Content-Length), over the {max_bytes} byte limit"
             )));
         }
-        // Read one byte past the ceiling to tell "exactly at the limit" from
-        // "over it": ureq stops the read past its limit and errors.
-        let body = self
-            .resp
-            .body_mut()
-            .with_config()
-            .limit(max_bytes.saturating_add(1))
-            .read_to_vec()
-            .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => too_large(),
-                e => {
-                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
-                    ReadError::Other(scrub(
-                        &format!("{what}: reading the body: {e}"),
-                        &self.scrub,
-                    ))
-                }
-            })?;
-        if body.len() as u64 > max_bytes {
-            return Err(too_large());
-        }
-        Ok(body)
+        Ok(Body {
+            reader: (!self.head).then(|| self.resp.into_body().into_reader()),
+            what,
+            max_bytes,
+            read: 0,
+            deadline: self.deadline,
+            scrub: self.scrub,
+        })
     }
 
     /// Up to `n` bytes of the body as one line of text, for a message about
@@ -280,6 +275,58 @@ impl Incoming {
             .take((n + extra) as u64)
             .read_to_end(&mut out);
         one_line(&scrub(&String::from_utf8_lossy(&out), &self.scrub), n)
+    }
+}
+
+/// How much of a body [`Incoming::read`] asks for at a time.
+const BODY_BUF: usize = 64 << 10;
+
+/// A response body being read: [`Incoming::body`]. Each read is counted
+/// against the limit, if there is one, and a failure is worded as
+/// [`Incoming::read`]'s, a timeout named for its deadline and every secret
+/// of the request scrubbed.
+pub(crate) struct Body {
+    /// `None` for a `HEAD`, which has no body.
+    reader: Option<ureq::BodyReader<'static>>,
+    what: String,
+    max_bytes: Option<u64>,
+    read: u64,
+    deadline: Option<(Instant, Duration)>,
+    scrub: Vec<String>,
+}
+
+impl Body {
+    /// Up to `buf.len()` more bytes of the body, `0` at its end.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, ReadError> {
+        let Some(reader) = &mut self.reader else {
+            return Ok(0);
+        };
+        let what = &self.what;
+        let n = loop {
+            match reader.read(buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Back to the `ureq::Error` it wraps, so a timeout is
+                    // recognised and the text is what reading whole gave.
+                    let e = ureq::Error::from(e);
+                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
+                    return Err(ReadError::Other(scrub(
+                        &format!("{what}: reading the body: {e}"),
+                        &self.scrub,
+                    )));
+                }
+            }
+        };
+        self.read += n as u64;
+        if let Some(max_bytes) = self.max_bytes
+            && self.read > max_bytes
+        {
+            return Err(ReadError::TooLarge(format!(
+                "{what}: the body is larger than the {max_bytes} byte limit"
+            )));
+        }
+        Ok(n)
     }
 }
 

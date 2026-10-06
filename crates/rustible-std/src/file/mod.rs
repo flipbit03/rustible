@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use rustible_sdk::backend::{FileKind, Stat};
+use rustible_sdk::backend::{FileKind, Stat, WriteAttrs};
 use rustible_sdk::prelude::*;
 
 mod absent;
@@ -179,11 +179,9 @@ impl AttrPlan {
 
     /// Set only the attributes that differ: what an op uses when `check`
     /// found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it; so does `file::Copy` when the
-    /// content is already right and only the attributes change; and so does
-    /// `http::Download` after a rewrite, which keeps the old owner and mode
-    /// (as root; see `System::write_atomic`), so what `check` found right is
-    /// still right after it. A `chown` that changes the owner needs root and
+    /// `ssh::authorized_keys` relies on it, and so do `file::Copy` and
+    /// `http::Download` when the content is already right and only the
+    /// attributes change. A `chown` that changes the owner needs root and
     /// is issued only when the owner is wrong; one to the owner the file
     /// already has would be a needless call that also clears setuid.
     ///
@@ -206,57 +204,34 @@ impl AttrPlan {
         }
     }
 
-    /// [`AttrPlan::apply_differing`] for an op that has just rewritten the
-    /// path, with the owner read again when one is wanted. The rewrite keeps
-    /// the old owner only when its `chown` succeeds, and it ignores a
-    /// failure (`System::write_atomic`): an unprivileged identity, or a
-    /// root without `CAP_CHOWN`, leaves the replacement with its own user or
-    /// group. Planning from what `check` saw would then issue no `chown`
-    /// and report the step changed with the wrong owner; read again, the
-    /// owner differs, the `chown` is issued, and it fails the step as it
-    /// failed in the rewrite. This is `apply` checking its own effect, not
-    /// planning again: the wanted values are the intent's. Without a wanted
-    /// owner there is nothing to verify, and no extra `stat`.
-    ///
-    /// That `chown` runs as the same identity as the rewrite's own, so it
-    /// fails as that one did, and the step fails there, after the wanted
-    /// mode (without setuid or setgid) and before anything else.
-    ///
-    /// With no mode wanted, the rewrite kept whatever mode the file it
-    /// replaced had, setuid included. Before a `chown` that changes the
-    /// owner, the bits that `chown` would clear are cleared with a `chmod`
-    /// of the mode just read (setuid, and setgid with group execute; see
-    /// [`cleared_by_chown`]), so a refused `chown` does not leave the new
-    /// content setuid under the old owner. A `chown` that succeeds would
-    /// have cleared the same bits, so the end state is the same.
-    pub(crate) fn apply_after_rewrite(&self, sys: &System, path: &Path) -> Result<()> {
-        if self.owner.is_none() {
-            return self.apply_differing(sys, path);
-        }
-        let now = sys.stat(path)?;
-        let plan = plan_attrs(
-            now.as_ref(),
-            self.mode.map(|m| m.want),
-            self.owner.map(|o| o.want),
-        );
-        if self.mode.is_none()
-            && plan.owner_to_set().is_some()
-            && let Some(now) = now.filter(|s| s.kind != FileKind::Dir)
-        {
-            let mode = now.mode & 0o7777;
-            let clear = cleared_by_chown(mode);
-            if clear != 0 {
-                sys.set_mode(path, mode & !clear)?;
-            }
-        }
-        plan.apply_differing(sys, path)
-    }
-
     /// The same plan for a path that is a directory, or will be once the op
     /// creates it: what `file::Directory` plans, since a missing path has
     /// no kind to read.
     pub(crate) fn on_a_directory(self) -> Self {
         AttrPlan { dir: true, ..self }
+    }
+
+    /// The mode and owner new content is written with, as
+    /// `System::write_from`'s `WriteAttrs`, for a file whose mode is
+    /// `existing` (`None`: missing). `.mode()` and `.owner()` as given;
+    /// without `.mode()`, a write that changes the owner gives the content
+    /// the mode the file has less what a `chown` clears (setuid, and setgid
+    /// with group execute), as a `chown` of the existing file would leave
+    /// it, where the write alone would carry them over to the new owner.
+    /// `None` when neither was given. `file::Copy` and `http::Download`
+    /// write new content with it.
+    pub(crate) fn write_attrs(&self, existing: Option<u32>) -> Option<WriteAttrs> {
+        let mode = self.mode.map(|m| m.want);
+        let kept = existing
+            .filter(|_| mode.is_none() && self.owner_to_set().is_some())
+            .map(|m| m & 0o7777)
+            .filter(|m| cleared_by_chown(*m) != 0)
+            .map(|m| m & !cleared_by_chown(m));
+        let w = WriteAttrs {
+            mode: mode.or(kept),
+            owner: self.owner.map(|o| (o.want.uid, o.want.gid)),
+        };
+        (w.mode.is_some() || w.owner.is_some()).then_some(w)
     }
 
     /// The owner this plan changes the path to, when it changes it.
@@ -307,9 +282,8 @@ pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
 /// exists at `0666 & ~umask`, and a rewrite carries the old mode, from the
 /// write until the mode is set. An op that writes new content with
 /// `System::write_from` and its `WriteAttrs` has no such time, because the
-/// staged file gets its mode and owner before the rename; `file::Copy` does
-/// (#86), and `http::Download` and `archive::Extracted` move to it in #87
-/// and #88.
+/// staged file gets its mode and owner before the rename; `file::Copy` and
+/// `http::Download` do, and `archive::Extracted` moves to it in #88.
 pub(crate) fn set_mode_and_owner(
     sys: &System,
     path: &Path,
@@ -520,7 +494,7 @@ pub(crate) fn write_from_with_backup(
     path: &Path,
     backup: bool,
     src: impl std::io::Read,
-    attrs: Option<rustible_sdk::backend::WriteAttrs>,
+    attrs: Option<WriteAttrs>,
 ) -> Result<(Option<PathBuf>, u64)> {
     let backup_path = if backup && sys.exists(path)? {
         Some(sys.backup(path)?)
@@ -544,7 +518,7 @@ pub(crate) mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
+    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
     use rustible_sdk::prelude::*;
 
@@ -695,6 +669,52 @@ pub(crate) mod testing {
             Plan::Change(c) => c,
             Plan::Satisfied(_) => panic!("expected a change, op was satisfied"),
         }
+    }
+
+    /// The `chmod` and `chown` calls since `planted`, and the one path they
+    /// were all made on: the staged file `write_from` renames over `dest`,
+    /// never `dest` itself (decision 24).
+    pub fn staged_calls(fake: &Fake, planted: usize, dest: &str) -> Vec<AttrCall> {
+        let calls = fake.attr_calls()[planted..].to_vec();
+        let dest = Path::new(dest);
+        for call in &calls {
+            let (AttrCall::Chmod { path, .. } | AttrCall::Chown { path, .. }) = call else {
+                unreachable!()
+            };
+            assert_ne!(
+                path, dest,
+                "set on the final path after the rename: {calls:?}"
+            );
+            assert_eq!(path.parent(), dest.parent(), "{calls:?}");
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".rustible-fake-"),
+                "{calls:?}"
+            );
+        }
+        calls
+    }
+
+    /// One call [`staged`] returns, its path left out.
+    #[derive(Debug, PartialEq)]
+    pub enum Set {
+        Mode(u32),
+        Owner(u32, u32),
+    }
+
+    /// `staged_calls`, with the staged path left out so a test can compare
+    /// the calls themselves.
+    pub fn staged(fake: &Fake, planted: usize, dest: &str) -> Vec<Set> {
+        staged_calls(fake, planted, dest)
+            .into_iter()
+            .map(|c| match c {
+                AttrCall::Chmod { mode, .. } => Set::Mode(mode),
+                AttrCall::Chown { uid, gid, .. } => Set::Owner(uid, gid),
+                _ => unreachable!(),
+            })
+            .collect()
     }
 }
 

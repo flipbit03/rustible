@@ -111,10 +111,10 @@ mod test_server;
 
 pub use client::{MAX_REDIRECTS, mask_url};
 pub use download::{
-    Algorithm, Checksum, DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT, Download, DownloadBuilder,
-    DownloadIntent, DownloadReport, digest, parse_checksum,
+    Algorithm, Checksum, DEFAULT_TIMEOUT, Download, DownloadBuilder, DownloadIntent,
+    DownloadReport, digest, parse_checksum,
 };
-pub use request::{REQUEST_MAX_BYTES, Request, RequestIntent, Response};
+pub use request::{Request, RequestIntent, Response};
 /// Re-exported from `serde_json`, so a playbook building or reading JSON
 /// needs no dependency of its own and cannot end up on another version.
 pub use serde_json::{Value, json};
