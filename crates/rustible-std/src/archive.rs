@@ -539,11 +539,21 @@ impl Extracted {
                 // member's name may already be near `NAME_MAX`, and a link
                 // left by a killed run never collides with the next.
                 let tmp = full.with_file_name(format!(".rustible-{}", random_hex()));
-                sys.symlink(target, &tmp)?;
-                if let Err(e) = sys.rename(&tmp, &full) {
-                    let _ = sys.remove(&tmp);
-                    return Err(e);
-                }
+                let link = || -> Result<()> {
+                    sys.symlink(target, &tmp)?;
+                    if let Err(e) = sys.rename(&tmp, &full) {
+                        let _ = sys.remove(&tmp);
+                        return Err(e);
+                    }
+                    Ok(())
+                };
+                link().with_context(|| {
+                    format!(
+                        "linking member `{}` at {}",
+                        m.path.display(),
+                        full.display()
+                    )
+                })?;
                 // `set_mode` and `set_owner` follow links; neither is
                 // applied to a symlink member.
                 chown = false;
@@ -650,20 +660,33 @@ fn kind_label(kind: &Kind) -> &'static str {
 /// when it carries none. GNU tar's `--format=posix -S` writes a sparse
 /// member in three formats (0.0, 0.1, 1.0), each marked by `GNU.sparse.*`
 /// records, and macOS's `tar` (bsdtar) writes 1.0 for any sparse file
-/// unless given `--no-read-sparse`. `tar` expands none of them: 0.0 lands
-/// at the right path with its holes squeezed out, 0.1 and 1.0 under
-/// `GNUSparseFile.<pid>/`, and 1.0 with the sparse map as text ahead of the
-/// data. 0.1 and 1.0 put a placeholder in the header and the real name in a
+/// unless given `--no-read-sparse`. The `tar` crate expands none of them:
+/// 0.0 lands at the right path with its holes squeezed out, 0.1 and 1.0
+/// under `GNUSparseFile.<pid>/`, and 1.0 with the sparse map as text ahead
+/// of the data. 0.1 and 1.0 put a placeholder in the header and the real name in a
 /// `GNU.sparse.name` record, so that record is the name when there is one,
 /// and `raw`, the member's path, otherwise. A global header (`g`) is no
 /// member, and is named as what it is.
 ///
-/// A record `tar` cannot parse is skipped, as `tar` itself skips it: its
-/// parser splits on newlines, so a value holding one (a binary xattr, a
-/// multi-line `comment`) reads as malformed, and refusing the archive over
-/// it would refuse legal archives.
+/// The `tar` crate returns a global header as an entry of its own, so its
+/// records are read as bytes and scanned for `GNU.sparse.`, without
+/// parsing. A member's own records the crate has already read and offers
+/// only parsed, so a record it cannot parse is skipped, as the crate's own
+/// xattr extraction skips it, unlike GNU tar, which reads some of those
+/// (a sparse record there can go unseen; `[ISSUE-80]` has the shapes).
+/// The crate splits records on newlines, so a value holding one (a binary
+/// xattr, a multi-line `comment`) reads as malformed, and refusing the
+/// archive over it would refuse legal archives.
 fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Option<String>> {
-    let global = entry.header().entry_type().is_pax_global_extensions();
+    if entry.header().entry_type().is_pax_global_extensions() {
+        let mut records = vec![];
+        entry
+            .read_to_end(&mut records)
+            .context("reading the archive's pax global header")?;
+        let sparse = records.windows(11).any(|w| w == b"GNU.sparse.");
+        return Ok(sparse
+            .then(|| "the archive's pax global header declares GNU sparse records".to_string()));
+    }
     let Some(records) = entry
         .pax_extensions()
         .with_context(|| format!("member `{}`: reading its pax records", raw.display()))?
@@ -681,13 +704,9 @@ fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Opti
             }
         }
     }
-    Ok(sparse.then(|| match (global, name) {
-        (true, _) => "the archive's pax global header declares GNU sparse records".to_string(),
-        (false, Some(name)) => format!("`{}` is a pax sparse member", quoted(&name)),
-        (false, None) => format!(
-            "`{}` is a pax sparse member",
-            quoted(&raw.to_string_lossy())
-        ),
+    Ok(sparse.then(|| {
+        let name = name.unwrap_or_else(|| raw.to_string_lossy().into_owned());
+        format!("`{}` is a pax sparse member", quoted(&name))
     }))
 }
 
@@ -1895,6 +1914,31 @@ mod tests {
         assert!(!err.contains("PaxHeaders"), "{err}");
     }
 
+    /// A global header's records are scanned as bytes, not parsed, so a
+    /// sparse record GNU tar reads and the `tar` crate cannot (whitespace
+    /// before its length, or after a value ending in a newline, which ends
+    /// the crate's iteration) is still seen.
+    #[test]
+    fn sparse_records_the_tar_crate_cannot_parse_in_a_global_header_are_refused() {
+        for records in [
+            b"\t23 GNU.sparse.major=1\n".to_vec(),
+            b" 23 GNU.sparse.major=1\n".to_vec(),
+            [
+                pax_record("comment", b"ends\n"),
+                pax_record("GNU.sparse.major", b"1"),
+            ]
+            .concat(),
+        ] {
+            let err = check_err(&tar_with_pax(b'g', &[records]));
+            assert!(
+                err.contains(&format!(
+                    "the archive's pax global header declares GNU sparse records{UNSPARSE}"
+                )),
+                "{err}"
+            );
+        }
+    }
+
     /// The name comes from the archive: control characters are escaped, so
     /// it cannot drive a terminal, and it is cut to 256 bytes.
     #[test]
@@ -2052,6 +2096,10 @@ mod tests {
                 let sys = Failing::sys(&fake, symlink, rename);
                 let c = expect_change(&op, &sys);
                 let err = op.apply(&sys, c).unwrap_err().chain();
+                assert!(
+                    err.contains("linking member `link` at /opt/link: "),
+                    "{err}"
+                );
                 assert!(err.contains(&format!("{refused} ")), "{err}");
                 assert!(err.contains("refused (test)"), "{err}");
                 let after = fake.file("/opt/link").unwrap();
