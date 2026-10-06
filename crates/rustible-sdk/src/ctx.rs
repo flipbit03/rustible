@@ -752,10 +752,9 @@ impl Ctx {
         };
         // `sys.read` puts the whole file in memory on this host, and an
         // escalated read also puts it in one helper frame, base64-inflated
-        // by 4/3 against the frame ceiling. Refuse first, with the numbers
-        // and the reason: without this the escalated case failed deep in
-        // the framing with "frame of N bytes exceeds limit", naming neither
-        // the file nor the helper.
+        // by 4/3 against the frame ceiling. The helper refuses a file that
+        // does not fit, naming it; this refuses first in `fetch`'s own
+        // terms, with the remedy that fits a fetch (#84).
         if let Some(st) = self.sys.stat_follow(remote)?
             && matches!(self.sys.identity(), Identity::User(_))
             && st.size > MAX_FRAME_PAYLOAD as u64

@@ -1337,7 +1337,10 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
 /// Capped at the SDK's own `MAX_FRAME`, the one its framing trims a failed
 /// command's stderr to fit. A playbook that writes to stdout desyncs the
 /// stream, and four bytes of prose read as a huge length; the cap turns that
-/// into a protocol error instead of an allocation.
+/// into a protocol error instead of an allocation. The other way to reach
+/// it is a genuine frame too large to carry: only a failed command's stderr
+/// is trimmed to fit, so an event with a diff or a log line of that size is
+/// sent whole. The message names both.
 async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     r: &mut R,
 ) -> Result<Option<T>> {
@@ -1351,7 +1354,10 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOw
     if len > MAX_FRAME {
         bail!(
             "protocol error: the binary announced a {len}-byte frame (limit {MAX_FRAME}); \
-             a playbook that prints to stdout desyncs the stream, use ctx.log instead"
+             either the stream is out of step, most often because the playbook printed to \
+             stdout (use ctx.log instead), or the binary sent an event too large for one \
+             frame, such as a diff or a log line of tens of megabytes (shorten what the step \
+             logs or diffs)"
         );
     }
     let mut body = vec![0u8; len];
@@ -1374,6 +1380,8 @@ mod tests {
             .to_string();
         assert!(err.contains("protocol error"), "{err}");
         assert!(err.contains("ctx.log"), "{err}");
+        // The other cause is named too: a frame that really is that large.
+        assert!(err.contains("event too large for one frame"), "{err}");
         // A clean EOF is still not an error.
         let mut empty: &[u8] = b"";
         assert!(read_frame::<_, Up>(&mut empty).await.unwrap().is_none());
