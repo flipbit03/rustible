@@ -161,7 +161,7 @@ impl AttrPlan {
     /// and `file::Directory` call this when their step changes. `chmod` is
     /// idempotent; `chown` is not, even to the owner the file already has,
     /// because it clears setuid (and setgid with group execute) on anything
-    /// but a directory. A wanted mode is set again after it when it carries
+    /// but a directory, and on macOS setgid on a directory too. A wanted mode is set again after it when it carries
     /// those bits, so they come back; a mode nobody asked for does not. An
     /// op that rewrote the file, whose replacement already has the old owner
     /// and mode, calls [`AttrPlan::apply_differing`] instead. The order of
@@ -178,10 +178,10 @@ impl AttrPlan {
 
     /// Set only the attributes that differ: what an op uses when `check`
     /// found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it, and so do `file::Copy` and
-    /// `http::Download`: a rewrite keeps the old owner and mode (as root;
-    /// see `System::write_atomic`), so what `check` found right is still
-    /// right after it. A `chown` that changes the owner needs root and is
+    /// `ssh::authorized_keys` relies on it, `file::Copy` for an
+    /// attributes-only change, and `http::Download`: a rewrite keeps the old
+    /// owner and mode (as root; see `System::write_atomic`), so what `check`
+    /// found right is still right after it. A `chown` that changes the owner needs root and is
     /// issued only when the owner is wrong; one to the owner the file
     /// already has would be a needless call that also clears setuid.
     ///
@@ -303,8 +303,11 @@ pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
 ///
 /// What this cannot close is the time before the first call: a new file
 /// exists at `0666 & ~umask`, and a rewrite carries the old mode, from the
-/// write until the mode is set. That is closed once the ops move to
-/// `write_from` (#85; #86 to #88).
+/// write until the mode is set. An op that writes new content with
+/// `System::write_from` and its `WriteAttrs` has no such time, because the
+/// staged file gets its mode and owner before the rename; `file::Copy` does
+/// (#86), and `http::Download` and `archive::Extracted` move to it in #87
+/// and #88.
 pub(crate) fn set_mode_and_owner(
     sys: &System,
     path: &Path,
@@ -499,6 +502,40 @@ pub(crate) fn write_with_backup(
     Ok(backup_path)
 }
 
+/// [`write_with_backup`] for content read from `src` rather than held:
+/// back up (when asked, and the file exists), then stream `src` into `path`
+/// with `attrs` (`System::write_from`). Returns the backup path and the
+/// bytes written.
+///
+/// The backup has to come first, since the content is not whole until the
+/// write ends. When the write then fails (the source fails, a reader that
+/// verifies a digest fails at its end, a requested owner is refused), the
+/// backup just taken is removed, best effort, and the write's own error is
+/// returned: `path` is as it was, so a backup exists only for a
+/// replacement that happened.
+pub(crate) fn write_from_with_backup(
+    sys: &System,
+    path: &Path,
+    backup: bool,
+    src: impl std::io::Read,
+    attrs: Option<rustible_sdk::backend::WriteAttrs>,
+) -> Result<(Option<PathBuf>, u64)> {
+    let backup_path = if backup && sys.exists(path)? {
+        Some(sys.backup(path)?)
+    } else {
+        None
+    };
+    match sys.write_from(path, src, attrs) {
+        Ok(n) => Ok((backup_path, n)),
+        Err(e) => {
+            if let Some(b) = &backup_path {
+                let _ = sys.remove(b);
+            }
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use std::io;
@@ -517,16 +554,60 @@ pub(crate) mod testing {
     /// for an unprivileged login or a root without `CAP_CHOWN`. The `Fake`
     /// models `chown` as root does, so it never fails there. The refused
     /// call changes nothing and is not recorded in `fake.attr_calls()`;
-    /// everything else passes through.
+    /// everything else passes through, `write_from` included, whose own
+    /// `chown`s are the `Fake`'s: use `Fake::with_chown_refused` for those.
     pub fn chown_refused_sys(fake: &Arc<Fake>) -> System {
+        twisted_sys(
+            fake,
+            Twisted {
+                chown_refused: true,
+                ..Twisted::default()
+            },
+        )
+    }
+
+    /// A `System` over `fake` where `stat` and `stat_follow` of `path`
+    /// report `FileKind::Other`, a FIFO, socket or device, which the `Fake`
+    /// cannot plant. Everything else passes through, reads of `path`
+    /// included, so `fake.reads()` still shows whether the op read it.
+    pub fn not_regular_sys(fake: &Arc<Fake>, path: &str) -> System {
+        twisted_sys(
+            fake,
+            Twisted {
+                not_regular: Some(PathBuf::from(path)),
+                ..Twisted::default()
+            },
+        )
+    }
+
+    fn twisted_sys(fake: &Arc<Fake>, twist: Twisted) -> System {
         let facts = fake_sys(fake).facts().clone();
-        let backend = Arc::new(ChownRefused(fake.clone()));
+        let backend = Arc::new(Twisting(fake.clone(), twist));
         System::new(backend, facts, false, Arc::new(Collect::default()))
     }
 
-    struct ChownRefused(Arc<Fake>);
+    /// What [`Twisting`] does differently from the `Fake` it wraps.
+    #[derive(Default)]
+    struct Twisted {
+        chown_refused: bool,
+        not_regular: Option<PathBuf>,
+    }
 
-    impl Backend for ChownRefused {
+    struct Twisting(Arc<Fake>, Twisted);
+
+    impl Twisting {
+        fn twist(&self, p: &Path, stat: Option<Stat>) -> Option<Stat> {
+            if self.1.not_regular.as_deref() != Some(p) {
+                return stat;
+            }
+            stat.map(|s| Stat {
+                kind: rustible_sdk::backend::FileKind::Other,
+                ..s
+            })
+        }
+    }
+
+    impl Backend for Twisting {
         fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
             self.0.read(p)
         }
@@ -545,10 +626,10 @@ pub(crate) mod testing {
             self.0.open_read(p)
         }
         fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
-            self.0.stat(p)
+            Ok(self.twist(p, self.0.stat(p)?))
         }
         fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
-            self.0.stat_follow(p)
+            Ok(self.twist(p, self.0.stat_follow(p)?))
         }
         fn mkdir_all(&self, p: &Path) -> io::Result<()> {
             self.0.mkdir_all(p)
@@ -565,7 +646,10 @@ pub(crate) mod testing {
         fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
             self.0.set_mode(p, mode)
         }
-        fn set_owner(&self, p: &Path, _uid: u32, _gid: u32) -> io::Result<()> {
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+            if !self.1.chown_refused {
+                return self.0.set_owner(p, uid, gid);
+            }
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("chown {}: Operation not permitted (test)", p.display()),
@@ -901,6 +985,45 @@ mod tests {
         let none = Regex::new("^zzz").unwrap();
         assert_eq!(Insert::After(none.clone()).position(&lines), 5);
         assert_eq!(Insert::Before(none).position(&lines), 5);
+    }
+
+    /// A source that yields some bytes, then fails, as a network body or a
+    /// verifying reader at its end does.
+    struct FailsPartWay(usize);
+
+    impl std::io::Read for FailsPartWay {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::other("the source broke"));
+            }
+            let n = buf.len().min(self.0);
+            buf[..n].fill(b'x');
+            self.0 -= n;
+            Ok(n)
+        }
+    }
+
+    /// Decision 26: a streamed write that fails removes the backup it took,
+    /// returns the source's own error, and leaves the file as it was; one
+    /// that succeeds leaves exactly one backup, of the old content.
+    #[test]
+    fn write_from_with_backup_removes_its_backup_when_the_write_fails() {
+        let fake = Arc::new(Fake::new().with_dir("/etc").with_file("/etc/x", "old\n"));
+        let sys = testing::fake_sys(&fake);
+        let err = write_from_with_backup(&sys, Path::new("/etc/x"), true, FailsPartWay(10), None)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("the source broke"), "{err}");
+        assert_eq!(sys.read_dir("/etc").unwrap(), [PathBuf::from("/etc/x")]);
+        assert_eq!(fake.content("/etc/x").unwrap(), "old\n");
+
+        let (backup, n) =
+            write_from_with_backup(&sys, Path::new("/etc/x"), true, &b"new\n"[..], None).unwrap();
+        let backup = backup.expect("a backup");
+        assert_eq!(n, 4);
+        assert_eq!(fake.content(&backup).unwrap(), "old\n");
+        assert_eq!(fake.content("/etc/x").unwrap(), "new\n");
+        assert_eq!(sys.read_dir("/etc").unwrap().len(), 2);
     }
 }
 
