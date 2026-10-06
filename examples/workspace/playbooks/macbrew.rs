@@ -21,14 +21,17 @@
 //! root under a scratch directory, copied there with `file::Copy` (the
 //! second run's `check` reads both sides back through the helper to report
 //! `ok`), and fetched to the workspace's ignored `out/macbrew/`, where CI
-//! compares it with what was generated and removes it (#86). A removal run
+//! compares it with what was generated and removes it (#86). The mac's own
+//! `tar` then makes a tarball of it, plain (over 48 MiB) and gzipped, and
+//! each is extracted as root, so the archive's reads and the member's
+//! writes alternate on the helper chunk by chunk (#88). A removal run
 //! removes the scratch directory.
 
 use std::path::{Component, Path, PathBuf};
 
 use rustible::prelude::*;
 use rustible::sdk::backend::FileKind;
-use rustible_std::{brew, file, shell};
+use rustible_std::{archive, brew, file, shell};
 
 /// The version the copied keg is filed under. Any directory in a rack is a
 /// version to Homebrew; this one cannot be mistaken for a real release.
@@ -125,9 +128,10 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
 }
 
 /// 50 MiB through the sudo helper, both ways (decision 30 on #82): one
-/// frame of the helper carries less, so the copy, its comparison and the
-/// fetch all cross it in chunks. Generated under a temporary name, so a
-/// generation cut short is not mistaken for a finished one by `creates`.
+/// frame of the helper carries less, so the copy, its comparison, the fetch
+/// and the extractions all cross it in chunks. Generated under a temporary
+/// name, so a generation cut short is not mistaken for a finished one by
+/// `creates`.
 fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
     let large = format!("{SCRATCH}/large");
     let copy = format!("{SCRATCH}/large-copy");
@@ -150,6 +154,39 @@ fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
     )?;
     if !root.check_mode() {
         root.fetch(&copy, "out/macbrew/")?;
+    }
+    // The file as a tarball member, made by the mac's own `tar` (bsdtar;
+    // `COPYFILE_DISABLE` keeps AppleDouble `._` members out): plain, over
+    // 48 MiB, and gzipped. `creates` makes the second run `ok`.
+    for (tarball, z) in [("large.tar", ""), ("large.tar.gz", "z")] {
+        let tarball = format!("{SCRATCH}/{tarball}");
+        root.step(
+            format!("tarball {tarball}, as root"),
+            shell::Command::sh(format!(
+                "mkdir -p {SCRATCH}/tree && ln -f {large} {SCRATCH}/tree/large \
+                 && COPYFILE_DISABLE=1 tar -C {SCRATCH} -c{z}f {tarball}.part tree \
+                 && mv {tarball}.part {tarball}"
+            ))
+            .creates(&tarball),
+        )?;
+        if root.check_mode() && !root.sys().exists(&tarball)? {
+            continue;
+        }
+        let dest = format!("{tarball}.d");
+        root.step(format!("{dest}, as root"), file::Directory::at(&dest))?;
+        root.step(
+            format!("50 MiB member of {tarball}, as root"),
+            archive::Extracted::from_path(&tarball)
+                .to(&dest)
+                .creates("tree/large"),
+        )?;
+        if !root.check_mode() {
+            root.sys()
+                .cmd("cmp")
+                .args([large.clone(), format!("{dest}/tree/large")])
+                .run()
+                .with_context(|| format!("the member extracted from {tarball} is not the 50 MiB file"))?;
+        }
     }
     Ok(())
 }

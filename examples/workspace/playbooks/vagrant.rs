@@ -21,13 +21,17 @@
 //! and fetches it back, both larger than one frame of the escalation helper
 //! can carry, so they cross it in chunks (#86). The second run's `check`
 //! reads the 50 MiB copy back through the helper to report `ok`, and
-//! `vm-test.sh` compares what was fetched with what was generated.
+//! `vm-test.sh` compares what was fetched with what was generated. And it
+//! extracts that file, as the same account, from a tarball the guest's own
+//! `tar` made of it, once plain and once through `zstd` (#88): the plain
+//! one is over 48 MiB too, so its reads cross the helper in chunks, and in
+//! both the member's writes do, alternating with them.
 
 use std::time::Duration;
 
 use rustible::prelude::*;
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{apt, file, shell, sysctl, systemd, user};
+use rustible_std::{apt, archive, file, shell, sysctl, systemd, user};
 
 /// What the marker file says, so a second run has something to compare.
 const MARKER: &str = "written by rustible from dev/vagrant\n";
@@ -56,6 +60,12 @@ const LARGE: &str = "/var/tmp/rustible-large";
 /// same bytes to compare the fetched copy with.
 const LARGE_BYTES: u64 = 50 * 1024 * 1024;
 const LARGE_LINE: &str = "rustible streams this line";
+
+/// The directory the tarballs hold, with the 50 MiB file in it as `large`,
+/// and the tarballs themselves: plain, which is over 48 MiB, and through
+/// `zstd`, which is not, but whose member is.
+const TREE: &str = "/var/tmp/rustible-tree";
+const TARBALLS: [&str; 2] = ["/var/tmp/rustible-large.tar", "/var/tmp/rustible-large.tar.zst"];
 
 /// Where the fetched copy lands, in the workspace's ignored `out/`, as
 /// `<this>/<host>/large-copy`; `vm-test.sh` checks it and removes it.
@@ -119,6 +129,30 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         login.step(format!("50 MiB copy as {LOGIN_ACCOUNT}"), file::Copy::from_local_path(LARGE).to(&copy))?;
         if !login.check_mode() {
             login.fetch(&copy, FETCHED)?;
+        }
+    }
+
+    // The 50 MiB file as a tarball member, made by the guest's own `tar`:
+    // a plain tarball over 48 MiB, and a `.tar.zst`. Each is extracted as
+    // the login account, so the archive's reads and the member's writes go
+    // through one helper, interleaved chunk by chunk; `creates` makes the
+    // second run `ok`.
+    ctx.step("zstd present", apt::Present::new(["zstd"]))?;
+    for tarball in TARBALLS {
+        let zstd = if tarball.ends_with(".zst") { "--zstd " } else { "" };
+        ctx.step(format!("tarball {tarball}"), shell::Command::sh(format!("mkdir -p {TREE} && ln -f {LARGE} {TREE}/large && tar -C /var/tmp {zstd}-cf {tarball}.part rustible-tree && mv {tarball}.part {tarball}")).creates(tarball))?;
+    }
+    for tarball in TARBALLS {
+        // A dry run on a guest that never had it has no archive to read.
+        if ctx.check_mode() && !ctx.sys().exists(tarball)? {
+            continue;
+        }
+        let dest = format!("/home/{LOGIN_ACCOUNT}/extracted-{}", tarball.rsplit('.').next().unwrap_or("tar"));
+        let mut login = ctx.as_user(LOGIN_ACCOUNT);
+        login.step(format!("{dest} directory"), file::Directory::at(&dest))?;
+        login.step(format!("50 MiB member of {tarball} as {LOGIN_ACCOUNT}"), archive::Extracted::from_path(tarball).to(&dest).creates("rustible-tree/large"))?;
+        if !ctx.check_mode() {
+            ctx.sys().cmd("cmp").args([LARGE.to_string(), format!("{dest}/rustible-tree/large")]).run().with_context(|| format!("the member extracted from {tarball} is not the 50 MiB file"))?;
         }
     }
 
