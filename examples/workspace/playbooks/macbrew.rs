@@ -7,10 +7,14 @@
 //!     rustible playbook run macbrew
 //!     rustible playbook run macbrew --var present=false
 //!
+//! A second formula is named by an alias, which has no rack of its own:
+//! `brew::Present` must find it through `<prefix>/opt/<alias>` on the second
+//! run, and `brew::Absent` must remove it by its rack's name.
+//!
 //! The removal first gives the formula a second version, a copy of its keg,
 //! which `brew::Absent` must take too, and pins it, which `brew::Absent` must
-//! refuse until it is unpinned. A removal run with the formula installed
-//! reports four `changed` and one `recovered`; the one after it, `ok`.
+//! refuse until it is unpinned. A removal run with both installed reports
+//! five `changed` and one `recovered`; the one after it, `ok`.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -28,6 +32,11 @@ struct Vars {
     /// service to leave running.
     #[default = "ninvaders"]
     package: String,
+    /// A formula named by an alias: `6tunnel` is `sixtunnel`'s, recorded in
+    /// its receipt, so brew links `opt/6tunnel` to the keg. Chosen for a
+    /// bottle of about 20 KB with no dependencies and no service.
+    #[default = "6tunnel"]
+    alias: String,
     /// False removes it again, which is how the `Absent` path is exercised.
     #[default = true]
     present: bool,
@@ -62,6 +71,16 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
                 out.installed, out.already_present
             ));
         }
+        let out = ctx.step(
+            format!("{} present, by its alias", vars.alias),
+            brew::Present::new([vars.alias.as_str()]),
+        )?;
+        if !ctx.check_mode() {
+            ctx.log(format!(
+                "installed {:?}, already there {:?}",
+                out.installed, out.already_present
+            ));
+        }
     } else {
         if !ctx.check_mode() {
             second_version_and_pin(ctx, &vars.package)?;
@@ -69,6 +88,13 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         let out = ctx.step(
             format!("{} absent", vars.package),
             brew::Absent::new([vars.package.as_str()]),
+        )?;
+        if !ctx.check_mode() {
+            ctx.log(format!("removed {:?}", out.removed));
+        }
+        let out = ctx.step(
+            format!("{} absent, by its alias", vars.alias),
+            brew::Absent::new([vars.alias.as_str()]),
         )?;
         if !ctx.check_mode() {
             ctx.log(format!("removed {:?}", out.removed));
