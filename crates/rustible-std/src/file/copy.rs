@@ -673,14 +673,21 @@ mod tests {
         calls
     }
 
+    /// One call [`staged`] returns, its path left out.
+    #[derive(Debug, PartialEq)]
+    enum Set {
+        Mode(u32),
+        Owner(u32, u32),
+    }
+
     /// `staged_calls`, with the staged path left out so a test can compare
     /// the calls themselves.
-    fn staged(fake: &Fake, planted: usize, dest: &str) -> Vec<(Option<u32>, Option<(u32, u32)>)> {
+    fn staged(fake: &Fake, planted: usize, dest: &str) -> Vec<Set> {
         staged_calls(fake, planted, dest)
             .into_iter()
             .map(|c| match c {
-                AttrCall::Chmod { mode, .. } => (Some(mode), None),
-                AttrCall::Chown { uid, gid, .. } => (None, Some((uid, gid))),
+                AttrCall::Chmod { mode, .. } => Set::Mode(mode),
+                AttrCall::Chown { uid, gid, .. } => Set::Owner(uid, gid),
                 _ => unreachable!(),
             })
             .collect()
@@ -704,11 +711,7 @@ mod tests {
             assert_eq!((f.mode, f.uid, f.gid), (mode, 0, 0), "{mode:o}");
             assert_eq!(
                 staged(&fake, planted, "/usr/local/bin/x"),
-                [
-                    (Some(0o755), None),
-                    (None, Some((0, 0))),
-                    (Some(mode), None)
-                ],
+                [Set::Mode(0o755), Set::Owner(0, 0), Set::Mode(mode)],
                 "{mode:o}"
             );
             assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
@@ -734,7 +737,7 @@ mod tests {
         assert_eq!((f.mode, f.uid, f.gid), (0o640, 0, 0));
         assert_eq!(
             staged(&fake, planted, "/srv/app.conf"),
-            [(Some(0o640), None), (None, Some((0, 0)))]
+            [Set::Mode(0o640), Set::Owner(0, 0)]
         );
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
@@ -786,7 +789,7 @@ mod tests {
         op.apply(&sys, c).unwrap();
         assert_eq!(
             staged(&fake, planted, "/etc/app/key"),
-            [(Some(0o600), None), (None, Some((5, 6)))]
+            [Set::Mode(0o600), Set::Owner(5, 6)]
         );
         let f = fake.file("/etc/app/key").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o600, 5, 6));
@@ -817,11 +820,7 @@ mod tests {
         op.apply(&sys, c).unwrap();
         assert_eq!(
             staged(&fake, planted, "/usr/local/bin/x"),
-            [
-                (Some(0o755), None),
-                (None, Some((5, 6))),
-                (Some(0o4755), None)
-            ]
+            [Set::Mode(0o755), Set::Owner(5, 6), Set::Mode(0o4755)]
         );
         let f = fake.file("/usr/local/bin/x").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));

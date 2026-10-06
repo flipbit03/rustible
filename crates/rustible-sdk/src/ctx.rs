@@ -738,6 +738,14 @@ impl Ctx {
     /// `<dest>/<host name>/<file name>` so several hosts do not collide
     /// (Ansible's `fetch` layout). The read goes through `sys`, so an
     /// escalated `Ctx` fetches what its identity can read.
+    ///
+    /// The file streams: it is read and sent a chunk at a time, so a file of
+    /// any size takes a few chunks' memory here, as root or as any account.
+    /// The orchestrator writes it beside the destination and renames it into
+    /// place only once the last chunk arrives, so the destination holds
+    /// either what it held before or the whole new file: a read that fails
+    /// part way fails this call and leaves nothing behind. Whatever `remote`
+    /// is gets read, as `cat` does, so a FIFO waits for a writer.
     pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
         let remote = remote.as_ref();
         let dest = path_str(local_dest.as_ref());
@@ -749,22 +757,20 @@ impl Ctx {
         } else {
             dest
         };
-        // `sys.read` puts the whole file in memory on this host; through a
-        // helper it crosses in chunks, so an escalated fetch has no size
-        // limit either. Reading it as a stream is #86.
-        let bytes = self
+        let file = self
             .sys
-            .read(remote)
+            .open_read(remote)
             .with_context(|| format!("fetching {}", remote.display()))?;
         let req = self.shared.channel.next_req();
-        for chunk in chunks(bytes.as_slice()) {
-            let chunk: Chunk = chunk.with_context(|| format!("reading {}", remote.display()))?;
+        let mut bytes = 0u64;
+        for chunk in chunks(file) {
+            let chunk: Chunk = chunk.with_context(|| format!("fetching {}", remote.display()))?;
+            bytes += chunk.bytes.len() as u64;
             self.shared.channel.send_fetch(req, &dest, &chunk)?;
         }
         self.debug(format!(
-            "fetched {} ({} bytes) to {dest}",
-            remote.display(),
-            bytes.len()
+            "fetched {} ({bytes} bytes) to {dest}",
+            remote.display()
         ));
         Ok(())
     }
@@ -1508,6 +1514,63 @@ mod tests {
                 .contains("denied")
         );
         assert!(ctx.fetch("/missing", "out/").is_err());
+    }
+
+    struct CaptureUp(std::sync::Mutex<Vec<Up>>);
+    impl UpLink for CaptureUp {
+        fn send(&self, up: &Up) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(up.clone());
+            Ok(())
+        }
+    }
+
+    /// `ctx.fetch` streams (#86): a file of several chunks is read through
+    /// `open_read`, never whole, and goes up as `FetchChunk`s of one
+    /// request, in order, offsets contiguous, with exactly one `last`, on
+    /// the final chunk. A file that cannot be opened sends nothing.
+    #[test]
+    fn fetch_streams_its_chunks_in_order_with_one_last() {
+        use crate::stream::CHUNK_SIZE;
+
+        let size = 2 * CHUNK_SIZE + 7;
+        let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let fake = Arc::new(Fake::new().with_file("/var/log/big", &content));
+        let sys = System::fake(fake.clone(), Arc::new(Collect::default()));
+        let up = Arc::new(CaptureUp(std::sync::Mutex::new(vec![])));
+        let (channel, _feeder) = Channel::remote(up.clone());
+        let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+        ctx.fetch("/var/log/big", "out/").unwrap();
+
+        let frames = up.0.lock().unwrap().clone();
+        let mut got = Vec::new();
+        let mut seen = vec![];
+        for f in &frames {
+            let Up::FetchChunk {
+                req,
+                dest,
+                offset,
+                bytes,
+                last,
+            } = f
+            else {
+                panic!("not a FetchChunk: {f:?}")
+            };
+            assert_eq!(dest, "out/local/big");
+            assert_eq!(*offset, got.len() as u64, "chunks in order, no gap");
+            got.extend_from_slice(bytes);
+            seen.push((*req, *last));
+        }
+        assert_eq!(got, content);
+        let req = seen[0].0;
+        assert_eq!(seen, [(req, false), (req, false), (req, true)]);
+        let reads = fake.reads();
+        assert!(
+            reads.len() == 1 && reads[0].streamed && reads[0].bytes == size as u64,
+            "{reads:?}"
+        );
+
+        assert!(ctx.fetch("/missing", "out/").is_err());
+        assert_eq!(up.0.lock().unwrap().len(), frames.len(), "nothing sent");
     }
 
     // ---- ctx.block ----

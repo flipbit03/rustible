@@ -13,6 +13,7 @@
 
 mod create;
 mod describe;
+mod fetch;
 mod init;
 mod render;
 mod run;

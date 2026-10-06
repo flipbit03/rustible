@@ -7,8 +7,9 @@
 //! drive the protocol; render.
 //!
 //! While the protocol runs, this side also answers the binary's
-//! `FileRequest`s from the workspace root, writes its `FetchChunk`s back
-//! under the same root, and turns ctrl-c into a `Cancel` frame to every
+//! `FileRequest`s from the workspace root, stages its `FetchChunk`s under
+//! the same root and renames each file into place on its last chunk, and
+//! turns ctrl-c into a `Cancel` frame to every
 //! host with a ten second grace period before the binary is killed
 //! (vision doc 5.5).
 
@@ -35,6 +36,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::describe::{self, Cargo, Describe};
+use crate::fetch::Fetches;
 use crate::render::Renderer;
 use crate::transport::{KillTarget, Probe, SshTarget, Transport};
 use crate::usage;
@@ -1185,13 +1187,16 @@ async fn drive_frames(
 
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut killed = false;
+    // Fetches still waiting for their last chunk. Dropped when this returns,
+    // however it returns, which removes their temporary files.
+    let mut fetches = Fetches::default();
     loop {
         tokio::select! {
             frame = frames.recv() => {
                 let Some(up) = frame else { break };
                 let up = up?;
                 *hello |= matches!(up, Up::Hello { .. });
-                handle_frame(plan, proc, out, host, name, up, &cancel_rx).await?;
+                handle_frame(plan, proc, out, host, name, up, &cancel_rx, &mut fetches).await?;
             }
             changed = cancel_rx.changed(), if deadline.is_none() => {
                 if changed.is_err() || !*cancel_rx.borrow() {
@@ -1219,7 +1224,7 @@ async fn drive_frames(
 }
 
 /// One `Up` frame: the `Hello` check, an event to render, a file to serve,
-/// or a chunk of a fetched file to write.
+/// or a chunk of a fetched file to stage in `fetches`.
 ///
 /// Serving a file is the one arm that can run for minutes (a 50 MB stream
 /// over a slow link), and while it does, nothing else watches `cancel_rx`.
@@ -1234,6 +1239,7 @@ async fn handle_frame(
     name: &str,
     up: Up,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    fetches: &mut Fetches,
 ) -> Result<()> {
     match &up {
         Up::Hello { protocol, playbook } => {
@@ -1298,20 +1304,19 @@ async fn handle_frame(
             }
         }
         Up::FetchChunk {
+            req,
             dest,
             offset,
             bytes,
             last,
-            ..
         } => {
-            let written = plan
-                .files
-                .write_chunk(dest, *offset, bytes)
+            // Staged beside the destination and renamed over it on the last
+            // chunk, so it is reported only once it is there whole.
+            let landed = fetches
+                .chunk(&plan.files, *req, dest, *offset, bytes, *last)
                 .map_err(|reason| anyhow::anyhow!("fetch to `{dest}` refused: {reason}"))?;
-            if *last {
-                out.lock()
-                    .unwrap()
-                    .fetched(host, dest, &written, offset + bytes.len() as u64);
+            if let Some((path, size)) = landed {
+                out.lock().unwrap().fetched(host, dest, &path, size);
             }
             // Not `frame`: the chunk's bytes would be re-encoded into the
             // JSON stream after being written to disk.
@@ -1735,6 +1740,15 @@ host "laptop" connection="local"
     /// [`stand_in`], saying `Hello` with this protocol version when there is
     /// one.
     fn stand_in_speaking(start: &Path, name: &str, hello: Option<u32>, stderr: &str) -> String {
+        let hello = hello.map(|protocol| Up::Hello {
+            protocol,
+            playbook: name.into(),
+        });
+        stand_in_saying(start, hello.as_slice(), stderr)
+    }
+
+    /// [`stand_in`], saying these frames after reading `Start`.
+    fn stand_in_saying(start: &Path, frames: &[Up], stderr: &str) -> String {
         let mut script = format!(
             "#!/bin/sh\nset -e\n\
              set -- $(dd bs=1 count=4 2>/dev/null | od -An -tu1)\n\
@@ -1742,12 +1756,8 @@ host "laptop" connection="local"
              dd bs=1 count=$n of='{}' 2>/dev/null\n",
             start.display()
         );
-        if let Some(protocol) = hello {
-            let json = serde_json::to_string(&Up::Hello {
-                protocol,
-                playbook: name.into(),
-            })
-            .unwrap();
+        for frame in frames {
+            let json = serde_json::to_string(frame).unwrap();
             let len = (json.len() as u32).to_be_bytes();
             script.push_str(&format!(
                 "printf '\\{:03o}\\{:03o}\\{:03o}\\{:03o}%s' '{json}'\n",
@@ -1830,6 +1840,76 @@ host "laptop" connection="local"
             assert_eq!(hello, said_hello);
             assert_eq!(proc.wait().await.unwrap(), 3);
         }
+    }
+
+    /// A fetch whose last chunk never comes, because the binary's read
+    /// failed or it died, leaves the destination as it was and nothing
+    /// beside it once the host's frame loop ends (decision 27): the chunks
+    /// that did arrive were staged, not written over it.
+    #[tokio::test]
+    async fn an_unfinished_fetch_leaves_the_destination_when_the_run_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/f"), b"the previous run's copy").unwrap();
+        let chunk = |offset: u64, bytes: &[u8]| Up::FetchChunk {
+            req: 1,
+            dest: "out/f".into(),
+            offset,
+            bytes: bytes.to_vec().into(),
+            last: false,
+        };
+        let script = dir.path().join("bin");
+        std::fs::write(
+            &script,
+            stand_in_saying(
+                &dir.path().join("start"),
+                &[
+                    Up::Hello {
+                        protocol: PROTOCOL_VERSION,
+                        playbook: "games/minecraft".into(),
+                    },
+                    chunk(0, b"half of "),
+                    chunk(8, b"a new one"),
+                ],
+                "",
+            ),
+        )
+        .unwrap();
+        let tr = Transport::Local;
+        let mut proc = tr
+            .spawn(&["sh".into(), script.display().to_string()], None)
+            .await
+            .unwrap();
+        let r = by_defaults();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut hello = false;
+        drive_frames(
+            &tr,
+            &mut proc,
+            &plan(dir.path(), None),
+            &r,
+            None,
+            Value::Null,
+            &quiet(&r.host),
+            &r.host,
+            "games/minecraft",
+            rx,
+            "run",
+            &mut hello,
+        )
+        .await
+        .unwrap();
+        assert!(hello);
+        let _ = proc.wait().await;
+        assert_eq!(
+            std::fs::read(dir.path().join("out/f")).unwrap(),
+            b"the previous run's copy"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("out"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["f"]);
     }
 
     /// A binary of the previous protocol is refused at its `Hello`, before
