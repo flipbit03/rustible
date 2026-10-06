@@ -3385,12 +3385,13 @@ mod tests {
 
     /// The refusal of an answer fits a frame of a couple of kilobytes
     /// whatever the request said, since it quotes nothing from the request:
-    /// here a chunk larger than the frame, for a path of control characters.
+    /// here a chunk larger than the frame, for a path as long as a name may
+    /// be.
     #[test]
     fn the_refusal_fits_a_small_frame_whatever_the_request_said() {
         let limit = 2500;
         let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("\x01".repeat(200));
+        let f = dir.path().join("n".repeat(250));
         std::fs::write(&f, data(5000)).unwrap();
         let mut rx = Vec::new();
         write_frame(
