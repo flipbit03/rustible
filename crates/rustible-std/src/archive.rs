@@ -1261,8 +1261,10 @@ mod tests {
         );
     }
 
-    // `fixtures/archive/hello.tar*`: one tree, four encodings, made with
-    // GNU tar 1.35, gzip -9 -n, xz -9 and zstd -19:
+    // `fixtures/archive/hello*.tar*`: one tree, five encodings, made with
+    // GNU tar 1.35, gzip -9 -n, xz -9 and zstd -19, the last twice: one
+    // frame, and two frames cut inside `README.txt` with a skippable frame
+    // between them (the README beside them has the commands):
     //   hello/            0775
     //   hello/README.txt  0644  "hello from rustible\n"
     //   hello/bin/        0775
@@ -1273,13 +1275,15 @@ mod tests {
     const TGZ: &[u8] = include_bytes!("../fixtures/archive/hello.tar.gz");
     const TXZ: &[u8] = include_bytes!("../fixtures/archive/hello.tar.xz");
     const TZST: &[u8] = include_bytes!("../fixtures/archive/hello.tar.zst");
+    const TZST_FRAMES: &[u8] = include_bytes!("../fixtures/archive/hello-frames.tar.zst");
 
-    fn all() -> [(&'static str, Format, &'static [u8]); 4] {
+    fn all() -> [(&'static str, Format, &'static [u8]); 5] {
         [
             ("/tmp/hello.tar", Format::Tar, TAR),
             ("/tmp/hello.tar.gz", Format::TarGz, TGZ),
             ("/tmp/hello.tar.xz", Format::TarXz, TXZ),
             ("/tmp/hello.tar.zst", Format::TarZst, TZST),
+            ("/tmp/hello-frames.tar.zst", Format::TarZst, TZST_FRAMES),
         ]
     }
 
@@ -1348,6 +1352,7 @@ mod tests {
         assert_eq!(detect_format(TGZ), Ok(Format::TarGz));
         assert_eq!(detect_format(TXZ), Ok(Format::TarXz));
         assert_eq!(detect_format(TZST), Ok(Format::TarZst));
+        assert_eq!(detect_format(TZST_FRAMES), Ok(Format::TarZst));
         assert!(
             detect_format(b"PK\x03\x04rest")
                 .unwrap_err()

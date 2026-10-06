@@ -9,6 +9,18 @@ outside the archive.
 One tree in four encodings, made with GNU tar 1.35, `gzip -9 -n`, `xz -9`
 and `zstd -19`; the tree is listed above the `TAR` constant in `archive.rs`.
 
+`hello-frames.tar.zst` is the same tar as two zstd frames, cut inside
+`hello/README.txt`'s data, with a skippable frame between them, which
+`archive::Extracted` must read to the end of (issue #88). Made with zstd
+1.5.5, from `hello.tar`:
+
+```sh
+head -c 1030 hello.tar | zstd -19 --check -q > a.zst
+tail -c +1031 hello.tar | zstd -19 --check -q > b.zst
+printf 'P*M\030\010\000\000\000rustible' > skip
+cat a.zst skip b.zst > hello-frames.tar.zst
+```
+
 ## `pax-sparse-*.tar` and `gnu-sparse.tar`
 
 One sparse file in each of GNU tar's three pax sparse formats, which
