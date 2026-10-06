@@ -406,7 +406,17 @@ fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, max_frame: usize) -> io::Res
         } else {
             answer(&local, &req.op, max_frame)
         };
-        let body = match encode_frame(&resp, max_frame) {
+        // A command's output is measured before it is encoded: encoding
+        // 100 MB of it only to refuse it would cost more than twice that
+        // again in the helper.
+        let over =
+            matches!(&resp, HelperResponse::Output(o) if encoded_output_len(o) > max_frame as u64);
+        let encoded = if over {
+            Ok(None)
+        } else {
+            encode_frame(&resp, max_frame)
+        };
+        let body = match encoded {
             Ok(Some(body)) => body,
             Ok(None) => refuse(too_large_code(), too_large(&resp, max_frame), max_frame)?,
             Err(e) => refuse(
@@ -472,11 +482,31 @@ fn answer(local: &Local, op: &HelperOp, max_frame: usize) -> HelperResponse {
     }
 }
 
+/// The length of `size` bytes in base64: four characters for every three
+/// bytes or part of three.
+fn base64_len(size: u64) -> u64 {
+    size.div_ceil(3) * 4
+}
+
 /// The encoded length of a [`HelperResponse::Bytes`] carrying `size` bytes:
-/// base64 of them, four characters for every three bytes or part of three,
-/// inside `{"Bytes":"…"}`.
+/// their base64 inside `{"Bytes":"…"}`.
 fn encoded_bytes_len(size: u64) -> u64 {
-    size.div_ceil(3) * 4 + r#"{"Bytes":""}"#.len() as u64
+    base64_len(size) + r#"{"Bytes":""}"#.len() as u64
+}
+
+/// The encoded length of a [`HelperResponse::Output`] carrying `o`, exactly,
+/// without encoding the output: the envelope with both streams empty, which
+/// is a few dozen bytes to encode, plus their base64. Base64 needs no JSON
+/// escaping, so the two add up.
+fn encoded_output_len(o: &Output) -> u64 {
+    let empty = HelperResponse::Output(Output {
+        status: o.status,
+        signal: o.signal,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    });
+    let envelope = serde_json::to_vec(&empty).map_or(0, |v| v.len()) as u64;
+    envelope + base64_len(o.stdout.len() as u64) + base64_len(o.stderr.len() as u64)
 }
 
 /// The frame carrying a refusal marked `code`: `message`, or, at a limit
@@ -1235,7 +1265,7 @@ impl Elevated {
                      ({MAX_FRAME_PAYLOAD} bytes); running as `{}` sends the whole file in \
                      one request, so a file this large has to be handled without \
                      `as_user`/`as_root`",
-                    path.display(),
+                    cut(&path.display().to_string(), 512),
                     self.user
                 ),
             }));
@@ -1308,10 +1338,21 @@ impl Elevated {
             HelperResponse::Err {
                 code: Some(code),
                 message,
-            } if code == too_large_code() || code == unencodable_code() => Err(io::Error::new(
-                io::Error::from_raw_os_error(code).kind(),
-                format!("{label} as `{}`: {message}", self.user),
-            )),
+            } if code == too_large_code() || code == unencodable_code() => {
+                // Empty when the frame limit left no room for the helper's
+                // wording; say which refusal it was.
+                let reason = match message.as_str() {
+                    "" if code == too_large_code() => {
+                        "refused: the answer is larger than one helper frame"
+                    }
+                    "" => "refused: the answer cannot be encoded",
+                    m => m,
+                };
+                Err(io::Error::new(
+                    io::Error::from_raw_os_error(code).kind(),
+                    format!("{label} as `{}`: {reason}", self.user),
+                ))
+            }
             other => other.into_io(),
         }
     }
@@ -1495,6 +1536,27 @@ mod tests {
             cwd: None,
             stdin: None,
             prefix: vec![],
+        }
+    }
+
+    /// Create an empty file named `caf\xe9`, not UTF-8, in `dir`, and say
+    /// whether that worked. A filesystem that only stores UTF-8 names
+    /// refuses it with `EILSEQ` (APFS on a mac does): no listing there can
+    /// hold such a name, so the answer that cannot be encoded never arises,
+    /// and a test of it skips that case and says so on stderr.
+    fn plant_a_name_that_is_not_utf8(dir: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let name = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        match std::fs::write(&name, b"") {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(unencodable_code()) => {
+                eprintln!(
+                    "note: skipping the listing that cannot be encoded: this filesystem \
+                     refuses a name that is not UTF-8 ({e})"
+                );
+                false
+            }
+            Err(e) => panic!("creating {}: {e}", name.display()),
         }
     }
 
@@ -1811,13 +1873,9 @@ mod tests {
         long_argv.args.push("y".repeat(SMALL_FRAME));
         let odd = dir.path().join("odd");
         std::fs::create_dir(&odd).unwrap();
-        std::fs::write(
-            odd.join(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"caf\xe9")),
-            b"",
-        )
-        .unwrap();
+        let odd_listing = plant_a_name_that_is_not_utf8(&odd);
 
-        let requests = [
+        let mut requests = vec![
             (false, HelperOp::Read { path: big.clone() }),
             (false, HelperOp::Read { path: small }),
             (false, HelperOp::ReadDir { path: listed }),
@@ -1825,8 +1883,10 @@ mod tests {
             (false, HelperOp::Spawn(sh("printf ok"))),
             (true, HelperOp::Remove { path: absurd }),
             (false, HelperOp::Spawn(long_argv)),
-            (false, HelperOp::ReadDir { path: odd }),
         ];
+        if odd_listing {
+            requests.push((false, HelperOp::ReadDir { path: odd }));
+        }
         let mut rx = Vec::new();
         for (checking, op) in requests {
             write_frame(&mut rx, &HelperRequest { checking, op }).unwrap();
@@ -1867,7 +1927,7 @@ mod tests {
             other => panic!("expected a refusal marked {marker}, got {other:?}"),
         };
         let big_answer = too_large_code();
-        assert_eq!(answers.len(), 8, "{answers:?}");
+        assert_eq!(answers.len(), 7 + usize::from(odd_listing), "{answers:?}");
         assert!(refusal(&answers[0], big_answer).starts_with("the file is 20000 bytes"));
         assert!(matches!(&answers[1], HelperResponse::Bytes(b) if b == b"small"));
         assert!(refusal(&answers[2], big_answer).starts_with("the directory has 200 entries"));
@@ -1880,10 +1940,12 @@ mod tests {
             "the answer is more than one helper frame holds (16384 bytes)"
         );
         assert!(refusal(&answers[6], big_answer).starts_with("it exited 0 and wrote 20000 bytes"));
-        assert!(
-            refusal(&answers[7], unencodable_code())
-                .starts_with("the helper's answer cannot be encoded: ")
-        );
+        if odd_listing {
+            assert!(
+                refusal(&answers[7], unencodable_code())
+                    .starts_with("the helper's answer cannot be encoded: ")
+            );
+        }
     }
 
     /// The refusal for a command's stdin larger than a frame names the
@@ -2006,14 +2068,11 @@ mod tests {
     /// naming it: the helper does not exit, and the identity is not latched.
     #[test]
     fn an_answer_that_cannot_be_encoded_is_refused_and_the_helper_survives() {
-        use std::os::unix::ffi::OsStrExt;
         let e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9")),
-            b"",
-        )
-        .unwrap();
+        if !plant_a_name_that_is_not_utf8(dir.path()) {
+            return;
+        }
         let err = e.read_dir(dir.path()).unwrap_err().to_string();
         assert!(
             err.starts_with(&format!(
@@ -2065,6 +2124,55 @@ mod tests {
         );
         assert!(err.len() < 1024, "{} bytes of message", err.len());
         still_serves(&e);
+    }
+
+    /// The size of a command's output in a frame is computed, not encoded,
+    /// and computed exactly: a frame of exactly that size carries it, one
+    /// byte less does not. Output of every length modulo three, with and
+    /// without a signal, a negative status, and both streams.
+    #[test]
+    fn a_commands_output_is_measured_exactly_without_encoding_it() {
+        for (status, signal, out, err) in [
+            (0, None, 0, 0),
+            (0, None, 1, 0),
+            (3, None, 2, 5),
+            (-1, Some(9), 3, 4),
+            (127, None, 20000, 1),
+        ] {
+            let o = Output {
+                status,
+                signal,
+                stdout: vec![b'o'; out],
+                stderr: vec![0xff; err],
+            };
+            let exact = encoded_output_len(&o) as usize;
+            let resp = HelperResponse::Output(o);
+            let body = encode_frame(&resp, exact).unwrap();
+            assert_eq!(body.map(|b| b.len()), Some(exact), "{resp:?}");
+            assert!(
+                encode_frame(&resp, exact - 1).unwrap().is_none(),
+                "{resp:?}"
+            );
+        }
+    }
+
+    /// At a limit too small for the helper's wording, the refusal is the
+    /// bare marker, and the main side still says what was refused and why.
+    #[test]
+    fn a_bare_refusal_still_says_what_was_refused() {
+        // Room for `{"Err":{"code":27,"message":""}}` and not much more.
+        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), 50);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, vec![b'x'; 1000]).unwrap();
+        let err = e.read(&f).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "read {} as `tester`: refused: the answer is larger than one helper frame",
+                f.display()
+            )
+        );
     }
 
     /// The refusal fits a frame of a couple of kilobytes whatever the
