@@ -350,7 +350,11 @@ impl Fake {
                 _ => None,
             };
             (
-                attrs.mode.or(old.map(|o| o.0)).unwrap_or(0o644),
+                attrs
+                    .mode
+                    .map(|m| m & 0o7777)
+                    .or(old.map(|o| o.0))
+                    .unwrap_or(0o644),
                 attrs.owner.or(old.map(|o| o.1)),
             )
         };

@@ -44,10 +44,10 @@ impl Local {
 ///
 /// The temporary file is `.rustible-<random>` in the target's directory, so
 /// the rename never crosses a filesystem. It is created at `0600` for a
-/// rewrite, and at `0600` for a new file given attributes, so the new
-/// content is readable by nobody else while it streams in; a new file
-/// without attributes is created as any new file is (0666 minus the umask),
-/// which is the mode it keeps. Dropping a `Staged` that was not committed
+/// rewrite and for a new file given a mode, so the new content is readable
+/// by nobody else while it streams in; any other new file is created as any
+/// new file is (0666 minus the umask), which is the mode it keeps
+/// ([`creation_mode`]). Dropping a `Staged` that was not committed
 /// removes the temporary file, so a failure part way, or a helper whose
 /// parent went away, leaves the target exactly as it was and nothing beside
 /// it.
@@ -61,9 +61,11 @@ impl Local {
 /// - **A rewrite** keeps the existing file's mode, setuid and setgid
 ///   included, and its owner, best effort: only root can give a file away,
 ///   and an unprivileged rewrite of another user's file goes on, the file
-///   now the writer's. The existing file is found with a `stat` that follows
-///   symlinks, so writing at a link's path takes the target's mode and owner
-///   and the rename replaces the link itself.
+///   now the writer's. The existing file is found at commit, with a `stat`
+///   that follows symlinks, so a change to it during the stream is kept,
+///   writing at a link's path takes the target's mode and owner, and the
+///   rename replaces the link itself. A target removed during the stream
+///   leaves the new file at the 0600 it was staged at.
 /// - **A new file** without attributes is left as created.
 ///
 /// The setuid and setgid bits go on last because a `chown` clears them: on
@@ -93,60 +95,54 @@ impl Local {
 pub(crate) struct Staged {
     tmp: tempfile::NamedTempFile,
     target: PathBuf,
-    /// The mode the file is given at commit. `None` for a new file without
-    /// attributes, which keeps the mode it was created with.
-    mode: Option<u32>,
-    /// The owner it is given at commit, if any.
-    owner: Option<(u32, u32)>,
-    /// Whether [`owner`](Self::owner) was asked for, so failing to give it
-    /// fails the write, or kept from the file being replaced, best effort.
-    owner_required: bool,
+    /// What was asked for, mode masked to `0o7777`; `None` when nothing was.
+    attrs: Option<WriteAttrs>,
+    /// The mode the staged file was created with, read from its descriptor
+    /// before anything else touched it: a new file's mode, unless one is
+    /// asked for.
+    created: u32,
     written: u64,
 }
 
+/// The mode the staged file is created with. 0600 whenever the content may
+/// end narrower than the umask allows: a rewrite (the old file's mode is not
+/// known to be wider) and a new file with a mode asked for. Only a new file
+/// without a mode is created as any new file is, 0666 minus the umask, since
+/// that is the mode it keeps. Creating it wider and narrowing it afterwards
+/// leaves a window in which another user can open it and keep the
+/// descriptor, and read through it later.
+fn creation_mode(exists: bool, attrs: Option<WriteAttrs>) -> u32 {
+    if exists || attrs.is_some_and(|a| a.mode.is_some()) {
+        0o600
+    } else {
+        0o666
+    }
+}
+
 impl Staged {
-    /// Stage a write of `p`: decide its mode and owner from `attrs` and from
-    /// the file already there, and create the temporary file beside it.
+    /// Stage a write of `p`: create the temporary file beside it.
     pub(crate) fn begin(p: &Path, attrs: Option<WriteAttrs>) -> io::Result<Staged> {
         let dir = p.parent().unwrap_or(Path::new("."));
-        // Followed: writing at a symlink's path takes the target's mode and
-        // owner, and the rename then replaces the link itself.
-        let existing = std::fs::metadata(p).ok();
-        let attrs = attrs.filter(|a| a.mode.is_some() || a.owner.is_some());
-        // A new file is created as any newly created file is (0666 minus the
-        // umask); tempfile's own default is 0600, which is not what an op
-        // that creates a config file expects. A rewrite starts at 0600
-        // instead, so the new content is never readable by more than the
-        // writer until its own mode is set at commit.
-        let create = if existing.is_some() { 0o600 } else { 0o666 };
+        let attrs = attrs
+            .filter(|a| a.mode.is_some() || a.owner.is_some())
+            .map(|a| WriteAttrs {
+                mode: a.mode.map(|m| m & 0o7777),
+                ..a
+            });
+        // Followed, as at commit.
+        let exists = std::fs::metadata(p).is_ok();
         let tmp = tempfile::Builder::new()
             .prefix(".rustible-")
-            .permissions(std::fs::Permissions::from_mode(create))
+            .permissions(std::fs::Permissions::from_mode(creation_mode(
+                exists, attrs,
+            )))
             .tempfile_in(dir)?;
-        // What the umask made of 0666 is a new file's mode unless one is
-        // asked for. Read before narrowing to 0600, which happens before the
-        // first byte is written.
         let created = tmp.as_file().metadata()?.permissions().mode() & 0o7777;
-        if attrs.is_some() && existing.is_none() {
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        let old_mode = existing.as_ref().map(|m| m.permissions().mode() & 0o7777);
-        let old_owner = existing.as_ref().map(|m| (m.uid(), m.gid()));
-        let (mode, owner, owner_required) = match attrs {
-            None => (old_mode, old_owner, false),
-            Some(a) => (
-                Some(a.mode.or(old_mode).unwrap_or(created)),
-                a.owner.or(old_owner),
-                a.owner.is_some(),
-            ),
-        };
         Ok(Staged {
             tmp,
             target: p.to_path_buf(),
-            mode,
-            owner,
-            owner_required,
+            attrs,
+            created,
             written: 0,
         })
     }
@@ -176,11 +172,27 @@ impl Staged {
     fn prepare(&mut self) -> io::Result<()> {
         let f = self.tmp.as_file();
         f.sync_all()?;
-        let Some(mode) = self.mode else {
+        // The file being replaced is looked at now, not when the stream
+        // began: a `chmod` or `chown` of it during a long stream is kept,
+        // and a file someone created meanwhile is kept by the same rules.
+        // Followed: writing at a symlink's path takes the target's mode and
+        // owner, and the rename then replaces the link itself.
+        let existing = std::fs::metadata(&self.target).ok();
+        let old_mode = existing.as_ref().map(|m| m.permissions().mode() & 0o7777);
+        let old_owner = existing.as_ref().map(|m| (m.uid(), m.gid()));
+        let (mode, owner, owner_required) = match self.attrs {
+            None => (old_mode, old_owner, false),
+            Some(a) => (
+                Some(a.mode.or(old_mode).unwrap_or(self.created)),
+                a.owner.or(old_owner),
+                a.owner.is_some(),
+            ),
+        };
+        let Some(mode) = mode else {
             return Ok(());
         };
         let mut owned = None;
-        for step in attr_steps(mode, self.owner) {
+        for step in attr_steps(mode, owner) {
             match step {
                 AttrStep::Mode(m) => {
                     f.set_permissions(std::fs::Permissions::from_mode(m))
@@ -199,7 +211,7 @@ impl Staged {
                 AttrStep::Owner(uid, gid) => {
                     match std::os::unix::fs::fchown(f, Some(uid), Some(gid)) {
                         Ok(()) => owned = Some((uid, gid)),
-                        Err(e) if self.owner_required => {
+                        Err(e) if owner_required => {
                             return Err(reworded(
                                 &e,
                                 format!(
@@ -218,12 +230,19 @@ impl Staged {
         let got = f.metadata()?;
         let got_mode = got.permissions().mode() & 0o7777;
         if got_mode != mode {
+            // The one drop measured: setgid, for a writer neither in the
+            // file's group nor holding `CAP_FSETID`.
+            let why = if mode ^ got_mode == 0o2000 && mode & 0o2000 != 0 {
+                "; setting setgid on a file whose group this process is not in takes \
+                 CAP_FSETID"
+            } else {
+                ""
+            };
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
                     "set mode {mode:04o} on the new file but the kernel left {got_mode:04o} \
-                     (group {}); setting setgid on a file whose group this process is not in \
-                     takes CAP_FSETID. The file was not replaced",
+                     (group {}){why}. The file was not replaced",
                     got.gid()
                 ),
             ));
@@ -753,6 +772,97 @@ mod tests {
                 assert_eq!(std::fs::read(&p).unwrap(), b"secret");
             }
         }
+    }
+
+    /// The staged file is created at 0600 for a rewrite and for a new file
+    /// given a mode; only a new file without one starts at the umask's mode.
+    #[test]
+    fn creation_mode_is_0600_unless_a_new_file_keeps_the_umask_mode() {
+        let mode = Some(WriteAttrs {
+            mode: Some(0o644),
+            owner: None,
+        });
+        let owner = Some(WriteAttrs {
+            mode: None,
+            owner: Some((1, 1)),
+        });
+        assert_eq!(creation_mode(false, None), 0o666);
+        assert_eq!(creation_mode(false, owner), 0o666);
+        assert_eq!(creation_mode(false, mode), 0o600);
+        for attrs in [None, mode, owner] {
+            assert_eq!(creation_mode(true, attrs), 0o600, "{attrs:?}");
+        }
+    }
+
+    /// At the descriptor, at creation: `created` is read from the staged
+    /// file's descriptor before anything else touches it, so a staged file
+    /// made wider and narrowed afterwards (the window a racer used to open a
+    /// secret at 0644 and keep the descriptor) shows here.
+    #[test]
+    fn a_new_file_given_a_mode_is_created_at_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        let umasked = Local.stat(&plain).unwrap().unwrap().mode;
+        let mode = |m| {
+            Some(WriteAttrs {
+                mode: Some(m),
+                owner: None,
+            })
+        };
+        for (p, attrs, created) in [
+            (dir.path().join("new"), mode(0o644), 0o600),
+            (dir.path().join("new"), mode(0o4755), 0o600),
+            (plain.clone(), None, 0o600),
+            (dir.path().join("new"), None, umasked),
+        ] {
+            let s = Staged::begin(&p, attrs).unwrap();
+            assert_eq!(s.created, created, "{} {attrs:?}", p.display());
+        }
+    }
+
+    /// The file being replaced is looked at when the write commits, not when
+    /// it began: a `chmod` of it during the stream is kept, and so is the
+    /// mode of a file someone created meanwhile.
+    #[test]
+    fn the_target_is_looked_at_when_the_write_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, "v1").unwrap();
+        Local.set_mode(&old, 0o644).unwrap();
+        let mut s = Staged::begin(&old, None).unwrap();
+        s.write(b"v2").unwrap();
+        Local.set_mode(&old, 0o640).unwrap();
+        s.commit().unwrap();
+        assert_eq!(Local.stat(&old).unwrap().unwrap().mode, 0o640);
+
+        let late = dir.path().join("late");
+        let mut s = Staged::begin(&late, None).unwrap();
+        s.write(b"mine").unwrap();
+        std::fs::write(&late, "theirs").unwrap();
+        Local.set_mode(&late, 0o600).unwrap();
+        s.commit().unwrap();
+        assert_eq!(Local.stat(&late).unwrap().unwrap().mode, 0o600);
+        assert_eq!(std::fs::read(&late).unwrap(), b"mine");
+    }
+
+    /// A mode asked for is the permission bits only: anything above
+    /// `0o7777` (a whole `st_mode`, file type and all) is dropped.
+    #[test]
+    fn a_requested_mode_is_masked_to_its_permission_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        let mut s = Staged::begin(
+            &p,
+            Some(WriteAttrs {
+                mode: Some(0o100_640),
+                owner: None,
+            }),
+        )
+        .unwrap();
+        s.write(b"x").unwrap();
+        s.commit().unwrap();
+        assert_eq!(Local.stat(&p).unwrap().unwrap().mode, 0o640);
     }
 
     /// A new file without attributes keeps the mode any new file gets here,

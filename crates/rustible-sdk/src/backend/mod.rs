@@ -155,7 +155,7 @@ impl Output {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteAttrs {
     /// Permission bits as `chmod` takes them, setuid, setgid and sticky
-    /// included: `0o600`, `0o4755`.
+    /// included: `0o600`, `0o4755`. Anything above `0o7777` is ignored.
     pub mode: Option<u32>,
     /// Numeric `(uid, gid)`, both of them, as [`Backend::set_owner`] takes
     /// them. Handing a file to another user needs root.
