@@ -3585,6 +3585,118 @@ mod tests {
         );
     }
 
+    /// A rewrite through the helper keeps the old file's whole mode,
+    /// setuid and setgid included, and its owner: the helper's writes are
+    /// `Local`'s `Staged`, so `Local`'s rules hold (issue #51). Linux only,
+    /// as `Local`'s own test is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rewrite_through_the_helper_keeps_setuid_and_setgid() {
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o4755, 0o2755, 0o6755, 0o2745, 0o1755, 0o640] {
+            let f = dir.path().join(format!("f{mode:o}"));
+            std::fs::write(&f, "v1").unwrap();
+            Local.set_mode(&f, mode).unwrap();
+            let before = Local.stat(&f).unwrap().unwrap();
+            assert_eq!(before.mode, mode, "planting {mode:o}");
+            let body = data(3 * SMALL.chunk);
+            e.write(&f, &body).unwrap();
+            let after = Local.stat(&f).unwrap().unwrap();
+            assert_eq!(std::fs::read(&f).unwrap(), body);
+            assert_eq!(
+                (after.mode, after.uid, after.gid),
+                (mode, before.uid, before.gid),
+                "{mode:o}"
+            );
+        }
+        assert!(staged_in(dir.path()).is_empty());
+    }
+
+    /// Releasing a stream never starts a helper, so a reader dropped after
+    /// the helper is gone, or before one ever ran, costs no `sudo`; and it
+    /// does not panic on a lock poisoned by a panic elsewhere, so it is safe
+    /// from a `Drop` that runs while unwinding.
+    #[test]
+    fn releasing_a_stream_never_spawns_a_helper_or_panics() {
+        // `none` refuses at spawn without running anything, and a spawn
+        // that failed would be latched.
+        let spawner = Spawner {
+            method: "none".into(),
+            exe: PathBuf::from("/nonexistent/rustible-bin"),
+            password: None,
+            note: None,
+        };
+        let e = Elevated::new("root", spawner, applying());
+        e.release(HelperOp::Close { handle: 1 });
+        drop(Held::new(&e, Some(2), Release::Abort));
+        assert!(lock(&e.failed).is_none(), "a helper was started");
+
+        let e = in_process(applying());
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _held = e.conn.lock().unwrap();
+                    panic!("poisoning the connection lock on purpose");
+                })
+                .join();
+        });
+        assert!(e.conn.is_poisoned());
+        e.release(HelperOp::Close { handle: 3 });
+        drop(Held::new(&e, Some(4), Release::Close));
+        still_serves(&e);
+    }
+
+    /// Not a test: the measurement decision 23 on #85 asked for, one 1 GiB
+    /// write and one 1 GiB read through an in-process helper, against the
+    /// same through `Local`. Run by hand, in release:
+    /// `cargo test --release -p rustible-sdk --lib -- --ignored --nocapture measure_one_gib`.
+    #[test]
+    #[ignore = "a measurement, run by hand in release"]
+    fn measure_one_gib_through_the_helper() {
+        /// `left` pseudo-random bytes, made as they are read.
+        struct Gen {
+            left: u64,
+            x: u64,
+        }
+        impl Read for Gen {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = buf.len().min(self.left as usize);
+                for b in &mut buf[..n] {
+                    self.x ^= self.x << 13;
+                    self.x ^= self.x >> 7;
+                    self.x ^= self.x << 17;
+                    *b = self.x as u8;
+                }
+                self.left -= n as u64;
+                Ok(n)
+            }
+        }
+        const GIB: u64 = 1 << 30;
+        let dir = tempfile::tempdir_in(std::env::var("MEASURE_DIR").unwrap_or(".".into())).unwrap();
+        let e = in_process(applying());
+        for (name, backend) in [("Local", &Local as &dyn Backend), ("helper", &e)] {
+            let f = dir.path().join(name);
+            let t0 = Instant::now();
+            let n = backend
+                .write_from(&f, &mut Gen { left: GIB, x: 7 }, None)
+                .unwrap();
+            let wrote = t0.elapsed();
+            assert_eq!(n, GIB);
+            let t0 = Instant::now();
+            let read = io::copy(&mut backend.open_read(&f).unwrap(), &mut io::sink()).unwrap();
+            let took = t0.elapsed();
+            assert_eq!(read, GIB);
+            let rate = |d: Duration| 1024.0 / d.as_secs_f64();
+            println!(
+                "{name}: write 1 GiB {wrote:.2?} ({:.0} MiB/s), read 1 GiB {took:.2?} ({:.0} MiB/s)",
+                rate(wrote),
+                rate(took)
+            );
+            std::fs::remove_file(&f).unwrap();
+        }
+    }
+
     /// An answer of the wrong shape is reported by its variant's name, never
     /// its contents, which may be a file's.
     #[test]
