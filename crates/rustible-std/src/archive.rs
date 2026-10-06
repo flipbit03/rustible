@@ -1051,7 +1051,7 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat};
+    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -2216,6 +2216,18 @@ mod tests {
         fn write(&self, p: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Self::name_max(p)?;
             self.fake.write(p, bytes)
+        }
+        fn write_from(
+            &self,
+            p: &Path,
+            src: &mut dyn std::io::Read,
+            attrs: Option<WriteAttrs>,
+        ) -> std::io::Result<u64> {
+            Self::name_max(p)?;
+            self.fake.write_from(p, src, attrs)
+        }
+        fn open_read(&self, p: &Path) -> std::io::Result<Box<dyn std::io::Read + Send + '_>> {
+            self.fake.open_read(p)
         }
         fn stat(&self, p: &Path) -> std::io::Result<Option<Stat>> {
             self.fake.stat(p)

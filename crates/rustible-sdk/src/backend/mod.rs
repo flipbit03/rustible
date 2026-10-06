@@ -1,7 +1,7 @@
 //! The only thing that touches reality. One method per primitive.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -11,8 +11,9 @@ pub(crate) use elevated::HelperGone;
 mod fake;
 mod local;
 
+pub(crate) use elevated::Limits;
 pub use elevated::{Elevated, Spawner, helper_argv, serve_helper};
-pub use fake::{AttrCall, Fake, FakeFile};
+pub use fake::{AttrCall, Fake, FakeFile, ReadCall};
 pub use local::Local;
 pub(crate) use local::Staged;
 
@@ -251,6 +252,37 @@ pub trait Backend: Send + Sync {
     fn read(&self, p: &Path) -> io::Result<Vec<u8>>;
     /// Must be atomic (temp file + rename) and preserve mode/owner of an existing file.
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()>;
+    /// Like [`write`](Backend::write), from a reader: what `src` yields is
+    /// staged beside `p` and renamed over it only once `src` reaches its
+    /// end without an error, then the number of bytes is returned. An error
+    /// from `src` (including one that a reader checking a digest returns at
+    /// its end) leaves `p` as it was and nothing beside it, and is returned
+    /// as `src` gave it, not reworded as a failure of `p`.
+    ///
+    /// `attrs` are applied to the staged file before the rename
+    /// ([`WriteAttrs`]), so the content is never visible at a wider mode,
+    /// or setuid with the wrong owner. `None` is [`write`](Backend::write)'s
+    /// behaviour.
+    ///
+    /// The content streams: `Local` writes as it reads, and [`Elevated`]
+    /// sends it to its helper a chunk at a time, taking its connection only
+    /// per chunk, so `src` may itself read through the same helper. No
+    /// default implementation, so a backend cannot quietly buffer the whole
+    /// file.
+    fn write_from(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64>;
+    /// A reader over the file at `p`, symlinks followed, as
+    /// [`read`](Backend::read) without holding the whole file. Whatever `p`
+    /// is gets opened and read, as `read` and `cat` do: a FIFO blocks for a
+    /// writer, and `/dev/zero` never ends. Through [`Elevated`] each chunk is
+    /// one request and no lock is held between them, so other primitives on
+    /// the same identity may run while the reader is alive; dropping it
+    /// before its end releases what the helper held for it.
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn Read + Send + '_>>;
     /// `lstat`: a symlink reports `FileKind::Symlink`.
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>>;
     /// `stat`: follows symlinks, so a link to a directory reports `Dir`.

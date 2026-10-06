@@ -1571,7 +1571,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
     use rustible_sdk::{Ctx, HostInfo};
 
@@ -3212,6 +3212,17 @@ mod tests {
         }
         fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
             self.fake.write(p, bytes)
+        }
+        fn write_from(
+            &self,
+            p: &Path,
+            src: &mut dyn io::Read,
+            attrs: Option<WriteAttrs>,
+        ) -> io::Result<u64> {
+            self.fake.write_from(p, src, attrs)
+        }
+        fn open_read(&self, p: &Path) -> io::Result<Box<dyn io::Read + Send + '_>> {
+            self.fake.open_read(p)
         }
         fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
             if p == Path::new(SOCKET) {

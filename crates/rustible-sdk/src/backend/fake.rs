@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Backend, CmdSpec, FileKind, Output, Stat};
+use super::{AttrStep, Backend, CmdSpec, FileKind, Output, Stat, WriteAttrs, attr_steps};
 
 /// One path inside a [`Fake`], as [`Fake::file`] hands it back: the whole
 /// of what the fake knows about it. A test reaches for this when
@@ -60,6 +61,23 @@ pub enum AttrCall {
     },
 }
 
+/// One read an op made, as [`Fake::reads`] records it: the path as the op
+/// passed it, and how many bytes it was served. A [`Backend::read`] is served
+/// the whole file at once; a reader from [`Backend::open_read`] is recorded
+/// when it is opened and counts the bytes as they are read from it, so a
+/// test can tell that an op compared a large file without reading it whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadCall {
+    /// The path passed.
+    pub path: PathBuf,
+    /// The bytes served so far.
+    pub bytes: u64,
+    /// Whether it came from [`Backend::open_read`] rather than
+    /// [`Backend::read`].
+    pub streamed: bool,
+}
+
 /// The mode a `chown(2)` by **root** (`CAP_FSETID`) leaves on an inode,
 /// measured on Linux (debian:12; `docs/plan/DECISIONS.md` `[FAKE-CHOWN]` has
 /// the table): on anything that is not a directory, every successful `chown`
@@ -95,6 +113,9 @@ pub struct Fake {
     canned: Mutex<Vec<Canned>>,
     ran: Mutex<Vec<CmdSpec>>,
     attr_calls: Mutex<Vec<AttrCall>>,
+    reads: Mutex<Vec<ReadCall>>,
+    /// Names the staged file of each [`Backend::write_from`] with attributes.
+    staged: AtomicU64,
 }
 
 impl Fake {
@@ -236,9 +257,19 @@ impl Fake {
     /// order of its `set_mode` and `set_owner` calls. A fixture's own
     /// `Backend::set_*` calls are recorded too; take the length first to
     /// skip past them. The `chown` a rewrite does inside [`Backend::write`]
-    /// is the backend's own, not an op's call, and is not recorded.
+    /// is the backend's own, not an op's call, and is not recorded; the
+    /// attributes a [`Backend::write_from`] was given are recorded, on the
+    /// staged `.rustible-fake-<n>` path beside the target, before the
+    /// rename that puts it in place.
     pub fn attr_calls(&self) -> Vec<AttrCall> {
         self.attr_calls.lock().unwrap().clone()
+    }
+
+    /// Every [`Backend::read`] and [`Backend::open_read`] that found a file,
+    /// in order, with the bytes each was served ([`ReadCall`]). A fixture's
+    /// own reads are recorded too; take the length first to skip past them.
+    pub fn reads(&self) -> Vec<ReadCall> {
+        self.reads.lock().unwrap().clone()
     }
 
     /// The `chown` calls alone, as `(path, uid, gid)`, in order.
@@ -271,9 +302,10 @@ fn not_found(p: &Path) -> io::Error {
     )
 }
 
-impl Backend for Fake {
-    fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
-        // Reads follow symlinks, as `std::fs::read` does.
+impl Fake {
+    /// What a read of `p` is served, following symlinks as `std::fs::read`
+    /// does.
+    fn contents(&self, p: &Path) -> io::Result<Vec<u8>> {
         let files = self.files.lock().unwrap();
         let real = Self::resolve(&files, p);
         match files.get(&real) {
@@ -284,6 +316,122 @@ impl Backend for Fake {
             Some(f) => Ok(f.bytes.clone()),
             None => Err(not_found(p)),
         }
+    }
+
+    /// Record a read of `p`, served `bytes` so far; its index in the log.
+    fn log_read(&self, p: &Path, bytes: u64, streamed: bool) -> usize {
+        let mut reads = self.reads.lock().unwrap();
+        reads.push(ReadCall {
+            path: p.to_path_buf(),
+            bytes,
+            streamed,
+        });
+        reads.len() - 1
+    }
+
+    /// [`Backend::write_from`] with attributes, as `Local`'s staged writer
+    /// does it: the content goes to a `.rustible-fake-<n>` file beside `p`,
+    /// at 0600, which gets its mode and owner through this backend's own
+    /// `set_mode` and `set_owner` (so they are in [`Fake::attr_calls`],
+    /// naming the staged path) and is then renamed over `p`. A field left
+    /// `None` keeps the existing file's mode or owner (a symlink at `p` is
+    /// followed for them), or is a new file's 0644 and nothing.
+    fn write_staged(&self, p: &Path, bytes: Vec<u8>, attrs: WriteAttrs) -> io::Result<()> {
+        let (mode, owner) = {
+            let files = self.files.lock().unwrap();
+            if files.get(p).is_some_and(|f| f.kind == FileKind::Dir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::IsADirectory,
+                    format!("{}: is a directory (fake)", p.display()),
+                ));
+            }
+            let old = match files.get(&Self::resolve(&files, p)) {
+                Some(f) if f.kind != FileKind::Symlink => Some((f.mode, (f.uid, f.gid))),
+                _ => None,
+            };
+            (
+                attrs.mode.or(old.map(|o| o.0)).unwrap_or(0o644),
+                attrs.owner.or(old.map(|o| o.1)),
+            )
+        };
+        let n = self.staged.fetch_add(1, Ordering::SeqCst);
+        let tmp = p.with_file_name(format!(".rustible-fake-{n}"));
+        self.files.lock().unwrap().insert(
+            tmp.clone(),
+            FakeFile {
+                bytes,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                kind: FileKind::File,
+            },
+        );
+        let attributed = attr_steps(mode, owner)
+            .into_iter()
+            .try_for_each(|step| match step {
+                AttrStep::Mode(m) => self.set_mode(&tmp, m),
+                AttrStep::Owner(uid, gid) => self.set_owner(&tmp, uid, gid),
+            });
+        match attributed.and_then(|()| self.rename(&tmp, p)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.files.lock().unwrap().remove(&tmp);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// [`Backend::open_read`] on a [`Fake`]: the file as it was when opened,
+/// counting what is read from it into the read log.
+struct FakeReader<'a> {
+    data: io::Cursor<Vec<u8>>,
+    reads: &'a Mutex<Vec<ReadCall>>,
+    index: usize,
+}
+
+impl Read for FakeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.data.read(buf)?;
+        self.reads.lock().unwrap()[self.index].bytes += n as u64;
+        Ok(n)
+    }
+}
+
+impl Backend for Fake {
+    fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+        let bytes = self.contents(p)?;
+        self.log_read(p, bytes.len() as u64, false);
+        Ok(bytes)
+    }
+
+    /// The whole of `src` first, so a source that fails writes nothing,
+    /// then [`write`](Backend::write) when there are no attributes, or the
+    /// staged write `Local` does when there are (see [`Fake::attr_calls`]).
+    fn write_from(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64> {
+        let mut bytes = Vec::new();
+        src.read_to_end(&mut bytes)?;
+        let n = bytes.len() as u64;
+        match attrs.filter(|a| a.mode.is_some() || a.owner.is_some()) {
+            None => self.write(p, &bytes)?,
+            Some(attrs) => self.write_staged(p, bytes, attrs)?,
+        }
+        Ok(n)
+    }
+
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn Read + Send + '_>> {
+        let data = io::Cursor::new(self.contents(p)?);
+        let index = self.log_read(p, 0, true);
+        Ok(Box::new(FakeReader {
+            data,
+            reads: &self.reads,
+            index,
+        }))
     }
 
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -793,6 +941,142 @@ mod tests {
             Backend::read(&f, Path::new("/real/f")).unwrap(),
             b"hi",
             "target untouched"
+        );
+    }
+
+    /// Every read that found a file is logged with the bytes it was served:
+    /// a `read` the whole file, a reader what was taken from it, so a reader
+    /// dropped half way shows half. A miss is not logged.
+    #[test]
+    fn reads_are_logged_with_the_bytes_served() {
+        let fake = Fake::new()
+            .with_file("/big", vec![b'x'; 1000])
+            .with_symlink("/link", "/big");
+        assert_eq!(
+            Backend::read(&fake, Path::new("/link")).unwrap().len(),
+            1000
+        );
+        let mut r = fake.open_read(Path::new("/big")).unwrap();
+        r.read_exact(&mut [0u8; 100]).unwrap();
+        r.read_exact(&mut [0u8; 50]).unwrap();
+        drop(r);
+        assert!(fake.open_read(Path::new("/nope")).is_err());
+        let mut whole = Vec::new();
+        fake.open_read(Path::new("/big"))
+            .unwrap()
+            .read_to_end(&mut whole)
+            .unwrap();
+        let log = |path: &str, bytes, streamed| ReadCall {
+            path: path.into(),
+            bytes,
+            streamed,
+        };
+        assert_eq!(
+            fake.reads(),
+            [
+                log("/link", 1000, false),
+                log("/big", 150, true),
+                log("/big", 1000, true),
+            ]
+        );
+    }
+
+    /// `write_from` with attributes stages the content beside the target,
+    /// gives the staged file its mode and owner in the safe order (each call
+    /// recorded, naming the staged path), and only then renames it over the
+    /// target; without attributes it is `write`. A source that fails writes
+    /// nothing and makes no call.
+    #[test]
+    fn write_from_applies_attributes_to_the_staged_file_before_the_rename() {
+        let fake = Fake::new()
+            .with_dir("/d")
+            .with_file_mode("/d/old", "old", 0o640);
+        fake.set_owner(Path::new("/d/old"), 7, 8).unwrap();
+        let planted = fake.attr_calls().len();
+
+        let attrs = WriteAttrs {
+            mode: Some(0o4750),
+            owner: Some((5, 6)),
+        };
+        let n = fake
+            .write_from(Path::new("/d/new"), &mut &b"new"[..], Some(attrs))
+            .unwrap();
+        assert_eq!(n, 3);
+        let staged = PathBuf::from("/d/.rustible-fake-0");
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: staged.clone(),
+                    mode: 0o750
+                },
+                AttrCall::Chown {
+                    path: staged.clone(),
+                    uid: 5,
+                    gid: 6
+                },
+                AttrCall::Chmod {
+                    path: staged.clone(),
+                    mode: 0o4750
+                },
+            ]
+        );
+        let f = fake.file("/d/new").unwrap();
+        assert_eq!(
+            (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+            (0o4750, 5, 6, &b"new"[..])
+        );
+        assert!(fake.file(&staged).is_none());
+
+        // A rewrite given only a mode keeps the owner it had, with a `chown`
+        // to it, as `Local` keeps it.
+        let planted = fake.attr_calls().len();
+        let only_mode = WriteAttrs {
+            mode: Some(0o600),
+            owner: None,
+        };
+        fake.write_from(Path::new("/d/old"), &mut &b"v2"[..], Some(only_mode))
+            .unwrap();
+        let staged = PathBuf::from("/d/.rustible-fake-1");
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: staged.clone(),
+                    mode: 0o600
+                },
+                AttrCall::Chown {
+                    path: staged,
+                    uid: 7,
+                    gid: 8
+                },
+            ]
+        );
+        let f = fake.file("/d/old").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o600, 7, 8));
+
+        // Without attributes, `write`: the mode and owner kept, no call.
+        let planted = fake.attr_calls().len();
+        fake.write_from(Path::new("/d/old"), &mut &b"v3"[..], None)
+            .unwrap();
+        assert_eq!(fake.attr_calls().len(), planted);
+        assert_eq!(fake.content("/d/old").unwrap(), "v3");
+
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broke"))
+            }
+        }
+        let err = fake
+            .write_from(Path::new("/d/old"), &mut Failing, Some(attrs))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "broke");
+        assert_eq!(fake.attr_calls().len(), planted);
+        assert_eq!(fake.content("/d/old").unwrap(), "v3");
+        assert_eq!(
+            fake.read_dir(Path::new("/d")).unwrap(),
+            [PathBuf::from("/d/new"), PathBuf::from("/d/old")]
         );
     }
 

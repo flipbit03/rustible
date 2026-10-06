@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -247,6 +247,32 @@ impl Backend for Local {
         let mut staged = Staged::begin(p, None)?;
         staged.write(bytes)?;
         staged.commit()
+    }
+
+    fn write_from(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64> {
+        let mut staged = Staged::begin(p, attrs)?;
+        let mut buf = zeroize::Zeroizing::new(vec![0u8; 64 * 1024]);
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => staged.write(&buf[..n])?,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // Dropping `staged` removes the temporary file.
+                Err(e) => return Err(e),
+            }
+        }
+        let written = staged.written();
+        staged.commit()?;
+        Ok(written)
+    }
+
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn Read + Send + '_>> {
+        Ok(Box::new(std::fs::File::open(p)?))
     }
 
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {

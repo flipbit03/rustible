@@ -1735,7 +1735,6 @@ impl Elevated {
     /// `wrap_rx` may put something between this side and the pipes, which
     /// is how a test watches the frames. The thread ends when this is
     /// dropped and the helper sees EOF.
-    #[cfg(test)]
     pub(crate) fn in_process_with(
         user: &str,
         phase: Arc<AtomicU8>,
@@ -2162,6 +2161,19 @@ impl Backend for Elevated {
         self.write_stream(p, &mut bytes, None).map(drop)
     }
 
+    fn write_from(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64> {
+        self.write_stream(p, src, attrs)
+    }
+
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn Read + Send + '_>> {
+        Ok(Box::new(self.reader(p)?))
+    }
+
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
         match self.call(HelperOp::Stat { path: p.into() })? {
             HelperResponse::Stat(s) => Ok(s),
@@ -2567,6 +2579,52 @@ mod tests {
         holds_no_stream(&e, chunk);
     }
 
+    /// Over 48 MiB, more than one frame could ever carry whole, at the real
+    /// chunk size and through `System`: `write_from`, `open_read`,
+    /// `write_atomic` and `read` all carry it byte for byte, and no frame
+    /// either way is larger than a chunk's base64 and a little envelope,
+    /// measured on the pipes themselves.
+    #[test]
+    fn a_file_over_48_mib_crosses_the_helper_in_bounded_frames() {
+        use crate::system::System;
+
+        let (requests, answers) = (Log::default(), Log::default());
+        let (rq, an) = (requests.clone(), answers.clone());
+        let sys = System::over_helper(Arc::new(crate::event::Collect::default()), |phase| {
+            Elevated::in_process_with(
+                "tester",
+                phase,
+                Limits::REAL,
+                move |w| Box::new(Recorded { inner: w, log: rq }),
+                move |r| Box::new(Recorded { inner: r, log: an }),
+            )
+        })
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let body = data(50 << 20);
+        assert!(body.len() > crate::protocol::MAX_FRAME_PAYLOAD);
+
+        assert_eq!(
+            sys.write_from(&a, body.as_slice(), None).unwrap(),
+            body.len() as u64
+        );
+        let mut back = Vec::new();
+        sys.open_read(&a).unwrap().read_to_end(&mut back).unwrap();
+        assert!(back == body, "open_read differs");
+        sys.write_atomic(&b, &body).unwrap();
+        assert!(sys.read(&b).unwrap() == body, "read differs");
+
+        let bound = CHUNK_SIZE / 3 * 4 + 64 * 1024;
+        for (way, log) in [("request", &requests), ("answer", &answers)] {
+            let sizes = &log.lock().unwrap().sizes;
+            let largest = sizes.iter().max().copied().unwrap_or(0);
+            assert!(largest <= bound, "a {largest}-byte {way} frame");
+            // Fifty chunks a transfer, four transfers.
+            assert_eq!(sizes.len(), 200, "{way}s");
+        }
+    }
+
     /// A reader that takes a few hundred bytes at a time, as a tar walk
     /// does, costs one request per chunk, not one per read: each chunk's
     /// remainder is kept on this side.
@@ -2883,6 +2941,22 @@ mod tests {
             assert!(!err.contains("104"), "byte values leaked: {err}");
             assert!(!f.exists());
         }
+        // And through `write_from`, with attributes.
+        let secret = b"hunter2-the-secret".repeat(1000);
+        let attrs = WriteAttrs {
+            mode: Some(0o600),
+            owner: None,
+        };
+        let err = Backend::write_from(&e, &f, &mut secret.as_slice(), Some(attrs))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "mutation during check refused by helper: write {} (first 4096 bytes)",
+                f.display()
+            )
+        );
         // Reads, listings, commands and releasing are fine while checking.
         assert_eq!(e.stat(&f).unwrap(), None);
         assert!(e.read_dir(dir.path()).unwrap().is_empty());
