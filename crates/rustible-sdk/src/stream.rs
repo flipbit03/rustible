@@ -611,8 +611,8 @@ mod tests {
     /// was, and its temporary file goes when the `FetchStaging` is dropped,
     /// or, for a process that exits without dropping it, with
     /// `remove_unfinished_fetches` (here limited to this test's directory,
-    /// since the tests share the process). One that never had a destination leaves
-    /// nothing at all.
+    /// since the tests share the process). One that never had a destination
+    /// leaves nothing at all.
     #[test]
     fn an_unfinished_fetch_leaves_the_destination_and_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();

@@ -155,7 +155,7 @@ impl Copy {
             None => Ok(None),
             Some(s) if s.kind == FileKind::File => Ok(Some(s.size)),
             Some(s) => bail!(
-                "{} is not a regular file ({}), so not copied; file::Copy copies regular files",
+                "`{}` is not a regular file ({}), so not copied; `file::Copy` copies regular files",
                 p.display(),
                 kind_name(s.kind)
             ),
@@ -173,28 +173,42 @@ impl Copy {
     }
 
     /// The change to `dest`'s content as the report shows it, `dest` being
-    /// `before` bytes (`None`: missing) and the source `after`. The two are
-    /// read, up to `TEXT_DIFF_LIMIT`, only when both claim to fit in it.
+    /// `before` bytes (`None`: missing) and the source `claimed` bytes by its
+    /// `stat`. A source that claims to fit in `TEXT_DIFF_LIMIT` is read, at
+    /// most one byte past it, because a `/proc` file claims 0 whatever it
+    /// holds: one that fits gives its real size, and one that does not has
+    /// a size nobody knows. The destination is read, the same way, only for
+    /// a text diff.
     fn content_change(
         &self,
         sys: &System,
         before: Option<u64>,
-        after: u64,
+        claimed: u64,
     ) -> Result<ContentChange> {
         let fits = |n: u64| n <= TEXT_DIFF_LIMIT as u64;
-        if before.is_none_or(fits) && fits(after) {
+        let new = match fits(claimed) {
+            true => read_at_most(self.open_source(sys)?, TEXT_DIFF_LIMIT)?,
+            false => None,
+        };
+        let after = match &new {
+            Some(new) => Some(new.len()),
+            None if fits(claimed) => None,
+            None => Some(size(claimed)),
+        };
+        if let Some(new) = &new
+            && before.is_none_or(fits)
+        {
             let old = match before {
                 None => Some(vec![]),
                 Some(_) => read_at_most(sys.open_read(&self.dest)?, TEXT_DIFF_LIMIT)?,
             };
-            let new = read_at_most(self.open_source(sys)?, TEXT_DIFF_LIMIT)?;
-            if let (Some(old), Some(new)) = (old, new) {
-                return Ok(ContentChange::of(Some(&old), &new));
+            if let Some(old) = old {
+                return Ok(ContentChange::of(Some(&old), new));
             }
         }
         Ok(ContentChange::Sizes {
             before: size(before.unwrap_or(0)),
-            after: size(after),
+            after,
         })
     }
 
@@ -294,8 +308,9 @@ fn read_at_most(r: impl Read, limit: usize) -> io::Result<Option<Vec<u8>>> {
 pub(crate) enum ContentChange {
     /// Both sides within [`TEXT_DIFF_LIMIT`] and valid UTF-8.
     Text { before: String, after: String },
-    /// Anything else: binary, or too large to diff.
-    Sizes { before: usize, after: usize },
+    /// Anything else: binary, or too large to diff. `after` is `None` for a
+    /// source too large to read whose `stat` gives no size (`/proc`).
+    Sizes { before: usize, after: Option<usize> },
 }
 
 impl ContentChange {
@@ -312,7 +327,7 @@ impl ContentChange {
         }
         ContentChange::Sizes {
             before: old.len(),
-            after: new.len(),
+            after: Some(new.len()),
         }
     }
 
@@ -321,8 +336,18 @@ impl ContentChange {
             ContentChange::Text { before, after } => {
                 Diff::text(path, before.as_str(), after.as_str())
             }
-            ContentChange::Sizes { before, after } => Diff::summary(format!(
+            ContentChange::Sizes {
+                before,
+                after: Some(after),
+            } => Diff::summary(format!(
                 "{}: {before} bytes -> {after} bytes",
+                path.display()
+            )),
+            ContentChange::Sizes {
+                before,
+                after: None,
+            } => Diff::summary(format!(
+                "{}: {before} bytes -> size unknown (a /proc-style source whose stat gives no size)",
                 path.display()
             )),
         }
@@ -389,21 +414,24 @@ impl Op for Copy {
             None => None,
             Some(s) if s.kind == FileKind::File => Some(s.size),
             Some(s) => bail!(
-                "{} exists and is not a regular file ({:?}); remove it first with file::Absent",
+                "`{}` exists and is not a regular file ({}); remove it first with `file::Absent`",
                 self.dest.display(),
-                s.kind
+                kind_name(s.kind)
             ),
         };
+        // Opened on every path, read or not, so a source that is missing or
+        // that this identity cannot read is refused here, before anything
+        // changes, and not first in `apply`.
+        let mut src = self.open_source(sys)?;
         // Sizes first, where both are exact: bytes in memory against the
         // destination's `stat`. A path's `stat` is not its content's size
-        // under `/proc` and `/sys`, so a path source is always compared. A
-        // source that does not exist fails here or in `content_change`,
-        // whichever opens it first.
+        // under `/proc` and `/sys`, so a path source is always compared.
         let same = match dest_size {
             None => None,
             Some(n) if matches!(self.source, CopySource::Bytes(_)) && Some(n) != src_size => None,
-            Some(_) => same_content(&mut self.open_source(sys)?, &mut sys.open_read(&self.dest)?)?,
+            Some(_) => same_content(&mut src, &mut sys.open_read(&self.dest)?)?,
         };
+        drop(src);
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
         let content = match same {
             Some(n) if !attrs.differs() => {
@@ -473,7 +501,7 @@ mod tests {
     use rustible_sdk::backend::{AttrCall, Fake, ReadCall};
     use rustible_sdk::event::Collect;
 
-    use super::super::testing::{expect_change, fake_sys, not_regular_sys};
+    use super::super::testing::{expect_change, fake_sys, not_regular_sys, sizeless_sys};
     use super::*;
 
     /// The other half of the platform work: a portable op has to keep
@@ -596,7 +624,7 @@ mod tests {
             ContentChange::of(Some(b"small"), big.as_bytes()),
             ContentChange::Sizes {
                 before: 5,
-                after: TEXT_DIFF_LIMIT + 1
+                after: Some(TEXT_DIFF_LIMIT + 1)
             }
         );
         let d = content_diff(Path::new("/f"), None, b"small");
@@ -946,13 +974,19 @@ mod tests {
             .check(&sys)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a regular file (Dir)"), "{err}");
+        assert!(
+            err.contains("`/etc/d` exists and is not a regular file (a directory)"),
+            "{err}"
+        );
         let err = Copy::from_str("x")
             .to("/etc/l")
             .check(&sys)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not a regular file (Symlink)"), "{err}");
+        assert!(
+            err.contains("`/etc/l` exists and is not a regular file (a symlink)"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1087,7 +1121,8 @@ mod tests {
     }
 
     /// A small change to a missing file reads only the source, and shows it
-    /// as text; a large one reads nothing and shows the sizes.
+    /// as text; a large one opens the source without reading it and shows
+    /// the sizes.
     #[test]
     fn a_new_file_is_shown_as_text_when_small_and_as_a_size_when_not() {
         let big = TEXT_DIFF_LIMIT + 1;
@@ -1105,7 +1140,87 @@ mod tests {
             c.diff().render(),
             format!("/srv/d2: 0 bytes -> {big} bytes")
         );
-        assert_eq!(fake.reads()[from..], []);
+        let reads = &fake.reads()[from..];
+        assert!(
+            reads.len() == 1 && reads[0].bytes == 0,
+            "opened, so a source that cannot be read is refused here, and not read: {reads:?}"
+        );
+    }
+
+    /// A source whose `stat` gives no size, as a file under `/proc` does
+    /// (`/proc/kallsyms` reports 0): a byte count is shown only once it has
+    /// been read. Too large to read for the diff, its size is unknown and
+    /// the diff says so; small, it is read, and its real size is shown.
+    #[test]
+    fn a_source_whose_stat_gives_no_size_is_not_shown_with_a_wrong_one() {
+        let big = 2 * TEXT_DIFF_LIMIT;
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/proc/kallsyms", vec![b'k'; big])
+                .with_file("/proc/small", "ten bytes\n")
+                .with_file("/srv/large", vec![0u8; big]),
+        );
+        let sys = sizeless_sys(&fake, "/proc/kallsyms");
+        let c = expect_change(
+            &Copy::from_local_path("/proc/kallsyms").to("/srv/new"),
+            &sys,
+        );
+        assert_eq!(
+            c.diff().render(),
+            "/srv/new: 0 bytes -> size unknown (a /proc-style source whose stat gives no size)"
+        );
+
+        let sys = sizeless_sys(&fake, "/proc/small");
+        let c = expect_change(&Copy::from_local_path("/proc/small").to("/srv/large"), &sys);
+        assert_eq!(
+            c.diff().render(),
+            format!("/srv/large: {big} bytes -> 10 bytes")
+        );
+        let c = expect_change(&Copy::from_local_path("/proc/small").to("/srv/new"), &sys);
+        assert_eq!(c.diff().short(), "+1 -0 lines");
+    }
+
+    /// `check` opens the source on every path, so one this identity cannot
+    /// read is refused there, before anything changes, and not first in
+    /// `apply`: here 128 KiB at mode 0000 onto a missing destination, which
+    /// is too large to read for a diff. Root reads it anyway, so the test
+    /// says nothing as root.
+    #[test]
+    fn an_unreadable_source_is_refused_in_check_whatever_its_size() {
+        let sys = System::local(false, Arc::new(Collect::default()));
+        if sys.is_root() {
+            return;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustible-copy-unreadable-{}-{nanos}",
+            std::process::id()
+        ));
+        struct Cleanup<'a>(&'a System, PathBuf);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.set_mode(self.1.join("src"), 0o600);
+                let _ = self.0.remove_all(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(&sys, dir.clone());
+        sys.mkdir_all(&dir).unwrap();
+        let src = dir.join("src");
+        sys.write_atomic(&src, &vec![b'x'; 128 * 1024]).unwrap();
+        sys.set_mode(&src, 0).unwrap();
+        let err = Copy::from_local_path(&src)
+            .to(dir.join("dest"))
+            .check(&sys)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(&format!("reading copy source {}", src.display()))
+                && err.contains("ermission denied"),
+            "{err}"
+        );
     }
 
     /// Decision 25: a source that is not a regular file is refused before
@@ -1132,8 +1247,8 @@ mod tests {
                 .chain();
             assert!(
                 err.contains(
-                    "/run/fifo is not a regular file (a FIFO, socket or device), so not \
-                     copied; file::Copy copies regular files"
+                    "`/run/fifo` is not a regular file (a FIFO, socket or device), so not \
+                     copied; `file::Copy` copies regular files"
                 ),
                 "{err}"
             );
@@ -1143,7 +1258,7 @@ mod tests {
                 .unwrap_err()
                 .chain();
             assert!(
-                err.contains("/srv/dir is not a regular file (a directory), so not copied"),
+                err.contains("`/srv/dir` is not a regular file (a directory), so not copied"),
                 "{err}"
             );
             assert_eq!(fake.reads(), [], "nothing was read");

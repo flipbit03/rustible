@@ -161,11 +161,12 @@ impl AttrPlan {
     /// and `file::Directory` call this when their step changes. `chmod` is
     /// idempotent; `chown` is not, even to the owner the file already has,
     /// because it clears setuid (and setgid with group execute) on anything
-    /// but a directory, and on macOS setgid on a directory too. A wanted mode is set again after it when it carries
-    /// those bits, so they come back; a mode nobody asked for does not. An
-    /// op that rewrote the file, whose replacement already has the old owner
-    /// and mode, calls [`AttrPlan::apply_differing`] instead. The order of
-    /// the calls is [`set_mode_and_owner`]'s.
+    /// but a directory, and on macOS setgid on a directory too. A wanted
+    /// mode is set again after it when it carries those bits, so they come
+    /// back; a mode nobody asked for does not. An op that rewrote the file,
+    /// whose replacement already has the old owner and mode, calls
+    /// [`AttrPlan::apply_differing`] instead. The order of the calls is
+    /// [`set_mode_and_owner`]'s.
     pub(crate) fn apply(&self, sys: &System, path: &Path) -> Result<()> {
         set_mode_and_owner(
             sys,
@@ -178,11 +179,12 @@ impl AttrPlan {
 
     /// Set only the attributes that differ: what an op uses when `check`
     /// found the rest already right and must not touch them.
-    /// `ssh::authorized_keys` relies on it, `file::Copy` for an
-    /// attributes-only change, and `http::Download`: a rewrite keeps the old
-    /// owner and mode (as root; see `System::write_atomic`), so what `check`
-    /// found right is still right after it. A `chown` that changes the owner needs root and is
-    /// issued only when the owner is wrong; one to the owner the file
+    /// `ssh::authorized_keys` relies on it; so does `file::Copy` when the
+    /// content is already right and only the attributes change; and so does
+    /// `http::Download` after a rewrite, which keeps the old owner and mode
+    /// (as root; see `System::write_atomic`), so what `check` found right is
+    /// still right after it. A `chown` that changes the owner needs root and
+    /// is issued only when the owner is wrong; one to the owner the file
     /// already has would be a needless call that also clears setuid.
     ///
     /// When it does `chown`, it sets a wanted mode around it even if the
@@ -586,23 +588,38 @@ pub(crate) mod testing {
         System::new(backend, facts, false, Arc::new(Collect::default()))
     }
 
+    /// A `System` over `fake` where `stat` and `stat_follow` of `path`
+    /// report a size of 0 whatever it holds, as a file under `/proc` does.
+    pub fn sizeless_sys(fake: &Arc<Fake>, path: &str) -> System {
+        twisted_sys(
+            fake,
+            Twisted {
+                sizeless: Some(PathBuf::from(path)),
+                ..Twisted::default()
+            },
+        )
+    }
+
     /// What [`Twisting`] does differently from the `Fake` it wraps.
     #[derive(Default)]
     struct Twisted {
         chown_refused: bool,
         not_regular: Option<PathBuf>,
+        sizeless: Option<PathBuf>,
     }
 
     struct Twisting(Arc<Fake>, Twisted);
 
     impl Twisting {
         fn twist(&self, p: &Path, stat: Option<Stat>) -> Option<Stat> {
-            if self.1.not_regular.as_deref() != Some(p) {
-                return stat;
-            }
-            stat.map(|s| Stat {
-                kind: rustible_sdk::backend::FileKind::Other,
-                ..s
+            let p = Some(p);
+            stat.map(|s| match s {
+                s if self.1.not_regular.as_deref() == p => Stat {
+                    kind: rustible_sdk::backend::FileKind::Other,
+                    ..s
+                },
+                s if self.1.sizeless.as_deref() == p => Stat { size: 0, ..s },
+                s => s,
             })
         }
     }
