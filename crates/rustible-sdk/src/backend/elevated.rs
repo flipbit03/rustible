@@ -94,11 +94,13 @@ use crate::launch::{self, Answer, Launch, Mode, Next};
 use crate::protocol::{CHUNK_SIZE, FrameTooLarge, MAX_FRAME, encode_frame, read_frame, write_body};
 use crate::secret::{Secret, extend_wiping};
 
-/// The most streams a helper keeps open at once (`[ISSUE-85]`). A request
-/// that would open one more is refused, so a parent that forgets to close
-/// its streams cannot run the helper out of descriptors or memory; closing
-/// one frees its slot. Far above what any op holds: an archive extraction
-/// holds two.
+/// The most streams a helper keeps open at once (`[ISSUE-85]`). When that
+/// many are open, a request that could open one more is refused before it
+/// does anything (opens a file, runs a command), so a parent that forgets to
+/// close its streams cannot run the helper out of descriptors or memory;
+/// only a write of one chunk, which opens nothing, still goes through.
+/// Closing a stream frees its slot. Far above what any op holds: an archive
+/// extraction holds two.
 const MAX_HANDLES: usize = 64;
 
 /// How large the helper lets a frame and a chunk be. Always [`Limits::REAL`]
@@ -645,8 +647,11 @@ fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, limits: Limits) -> io::Resul
     let mut table = Table::default();
     while let Some(req) = read_frame::<_, HelperRequest>(rx)? {
         let mut resp = if req.checking && req.op.mutates() {
-            // A refused chunk ends its stream, as any failed one does.
-            if let HelperOp::WriteChunk { handle, .. } = &req.op {
+            // A refused chunk ends its write, as any failed one does; a
+            // stream of another kind under that handle is not its to end.
+            if let HelperOp::WriteChunk { handle, .. } = &req.op
+                && matches!(table.streams.get(handle), Some(Stream::Write(_)))
+            {
                 table.streams.remove(handle);
             }
             HelperResponse::Err {
@@ -822,6 +827,9 @@ impl Table {
     ) -> io::Result<HelperResponse> {
         Ok(match op {
             HelperOp::ReadBegin { path } => {
+                // Before the file is opened: opening a FIFO, or reading a
+                // device, is not undone by a refusal afterwards.
+                self.room()?;
                 let file = std::fs::File::open(&path)?;
                 let mut stream = Stream::Read { file, cursor: 0 };
                 let (bytes, eof) = stream.chunk_at(0, limits.chunk)?;
@@ -889,7 +897,22 @@ impl Table {
                 }
                 HelperResponse::Unit
             }
-            HelperOp::WriteAbort { handle } | HelperOp::Close { handle } => {
+            // Abandoning a write that is not open is fine, so it is always
+            // safe to send; one under a handle that is not a write is
+            // refused and left alone.
+            HelperOp::WriteAbort { handle } => match self.streams.get(&handle) {
+                None | Some(Stream::Write(_)) => {
+                    self.streams.remove(&handle);
+                    HelperResponse::Unit
+                }
+                Some(_) => {
+                    return Err(coded(
+                        rustix::io::Errno::BADF.raw_os_error(),
+                        format!("stream {handle} is not a write, so it is not abandoned as one"),
+                    ));
+                }
+            },
+            HelperOp::Close { handle } => {
                 self.streams.remove(&handle);
                 HelperResponse::Unit
             }
@@ -905,6 +928,7 @@ impl Table {
             HelperOp::Symlink { target, link } => unit(local.symlink(&target, &link))?,
             HelperOp::ReadLink { path } => HelperResponse::Path(local.read_link(&path)?),
             HelperOp::ReadDirBegin { path } => {
+                self.room()?;
                 let mut dir = std::fs::read_dir(&path)?.peekable();
                 let names = batch(&mut dir, limits.chunk)?;
                 let handle = match dir.peek() {
@@ -957,6 +981,13 @@ impl Table {
                 HelperResponse::Unit
             }
             HelperOp::Spawn { cmd, stdin } => {
+                // Output too large for one answer needs a slot once the
+                // command has run, and refusing it then would throw away
+                // what the command did; so a full table refuses it first.
+                // The stdin it consumes frees one, so that counts.
+                if stdin.is_none_or(|h| !self.streams.contains_key(&h)) {
+                    self.room()?;
+                }
                 let staged = match stdin {
                     Some(handle) => {
                         match self.take(handle, "stdin", |s| matches!(s, Stream::Stdin(_)))? {
@@ -3059,6 +3090,35 @@ mod tests {
         assert!(f.exists());
     }
 
+    /// While a step checks, every request a read of several chunks makes is
+    /// allowed, not only the first: a file of several chunks
+    /// (`ReadChunk`), a listing of several batches (`ReadDirChunk`), a
+    /// command whose stdin is staged (`StdinBegin`, `StdinChunk`) and whose
+    /// output comes back in chunks.
+    #[test]
+    fn reads_of_several_chunks_are_allowed_while_checking() {
+        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Checking as u8)), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        let body = data(3 * SMALL.chunk + 1);
+        std::fs::write(&f, &body).unwrap();
+        assert_eq!(e.read(&f).unwrap(), body);
+        let mut streamed = Vec::new();
+        e.open_read(&f).unwrap().read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, body);
+
+        let listed = dir.path().join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        for i in 0..200 {
+            std::fs::write(listed.join(format!("{i:0>96}")), b"").unwrap();
+        }
+        assert_eq!(e.read_dir(&listed).unwrap().len(), 200);
+
+        let mut cat = sh("cat");
+        cat.stdin = Some(body.clone());
+        assert_eq!(e.spawn(&cat).unwrap().stdout, body);
+    }
+
     /// A stream the helper does not hold is `EBADF` for every request that
     /// needs one, and closing or aborting it is fine: release is
     /// idempotent. A stream of another kind is not taken for one.
@@ -3165,9 +3225,8 @@ mod tests {
     }
 
     /// At most 64 streams are open at once: the 65th open is refused naming
-    /// the cap, of whatever kind, and closing one frees a slot. A request
-    /// that opens nothing (a small file, a whole write) still works when the
-    /// table is full.
+    /// the cap, of whatever kind, and closing one frees a slot. A whole
+    /// write, which opens nothing, still works when the table is full.
     #[test]
     fn the_65th_stream_is_refused_and_closing_one_frees_a_slot() {
         let e = in_process_within(applying(), SMALL);
@@ -3199,9 +3258,12 @@ mod tests {
             bytes: Zeroizing::new(b"x".to_vec()),
         }));
         assert!(staged_in(dir.path()).is_empty());
-        // What opens nothing goes through.
+        // A whole write opens nothing and goes through; a read is refused
+        // before the file is opened, whatever its size.
         e.write(&dir.path().join("small"), b"small").unwrap();
-        assert_eq!(e.read(&dir.path().join("small")).unwrap(), b"small");
+        full(e.call(HelperOp::ReadBegin {
+            path: dir.path().join("small"),
+        }));
 
         readers.pop();
         let mut again = e.reader(&big).unwrap();
@@ -3210,6 +3272,85 @@ mod tests {
         assert_eq!(all.len(), 2 * SMALL.chunk);
         drop(readers);
         holds_no_stream(&e, SMALL.chunk);
+    }
+
+    /// With the table full, a request that could open a stream is refused
+    /// before it does anything: a command is not run (its output might need
+    /// a slot, and refusing after it ran would lose it), and a file is not
+    /// read (a FIFO here would block the test if it were opened and read).
+    #[test]
+    fn a_full_table_refuses_before_any_side_effect() {
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, data(2 * SMALL.chunk)).unwrap();
+        let fifo = dir.path().join("fifo");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success(), "mkfifo");
+        let readers: Vec<_> = (0..MAX_HANDLES).map(|_| e.reader(&big).unwrap()).collect();
+        let emfile = Some(rustix::io::Errno::MFILE.raw_os_error());
+
+        let ran = dir.path().join("ran");
+        let err = e
+            .spawn(&sh(&format!("touch {}", ran.display())))
+            .unwrap_err();
+        assert_eq!(errno(&err), emfile, "{err}");
+        assert!(!ran.exists(), "the command ran before it was refused");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let r = e.call(HelperOp::ReadBegin { path: fifo.clone() });
+                let _ = tx.send(r.map(|_| ()));
+            });
+            let r = rx.recv_timeout(Duration::from_secs(10));
+            if r.is_err() {
+                // Unblock the helper so the scope can end, then fail.
+                let _ = std::fs::write(&fifo, b"");
+                panic!("the FIFO was opened before the full table was seen");
+            }
+            assert_eq!(errno(&r.unwrap().unwrap_err()), emfile);
+        });
+        let err = e.call(HelperOp::ReadDirBegin {
+            path: dir.path().to_path_buf(),
+        });
+        assert_eq!(errno(&err.unwrap_err()), emfile);
+        drop(readers);
+        assert!(e.spawn(&sh("true")).unwrap().success());
+    }
+
+    /// Releasing or refusing a stream of another kind leaves it alone: a
+    /// `WriteAbort` of a read stream is `EBADF`, and a write chunk refused
+    /// while checking does not end a read stream that happens to carry its
+    /// handle. Either way the read goes on.
+    #[test]
+    fn a_stream_of_another_kind_is_not_ended() {
+        let phase = applying();
+        let e = in_process_within(phase.clone(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        let body = data(3 * SMALL.chunk);
+        std::fs::write(&f, &body).unwrap();
+        let mut r = e.reader(&f).unwrap();
+        let handle = r.held.handle.unwrap();
+
+        let err = e.call(HelperOp::WriteAbort { handle }).unwrap_err();
+        assert_eq!(errno(&err), ebadf(), "{err}");
+        phase.store(Phase::Checking as u8, Ordering::SeqCst);
+        let refused = e.call(HelperOp::WriteChunk {
+            handle,
+            offset: 0,
+            bytes: Zeroizing::new(b"x".to_vec()),
+            last: true,
+        });
+        assert!(refused.is_err());
+        phase.store(Phase::Applying as u8, Ordering::SeqCst);
+
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert!(got == body);
+        // A handle nobody holds is still fine to abort.
+        e.expect_unit(HelperOp::WriteAbort { handle: 999 }).unwrap();
     }
 
     /// The parent going away part way through a write (its pipe closed
@@ -3222,9 +3363,10 @@ mod tests {
         std::fs::write(&f, "before").unwrap();
         let (req_r, mut req_w) = io::pipe().unwrap();
         let (mut resp_r, resp_w) = io::pipe().unwrap();
-        let helper = std::thread::spawn(move || {
+        let (done_tx, done) = mpsc::channel();
+        std::thread::spawn(move || {
             let (mut rx, mut tx) = (req_r, resp_w);
-            serve(&mut rx, &mut tx, Limits::REAL)
+            let _ = done_tx.send(serve(&mut rx, &mut tx, Limits::REAL));
         });
         let send = |w: &mut io::PipeWriter, op| {
             write_frame(
@@ -3263,7 +3405,10 @@ mod tests {
         ));
         assert_eq!(staged_in(dir.path()).len(), 1);
         drop(req_w);
-        helper.join().unwrap().unwrap();
+        // Bounded: a helper that does not see EOF would hang the suite.
+        done.recv_timeout(Duration::from_secs(30))
+            .expect("the helper did not end when its parent went away")
+            .unwrap();
         assert!(staged_in(dir.path()).is_empty());
         assert_eq!(std::fs::read(&f).unwrap(), b"before");
     }
