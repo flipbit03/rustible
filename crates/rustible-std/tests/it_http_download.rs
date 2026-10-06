@@ -126,8 +126,8 @@ fn download_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 
     // A downloaded file keeps its setuid bit when `.owner` is also set.
     // Linux's `chown(2)` clears setuid and setgid on non-directories, so
-    // this only holds if `apply_attrs` chowns before it chmods; with the
-    // two swapped the file comes out 0o755 and the step reports success.
+    // this only holds if the full mode is set again after the `chown`; set
+    // only before it, the file comes out 0o755 and the step reports success.
     let r = ctx.step(
         "download a setuid helper",
         Download::get(format!("{base}/hello.txt"))

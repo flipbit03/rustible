@@ -287,10 +287,10 @@ impl Op for Copy {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{AttrCall, Fake};
     use rustible_sdk::event::Collect;
 
-    use super::super::testing::{expect_change, fake_sys};
+    use super::super::testing::{chown_refused_sys, expect_change, fake_sys};
     use super::*;
 
     /// The other half of the platform work: a portable op has to keep
@@ -538,6 +538,124 @@ mod tests {
         let f = fake.file("/usr/local/bin/x").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// A new file wanted at 0600 under another owner gets its mode before
+    /// its owner (issue #79), and no third call, since 0600 has no setuid
+    /// for the `chown` to clear. The `chown` is refused below, as it is for
+    /// an identity without `CAP_CHOWN`: the step fails with the file
+    /// already 0600, not at the 0644 it was created with.
+    #[test]
+    fn copy_sets_a_new_files_mode_before_its_owner() {
+        let fake = Arc::new(Fake::new().with_dir("/etc/app"));
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Copy::from_bytes(b"secret")
+            .to("/etc/app/key")
+            .mode(0o600)
+            .owner(5, 6);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/etc/app/key".into(),
+                    mode: 0o600
+                },
+                AttrCall::Chown {
+                    path: "/etc/app/key".into(),
+                    uid: 5,
+                    gid: 6
+                },
+            ]
+        );
+
+        let fake = Arc::new(Fake::new().with_dir("/etc/app"));
+        let sys = chown_refused_sys(&fake);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        let f = fake.file("/etc/app/key").unwrap();
+        assert_eq!(
+            (f.mode, f.uid, f.bytes.as_slice()),
+            (0o600, 0, &b"secret"[..])
+        );
+    }
+
+    /// A rewrite of a setuid file under a new owner, with `.mode(0o4755)`:
+    /// the bit the rewrite kept is cleared before the `chown` and set again
+    /// after it, so a refused `chown` would not leave the new content
+    /// setuid under the old owner. The rewrite itself still carries the old
+    /// mode until the first call; that window is #85's.
+    #[test]
+    fn copy_rewrite_under_a_new_owner_clears_setuid_before_the_chown() {
+        let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Copy::from_str("v2\n")
+            .to("/usr/local/bin/x")
+            .mode(0o4755)
+            .owner(5, 6);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/usr/local/bin/x".into(),
+                    mode: 0o755
+                },
+                AttrCall::Chown {
+                    path: "/usr/local/bin/x".into(),
+                    uid: 5,
+                    gid: 6
+                },
+                AttrCall::Chmod {
+                    path: "/usr/local/bin/x".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
+        let f = fake.file("/usr/local/bin/x").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+    }
+
+    /// A rewrite under a new owner with no `.mode()`, whose `chown` is
+    /// refused: the rewrite kept setuid from the file it replaced, and
+    /// `apply` clears it before the `chown`, so the new content is not left
+    /// setuid under the old owner. It clears what a `chown` would: setuid,
+    /// and setgid with group execute. Setgid without it survives a real
+    /// `chown`, so it is kept. A `chown` that succeeds ends the same way.
+    #[test]
+    fn an_owner_only_rewrite_clears_what_the_chown_would_before_it() {
+        for (mode, left) in [
+            (0o4755, 0o755),
+            (0o2755, 0o755),
+            (0o6750, 0o750),
+            (0o2745, 0o2745),
+            (0o6745, 0o2745),
+        ] {
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", mode));
+            let op = Copy::from_str("v2\n").to("/usr/local/bin/x").owner(5, 6);
+            let sys = chown_refused_sys(&fake);
+            let c = expect_change(&op, &sys);
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(err.contains("Operation not permitted"), "{err}");
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, f.uid, f.bytes.as_slice()),
+                (left, 0, &b"v2\n"[..]),
+                "{mode:04o}"
+            );
+
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", mode));
+            let sys = fake_sys(&fake);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (left, 5, 6), "{mode:04o}");
+        }
     }
 
     #[test]

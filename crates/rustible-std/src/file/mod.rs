@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use rustible_sdk::backend::Stat;
+use rustible_sdk::backend::{FileKind, Stat};
 use rustible_sdk::prelude::*;
 
 mod absent;
@@ -130,6 +130,9 @@ pub struct AttrPlan {
     /// The permission bits wanted, file type bits already masked off.
     pub(crate) mode: Option<Wanted<u32>>,
     pub(crate) owner: Option<Wanted<Owner>>,
+    /// The path is a directory, whose mode is not cleared before the
+    /// `chown`: see [`set_mode_and_owner`].
+    pub(crate) dir: bool,
 }
 
 impl AttrPlan {
@@ -158,23 +161,19 @@ impl AttrPlan {
     /// and `file::Directory` call this when their step changes. `chmod` is
     /// idempotent; `chown` is not, even to the owner the file already has,
     /// because it clears setuid (and setgid with group execute) on anything
-    /// but a directory. A wanted mode is set after it, so it comes back; a
-    /// mode nobody asked for does not. An op that rewrote the file, whose
-    /// replacement already has the old owner and mode, calls
-    /// [`AttrPlan::apply_differing`] instead.
-    ///
-    /// **Order matters.** `chown(2)` clears `S_ISUID` and `S_ISGID` on
-    /// anything that is not a directory, so the owner is set *first* and the
-    /// mode after it. The other order silently drops the setuid bit of a
-    /// `.mode(0o4755).owner(..)` op and still reports success.
+    /// but a directory. A wanted mode is set again after it when it carries
+    /// those bits, so they come back; a mode nobody asked for does not. An
+    /// op that rewrote the file, whose replacement already has the old owner
+    /// and mode, calls [`AttrPlan::apply_differing`] instead. The order of
+    /// the calls is [`set_mode_and_owner`]'s.
     pub(crate) fn apply(&self, sys: &System, path: &Path) -> Result<()> {
-        if let Some(o) = self.owner {
-            sys.set_owner(path, o.want.uid, o.want.gid)?;
-        }
-        if let Some(m) = self.mode {
-            sys.set_mode(path, m.want)?;
-        }
-        Ok(())
+        set_mode_and_owner(
+            sys,
+            path,
+            self.dir,
+            self.mode.map(|m| m.want),
+            self.owner.map(|o| o.want),
+        )
     }
 
     /// Set only the attributes that differ: what an op uses when `check`
@@ -186,25 +185,23 @@ impl AttrPlan {
     /// issued only when the owner is wrong; one to the owner the file
     /// already has would be a needless call that also clears setuid.
     ///
-    /// When it does `chown`, it sets a wanted mode afterwards even if the
-    /// mode already matched, because the `chown` just cleared setuid (and
-    /// setgid with group execute): owner first, then mode, as
-    /// [`AttrPlan::changes`]' rows promise. With no mode wanted, a `chown`
-    /// that changes the owner leaves the file without those bits: that is
-    /// the kernel's rule, and Ansible's `owner:` does the same. An op that
-    /// wants them kept asks for the mode too.
+    /// When it does `chown`, it sets a wanted mode around it even if the
+    /// mode already matched, in [`set_mode_and_owner`]'s order, because the
+    /// `chown` clears setuid (and setgid with group execute). With no mode
+    /// wanted, a `chown` that changes the owner leaves the file without
+    /// those bits: that is the kernel's rule, and Ansible's `owner:` does
+    /// the same. An op that wants them kept asks for the mode too.
     pub(crate) fn apply_differing(&self, sys: &System, path: &Path) -> Result<()> {
-        let chowned = match self.owner_to_set() {
-            Some(o) => {
-                sys.set_owner(path, o.uid, o.gid)?;
-                true
-            }
-            None => false,
-        };
-        if let Some(m) = self.mode.filter(|m| chowned || m.differs()) {
-            sys.set_mode(path, m.want)?;
+        match self.owner_to_set() {
+            Some(o) => set_mode_and_owner(sys, path, self.dir, self.mode.map(|m| m.want), Some(o)),
+            None => set_mode_and_owner(
+                sys,
+                path,
+                self.dir,
+                self.mode.filter(Wanted::differs).map(|m| m.want),
+                None,
+            ),
         }
-        Ok(())
     }
 
     /// [`AttrPlan::apply_differing`] for an op that has just rewritten the
@@ -220,24 +217,115 @@ impl AttrPlan {
     /// owner there is nothing to verify, and no extra `stat`.
     ///
     /// That `chown` runs as the same identity as the rewrite's own, so it
-    /// fails as that one did, and the step fails there, before any mode.
+    /// fails as that one did, and the step fails there, after the wanted
+    /// mode (without setuid or setgid) and before anything else.
+    ///
+    /// With no mode wanted, the rewrite kept whatever mode the file it
+    /// replaced had, setuid included. Before a `chown` that changes the
+    /// owner, the bits that `chown` would clear are cleared with a `chmod`
+    /// of the mode just read (setuid, and setgid with group execute; see
+    /// [`cleared_by_chown`]), so a refused `chown` does not leave the new
+    /// content setuid under the old owner. A `chown` that succeeds would
+    /// have cleared the same bits, so the end state is the same.
     pub(crate) fn apply_after_rewrite(&self, sys: &System, path: &Path) -> Result<()> {
         if self.owner.is_none() {
             return self.apply_differing(sys, path);
         }
         let now = sys.stat(path)?;
-        plan_attrs(
+        let plan = plan_attrs(
             now.as_ref(),
             self.mode.map(|m| m.want),
             self.owner.map(|o| o.want),
-        )
-        .apply_differing(sys, path)
+        );
+        if self.mode.is_none()
+            && plan.owner_to_set().is_some()
+            && let Some(now) = now.filter(|s| s.kind != FileKind::Dir)
+        {
+            let mode = now.mode & 0o7777;
+            let clear = cleared_by_chown(mode);
+            if clear != 0 {
+                sys.set_mode(path, mode & !clear)?;
+            }
+        }
+        plan.apply_differing(sys, path)
+    }
+
+    /// The same plan for a path that is a directory, or will be once the op
+    /// creates it: what `file::Directory` plans, since a missing path has
+    /// no kind to read.
+    pub(crate) fn on_a_directory(self) -> Self {
+        AttrPlan { dir: true, ..self }
     }
 
     /// The owner this plan changes the path to, when it changes it.
     pub(crate) fn owner_to_set(&self) -> Option<Owner> {
         self.owner.filter(Wanted::differs).map(|o| o.want)
     }
+}
+
+/// Setuid and setgid.
+const SETID: u32 = 0o6000;
+
+/// The bits of `mode` a `chown(2)` of anything but a directory clears on
+/// Linux: setuid, and setgid when group execute is set. Setgid without
+/// group execute marks mandatory locking and survives it.
+pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
+    let setgid = if mode & 0o010 != 0 { 0o2000 } else { 0 };
+    mode & (0o4000 | setgid)
+}
+
+/// Set `mode` and `owner` on `path`, in the one order that leaves it no
+/// more open than wanted whichever call fails and keeps the bits `chown`
+/// clears. With an owner to set, on anything but a directory:
+///
+/// 1. the mode, with setuid and setgid cleared;
+/// 2. the owner;
+/// 3. the full mode again, only when it carries setuid or setgid.
+///
+/// A `chown` that fails (no root, no `CAP_CHOWN`) fails the step with the
+/// restrictive mode already in place: a file wanted at `0600` is not left
+/// at the `0644` it was created with. The owner before the mode would
+/// leave it there. And a rewritten file that kept setuid or setgid from the
+/// one it replaced loses them before the `chown`, so a refused `chown` does
+/// not leave the new content setuid under the old owner. They come back
+/// after it: `chown(2)` clears them, so a mode set only before it would
+/// lose them. `keep_owner_and_mode` in the SDK's `Local` backend has the
+/// same shape. Without an owner, the mode is one call.
+///
+/// A directory (`dir`) gets its full mode first, nothing cleared, then its
+/// owner, then the full mode again only when it carries setuid or setgid.
+/// On Linux `chown(2)` keeps setgid on a directory, so clearing it first
+/// would only let a file created in the directory before the last call
+/// take the creator's group, and a refused `chown` would leave the bit off.
+/// Measured on macOS: `chown` clears setgid on directories too, even to
+/// the owner the directory already has, so the last call puts it back
+/// there. On Linux that call is idempotent.
+///
+/// What this cannot close is the time before the first call: a new file
+/// exists at `0666 & ~umask`, and a rewrite carries the old mode, from the
+/// write until the mode is set. That is closed once the ops move to
+/// `write_from` (#85; #86 to #88).
+pub(crate) fn set_mode_and_owner(
+    sys: &System,
+    path: &Path,
+    dir: bool,
+    mode: Option<u32>,
+    owner: Option<Owner>,
+) -> Result<()> {
+    let Some(o) = owner else {
+        if let Some(mode) = mode {
+            sys.set_mode(path, mode)?;
+        }
+        return Ok(());
+    };
+    if let Some(mode) = mode {
+        sys.set_mode(path, if dir { mode } else { mode & !SETID })?;
+    }
+    sys.set_owner(path, o.uid, o.gid)?;
+    if let Some(mode) = mode.filter(|m| m & SETID != 0) {
+        sys.set_mode(path, mode)?;
+    }
+    Ok(())
 }
 
 /// Pure planning of the attribute part shared by every op that takes
@@ -254,6 +342,7 @@ pub fn plan_attrs(current: Option<&Stat>, mode: Option<u32>, owner: Option<Owner
             now: current.map(Owner::of),
             want,
         }),
+        dir: current.is_some_and(|s| s.kind == FileKind::Dir),
     }
 }
 
@@ -412,14 +501,80 @@ pub(crate) fn write_with_backup(
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
     use rustible_sdk::prelude::*;
 
     pub fn fake_sys(fake: &Arc<Fake>) -> System {
         System::fake(fake.clone(), Arc::new(Collect::default()))
+    }
+
+    /// A `System` over `fake` whose `chown` fails with `EPERM`, as it does
+    /// for an unprivileged login or a root without `CAP_CHOWN`. The `Fake`
+    /// models `chown` as root does, so it never fails there. The refused
+    /// call changes nothing and is not recorded in `fake.attr_calls()`;
+    /// everything else passes through.
+    pub fn chown_refused_sys(fake: &Arc<Fake>) -> System {
+        let facts = fake_sys(fake).facts().clone();
+        let backend = Arc::new(ChownRefused(fake.clone()));
+        System::new(backend, facts, false, Arc::new(Collect::default()))
+    }
+
+    struct ChownRefused(Arc<Fake>);
+
+    impl Backend for ChownRefused {
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.0.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
+            self.0.write(p, bytes)
+        }
+        fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.0.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.0.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+            self.0.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.0.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> io::Result<()> {
+            self.0.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
+            self.0.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, _uid: u32, _gid: u32) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("chown {}: Operation not permitted (test)", p.display()),
+            ))
+        }
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+            self.0.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+            self.0.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+            self.0.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
+            self.0.spawn(spec)
+        }
     }
 
     /// Run `check`, insist on a change, return its intent.
@@ -433,7 +588,9 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use rustible_sdk::backend::{AttrCall, FileKind};
+    use std::sync::Arc;
+
+    use rustible_sdk::backend::{AttrCall, Fake, FileKind};
 
     use super::*;
 
@@ -502,11 +659,12 @@ mod tests {
     }
 
     /// Only the differing attributes are rows in the report, but every
-    /// attribute the op was given is set when the step applies, owner first:
-    /// `chown` clears setuid, so a mode that already matched is set again
-    /// after an owner change. The `Fake` models that clearing (measured on
-    /// Linux; `[FAKE-CHOWN]` in `DECISIONS.md`), so an `apply` that set only
-    /// what differed leaves 0755 here, and one that set the mode first does
+    /// attribute the op was given is set when the step applies, in
+    /// `set_mode_and_owner`'s order: the mode without setuid, the owner,
+    /// then the mode with it, because `chown` clears setuid. The `Fake`
+    /// models that clearing (measured on Linux; `[FAKE-CHOWN]` in
+    /// `DECISIONS.md`), so an `apply` that set only what differed leaves
+    /// 0755 here, and one that set the full mode only before the owner does
     /// too; `tests/it_file_ops.rs` holds the same on a real kernel.
     #[test]
     fn attr_plan_reports_what_differs_and_sets_everything_wanted() {
@@ -514,27 +672,178 @@ mod tests {
         let plan = plan_attrs(Some(&s), Some(0o4755), Some(Owner { uid: 5, gid: 6 }));
         assert_eq!(Diff::attrs("/f", plan.changes()).short(), "owner=5:6");
 
-        let fake = std::sync::Arc::new(
-            rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o4755),
-        );
+        let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o4755));
         let sys = testing::fake_sys(&fake);
         plan.apply(&sys, Path::new("/f")).unwrap();
         let f = fake.file("/f").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
-        assert_eq!(
-            fake.attr_calls(),
-            vec![
-                AttrCall::Chown {
-                    path: "/f".into(),
-                    uid: 5,
-                    gid: 6
-                },
-                AttrCall::Chmod {
-                    path: "/f".into(),
-                    mode: 0o4755
-                },
-            ]
-        );
+        assert_eq!(fake.attr_calls(), mode_owner_mode("/f", 0o4755, 5, 6));
+    }
+
+    /// The three calls `set_mode_and_owner` makes for a mode with setuid or
+    /// setgid and an owner: the mode without them, the owner, the mode.
+    fn mode_owner_mode(path: &str, mode: u32, uid: u32, gid: u32) -> Vec<AttrCall> {
+        vec![
+            AttrCall::Chmod {
+                path: path.into(),
+                mode: mode & 0o1777,
+            },
+            AttrCall::Chown {
+                path: path.into(),
+                uid,
+                gid,
+            },
+            AttrCall::Chmod {
+                path: path.into(),
+                mode,
+            },
+        ]
+    }
+
+    /// With an owner to set, the mode goes first and the owner after it.
+    /// Without setuid or setgid in the mode the `chown` clears nothing, so
+    /// there is no third call; with either, the full mode comes back after
+    /// the `chown`.
+    #[test]
+    fn set_mode_and_owner_sets_the_mode_first_and_the_setid_bits_last() {
+        let owner = Some(Owner { uid: 5, gid: 6 });
+        for (mode, calls) in [
+            (
+                0o600,
+                vec![
+                    AttrCall::Chmod {
+                        path: "/f".into(),
+                        mode: 0o600,
+                    },
+                    AttrCall::Chown {
+                        path: "/f".into(),
+                        uid: 5,
+                        gid: 6,
+                    },
+                ],
+            ),
+            (0o4755, mode_owner_mode("/f", 0o4755, 5, 6)),
+            (0o2750, mode_owner_mode("/f", 0o2750, 5, 6)),
+            (0o6755, mode_owner_mode("/f", 0o6755, 5, 6)),
+            (0o1777, {
+                // Sticky is not one `chown` clears: two calls.
+                let mut c = mode_owner_mode("/f", 0o1777, 5, 6);
+                c.pop();
+                c
+            }),
+        ] {
+            let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
+            let sys = testing::fake_sys(&fake);
+            set_mode_and_owner(&sys, Path::new("/f"), false, Some(mode), owner).unwrap();
+            assert_eq!(fake.attr_calls(), calls, "{mode:04o}");
+            let f = fake.file("/f").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (mode, 5, 6), "{mode:04o}");
+        }
+    }
+
+    /// Without an owner the mode is one call, setuid and all: there is no
+    /// `chown` to clear it.
+    #[test]
+    fn set_mode_and_owner_without_an_owner_sets_the_mode_once() {
+        let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
+        let sys = testing::fake_sys(&fake);
+        set_mode_and_owner(&sys, Path::new("/f"), false, Some(0o4755), None).unwrap();
+        assert_eq!(fake.chmods(), vec![(PathBuf::from("/f"), 0o4755)]);
+        assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
+        set_mode_and_owner(&sys, Path::new("/f"), false, None, None).unwrap();
+        assert_eq!(fake.attr_calls().len(), 1, "nothing asked, nothing set");
+    }
+
+    /// A directory gets its full mode, then its owner, with nothing cleared,
+    /// then its full mode again only when it carries setuid or setgid. On
+    /// Linux `chown(2)` keeps setgid on a directory, so clearing it first
+    /// would only open a moment where a file created in it takes the
+    /// creator's group, and a refused `chown` would leave the bit off. On
+    /// macOS `chown` clears it on a directory too (measured), which the last
+    /// call puts back; the `Fake` models Linux, so here it is idempotent. A
+    /// plan reads the kind from the `stat` it was given.
+    #[test]
+    fn set_mode_and_owner_on_a_directory_sets_the_full_mode_around_the_owner() {
+        let owner = Some(Owner { uid: 5, gid: 6 });
+        let d = Stat {
+            kind: FileKind::Dir,
+            ..stat(0o755, 0, 0)
+        };
+        assert!(!plan_attrs(Some(&stat(0o755, 0, 0)), None, None).dir);
+        let chmod = |mode| AttrCall::Chmod {
+            path: "/d".into(),
+            mode,
+        };
+        let chown = AttrCall::Chown {
+            path: "/d".into(),
+            uid: 5,
+            gid: 6,
+        };
+        for (mode, calls) in [
+            (0o2775, vec![chmod(0o2775), chown.clone(), chmod(0o2775)]),
+            (0o0750, vec![chmod(0o0750), chown.clone()]),
+        ] {
+            let plan = plan_attrs(Some(&d), Some(mode), owner);
+            assert!(plan.dir);
+            let fake = Arc::new(Fake::new().with_dir("/d"));
+            let planted = fake.attr_calls().len();
+            plan.apply(&testing::fake_sys(&fake), Path::new("/d"))
+                .unwrap();
+            assert_eq!(fake.attr_calls()[planted..], calls, "{mode:04o}");
+            let f = fake.file("/d").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (mode, 5, 6), "{mode:04o}");
+        }
+
+        // Refused, the `chown` is not recorded: the mode was set whole
+        // before it and stays.
+        let fake = Arc::new(Fake::new().with_dir("/d"));
+        let planted = fake.attr_calls().len();
+        let err = set_mode_and_owner(
+            &testing::chown_refused_sys(&fake),
+            Path::new("/d"),
+            true,
+            Some(0o2775),
+            owner,
+        )
+        .unwrap_err()
+        .chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        assert_eq!(fake.attr_calls()[planted..], [chmod(0o2775)]);
+        assert_eq!(fake.file("/d").unwrap().mode, 0o2775);
+    }
+
+    /// What a `chown` of a file clears, as the kernel does and the `Fake`
+    /// models it: setuid always, setgid only with group execute.
+    #[test]
+    fn cleared_by_chown_is_setuid_and_setgid_with_group_execute() {
+        assert_eq!(cleared_by_chown(0o4755), 0o4000);
+        assert_eq!(cleared_by_chown(0o2755), 0o2000);
+        assert_eq!(cleared_by_chown(0o6750), 0o6000);
+        assert_eq!(cleared_by_chown(0o2745), 0);
+        assert_eq!(cleared_by_chown(0o6745), 0o4000);
+        assert_eq!(cleared_by_chown(0o1777), 0);
+    }
+
+    /// The point of the order (issue #79): a `chown` the identity may not
+    /// make fails the step with the wanted mode already set, so a file
+    /// created at 0644 and wanted at 0600 is not left readable by everyone.
+    /// The owner first left it at 0644. A setuid mode is left without the
+    /// bit, never with it under the wrong owner.
+    #[test]
+    fn a_refused_chown_leaves_the_wanted_mode_without_setid() {
+        for (want, left) in [(0o600, 0o600), (0o4750, 0o750)] {
+            let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
+            let s = stat(0o644, 0, 0);
+            let plan = plan_attrs(Some(&s), Some(want), Some(Owner { uid: 5, gid: 6 }));
+            let sys = testing::chown_refused_sys(&fake);
+            let err = plan
+                .apply_differing(&sys, Path::new("/f"))
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("Operation not permitted"), "{err}");
+            let f = fake.file("/f").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (left, 0, 0), "{want:04o}");
+        }
     }
 
     /// `apply_differing` sets only what `check` found wrong: with the owner
@@ -545,8 +854,7 @@ mod tests {
     fn apply_differing_issues_no_chown_for_an_owner_already_right() {
         let s = stat(0o644, 5, 6);
         let plan = plan_attrs(Some(&s), Some(0o600), Some(Owner { uid: 5, gid: 6 }));
-        let fake =
-            std::sync::Arc::new(rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o644));
+        let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
         let sys = testing::fake_sys(&fake);
         plan.apply_differing(&sys, Path::new("/f")).unwrap();
         assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
@@ -554,33 +862,18 @@ mod tests {
     }
 
     /// With only the owner wrong, `apply_differing` still sets the wanted
-    /// mode after its `chown`, because the `chown` cleared setuid: owner
-    /// then mode, and the file ends as asked.
+    /// mode around its `chown`, because the `chown` cleared setuid: the
+    /// mode without it, the owner, the mode, and the file ends as asked.
     #[test]
     fn apply_differing_sets_the_mode_again_after_a_chown() {
         let s = stat(0o4755, 0, 0);
         let plan = plan_attrs(Some(&s), Some(0o4755), Some(Owner { uid: 5, gid: 6 }));
-        let fake = std::sync::Arc::new(
-            rustible_sdk::backend::Fake::new().with_file_mode("/f", "", 0o4755),
-        );
+        let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o4755));
         let sys = testing::fake_sys(&fake);
         plan.apply_differing(&sys, Path::new("/f")).unwrap();
         let f = fake.file("/f").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
-        assert_eq!(
-            fake.attr_calls(),
-            vec![
-                AttrCall::Chown {
-                    path: "/f".into(),
-                    uid: 5,
-                    gid: 6
-                },
-                AttrCall::Chmod {
-                    path: "/f".into(),
-                    mode: 0o4755
-                },
-            ]
-        );
+        assert_eq!(fake.attr_calls(), mode_owner_mode("/f", 0o4755, 5, 6));
     }
 
     #[test]
