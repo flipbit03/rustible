@@ -103,7 +103,7 @@ mod user_keys;
 pub use fetch::{Fetch, Https, Response};
 pub use github_ssh_keys_to_user::{GithubSshKeysToUser, github_ssh_keys_to_user};
 pub use login::validate_login;
-pub use user_keys::{KEYS_URL_BASE, KeysLookup, UserKeys, parse_keys_body};
+pub use user_keys::{KEYS_URL_BASE, KeysLookup, QUOTED_LINE_BYTES, UserKeys, parse_keys_body};
 
 /// Re-exported from `rustible_std::ssh::authorized_keys`: the parsed public
 /// key type [`UserKeys`] returns and `Present` consumes, so the two compose

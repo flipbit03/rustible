@@ -109,7 +109,7 @@ mod request;
 #[cfg(test)]
 mod test_server;
 
-pub use client::{MAX_REDIRECTS, mask_url};
+pub use client::{MAX_REDIRECTS, mask_url, one_line};
 pub use download::{
     Algorithm, Checksum, DEFAULT_TIMEOUT, Download, DownloadBuilder, DownloadIntent,
     DownloadReport, digest, parse_checksum,

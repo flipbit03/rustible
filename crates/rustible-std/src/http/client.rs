@@ -604,7 +604,9 @@ pub(crate) fn scrub_list(
 
 /// `text` as one line of at most `max` bytes: control characters escaped
 /// (`\u{1b}`), every run of whitespace a single space, a cut marked `...`.
-pub(crate) fn one_line(text: &str, max: usize) -> String {
+/// How a message quotes something a server sent, so that a body of any
+/// size makes a short message.
+pub fn one_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut space = false;
     for c in text.chars() {

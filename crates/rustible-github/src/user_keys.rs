@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustible_sdk::prelude::*;
+use rustible_std::http;
 use rustible_std::ssh::authorized_keys::{PublicKey, parse_line};
 
 use crate::fetch::{Fetch, Https};
@@ -12,6 +13,10 @@ use crate::login::validate_login;
 /// Where `<login>.keys` is appended. GitHub serves a user's public keys as
 /// `text/plain`, one `<type> <base64>` line per key, comments stripped.
 pub const KEYS_URL_BASE: &str = "https://github.com";
+
+/// The most of a body's line, or of its options field, that a refusal from
+/// [`parse_keys_body`] quotes.
+pub const QUOTED_LINE_BYTES: usize = 160;
 
 /// Look up a GitHub user's public SSH keys. A read-only op (vision 6.5): it
 /// runs through `ctx.step`, shows in the run output, is timed, and can never
@@ -139,6 +144,10 @@ impl UserKeys {
 /// `authorized_keys`, which is a remote-code-execution primitive dressed as a
 /// key. Comments are dropped rather than refused: they are cosmetic, never
 /// take part in matching, and the caller labels the keys itself.
+///
+/// A refusal quotes at most [`QUOTED_LINE_BYTES`] of the line or the options
+/// field, on one line: the body has no size limit, and a captive portal's
+/// one-line page can be megabytes.
 pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
     let mut keys = Vec::new();
     for (i, line) in body.lines().enumerate() {
@@ -150,9 +159,10 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
                 if let Some(options) = &k.options {
                     bail!(
                         "line {} of GitHub user `{login}`'s keys carries an authorized_keys \
-                         options field ({options}); the `.keys` endpoint serves bare keys, so \
+                         options field ({}); the `.keys` endpoint serves bare keys, so \
                          this response did not come from GitHub unaltered and is refused",
-                        i + 1
+                        i + 1,
+                        http::one_line(options, QUOTED_LINE_BYTES)
                     );
                 }
                 k.comment = None;
@@ -161,7 +171,7 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
             None => bail!(
                 "line {} of GitHub user `{login}`'s keys is not a public key: {}",
                 i + 1,
-                line.trim()
+                http::one_line(line, QUOTED_LINE_BYTES)
             ),
         }
     }
@@ -406,6 +416,34 @@ pub(crate) mod tests {
         assert!(e.contains("line 2"), "{e}");
         assert!(e.contains("flipbit03"), "{e}");
         assert!(e.contains("<html>"), "{e}");
+    }
+
+    /// The body has no size limit (decision 21 on #87), so what a refusal
+    /// quotes of it has its own: one line of a few hundred bytes, however
+    /// long the line or the options field it came from. A 5 MiB one-line
+    /// page, as a captive portal might serve, makes a short message.
+    #[test]
+    fn a_refusal_quotes_a_bounded_excerpt_of_a_huge_line() {
+        let page = format!("<html>{}\x1b</html>", "x".repeat(5 << 20));
+        let e = parse_keys_body("flipbit03", &format!("{ED1}\n{page}\n"))
+            .unwrap_err()
+            .chain();
+        assert!(e.len() < 400, "{} bytes", e.len());
+        assert!(e.contains("line 2"), "{e}");
+        assert!(e.contains("<html>xxx"), "{e}");
+        assert!(e.ends_with("..."), "{e}");
+
+        let options = format!("command=\"{}\" {ED1}\n", "y".repeat(5 << 20));
+        let e = parse_keys_body("flipbit03", &options).unwrap_err().chain();
+        assert!(e.len() < 600, "{} bytes", e.len());
+        assert!(e.contains("options field (command=\"yyy"), "{e}");
+        assert!(e.contains("did not come from GitHub"), "{e}");
+
+        // A short line is quoted whole, its control characters escaped.
+        let e = parse_keys_body("x", "not\u{1b}a key\n")
+            .unwrap_err()
+            .chain();
+        assert!(e.ends_with("is not a public key: not\\u{1b}a key"), "{e}");
     }
 
     // ---- Fake backend, canned network ----
