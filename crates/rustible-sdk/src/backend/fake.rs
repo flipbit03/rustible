@@ -116,6 +116,8 @@ pub struct Fake {
     reads: Mutex<Vec<ReadCall>>,
     /// Names the staged file of each [`Backend::write_from`] with attributes.
     staged: AtomicU64,
+    /// Every `chown` fails with `EPERM` ([`Fake::with_chown_refused`]).
+    chown_refused: bool,
 }
 
 impl Fake {
@@ -158,6 +160,18 @@ impl Fake {
                 kind: FileKind::File,
             },
         );
+        self
+    }
+
+    /// Make every `chown` fail with `EPERM`, as it does for an unprivileged
+    /// login or a root without `CAP_CHOWN`; the fake otherwise models root,
+    /// whose `chown` always succeeds. That includes the owner a
+    /// [`Backend::write_from`] is given, so a test can show that a refused
+    /// owner fails the write and leaves the target as it was. A refused call
+    /// changes nothing and is still recorded in [`Fake::attr_calls`]: it was
+    /// asked for.
+    pub fn with_chown_refused(mut self) -> Self {
+        self.chown_refused = true;
         self
     }
 
@@ -576,6 +590,12 @@ impl Backend for Fake {
             uid,
             gid,
         });
+        if self.chown_refused {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("chown {}: Operation not permitted (fake)", p.display()),
+            ));
+        }
         let mut files = self.files.lock().unwrap();
         let real = Self::resolve(&files, p);
         files
@@ -1082,6 +1102,47 @@ mod tests {
             fake.read_dir(Path::new("/d")).unwrap(),
             [PathBuf::from("/d/new"), PathBuf::from("/d/old")]
         );
+    }
+
+    /// With `chown` refused, a `write_from` given an owner fails: the
+    /// target keeps its content, mode and owner, and nothing is left beside
+    /// it. The mode was set on the staged file first, then the `chown` was
+    /// refused, so the calls stop there.
+    #[test]
+    fn a_refused_owner_fails_a_staged_write_and_leaves_the_target() {
+        let fake = Fake::new()
+            .with_dir("/d")
+            .with_file_mode("/d/f", "before", 0o640)
+            .with_chown_refused();
+        let attrs = WriteAttrs {
+            mode: Some(0o4750),
+            owner: Some((5, 6)),
+        };
+        for target in ["/d/f", "/d/new"] {
+            let planted = fake.attr_calls().len();
+            let err = fake
+                .write_from(Path::new(target), &mut &b"after"[..], Some(attrs))
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+            let calls = fake.attr_calls()[planted..].to_vec();
+            assert!(
+                matches!(
+                    &calls[..],
+                    [AttrCall::Chmod { mode: 0o750, .. }, AttrCall::Chown { .. }]
+                ),
+                "{calls:?}"
+            );
+        }
+        let f = fake.file("/d/f").unwrap();
+        assert_eq!(
+            (f.mode, f.uid, f.bytes.as_slice()),
+            (0o640, 0, &b"before"[..])
+        );
+        assert_eq!(
+            fake.read_dir(Path::new("/d")).unwrap(),
+            [PathBuf::from("/d/f")]
+        );
+        assert!(fake.set_owner(Path::new("/d/f"), 1, 1).is_err());
     }
 
     #[test]
