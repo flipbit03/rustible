@@ -257,9 +257,10 @@ fn main() {
             }
         }
     };
-    // `exit` runs no destructors, so a fetch a host task was part way
-    // through when the run stopped (a host task that panicked, say) would
-    // leave its temporary file beside its destination.
+    // `exit` runs no destructors, so a fetch that a host task still alive
+    // here was part way through (one left running when `dispatch` returned
+    // early with an error) would leave its temporary file beside its
+    // destination.
     rustible_sdk::stream::remove_unfinished_fetches();
     std::process::exit(code as i32);
 }

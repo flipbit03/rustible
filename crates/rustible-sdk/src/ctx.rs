@@ -741,11 +741,13 @@ impl Ctx {
     ///
     /// The file streams: it is read and sent a chunk at a time, so a file of
     /// any size takes a few chunks' memory here, as root or as any account.
-    /// The orchestrator writes it beside the destination and renames it into
-    /// place only once the last chunk arrives, so the destination holds
-    /// either what it held before or the whole new file: a read that fails
-    /// part way fails this call and leaves nothing behind. Whatever `remote`
-    /// is gets read, as `cat` does, so a FIFO waits for a writer.
+    /// Whatever receives it (the orchestrator, or a local run itself) stages
+    /// it beside the destination and renames it into place only once the
+    /// last chunk arrives, so the destination holds either what it held
+    /// before or the whole new file: a read that fails part way fails this
+    /// call and the destination keeps what it held; the partial file is
+    /// removed when the run ends. Whatever `remote` is gets read, as `cat`
+    /// does, so a FIFO waits for a writer.
     pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
         let remote = remote.as_ref();
         let dest = path_str(local_dest.as_ref());

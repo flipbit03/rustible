@@ -369,12 +369,19 @@ impl FetchStaging {
         let Some(tmp) = staged.tmp.take() else {
             unreachable!("a pending fetch has its temporary file")
         };
-        unfinished().remove(tmp.path());
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| format!("{}: {e}", tmp.path().display()))?;
-        tmp.persist(&staged.path)
-            .map_err(|e| format!("{}: {}", staged.path.display(), e.error))?;
+        // Out of the registry only once it has been renamed, or removed with
+        // the `PersistError` it fails with: an exit during the sync still
+        // finds it there.
+        let tmp_path = tmp.path().to_path_buf();
+        let landed = match tmp.as_file().sync_all() {
+            Err(e) => Err(format!("{}: {e}", tmp_path.display())),
+            Ok(()) => tmp
+                .persist(&staged.path)
+                .map(drop)
+                .map_err(|e| format!("{}: {}", staged.path.display(), e.error)),
+        };
+        unfinished().remove(&tmp_path);
+        landed?;
         Ok(Some((staged.path.clone(), staged.written)))
     }
 
@@ -403,7 +410,9 @@ impl FetchStaging {
         let dir = path.parent().unwrap_or(files.root());
         let tmp = tempfile::Builder::new()
             .prefix(".rustible-")
-            .permissions(Permissions::from_mode(0o666))
+            // Created with the mode it will have, so a 0600 file is never
+            // staged readable; set again below, since the umask applies.
+            .permissions(Permissions::from_mode(mode.unwrap_or(0o666)))
             .tempfile_in(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         unfinished().insert(tmp.path().to_path_buf());
@@ -607,6 +616,10 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new content");
         assert_eq!(names(&dir.path().join("out")), ["f"]);
         assert!(fetches.pending.is_empty());
+        assert!(
+            !unfinished().iter().any(|p| p.starts_with(files.root())),
+            "a fetch that landed is out of the registry"
+        );
     }
 
     /// A fetch that never gets its last chunk leaves the destination as it
