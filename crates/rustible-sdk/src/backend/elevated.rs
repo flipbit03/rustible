@@ -1436,15 +1436,20 @@ impl Started {
             let label = format!("helper as {user}");
             std::thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if echo.load(Ordering::SeqCst) {
-                        eprintln!("[{label}] {line}");
-                    }
                     {
                         let mut t = tail.lock().unwrap();
                         if t.len() >= 5 {
                             t.remove(0);
                         }
                         t.push(line.clone());
+                    }
+                    if echo.load(Ordering::SeqCst) {
+                        // One string, so one write, where `eprintln!` with
+                        // the pieces writes each: a process that exits
+                        // between them leaves a bare `[` behind (#90). The
+                        // macro, not `io::stderr()`, so tests capture it.
+                        let msg = format!("[{label}] {line}\n");
+                        eprint!("{msg}");
                     }
                     // Nobody listens once the handshake is over.
                     let _ = events_tx.send(Event::Line(line));
@@ -1500,7 +1505,7 @@ impl Started {
                 Ok(Event::Line(_)) => {}
                 Err(_) => {
                     self.kill();
-                    self.settle();
+                    settle(&mut self.reader);
                     let tail = self.tail.lock().unwrap().join("\n");
                     return Err(self.refusal(launch::deadline_message(&self.user, deadline, &tail)));
                 }
@@ -1536,26 +1541,8 @@ impl Started {
     fn finish(&mut self) -> (i32, String) {
         self.tx = None;
         let status = self.child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-        self.settle();
+        settle(&mut self.reader);
         (status, self.tail.lock().unwrap().join("\n"))
-    }
-
-    /// Wait for the stderr reader to reach EOF, briefly: the report quotes
-    /// its tail, and a line still in the pipe is usually the one that says
-    /// why. Bounded, because something the child left running may hold the
-    /// pipe open.
-    fn settle(&mut self) {
-        let t0 = Instant::now();
-        while let Some(r) = &self.reader {
-            if r.is_finished() {
-                let _ = self.reader.take().map(|r| r.join());
-                return;
-            }
-            if t0.elapsed() > Duration::from_secs(2) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 
     /// Close stdin, SIGKILL, reap. Stdin goes first: a sudo that runs with
@@ -1607,9 +1594,32 @@ impl Started {
             rx: Box::new(self.rx.take().expect("piped")),
             child: Some(self.child),
             stderr_tail: self.tail,
+            stderr_reader: self.reader.take(),
             note: self.note,
         }
     }
+}
+
+/// How long a report of a dead child waits for its stderr reader.
+const SETTLE: Duration = Duration::from_secs(2);
+
+/// Wait for a child's stderr reader to reach EOF, briefly: the report
+/// quotes its tail, and a line still in the pipe is usually the one that
+/// says why. A child that has exited closed its end, so EOF comes at once;
+/// a report built from the tail as it stood when the exit was seen lost
+/// that line now and then (#90). Bounded, because something the child left
+/// running may hold the pipe open; then the reader is let go, so nothing
+/// waits for it a second time.
+fn settle(reader: &mut Option<std::thread::JoinHandle<()>>) {
+    let Some(r) = reader.take() else { return };
+    let t0 = Instant::now();
+    while !r.is_finished() {
+        if t0.elapsed() > SETTLE {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = r.join();
 }
 
 /// Why a helper is gone, and the spawner's note. It travels as the inner
@@ -1649,6 +1659,8 @@ struct Connection {
     rx: Box<dyn Read + Send>,
     child: Option<Child>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    /// The thread filling `stderr_tail`, which a report waits for.
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     /// [`Spawner::note`], carried to where the failure is described.
     note: Option<String>,
 }
@@ -1687,6 +1699,7 @@ impl Connection {
             },
             None => "closed the connection".to_string(),
         };
+        settle(&mut self.stderr_reader);
         let tail = self.stderr_tail.lock().unwrap().join(" / ");
         let mut what = if tail.is_empty() {
             format!("helper {status}")
@@ -1702,20 +1715,33 @@ impl Connection {
         }
     }
 
-    /// Close stdin so the helper's loop ends, wait briefly, then kill.
+    /// Close stdin so the helper's loop ends, wait briefly, then kill. Its
+    /// last lines of stderr are echoed before this returns, so a run that
+    /// ends next does not cut them off.
+    ///
+    /// Its stdout is closed too before the wait for stderr: a helper killed
+    /// under `sudo` may leave a process blocked writing to it, which keeps
+    /// stderr open until it gets `EPIPE`.
     fn shutdown(mut self) {
         self.tx = Box::new(io::sink());
         if let Some(mut child) = self.child.take() {
             let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_secs(2) {
+            let exited = loop {
                 if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
-                    return;
+                    break true;
+                }
+                if t0.elapsed() >= Duration::from_secs(2) {
+                    break false;
                 }
                 std::thread::sleep(Duration::from_millis(20));
+            };
+            if !exited {
+                let _ = child.kill();
+                let _ = child.wait();
             }
-            let _ = child.kill();
-            let _ = child.wait();
         }
+        self.rx = Box::new(io::empty());
+        settle(&mut self.stderr_reader);
     }
 }
 
@@ -1804,6 +1830,7 @@ impl Elevated {
                 rx,
                 child: None,
                 stderr_tail: Arc::default(),
+                stderr_reader: None,
                 note: None,
             })),
             failed: Mutex::new(None),
@@ -4025,6 +4052,13 @@ mod tests {
     /// `Spawner::spawn` makes once `sudo` has started, so only the `sudo`
     /// itself is bypassed.
     fn dead_helper(note: Option<String>) -> Elevated {
+        dead_helper_running("echo boom >&2; exit 7", note)
+    }
+
+    /// [`dead_helper`] with `script` as the "helper". The request goes out
+    /// straight away, without waiting for the stderr reader, because that
+    /// race is what a real refused `sudo` runs (#90).
+    fn dead_helper_running(script: &str, note: Option<String>) -> Elevated {
         let spawner = Spawner {
             method: "sudo".into(),
             exe: PathBuf::from("/nonexistent/rustible-bin"),
@@ -4032,23 +4066,13 @@ mod tests {
             note,
         };
         let child = Command::new("sh")
-            .args(["-c", "echo boom >&2; exit 7"])
+            .args(["-c", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let conn = spawner.connection("root", child);
-        // The stderr reader is a thread of its own; let it finish the one
-        // line before the report reads the tail.
-        let t0 = Instant::now();
-        while conn.stderr_tail.lock().unwrap().is_empty() {
-            assert!(
-                t0.elapsed() < Duration::from_secs(10),
-                "no stderr from the helper"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
         Elevated {
             user: "root".into(),
             spawner: Some(spawner),
@@ -4076,6 +4100,103 @@ mod tests {
         );
         assert!(again.contains("exited 7"), "{again}");
         assert!(!again.contains("/nonexistent/rustible-bin"), "{again}");
+    }
+
+    /// A helper that says why on stderr and exits at once has that line in
+    /// the report, every time: the report waits for its stderr reader to
+    /// reach EOF rather than reading the tail as it stands when the exit is
+    /// seen, which left it empty now and then on a busy machine (#90). Run
+    /// many times, because one run loses the race only occasionally, and on
+    /// a thread with a bound, so a report that waits forever fails instead
+    /// of hanging.
+    #[test]
+    fn a_helper_that_exits_at_once_reports_its_stderr_every_time() {
+        const RUNS: usize = 3000;
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lost = Vec::new();
+            for _ in 0..RUNS {
+                let e =
+                    dead_helper_running("echo 'sudo: a password is required' >&2; exit 1", None);
+                let err = e.read(Path::new("/root")).unwrap_err().to_string();
+                if !err.contains("helper exited 1: sudo: a password is required") {
+                    lost.push(err);
+                }
+            }
+            let _ = done.send(lost);
+        });
+        let lost = finished
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the reports did not all come back within 120s");
+        assert!(
+            lost.is_empty(),
+            "{} of {RUNS} reports lost the stderr line, e.g. {:?}",
+            lost.len(),
+            lost[0]
+        );
+    }
+
+    /// A helper that exits while something it started keeps its stderr open
+    /// is still reported, without waiting for that to let go: the wait for
+    /// the stderr reader is bounded, and the report has what came before.
+    #[test]
+    fn a_helper_whose_stderr_outlives_it_is_reported_within_the_bound() {
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let e = dead_helper_running(
+                "echo boom >&2; sleep 30 </dev/null >/dev/null & exit 7",
+                None,
+            );
+            let t0 = Instant::now();
+            let err = e.read(Path::new("/etc/hostname")).unwrap_err().to_string();
+            let _ = done.send((err, t0.elapsed()));
+        });
+        let (err, took) = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a helper whose stderr stayed open was not reported within 20s");
+        assert!(err.starts_with("helper exited 7: boom"), "{err}");
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+    }
+
+    /// Shutting a helper down waits for its stderr reader without adding
+    /// to the wait: one that exits at EOF on stdin is gone in a moment, and
+    /// one that has to be killed is not held up a further [`SETTLE`] by
+    /// what it left writing to its stdout, which keeps its stderr open
+    /// until that stdout is closed.
+    #[test]
+    fn a_shutdown_waits_for_stderr_only_as_long_as_the_helper() {
+        let spawner = Spawner {
+            method: "sudo".into(),
+            exe: PathBuf::from("/nonexistent/rustible-bin"),
+            password: None,
+            note: None,
+        };
+        let shutdown = move |script: &str| {
+            let child = Command::new("sh")
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let conn = spawner.connection("root", child);
+            let t0 = Instant::now();
+            conn.shutdown();
+            t0.elapsed()
+        };
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let healthy = shutdown("cat > /dev/null");
+            let killed = shutdown("yes < /dev/null & wait");
+            let _ = done.send((healthy, killed));
+        });
+        let (healthy, killed) = finished
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the shutdowns did not finish within 20s");
+        assert!(healthy < Duration::from_secs(1), "took {healthy:?}");
+        // Two seconds for the helper to go before it is killed, and none
+        // waiting for stderr after.
+        assert!(killed < Duration::from_secs(3), "took {killed:?}");
     }
 
     /// A playbook whose `ssh_user` attribute chose the login has the
