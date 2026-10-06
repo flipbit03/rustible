@@ -11,12 +11,13 @@
 //!
 //! **Cache refresh.** [`Present`] and [`Latest`] take `.update_cache(max_age)`:
 //! `apt-get update` runs when the lists are older than `max_age` or of unknown
-//! age; `Duration::ZERO` means always. Their age is that of the newest of
-//! `/var/lib/apt/periodic/update-success-stamp`, `/var/lib/apt/lists` and
-//! `/var/cache/apt/pkgcache.bin`, and a refresh that exits 0 touches the stamp,
-//! because an `apt-get update` that changes no index leaves the other two as
-//! old as they were. *Where* it runs differs, because the two ops need the
-//! lists at different moments:
+//! age; `Duration::ZERO` means always. Their age is that of the newer of
+//! `/var/lib/apt/periodic/update-success-stamp` and `/var/lib/apt/lists`
+//! (`/var/cache/apt/pkgcache.bin` only when neither can be read), and a
+//! refresh that fetched every index touches the stamp, because an
+//! `apt-get update` that changes no index leaves the lists as old as they
+//! were. *Where* it runs differs, because the two ops need the lists at
+//! different moments:
 //!
 //! - [`Present`] only asks whether a package is installed, which dpkg answers
 //!   without the lists. It refreshes in `apply`, right before installing, and
@@ -185,27 +186,34 @@ const SUCCESS_STAMP: &str = "/var/lib/apt/periodic/update-success-stamp";
 const PERIODIC_DIR: &str = "/var/lib/apt/periodic";
 
 /// What the lists' age is read from, [`SUCCESS_STAMP`] first.
-const AGE_SOURCES: [&str; 3] = [
-    SUCCESS_STAMP,
-    "/var/lib/apt/lists",
-    "/var/cache/apt/pkgcache.bin",
-];
+const AGE_SOURCES: [&str; 2] = [SUCCESS_STAMP, "/var/lib/apt/lists"];
 
-/// Age of the apt lists: that of the newest of [`AGE_SOURCES`], each read
-/// with `stat -c %Y` (the SDK's `Stat` carries no mtime), skipping any that
-/// cannot be read. `None` when none can. The newest wins because the lists
-/// are as fresh as the last refresh anything recorded: an `apt-get update`
-/// that changes no index leaves `/var/lib/apt/lists` where it was, and an
-/// old stamp next to lists a newer refresh rewrote says nothing about them.
+/// Read for the lists' age only when none of [`AGE_SOURCES`] can be. Never
+/// in the newest-wins: any `apt-get install` rewrites it, and so does an
+/// `apt-cache policy` run as root after a dpkg change, so it would make
+/// lists weeks old look fresh. `ansible.builtin.apt` never reads it.
+const AGE_FALLBACK: &str = "/var/cache/apt/pkgcache.bin";
+
+/// The mtime of `path` from `stat -c %Y` (the SDK's `Stat` carries no
+/// mtime), or `None` when it cannot be read.
+fn mtime(sys: &System, path: &str) -> Result<Option<u64>> {
+    let out = sys.cmd("stat").args(["-c", "%Y", path]).ok()?;
+    Ok(out.and_then(|out| parse_stat_mtime(&out.stdout_str())))
+}
+
+/// Age of the apt lists: that of the newest of [`AGE_SOURCES`], skipping
+/// any that cannot be read, else that of [`AGE_FALLBACK`]. `None` when none
+/// can. The newest wins because the lists are as fresh as the last refresh
+/// anything recorded: an `apt-get update` that changes no index leaves
+/// `/var/lib/apt/lists` where it was, and an old stamp next to lists a
+/// newer refresh rewrote says nothing about them.
 fn cache_age(sys: &System) -> Result<Option<Duration>> {
     let mut newest = None;
     for path in AGE_SOURCES {
-        let Some(out) = sys.cmd("stat").args(["-c", "%Y", path]).ok()? else {
-            continue;
-        };
-        if let Some(mtime) = parse_stat_mtime(&out.stdout_str()) {
-            newest = newest.max(Some(mtime));
-        }
+        newest = newest.max(mtime(sys, path)?);
+    }
+    if newest.is_none() {
+        newest = mtime(sys, AGE_FALLBACK)?;
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -236,7 +244,7 @@ impl std::fmt::Display for Stale {
             ),
             Stale::AgeUnknown => write!(
                 f,
-                "the age of the package lists cannot be read (from {})",
+                "the age of the package lists cannot be read (from {}, {AGE_FALLBACK})",
                 AGE_SOURCES.join(", ")
             ),
             Stale::Older { age, max_age } => write!(
@@ -287,29 +295,52 @@ fn staleness(sys: &System, max_age: Duration) -> Result<Option<Stale>> {
     })
 }
 
+/// Pure: the first line of `apt-get update`'s output saying an index was
+/// not fetched, or `None` when every one was. apt exits 0 after such a
+/// failure (offline, a dead mirror), so the status alone cannot say; apt's
+/// own `Post-Invoke-Success` hooks do not run then either. The backend
+/// forces `LANG=C`, so the lines are apt's English ones.
+fn failed_fetch(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|l| {
+        l.contains("Failed to fetch") || l.contains("Some index files failed to download")
+    })
+}
+
 /// `apt-get update`: fetch the package lists from the host's mirrors, then
 /// record that it succeeded in [`SUCCESS_STAMP`], whose mtime [`cache_age`]
-/// reads. Never under `--check` (vision 12). A failed update writes no stamp;
-/// one that exits 0 having fetched only some indexes (`W: Some index files
-/// failed to download`) does, as Ubuntu's `Post-Invoke-Success` hook does.
+/// reads. Never under `--check` (vision 12). A failed update writes no
+/// stamp, and neither does one that exits 0 having failed to fetch an index
+/// ([`failed_fetch`]): that warns instead, and the next run refreshes again.
 ///
 /// The stamp is written with `mkdir -p` and `touch`, not through `sys`,
 /// because [`Latest`] refreshes in `check`, where the SDK refuses every
 /// write through `sys` even in a real run; a command is outside that guard,
-/// as `apt-get update` itself is.
+/// as `apt-get update` itself is. A stamp that cannot be written warns and
+/// does not fail the step, as Ubuntu's hook ignores a failed `touch`: the
+/// lists were refreshed, and the cost is a refresh the next run may repeat.
 fn refresh_lists(sys: &System) -> Result<()> {
-    apt_get(sys).arg("update").run()?;
-    sys.cmd("mkdir")
+    let out = apt_get(sys).arg("update").run()?;
+    let output = format!("{}\n{}", out.stdout_str(), out.stderr_str());
+    if let Some(line) = failed_fetch(&output) {
+        sys.warn(format!(
+            "`apt-get update` exited 0 but did not fetch every package index (`{line}`), \
+             so {SUCCESS_STAMP} was not written and the next run will refresh again; \
+             check the host's network and the mirrors in /etc/apt/sources.list"
+        ));
+        return Ok(());
+    }
+    let stamped = sys
+        .cmd("mkdir")
         .args(["-p", PERIODIC_DIR])
         .run()
-        .and_then(|_| sys.cmd("touch").arg(SUCCESS_STAMP).run())
-        .map_err(|e| {
-            e.context(format!(
-                "`apt-get update` succeeded, but recording it in {SUCCESS_STAMP} failed, \
-                 so the next run would read the lists as stale and refresh them again; \
-                 check that {PERIODIC_DIR} is a writable directory"
-            ))
-        })?;
+        .and_then(|_| sys.cmd("touch").arg(SUCCESS_STAMP).run());
+    if let Err(e) = stamped {
+        sys.warn(format!(
+            "`apt-get update` succeeded, but recording it in {SUCCESS_STAMP} failed ({}), \
+             so the next run may refresh again; check that {PERIODIC_DIR} is a writable directory",
+            e.chain()
+        ));
+    }
     Ok(())
 }
 
@@ -1007,7 +1038,7 @@ mod tests {
         let argvs = fake.argvs();
         let at = argvs
             .iter()
-            .position(|a| a[..2] == ["apt-get", "update"])
+            .position(|a| a.starts_with(&["apt-get".into(), "update".into()]))
             .unwrap_or_else(|| panic!("apt-get update ran: {argvs:?}"));
         argvs[at..].to_vec()
     }
@@ -1289,10 +1320,12 @@ mod tests {
         assert!(argv_starting(&argvs, &["apt-get", "update"]).is_some());
     }
 
-    /// Plants `stat -c %Y` for each of [`AGE_SOURCES`], in order: an mtime
-    /// that many seconds ago, or `None` for one `stat` cannot read.
+    /// Plants `stat -c %Y` for each of [`AGE_SOURCES`] and then
+    /// [`AGE_FALLBACK`], in order: an mtime that many seconds ago, or `None`
+    /// for one `stat` cannot read.
     fn ages(fake: Fake, ago: [Option<u64>; 3]) -> Fake {
-        AGE_SOURCES.iter().zip(ago).fold(fake, |fake, (path, ago)| {
+        let paths = [AGE_SOURCES[0], AGE_SOURCES[1], AGE_FALLBACK];
+        paths.iter().zip(ago).fold(fake, |fake, (path, ago)| {
             let args = ["-c", "%Y", path];
             match ago {
                 Some(ago) => fake.with_cmd("stat", Some(&args), 0, &(now_secs() - ago).to_string()),
@@ -1301,29 +1334,51 @@ mod tests {
         })
     }
 
-    /// The lists' age is the newest readable source's, whichever it is, and
-    /// unknown only when none can be read.
+    /// The lists' age is the newer of the stamp's and the lists', whichever
+    /// is readable; `pkgcache.bin` answers only when neither is, and the age
+    /// is unknown only when nothing can be read.
     #[test]
     fn cache_age_is_the_newest_readable_source() {
         const DAY: u64 = 86_400;
         let hour = Duration::from_secs(3_600);
         let staleness_of = |ago| staleness(&sys(&Arc::new(ages(Fake::new(), ago))), hour).unwrap();
 
-        // A refresh that changed no index: the stamp is fresh, the lists and
-        // pkgcache.bin are as old as the last refresh that did.
+        // A refresh that changed no index: the stamp is fresh, the lists are
+        // as old as the last refresh that did.
         assert_eq!(staleness_of([Some(60), Some(2 * DAY), Some(2 * DAY)]), None);
         // An old stamp next to fresh lists cannot make them look stale.
         assert_eq!(staleness_of([Some(2 * DAY), Some(60), None]), None);
-        // No stamp (Debian ships none) and no lists: pkgcache.bin answers.
-        assert_eq!(staleness_of([None, None, Some(60)]), None);
-        // All old: the age is the newest of them, to the second.
-        let Some(Stale::Older { age, .. }) = staleness_of([Some(3 * DAY), Some(2 * DAY), None])
+        // An install rewrote pkgcache.bin a minute ago without refreshing:
+        // it does not make two-day-old lists look fresh.
+        let Some(Stale::Older { age, .. }) = staleness_of([None, Some(2 * DAY), Some(60)]) else {
+            panic!("pkgcache.bin outweighed the lists")
+        };
+        assert!(age.as_secs().abs_diff(2 * DAY) <= 2, "{age:?}");
+        // All old: the age is the newer of the two, to the second.
+        let Some(Stale::Older { age, .. }) = staleness_of([Some(3 * DAY), Some(2 * DAY), Some(60)])
         else {
             panic!("expected stale")
         };
         assert!(age.as_secs().abs_diff(2 * DAY) <= 2, "{age:?}");
-        // None readable.
+        // Neither readable: pkgcache.bin is the fallback.
+        assert_eq!(staleness_of([None, None, Some(60)]), None);
+        let Some(Stale::Older { .. }) = staleness_of([None, None, Some(2 * DAY)]) else {
+            panic!("expected stale from the fallback")
+        };
+        // Nothing readable.
         assert_eq!(staleness_of([None, None, None]), Some(Stale::AgeUnknown));
+    }
+
+    /// `pkgcache.bin` is not even asked about while a source answers.
+    #[test]
+    fn cache_age_stats_the_fallback_only_when_no_source_answers() {
+        let fake = Arc::new(ages(Fake::new(), [None, Some(60), Some(60)]));
+        cache_age(&sys(&fake)).unwrap();
+        let argvs = fake.argvs();
+        assert!(
+            argvs.iter().all(|a| !a.contains(&AGE_FALLBACK.to_string())),
+            "{argvs:?}"
+        );
     }
 
     /// The same, end to end: the stamp a refresh wrote keeps `Present` from
@@ -1414,11 +1469,10 @@ mod tests {
         assert_eq!(after[1..3], stamp_argvs(), "{after:?}");
     }
 
-    /// A stamp that cannot be written fails the step after a successful
-    /// update, saying so, rather than leaving the next run to refresh again
-    /// without knowing why; and nothing is installed.
+    /// A stamp that cannot be written warns, saying the next run may
+    /// refresh again, and the step goes on: the lists were refreshed.
     #[test]
-    fn a_stamp_that_cannot_be_written_fails_the_step() {
+    fn a_stamp_that_cannot_be_written_warns_and_installs() {
         let fake = Arc::new(
             Fake::new()
                 .with_cmd("dpkg-query", None, 1, "")
@@ -1426,20 +1480,103 @@ mod tests {
                 .with_cmd("mkdir", Some(&["-p", PERIODIC_DIR]), 0, "")
                 .with_cmd("touch", Some(&[SUCCESS_STAMP]), 1, ""),
         );
-        let s = sys(&fake);
+        let sink = Arc::new(Collect::default());
+        let s = System::fake(fake.clone(), sink.clone());
         let op = Present::new(["mc"]).update_cache(Duration::ZERO);
         let Plan::Change(c) = op.check(&s).unwrap() else {
             panic!("expected change")
         };
-        let err = op.apply(&s, c).unwrap_err().chain();
+        op.apply(&s, c).unwrap();
+        let warned = warnings(&sink);
+        assert_eq!(warned.len(), 1, "{warned:?}");
         assert!(
-            err.contains("`apt-get update` succeeded, but recording it in")
-                && err.contains(SUCCESS_STAMP)
-                && err.contains("touch"),
-            "{err}"
+            warned[0].contains(SUCCESS_STAMP)
+                && warned[0].contains("may refresh again")
+                && warned[0].contains("touch"),
+            "{warned:?}"
         );
-        let argvs = fake.argvs();
-        assert_eq!(argvs.last().unwrap()[0], "touch", "{argvs:?}");
+        let after = from_update(&fake);
+        assert_eq!(after[1..3], stamp_argvs(), "{after:?}");
+        assert_eq!(after[3][..2], ["apt-get", "install"], "{after:?}");
+    }
+
+    /// What `apt-get update` prints, under `LANG=C`, when it cannot reach a
+    /// mirror and still exits 0.
+    const OFFLINE_UPDATE: &str = "\
+Ign:1 http://127.0.0.1:9/debian bookworm InRelease
+Err:1 http://127.0.0.1:9/debian bookworm InRelease
+  Could not connect to 127.0.0.1:9 (127.0.0.1). - connect (111: Connection refused)
+Reading package lists...
+W: Failed to fetch http://127.0.0.1:9/debian/dists/bookworm/InRelease  Could not connect to 127.0.0.1:9 (127.0.0.1). - connect (111: Connection refused)
+W: Some index files failed to download. They have been ignored, or old ones used instead.
+";
+
+    #[test]
+    fn failed_fetch_finds_either_line() {
+        assert_eq!(
+            failed_fetch(OFFLINE_UPDATE),
+            Some(
+                "W: Failed to fetch http://127.0.0.1:9/debian/dists/bookworm/InRelease  \
+                 Could not connect to 127.0.0.1:9 (127.0.0.1). - connect (111: Connection refused)"
+            )
+        );
+        assert!(
+            failed_fetch(
+                "W: Some index files failed to download. They have been ignored, or old ones used instead.\n"
+            )
+            .is_some()
+        );
+        let clean =
+            "Hit:1 http://deb.debian.org/debian bookworm InRelease\nReading package lists...\n";
+        assert_eq!(failed_fetch(clean), None);
+        assert_eq!(failed_fetch(""), None);
+    }
+
+    /// An update that exited 0 without fetching every index is not a
+    /// refresh to record: no stamp, and a warning that names the line. The
+    /// step goes on, for `Present` in `apply` and `Latest` in `check`.
+    #[test]
+    fn a_partial_refresh_warns_and_writes_no_stamp() {
+        let fake = Arc::new(stamp_tools(
+            Fake::new()
+                .with_cmd("dpkg-query", None, 1, "")
+                .with_cmd("apt-get", Some(&["update"]), 0, OFFLINE_UPDATE)
+                .with_cmd("apt-get", None, 0, ""),
+        ));
+        let sink = Arc::new(Collect::default());
+        let s = System::fake(fake.clone(), sink.clone());
+        let op = Present::new(["mc"]).update_cache(Duration::ZERO);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&s, c).unwrap();
+        assert!(stamp_writes(&fake).is_empty(), "{:?}", fake.argvs());
+        let warned = warnings(&sink);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("W: Failed to fetch")
+                && warned[0].contains("was not written")
+                && warned[0].contains("will refresh again"),
+            "{warned:?}"
+        );
+
+        let fake =
+            stamp_tools(Fake::new().with_cmd("apt-get", Some(&["update"]), 0, OFFLINE_UPDATE));
+        let fake = dpkg(fake, "openssl", 0, "install ok installed\t3.0.15-1\n");
+        let fake = Arc::new(
+            policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
+        );
+        let sink = Arc::new(Collect::default());
+        let mut ctx = Ctx::new(
+            System::fake(fake.clone(), sink.clone()),
+            rustible_sdk::HostInfo::local(),
+        );
+        let r = ctx
+            .step("up", Latest::new(["openssl"]).update_cache(Duration::ZERO))
+            .unwrap();
+        assert!(r.changed);
+        assert!(stamp_writes(&fake).is_empty(), "{:?}", fake.argvs());
+        assert_eq!(warnings(&sink).len(), 1, "{:?}", sink.events());
     }
 
     #[test]
@@ -1790,7 +1927,7 @@ mod tests {
         let after_check = fake.argvs();
         let update = after_check
             .iter()
-            .position(|a| a[..2] == ["apt-get", "update"])
+            .position(|a| a.starts_with(&["apt-get".into(), "update".into()]))
             .expect("check ran apt-get update");
         let policy = after_check
             .iter()
