@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustible_sdk::prelude::*;
+use rustible_std::http;
 use rustible_std::ssh::authorized_keys::{PublicKey, parse_line};
 
 use crate::fetch::{Fetch, Https};
@@ -12,6 +13,10 @@ use crate::login::validate_login;
 /// Where `<login>.keys` is appended. GitHub serves a user's public keys as
 /// `text/plain`, one `<type> <base64>` line per key, comments stripped.
 pub const KEYS_URL_BASE: &str = "https://github.com";
+
+/// The most of a body's line, or of its options field, that a refusal from
+/// [`parse_keys_body`] quotes.
+pub const QUOTED_LINE_BYTES: usize = 160;
 
 /// Look up a GitHub user's public SSH keys. A read-only op (vision 6.5): it
 /// runs through `ctx.step`, shows in the run output, is timed, and can never
@@ -60,12 +65,27 @@ pub const KEYS_URL_BASE: &str = "https://github.com";
 /// API's `/users/<user>/keys`. The plain-text endpoint needs no token, no JSON
 /// parsing, and is not subject to the API's 60-requests-per-hour anonymous
 /// limit; the API adds only key ids, which nothing here needs.
-#[derive(Debug, Clone)]
+///
+/// A `user:token@` in a [`base_url`](Self::base_url) is masked wherever the
+/// URL is shown: messages, the diff and `{:?}`.
+#[derive(Clone)]
 pub struct UserKeys {
     login: String,
     base: String,
     timeout: Option<Duration>,
     fetch: Option<Arc<dyn Fetch>>,
+}
+
+/// `{:?}` masks the base URL's userinfo.
+impl std::fmt::Debug for UserKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserKeys")
+            .field("login", &self.login)
+            .field("base", &http::mask_url(&self.base))
+            .field("timeout", &self.timeout)
+            .field("fetch", &self.fetch)
+            .finish()
+    }
 }
 
 impl UserKeys {
@@ -139,6 +159,10 @@ impl UserKeys {
 /// `authorized_keys`, which is a remote-code-execution primitive dressed as a
 /// key. Comments are dropped rather than refused: they are cosmetic, never
 /// take part in matching, and the caller labels the keys itself.
+///
+/// A refusal quotes at most [`QUOTED_LINE_BYTES`] of the line or the options
+/// field, on one line: the body has no size limit, and a captive portal's
+/// one-line page can be megabytes.
 pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
     let mut keys = Vec::new();
     for (i, line) in body.lines().enumerate() {
@@ -150,9 +174,10 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
                 if let Some(options) = &k.options {
                     bail!(
                         "line {} of GitHub user `{login}`'s keys carries an authorized_keys \
-                         options field ({options}); the `.keys` endpoint serves bare keys, so \
+                         options field ({}); the `.keys` endpoint serves bare keys, so \
                          this response did not come from GitHub unaltered and is refused",
-                        i + 1
+                        i + 1,
+                        http::one_line(options, QUOTED_LINE_BYTES)
                     );
                 }
                 k.comment = None;
@@ -161,7 +186,7 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
             None => bail!(
                 "line {} of GitHub user `{login}`'s keys is not a public key: {}",
                 i + 1,
-                line.trim()
+                http::one_line(line, QUOTED_LINE_BYTES)
             ),
         }
     }
@@ -170,10 +195,18 @@ pub fn parse_keys_body(login: &str, body: &str) -> Result<Vec<PublicKey>> {
 
 /// What [`UserKeys`]'s `check` decided: send `GET <url>`. It holds no keys,
 /// because `check` reads none: they are remote state, and `check` contacts
-/// nothing outside the target (vision 12).
-#[derive(Debug)]
+/// nothing outside the target (vision 12). Its `{:?}` masks the URL's
+/// userinfo.
 pub struct KeysLookup {
     url: String,
+}
+
+impl std::fmt::Debug for KeysLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeysLookup")
+            .field("url", &http::mask_url(&self.url))
+            .finish()
+    }
 }
 
 impl Intent for KeysLookup {
@@ -181,7 +214,7 @@ impl Intent for KeysLookup {
     /// both modes: under `--check` it is what the step would send, and in a
     /// real run, next to `ran, unchanged`, what it sent.
     fn diff(&self) -> Diff {
-        Diff::summary(format!("GET {}", self.url))
+        Diff::summary(format!("GET {}", http::mask_url(&self.url)))
     }
 }
 
@@ -215,14 +248,15 @@ impl Op for UserKeys {
     fn apply(&self, _: &System, intent: KeysLookup) -> Result<Vec<PublicKey>> {
         let KeysLookup { url } = intent;
         let resp = self.fetcher().get(&url)?;
+        let shown = http::mask_url(&url);
         match resp.status {
             200 => parse_keys_body(&self.login, &resp.body),
             404 => bail!(
-                "GitHub user `{}` does not exist (404 from {url}); an existing user with no keys \
-                 would return an empty list, not an error",
+                "GitHub user `{}` does not exist (404 from {shown}); an existing user with no \
+                 keys would return an empty list, not an error",
                 self.login
             ),
-            s => bail!("GET {url} returned HTTP {s}"),
+            s => bail!("GET {shown} returned HTTP {s}"),
         }
     }
 
@@ -408,6 +442,34 @@ pub(crate) mod tests {
         assert!(e.contains("<html>"), "{e}");
     }
 
+    /// The body has no size limit (decision 21 on #87), so what a refusal
+    /// quotes of it has its own: one line of a few hundred bytes, however
+    /// long the line or the options field it came from. A 5 MiB one-line
+    /// page, as a captive portal might serve, makes a short message.
+    #[test]
+    fn a_refusal_quotes_a_bounded_excerpt_of_a_huge_line() {
+        let page = format!("<html>{}\x1b</html>", "x".repeat(5 << 20));
+        let e = parse_keys_body("flipbit03", &format!("{ED1}\n{page}\n"))
+            .unwrap_err()
+            .chain();
+        assert!(e.len() < 400, "{} bytes", e.len());
+        assert!(e.contains("line 2"), "{e}");
+        assert!(e.contains("<html>xxx"), "{e}");
+        assert!(e.ends_with("..."), "{e}");
+
+        let options = format!("command=\"{}\" {ED1}\n", "y".repeat(5 << 20));
+        let e = parse_keys_body("flipbit03", &options).unwrap_err().chain();
+        assert!(e.len() < 600, "{} bytes", e.len());
+        assert!(e.contains("options field (command=\"yyy"), "{e}");
+        assert!(e.contains("did not come from GitHub"), "{e}");
+
+        // A short line is quoted whole, its control characters escaped.
+        let e = parse_keys_body("x", "not\u{1b}a key\n")
+            .unwrap_err()
+            .chain();
+        assert!(e.ends_with("is not a public key: not\\u{1b}a key"), "{e}");
+    }
+
     // ---- Fake backend, canned network ----
 
     #[test]
@@ -531,6 +593,50 @@ pub(crate) mod tests {
             .chain();
         assert!(e.contains("HTTP 503"), "{e}");
         assert!(e.contains("https://github.com/flipbit03.keys"), "{e}");
+    }
+
+    /// A `.base_url` with a token in its userinfo, as a GitHub Enterprise
+    /// mirror behind basic auth might take, never shows the token: not in a
+    /// status failure, a diff or a `{:?}`. The request itself still carries
+    /// it.
+    #[test]
+    fn a_token_in_the_base_url_is_masked_everywhere_it_is_shown() {
+        let url = "https://bob:t0ken@ghe.example/flipbit03.keys";
+        for (status, says) in [(404, "does not exist"), (500, "returned HTTP 500")] {
+            let canned = Canned::answering(url, Ok(Response::with_status(status, "")));
+            let op = UserKeys::of("flipbit03")
+                .base_url("https://bob:t0ken@ghe.example/")
+                .fetch_with(canned.clone());
+            let (sys, _) = sys();
+            let Plan::Change(intent) = op.check(&sys).unwrap() else {
+                panic!("UserKeys::check always plans the request")
+            };
+            let shown = [
+                intent.diff().render(),
+                format!("{intent:?}"),
+                // Without the canned fetcher, whose own `{:?}` lists its URLs.
+                format!(
+                    "{:?}",
+                    UserKeys::of("flipbit03").base_url("https://bob:t0ken@ghe.example/")
+                ),
+                op.apply(&sys, intent).unwrap_err().chain(),
+            ];
+            for text in &shown {
+                assert!(!text.contains("t0ken"), "{text}");
+            }
+            assert!(
+                shown[0].contains("GET https://bob:********@ghe.example/flipbit03.keys"),
+                "{}",
+                shown[0]
+            );
+            assert!(shown[3].contains(says), "{}", shown[3]);
+            assert!(
+                shown[3].contains("https://bob:********@ghe.example/flipbit03.keys"),
+                "{}",
+                shown[3]
+            );
+            assert_eq!(canned.asked(), [url]);
+        }
     }
 
     #[test]

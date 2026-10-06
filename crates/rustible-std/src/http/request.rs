@@ -16,10 +16,6 @@ use super::client::{
 };
 use super::{DEFAULT_TIMEOUT, validate_url};
 
-/// The default ceiling on a [`Request`]'s response body, raised or lowered
-/// with [`Request::max_bytes`]. The body is held in memory.
-pub const REQUEST_MAX_BYTES: u64 = 16 << 20;
-
 /// How much of a request body a diff shows before it says it was cut.
 const SHOWN_BODY_BYTES: usize = 2048;
 
@@ -123,8 +119,8 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 ///
 /// **Limits.** [`Request::timeout`] bounds the whole exchange, redirects
 /// and body included, 30 seconds by default as in Ansible. The response
-/// body is held in memory, up to [`REQUEST_MAX_BYTES`] unless
-/// [`Request::max_bytes`] says otherwise. `validate_certs: no` has no
+/// body is held in memory, as large as the server sends unless
+/// [`Request::max_bytes`] sets a limit. `validate_certs: no` has no
 /// equivalent: certificates are always checked against Mozilla's roots.
 #[derive(Clone)]
 pub struct Request {
@@ -136,7 +132,7 @@ pub struct Request {
     content_type: Option<String>,
     status: Option<Vec<u16>>,
     timeout: Duration,
-    max_bytes: u64,
+    max_bytes: Option<u64>,
     follow: Option<bool>,
     changed_when: Option<Predicate>,
 }
@@ -225,7 +221,7 @@ impl Request {
             content_type: None,
             status: None,
             timeout: DEFAULT_TIMEOUT,
-            max_bytes: REQUEST_MAX_BYTES,
+            max_bytes: None,
             follow: None,
             changed_when: None,
         }
@@ -373,11 +369,12 @@ impl Request {
         self
     }
 
-    /// The largest response body to accept, in bytes ([`REQUEST_MAX_BYTES`]
-    /// by default). A `Content-Length` above it fails before the body is
-    /// read; a body without one fails as soon as the read passes it.
+    /// The largest response body to accept, in bytes. Unset by default: a
+    /// response is as large as the API sends. A `Content-Length` above it
+    /// fails before the body is read; a body without one fails as soon as
+    /// the read passes it.
     pub fn max_bytes(mut self, n: u64) -> Self {
-        self.max_bytes = n;
+        self.max_bytes = Some(n);
         self
     }
 
@@ -2363,6 +2360,36 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains(".max_bytes()"), "{e}");
+        // A `HEAD` answer declares the size of a body it does not send, and
+        // so may a `304` or a `204` (RFC 9110 section 8.6): no body to read
+        // is no body over the limit.
+        let r = Request::head(server.url("/big"))
+            .max_bytes(100)
+            .send()
+            .unwrap();
+        assert!(r.body.is_empty());
+        let s = serve(vec![
+            (
+                "/not-modified",
+                304,
+                vec![("X-Declare-Length", "4096".into())],
+                vec![],
+            ),
+            (
+                "/no-content",
+                204,
+                vec![("X-Declare-Length", "4096".into())],
+                vec![],
+            ),
+        ]);
+        for (path, status) in [("/not-modified", 304), ("/no-content", 204)] {
+            let r = Request::get(s.url(path))
+                .status([status])
+                .max_bytes(100)
+                .send()
+                .unwrap();
+            assert_eq!((r.status, r.body.len()), (status, 0), "{path}");
+        }
         assert_eq!(
             Request::get(server.url("/big"))
                 .max_bytes(4096)
@@ -2393,6 +2420,28 @@ mod tests {
             e.ends_with("larger than the 100 byte limit; raise it with .max_bytes()"),
             "{e}"
         );
+    }
+
+    /// No limit unless one is set (decision 20 on #87): a response over the
+    /// 16 MiB a request used to refuse by default comes back whole, with a
+    /// `Content-Length` and without one, as a step and from `send`.
+    #[test]
+    fn a_response_over_the_old_16_mib_default_is_accepted() {
+        let n = (16 << 20) + 1;
+        let s = serve(vec![
+            ("/big", 200, vec![], vec![b'x'; n]),
+            (
+                "/unsized",
+                200,
+                vec![("X-Omit-Length", String::new())],
+                vec![b'y'; n],
+            ),
+        ]);
+        let (r, _) = step(false, Request::get(s.url("/big")));
+        assert_eq!(r.unwrap().body.len(), n);
+        let r = Request::get(s.url("/unsized")).send().unwrap();
+        assert_eq!(r.body.len(), n);
+        assert!(r.body.iter().all(|&b| b == b'y'));
     }
 
     /// The timeout covers the body: a server that sends its head and then

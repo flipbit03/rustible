@@ -210,53 +210,54 @@ impl Incoming {
             .unwrap_or("")
     }
 
-    /// The whole body, at most `max_bytes`. A `Content-Length` above it
-    /// fails before the body is read; a body without one, or one that lies,
-    /// fails as soon as the read passes it, so memory stays bounded.
-    pub(crate) fn read(mut self, max_bytes: u64) -> std::result::Result<Vec<u8>, ReadError> {
-        if self.head {
-            return Ok(vec![]);
+    /// The whole body, in memory, at most `max_bytes` when there is a limit:
+    /// [`Incoming::body`] read to its end.
+    pub(crate) fn read(self, max_bytes: Option<u64>) -> std::result::Result<Vec<u8>, ReadError> {
+        let mut body = self.body(max_bytes)?;
+        let mut out = Vec::new();
+        let mut buf = vec![0; BODY_BUF];
+        loop {
+            match body.read(&mut buf)? {
+                0 => return Ok(out),
+                n => out.extend_from_slice(&buf[..n]),
+            }
         }
-        let what = &self.what;
-        let too_large = || {
-            ReadError::TooLarge(format!(
-                "{what}: the body is larger than the {max_bytes} byte limit"
-            ))
-        };
-        if let Some(len) = self
-            .resp
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
+    }
+
+    /// The body as it arrives, for a caller that streams it rather than
+    /// holding it; empty for an answer that has none (to a `HEAD`, or a
+    /// `1xx`, `204` or `304`). With a limit, a `Content-Length` above it
+    /// fails here, before the body is read, and a body without one, or one
+    /// that lies, fails as soon as a read passes it. Without one, a body is
+    /// as large as the server sends.
+    pub(crate) fn body(self, max_bytes: Option<u64>) -> std::result::Result<Body, ReadError> {
+        let what = self.what;
+        // An answer that has no body may still carry a `Content-Length`:
+        // a `HEAD`'s, a `304`'s and a `204`'s is the size of a body they do
+        // not send (RFC 9110 section 8.6).
+        let bodiless = self.head || matches!(self.status, 100..=199 | 204 | 304);
+        if !bodiless
+            && let Some(max_bytes) = max_bytes
+            && let Some(len) = self
+                .resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
             && len > max_bytes
         {
             return Err(ReadError::TooLarge(format!(
                 "{what}: the server declares a {len} byte body (Content-Length), over the {max_bytes} byte limit"
             )));
         }
-        // Read one byte past the ceiling to tell "exactly at the limit" from
-        // "over it": ureq stops the read past its limit and errors.
-        let body = self
-            .resp
-            .body_mut()
-            .with_config()
-            .limit(max_bytes.saturating_add(1))
-            .read_to_vec()
-            .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => too_large(),
-                e => {
-                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
-                    ReadError::Other(scrub(
-                        &format!("{what}: reading the body: {e}"),
-                        &self.scrub,
-                    ))
-                }
-            })?;
-        if body.len() as u64 > max_bytes {
-            return Err(too_large());
-        }
-        Ok(body)
+        Ok(Body {
+            reader: (!bodiless).then(|| self.resp.into_body().into_reader()),
+            what,
+            max_bytes,
+            read: 0,
+            deadline: self.deadline,
+            scrub: self.scrub,
+        })
     }
 
     /// Up to `n` bytes of the body as one line of text, for a message about
@@ -280,6 +281,59 @@ impl Incoming {
             .take((n + extra) as u64)
             .read_to_end(&mut out);
         one_line(&scrub(&String::from_utf8_lossy(&out), &self.scrub), n)
+    }
+}
+
+/// How much of a body [`Incoming::read`] asks for at a time.
+const BODY_BUF: usize = 64 << 10;
+
+/// A response body being read: [`Incoming::body`]. Each read is counted
+/// against the limit, if there is one, and a failure is worded as
+/// [`Incoming::read`]'s, a timeout named for its deadline and every secret
+/// of the request scrubbed.
+pub(crate) struct Body {
+    /// `None` for an answer that has no body: to a `HEAD`, or a `1xx`, `204`
+    /// or `304`.
+    reader: Option<ureq::BodyReader<'static>>,
+    what: String,
+    max_bytes: Option<u64>,
+    read: u64,
+    deadline: Option<(Instant, Duration)>,
+    scrub: Vec<String>,
+}
+
+impl Body {
+    /// Up to `buf.len()` more bytes of the body, `0` at its end.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, ReadError> {
+        let Some(reader) = &mut self.reader else {
+            return Ok(0);
+        };
+        let what = &self.what;
+        let n = loop {
+            match reader.read(buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Back to the `ureq::Error` it wraps, so a timeout is
+                    // recognised and the text is what reading whole gave.
+                    let e = ureq::Error::from(e);
+                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
+                    return Err(ReadError::Other(scrub(
+                        &format!("{what}: reading the body: {e}"),
+                        &self.scrub,
+                    )));
+                }
+            }
+        };
+        self.read += n as u64;
+        if let Some(max_bytes) = self.max_bytes
+            && self.read > max_bytes
+        {
+            return Err(ReadError::TooLarge(format!(
+                "{what}: the body is larger than the {max_bytes} byte limit"
+            )));
+        }
+        Ok(n)
     }
 }
 
@@ -552,33 +606,42 @@ pub(crate) fn scrub_list(
     out
 }
 
-/// `text` as one line of at most `max` bytes: control characters escaped
-/// (`\u{1b}`), every run of whitespace a single space, a cut marked `...`.
-pub(crate) fn one_line(text: &str, max: usize) -> String {
+/// `text` as one line: control characters escaped (`\u{1b}`), every run of
+/// whitespace a single space. Only the first `max` bytes of that, then
+/// `...` when it was cut, so the result is at most `max + 3` bytes. The cut
+/// falls before a character or an escape that would not fit whole, and
+/// `text` is read only as far as the cut.
+///
+/// How a message quotes something a server sent, so that a body of any
+/// size makes a short message.
+pub fn one_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut space = false;
+    let mut escape = String::new();
+    let mut utf8 = [0; 4];
     for c in text.chars() {
         if c.is_whitespace() {
             space = !out.is_empty();
             continue;
         }
         if space {
+            if out.len() + 1 > max {
+                return out + "...";
+            }
             out.push(' ');
             space = false;
         }
-        if c.is_control() {
-            out.extend(c.escape_default());
+        let piece = if c.is_control() {
+            escape.clear();
+            escape.extend(c.escape_default());
+            escape.as_str()
         } else {
-            out.push(c);
+            &*c.encode_utf8(&mut utf8)
+        };
+        if out.len() + piece.len() > max {
+            return out + "...";
         }
-    }
-    if out.len() > max {
-        let mut cut = max;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-        out.push_str("...");
+        out.push_str(piece);
     }
     out
 }
@@ -1042,6 +1105,26 @@ mod tests {
         assert_eq!(one_line("abcdef", 3), "abc...");
         assert_eq!(one_line("ééé", 3), "é...", "cut on a character boundary");
         assert_eq!(one_line("", 3), "");
+        assert_eq!(one_line("ab cd", 3), "ab ...");
+        assert_eq!(one_line("abc   ", 3), "abc", "trailing space is no cut");
+    }
+
+    /// An escape goes in whole or not at all, and a huge input is read only
+    /// as far as the cut: the result is at most `max + 3` bytes.
+    #[test]
+    fn one_line_never_halves_an_escape_and_stops_at_the_cut() {
+        assert_eq!(one_line("ab\x1b", 8), "ab\\u{1b}");
+        assert_eq!(one_line("ab\x1bc", 8), "ab\\u{1b}...");
+        for max in 2..8 {
+            assert_eq!(one_line("ab\x1b", max), "ab...", "{max}");
+        }
+        let huge = format!("{}\x1b", "x".repeat(5 << 20));
+        let line = one_line(&huge, 160);
+        assert_eq!(line, format!("{}...", "x".repeat(160)));
+        let huge = "\x1b".repeat(1 << 20);
+        let line = one_line(&huge, 160);
+        assert!(line.len() <= 163, "{}", line.len());
+        assert!(line.ends_with("}..."), "{line}");
     }
 
     /// What a message must never quote, every form of it.

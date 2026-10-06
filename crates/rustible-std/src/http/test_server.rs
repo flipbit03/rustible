@@ -15,7 +15,9 @@ use std::time::Duration;
 /// sends its head and then waits that many milliseconds before the body;
 /// one carrying `X-Stall-Head` waits that long before sending anything;
 /// one carrying `X-Stall-After: <bytes>:<ms>` sends that many bytes of the
-/// body, then waits, then sends the rest; and
+/// body, then waits, then sends the rest; one carrying
+/// `X-Declare-Length: <bytes>` sends that as its `Content-Length` whatever
+/// the body is, so a body can end before what its head declared; and
 /// one carrying `X-Echo` answers with the request as it arrived, head and
 /// body, as a misbehaving API's error page might.
 pub(crate) type Route = (&'static str, u16, Vec<(&'static str, String)>, Vec<u8>);
@@ -147,16 +149,23 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
             if let Some(ms) = stall_head {
                 std::thread::sleep(Duration::from_millis(ms));
             }
+            let length = headers
+                .iter()
+                .find(|(k, _)| *k == "X-Declare-Length")
+                .map_or_else(|| body.len().to_string(), |(_, v)| v.clone());
             let mut out = if omit_length {
                 format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n")
             } else {
                 format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                    body.len()
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {length}\r\nConnection: close\r\n"
                 )
             };
             for (k, v) in &headers {
-                if k.starts_with("X-Omit") || k.starts_with("X-Stall") || *k == "X-Echo" {
+                if k.starts_with("X-Omit")
+                    || k.starts_with("X-Stall")
+                    || k.starts_with("X-Declare")
+                    || *k == "X-Echo"
+                {
                     continue;
                 }
                 out.push_str(&format!("{k}: {v}\r\n"));

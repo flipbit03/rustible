@@ -1,10 +1,11 @@
 //! [`Download`]: a URL into a file on the target. Ansible's
 //! `ansible.builtin.get_url`.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustible_sdk::backend::FileKind;
+use rustible_sdk::backend::{FileKind, WriteAttrs};
 use rustible_sdk::prelude::*;
 use sha2::Digest;
 
@@ -12,7 +13,7 @@ use ureq::http::Method;
 
 use super::client::{self, Field, HeaderSpec, Outgoing, Timeout, mask_url};
 use super::validate_url;
-use crate::file::{AttrPlan, Owner, plan_attrs, write_with_backup};
+use crate::file::{AttrPlan, Owner, plan_attrs, write_from_with_backup};
 
 /// The default timeout of both ops. For [`Download`] it bounds connecting
 /// and the response head, and the body has none (Ansible's `get_url`
@@ -20,11 +21,11 @@ use crate::file::{AttrPlan, Owner, plan_attrs, write_with_backup};
 /// whole exchange, body included (Ansible's `uri` default is 30 seconds).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default ceiling on a response body, raised or lowered with
-/// [`Download::max_bytes`]. The body is held in memory before the atomic
-/// write, so an unbounded download is an out-of-memory kill on the target,
-/// not a slow one. One gibibyte fits the release tarballs this op is for.
-pub const DEFAULT_MAX_BYTES: u64 = 1 << 30;
+/// How much of a file or a body is hashed at a time.
+const BUF: usize = 64 << 10;
+
+/// What a refusal over [`Download::max_bytes`] adds to the client's message.
+const MAX_BYTES_HINT: &str = "raise it with .max_bytes()";
 
 /// A checksum algorithm the `.checksum("<algorithm>:<hex>")` option accepts.
 /// One variant per word the spec takes before the colon; [`Algorithm::name`]
@@ -113,14 +114,85 @@ pub fn parse_checksum(spec: &str) -> std::result::Result<Checksum, String> {
 
 /// Lowercase hex digest of `bytes`. Pure.
 pub fn digest(algorithm: Algorithm, bytes: &[u8]) -> String {
-    fn hex(d: impl AsRef<[u8]>) -> String {
-        d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    let mut h = Hasher::new(algorithm);
+    h.update(bytes);
+    h.hex()
+}
+
+/// A digest computed a piece at a time, so a file or a body of any size is
+/// hashed in one buffer's memory.
+enum Hasher {
+    Sha224(sha2::Sha224),
+    Sha256(sha2::Sha256),
+    Sha384(sha2::Sha384),
+    Sha512(sha2::Sha512),
+}
+
+impl Hasher {
+    fn new(algorithm: Algorithm) -> Self {
+        match algorithm {
+            Algorithm::Sha224 => Hasher::Sha224(sha2::Sha224::new()),
+            Algorithm::Sha256 => Hasher::Sha256(sha2::Sha256::new()),
+            Algorithm::Sha384 => Hasher::Sha384(sha2::Sha384::new()),
+            Algorithm::Sha512 => Hasher::Sha512(sha2::Sha512::new()),
+        }
     }
-    match algorithm {
-        Algorithm::Sha224 => hex(sha2::Sha224::digest(bytes)),
-        Algorithm::Sha256 => hex(sha2::Sha256::digest(bytes)),
-        Algorithm::Sha384 => hex(sha2::Sha384::digest(bytes)),
-        Algorithm::Sha512 => hex(sha2::Sha512::digest(bytes)),
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Hasher::Sha224(h) => h.update(bytes),
+            Hasher::Sha256(h) => h.update(bytes),
+            Hasher::Sha384(h) => h.update(bytes),
+            Hasher::Sha512(h) => h.update(bytes),
+        }
+    }
+
+    /// The digest, lowercase hex.
+    fn hex(self) -> String {
+        fn hex(d: impl AsRef<[u8]>) -> String {
+            d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        }
+        match self {
+            Hasher::Sha224(h) => hex(h.finalize()),
+            Hasher::Sha256(h) => hex(h.finalize()),
+            Hasher::Sha384(h) => hex(h.finalize()),
+            Hasher::Sha512(h) => hex(h.finalize()),
+        }
+    }
+}
+
+/// The digests one pass over some bytes yields: SHA-256, which the report
+/// carries whatever `.checksum` asked for, and the checksum's own
+/// algorithm when that is another one.
+struct Digests {
+    sha256: Hasher,
+    other: Option<Hasher>,
+}
+
+impl Digests {
+    fn new(checksum: Option<&Checksum>) -> Self {
+        Digests {
+            sha256: Hasher::new(Algorithm::Sha256),
+            other: checksum
+                .map(|c| c.algorithm)
+                .filter(|a| *a != Algorithm::Sha256)
+                .map(Hasher::new),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.sha256.update(bytes);
+        if let Some(h) = &mut self.other {
+            h.update(bytes);
+        }
+    }
+
+    /// The SHA-256, and the digest by the checksum's algorithm (the same
+    /// SHA-256 when that is the one, or when there is no checksum).
+    fn finish(self) -> (String, String) {
+        let sha256 = self.sha256.hex();
+        let actual = self.other.map_or_else(|| sha256.clone(), Hasher::hex);
+        (sha256, actual)
     }
 }
 
@@ -152,24 +224,29 @@ pub fn digest(algorithm: Algorithm, bytes: &[u8]) -> String {
 /// `.force(true)`. A `.mode`/`.owner` that differs is fixed without a
 /// download and shown as an attribute diff.
 ///
-/// **Honesty.** The write is atomic (`sys.write_atomic`): the old file
-/// stays untouched until the new bytes are complete. A checksum mismatch
-/// after the download fails the step and writes nothing. A non-2xx status
-/// fails the step naming the status and the URL. Redirects are followed, up
-/// to ten, and a header given with [`Download::header_secret`] is dropped
-/// when one leaves the scheme, host and port it was meant for (the
-/// [module docs](super) have the policy). A URL's `user:pass@` is masked in
-/// every message and diff.
+/// **Honesty.** The body streams into a file staged beside `dest`
+/// (`sys.write_from`), hashed as it arrives, and is renamed over `dest`
+/// only once it is whole: the old file stays untouched until then. A
+/// checksum mismatch at the end of the body, or a body over
+/// [`Download::max_bytes`], fails the step and writes nothing, and so does
+/// a body that ends before the size its `Content-Length` declares, or
+/// before its chunked encoding's last chunk. A body framed only by the
+/// server closing the connection cannot be told from a whole one when the
+/// connection drops; `.checksum` is what catches that. A non-2xx
+/// status fails the step naming the status and the URL. Redirects are
+/// followed, up to ten, and a header given with [`Download::header_secret`]
+/// is dropped when one leaves the scheme, host and port it was meant for
+/// (the [module docs](super) have the policy). A URL's `user:pass@` is
+/// masked in every message and diff.
 /// `check` never opens the connection: a dry run reports what would be
 /// fetched and why, and a step that would change has no output there
 /// (vision 12).
 ///
-/// **Limits.** The body is held in memory before the atomic write, so this
-/// op is for release tarballs, not disk images, and a body over
-/// [`DEFAULT_MAX_BYTES`] fails rather than filling the target's memory.
-/// Raise or lower that with [`Download::max_bytes`]. Fails if `dest` exists
-/// and is not a regular file, or if its parent directory does not exist
-/// (vision 6.7: create it with [`crate::file::Directory`]).
+/// **Limits.** None on the size of the body unless [`Download::max_bytes`]
+/// sets one: it passes through the target a buffer at a time, as root or as
+/// any account, so a JDK or a disk image takes disk, not memory. Fails if
+/// `dest` exists and is not a regular file, or if its parent directory does
+/// not exist (vision 6.7: create it with [`crate::file::Directory`]).
 #[derive(Clone)]
 pub struct Download {
     url: String,
@@ -180,7 +257,7 @@ pub struct Download {
     force: bool,
     backup: bool,
     timeout: Duration,
-    max_bytes: u64,
+    max_bytes: Option<u64>,
     headers: Vec<HeaderSpec>,
 }
 
@@ -228,7 +305,8 @@ pub struct DownloadReport {
     /// Whether the URL was (or would be) fetched, as opposed to an
     /// attributes-only change or nothing at all.
     pub downloaded: bool,
-    /// Size of the file now at `path`.
+    /// Size of the file now at `path`: after a download, the bytes the
+    /// body had, counted as they were written.
     pub bytes: u64,
     /// SHA-256 of the file now at `path`, whatever `.checksum` asked for.
     ///
@@ -236,7 +314,7 @@ pub struct DownloadReport {
     /// was configured and the file was already in place, so hashing it
     /// would have decided nothing and cost a full read of, say, a 500 MB
     /// tarball on every run, check mode included. Always `Some` after a
-    /// download.
+    /// download, computed from the body as it was written.
     pub sha256: Option<String>,
     /// Set only when `.backup(true)` and a previous version was saved.
     pub backup_path: Option<PathBuf>,
@@ -270,17 +348,20 @@ impl Download {
     }
 
     /// Permission bits for `dest` (`0o644`, `0o755`). Unset by default: a new
-    /// file keeps whatever `write_atomic` gives it, an existing one keeps its
-    /// own. Enforced on every run, so a file whose only difference is its mode
-    /// is a `changed` step with an attribute diff and no download.
+    /// file gets the mode any new file gets (0666 less the umask), an
+    /// existing one keeps its own. A download has it before it is renamed
+    /// into place. Enforced on every run, so a file whose only difference is
+    /// its mode is a `changed` step with an attribute diff and no download.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
         self
     }
 
-    /// Numeric owner (`chown uid:gid`). Changing the owner clears setuid,
-    /// and setgid with group execute, as `chown` does; give `.mode(..)` too
-    /// to keep them.
+    /// Numeric owner (`chown uid:gid`). A download has it before it is
+    /// renamed into place, and one this identity may not give fails the
+    /// step with `dest` as it was. Changing the owner clears setuid, and
+    /// setgid with group execute, as `chown` does; give `.mode(..)` too to
+    /// keep them.
     pub fn owner(mut self, uid: u32, gid: u32) -> Self {
         self.owner = Some(Owner { uid, gid });
         self
@@ -294,7 +375,8 @@ impl Download {
     }
 
     /// Keep a copy of the previous file next to it before overwriting
-    /// (`<name>.~rustible.<unix-ts>`).
+    /// (`<name>.~rustible.<unix-ts>`). A download that fails removes the
+    /// copy it took, so one is left only beside a replacement.
     pub fn backup(mut self, on: bool) -> Self {
         self.backup = on;
         self
@@ -307,14 +389,13 @@ impl Download {
         self
     }
 
-    /// Largest response body to accept, in bytes (default
-    /// [`DEFAULT_MAX_BYTES`]). The body is buffered in memory before the
-    /// atomic write, so this is what stands between a hostile or misbehaving
-    /// server and an out-of-memory kill on the target. A `Content-Length`
+    /// Largest response body to accept, in bytes. Unset by default: a
+    /// download is as large as the URL it was given. A `Content-Length`
     /// above it fails before the body is read; a response without one, or
-    /// one that lies, fails as soon as the read passes it.
+    /// one that lies, fails as soon as the read passes it. Either way
+    /// nothing is written.
     pub fn max_bytes(mut self, n: u64) -> Self {
-        self.max_bytes = n;
+        self.max_bytes = Some(n);
         self
     }
 
@@ -385,13 +466,7 @@ impl Download {
         // mode included, to fill a report field nobody asked for.
         let state = match checksum {
             Some(c) => {
-                let bytes = sys.read(&self.dest)?;
-                let sha256 = digest(Algorithm::Sha256, &bytes);
-                let actual = if c.algorithm == Algorithm::Sha256 {
-                    sha256.clone()
-                } else {
-                    digest(c.algorithm, &bytes)
-                };
+                let (sha256, actual) = hash_file(sys, &self.dest, c)?;
                 if actual == c.hex {
                     ContentState::Current {
                         sha256: Some(sha256),
@@ -411,7 +486,9 @@ impl Download {
         Ok((Some(stat), state))
     }
 
-    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+    /// The response body, unread, once the status says there is one to
+    /// write.
+    fn fetch(&self, url: &str) -> Result<client::Body> {
         let resp = client::send(Outgoing {
             method: Method::GET,
             url: url.to_string(),
@@ -425,8 +502,111 @@ impl Download {
             let status = format!("{} {}", resp.status, resp.reason());
             bail!("GET {} returned {}", mask_url(url), status.trim_end());
         }
-        resp.read(self.max_bytes)
-            .map_err(|e| e.hinted("raise it with .max_bytes()"))
+        resp.body(self.max_bytes)
+            .map_err(|e| e.hinted(MAX_BYTES_HINT))
+    }
+}
+
+/// SHA-256 of the file at `path`, and its digest by `checksum`'s algorithm,
+/// read through `open_read` a buffer at a time.
+fn hash_file(sys: &System, path: &Path, checksum: &Checksum) -> Result<(String, String)> {
+    let mut file = sys.open_read(path)?;
+    let mut digests = Digests::new(Some(checksum));
+    let mut buf = vec![0; BUF];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => return Ok(digests.finish()),
+            Ok(n) => digests.update(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The response body on its way to `dest`, as the reader `write_from`
+/// streams into the staged file: counted and hashed as it is read, and at
+/// its end checked against `.checksum`, failing there on a mismatch so the
+/// staged file is never renamed into place. A body over `.max_bytes()`
+/// fails as soon as the read passes it.
+///
+/// A failure is kept here as the step's message, word for word, and
+/// `write_from` is handed an error carrying the same text; `apply` reports
+/// the kept one, whatever a backend made of its copy.
+struct Verified {
+    body: client::Body,
+    /// `None` once the body has ended and been checked.
+    digests: Option<Digests>,
+    checksum: Option<Checksum>,
+    /// `GET <masked url>`, which the mismatch message opens with.
+    what: String,
+    dest: PathBuf,
+    /// Bytes read so far: at the end, the body's size.
+    bytes: u64,
+    /// The body's SHA-256, set at its end.
+    sha256: Option<String>,
+    failure: Option<Error>,
+}
+
+impl Verified {
+    fn new(body: client::Body, checksum: Option<Checksum>, url: &str, dest: &Path) -> Self {
+        Verified {
+            body,
+            digests: Some(Digests::new(checksum.as_ref())),
+            checksum,
+            what: format!("GET {}", mask_url(url)),
+            dest: dest.to_path_buf(),
+            bytes: 0,
+            sha256: None,
+            failure: None,
+        }
+    }
+
+    /// Keep `e` as the step's error, and hand `write_from` its text.
+    fn fail(&mut self, e: Error) -> io::Error {
+        let handed = io::Error::other(e.to_string());
+        self.failure = Some(e);
+        handed
+    }
+}
+
+impl Read for Verified {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(e) = &self.failure {
+            return Err(io::Error::other(e.to_string()));
+        }
+        if self.digests.is_none() {
+            return Ok(0);
+        }
+        match self.body.read(buf) {
+            Ok(0) => {
+                let Some(digests) = self.digests.take() else {
+                    return Ok(0);
+                };
+                let (sha256, actual) = digests.finish();
+                if let Some(c) = &self.checksum
+                    && actual != c.hex
+                {
+                    let e = Error::msg(format!(
+                        "{}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
+                        self.what,
+                        c.algorithm.name(),
+                        c.hex,
+                        self.dest.display()
+                    ));
+                    return Err(self.fail(e));
+                }
+                self.sha256 = Some(sha256);
+                Ok(0)
+            }
+            Ok(n) => {
+                if let Some(digests) = &mut self.digests {
+                    digests.update(&buf[..n]);
+                }
+                self.bytes += n as u64;
+                Ok(n)
+            }
+            Err(e) => Err(self.fail(e.hinted(MAX_BYTES_HINT))),
+        }
     }
 }
 
@@ -442,7 +622,7 @@ impl DownloadBuilder {
             force: false,
             backup: false,
             timeout: DEFAULT_TIMEOUT,
-            max_bytes: DEFAULT_MAX_BYTES,
+            max_bytes: None,
             headers: vec![],
         }
     }
@@ -475,6 +655,9 @@ struct Fetch {
     /// Why the file is fetched, for the report: `missing`, or what made the
     /// present one stale.
     reason: String,
+    /// The mode and owner the downloaded file is given before it is renamed
+    /// into place (decision 24 on #85).
+    write: Option<WriteAttrs>,
 }
 
 impl std::fmt::Debug for Fetch {
@@ -482,6 +665,7 @@ impl std::fmt::Debug for Fetch {
         f.debug_struct("Fetch")
             .field("url", &mask_url(&self.url))
             .field("reason", &self.reason)
+            .field("write", &self.write)
             .finish()
     }
 }
@@ -491,7 +675,7 @@ impl Intent for DownloadIntent {
         match &self.fetch {
             // Size and digest are unknown until fetched; the diff says what
             // would be fetched and why.
-            Some(Fetch { url, reason }) => Diff::summary(format!(
+            Some(Fetch { url, reason, .. }) => Diff::summary(format!(
                 "GET {} -> {} ({reason})",
                 mask_url(url),
                 self.dest.display()
@@ -547,6 +731,7 @@ impl Op for Download {
             fetch: Some(Fetch {
                 url: self.url.clone(),
                 reason,
+                write: attrs.write_attrs(stat.as_ref().map(|s| s.mode)),
             }),
             attrs,
         }))
@@ -555,7 +740,7 @@ impl Op for Download {
     fn apply(&self, sys: &System, intent: DownloadIntent) -> Result<DownloadReport> {
         let checksum = self.parsed_checksum()?;
         let DownloadIntent { dest, fetch, attrs } = intent;
-        let Some(Fetch { url, .. }) = fetch else {
+        let Some(Fetch { url, write, .. }) = fetch else {
             // The content already matched: no fetch. The report reads the
             // file as it is rather than carrying a copy of what `check` saw.
             attrs.apply_differing(sys, &dest)?;
@@ -573,35 +758,24 @@ impl Op for Download {
                 backup_path: None,
             });
         };
-        let bytes = self.fetch(&url)?;
-        let sha256 = digest(Algorithm::Sha256, &bytes);
-        if let Some(c) = &checksum {
-            let actual = if c.algorithm == Algorithm::Sha256 {
-                sha256.clone()
-            } else {
-                digest(c.algorithm, &bytes)
-            };
-            ensure!(
-                actual == c.hex,
-                "GET {}: {} checksum mismatch: got {actual}, want {}; nothing written to {}",
-                mask_url(&url),
-                c.algorithm.name(),
-                c.hex,
-                dest.display()
-            );
+        // The body streams into the file staged beside `dest`, with its
+        // mode and owner, and is renamed over it only once it is whole and
+        // verified: a mismatch, a body over `.max_bytes()`, a read that
+        // fails (one short of its `Content-Length` or chunked framing) or
+        // a refused owner leaves `dest` as it was, and removes the backup
+        // taken for it (decision 26).
+        let mut body = Verified::new(self.fetch(&url)?, checksum, &url, &dest);
+        let written = write_from_with_backup(sys, &dest, self.backup, &mut body, write);
+        if let Some(e) = body.failure.take() {
+            return Err(e);
         }
-        let backup_path = write_with_backup(sys, &dest, self.backup, &bytes)?;
-        // Only what is wrong: the rewrite kept the old owner and mode, and a
-        // `chown` to the owner the file already has would clear setuid with
-        // nothing to set it back when no mode was asked for. The owner is
-        // read again, because a rewrite that could not keep it does not fail.
-        attrs.apply_after_rewrite(sys, &dest)?;
+        let (backup_path, _) = written?;
         Ok(DownloadReport {
             url,
             path: dest,
             downloaded: true,
-            bytes: bytes.len() as u64,
-            sha256: Some(sha256),
+            bytes: body.bytes,
+            sha256: body.sha256,
             backup_path,
         })
     }
@@ -613,12 +787,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rustible_sdk::backend::{AttrCall, Fake};
+    use rustible_sdk::backend::Fake;
     use rustible_sdk::event::Collect;
 
     use super::super::test_server::Route;
     use super::*;
-    use crate::file::testing::{chown_refused_sys, expect_change, fake_sys};
+    use crate::file::testing::{Set, expect_change, fake_sys, sizeless_sys, staged};
 
     /// `http::Download` claims a mac and refuses a platform nobody claimed.
     /// The mac half is a real download from the test server with Darwin
@@ -893,8 +1067,8 @@ mod tests {
     #[test]
     fn a_body_over_max_bytes_is_refused_without_a_content_length() {
         // No `Content-Length`, so the size is unknown until it is read and
-        // only ureq's `limit` can stop it: the guard that actually bounds
-        // memory, rather than trusting the server's header.
+        // only the count `client::Body` keeps as it reads can stop it: the
+        // guard that holds whatever the server's header says.
         let big = vec![b'x'; 4096];
         let (base, _) = serve(vec![(
             "/big",
@@ -945,14 +1119,25 @@ mod tests {
         };
         assert_eq!(r.sha256, None, "no checksum configured, so no digest");
         assert_eq!(r.bytes, HELLO.len() as u64, "size comes from the stat");
+        assert_eq!(fake.reads(), vec![]);
 
         // With a checksum the read has to happen anyway, so the digest it
-        // produces is reported.
+        // produces is reported. It streams through `open_read`, so a
+        // destination of any size is hashed a buffer at a time.
         let op = op.checksum(format!("sha256:{HELLO_SHA256}"));
         let Plan::Satisfied(r) = op.check(&sys).unwrap() else {
             panic!("expected Satisfied");
         };
         assert_eq!(r.sha256.as_deref(), Some(HELLO_SHA256));
+        let reads: Vec<_> = fake
+            .reads()
+            .into_iter()
+            .map(|r| (r.path, r.bytes, r.streamed))
+            .collect();
+        assert_eq!(
+            reads,
+            [(PathBuf::from("/opt/hello.txt"), HELLO.len() as u64, true)]
+        );
     }
 
     #[test]
@@ -1003,11 +1188,15 @@ mod tests {
             .to("/opt/hello.txt")
             .checksum(format!("sha256:{HELLO_SHA256}"))
             .mode(0o600);
+        let planted = fake.attr_calls().len();
         let c = expect_change(&op, &sys);
         let r = op.apply(&sys, c).unwrap();
         assert_eq!(r, report(&url, true));
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!((f.mode, f.bytes.as_slice()), (0o600, HELLO));
+        // The mode is the staged file's, before the rename (decision 24),
+        // and nothing is set on `dest` afterwards.
+        assert_eq!(staged(&fake, planted, "/opt/hello.txt"), [Set::Mode(0o600)]);
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         assert_eq!(hits.load(Ordering::SeqCst), 1, "check never fetched");
     }
@@ -1035,13 +1224,13 @@ mod tests {
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
-    /// A rewrite that could not keep the owner does not fail, so `apply`
-    /// reads the owner again and `chown`s back, which on a real machine
-    /// fails the step as the rewrite's `chown` failed. The lost owner is
-    /// planted between `check` and `apply`, since the `Fake`'s rewrite keeps
-    /// it (`file::copy`'s `a_rewrite_that_did_not_keep_the_owner_is_chowned_back`).
+    /// The owner asked for is given to the new content whatever the file
+    /// had by the time of `apply`: here a `chown` planted between `check`
+    /// and `apply`, as an unprivileged rewrite used to leave it. It is set
+    /// on the staged file, never on `dest` after the rename
+    /// (`file::copy`'s `a_rewrite_gives_the_owner_asked_for_whatever_the_file_has_by_then`).
     #[test]
-    fn a_download_that_did_not_keep_the_owner_is_chowned_back() {
+    fn a_download_gives_the_owner_asked_for_whatever_the_file_has_by_then() {
         let (base, _) = hello_server();
         let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
             "/opt/hello.txt",
@@ -1061,15 +1250,22 @@ mod tests {
             1000,
         )
         .unwrap();
+        let planted = fake.attr_calls().len();
         op.apply(&sys, c).unwrap();
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o640, 0, 0));
-        assert_eq!(fake.chowns().len(), 2, "{:?}", fake.attr_calls());
+        assert_eq!(
+            staged(&fake, planted, "/opt/hello.txt"),
+            [Set::Mode(0o640), Set::Owner(0, 0)]
+        );
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
     /// With `.owner()` already right and no `.mode()`, a download over a
-    /// setuid or setgid file keeps the bit: `apply` issues no `chown`, which
-    /// would clear it with nothing to set it back (found by review of #74).
+    /// setuid or setgid file keeps the bit: the owner is given to the
+    /// staged file, whose `chown` clears it, and the write sets the mode it
+    /// kept again after it (found by review of #74, when the `chown` came
+    /// after the rename and nothing set the bit back).
     #[test]
     fn a_download_with_owner_already_right_keeps_setuid() {
         let (base, _) = hello_server();
@@ -1079,6 +1275,7 @@ mod tests {
                 "old",
                 mode,
             ));
+            let planted = fake.attr_calls().len();
             let sys = fake_sys(&fake);
             let op = Download::get(format!("{base}/hello.txt"))
                 .to("/opt/hello.txt")
@@ -1091,17 +1288,24 @@ mod tests {
                 (f.mode, f.uid, f.gid, f.bytes.as_slice()),
                 (mode, 0, 0, HELLO)
             );
-            assert!(fake.chowns().is_empty(), "{:?}", fake.attr_calls());
+            assert_eq!(
+                staged(&fake, planted, "/opt/hello.txt"),
+                [Set::Mode(0o755), Set::Owner(0, 0), Set::Mode(mode)],
+                "{mode:o}"
+            );
             assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
         }
     }
 
-    /// A download wanted at 0600 under another owner gets its mode before
-    /// its owner (issue #79), with no third call since 0600 has no setuid.
-    /// With the `chown` refused, as for an identity without `CAP_CHOWN`,
-    /// the step fails with the file already 0600, not at 0644.
+    /// A new file wanted at 0600 under another owner gets both before it is
+    /// renamed into place (#79, decision 24 on #85), mode before owner, and
+    /// no third call, since 0600 has no setuid for the `chown` to clear;
+    /// nothing is set on the final path afterwards. A `chown` this identity
+    /// may not make, as without `CAP_CHOWN`, fails the step with nothing
+    /// created at all: not a file at 0644, nor one at 0600 under the wrong
+    /// owner, nor a staged file beside it.
     #[test]
-    fn a_download_gets_its_mode_before_its_owner() {
+    fn a_download_gets_its_mode_and_owner_before_the_rename() {
         let (base, _) = hello_server();
         let op = Download::get(format!("{base}/hello.txt"))
             .to("/opt/hello.txt")
@@ -1114,34 +1318,28 @@ mod tests {
         let c = expect_change(&op, &sys);
         op.apply(&sys, c).unwrap();
         assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                AttrCall::Chmod {
-                    path: "/opt/hello.txt".into(),
-                    mode: 0o600
-                },
-                AttrCall::Chown {
-                    path: "/opt/hello.txt".into(),
-                    uid: 5,
-                    gid: 6
-                },
-            ]
+            staged(&fake, planted, "/opt/hello.txt"),
+            [Set::Mode(0o600), Set::Owner(5, 6)]
+        );
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!(
+            (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+            (0o600, 5, 6, HELLO)
         );
 
-        let fake = Arc::new(Fake::new().with_dir("/opt"));
-        let sys = chown_refused_sys(&fake);
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_chown_refused());
+        let sys = fake_sys(&fake);
         let c = expect_change(&op, &sys);
         let err = op.apply(&sys, c).unwrap_err().chain();
         assert!(err.contains("Operation not permitted"), "{err}");
-        let f = fake.file("/opt/hello.txt").unwrap();
-        assert_eq!((f.mode, f.uid, f.bytes.as_slice()), (0o600, 0, HELLO));
+        assert!(fake.file("/opt/hello.txt").is_none());
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
     }
 
     /// A download over a setuid file, under a new owner with
-    /// `.mode(0o4755)`: the mode without the bit, the owner, then the full
-    /// mode, so a refused `chown` would not leave the new content setuid
-    /// under the old owner. The rewrite itself still carries the old mode
-    /// until the first call; that window is #85's.
+    /// `.mode(0o4755)`: the staged content is 0755 for its `chown` and 4755
+    /// after it, so a refused `chown` never leaves the new content setuid
+    /// under the old owner, and the rename puts it in place finished.
     #[test]
     fn a_download_under_a_new_owner_clears_setuid_before_the_chown() {
         let (base, _) = hello_server();
@@ -1160,22 +1358,8 @@ mod tests {
         let c = expect_change(&op, &sys);
         op.apply(&sys, c).unwrap();
         assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                AttrCall::Chmod {
-                    path: "/opt/hello.txt".into(),
-                    mode: 0o755
-                },
-                AttrCall::Chown {
-                    path: "/opt/hello.txt".into(),
-                    uid: 5,
-                    gid: 6
-                },
-                AttrCall::Chmod {
-                    path: "/opt/hello.txt".into(),
-                    mode: 0o4755
-                },
-            ]
+            staged(&fake, planted, "/opt/hello.txt"),
+            [Set::Mode(0o755), Set::Owner(5, 6), Set::Mode(0o4755)]
         );
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!(
@@ -1184,28 +1368,48 @@ mod tests {
         );
     }
 
-    /// A download over a setuid file under a new owner, with no `.mode()`,
-    /// whose `chown` is refused: `apply` cleared setuid before the `chown`,
-    /// so the new content is not left setuid under the old owner
-    /// (`file::copy`'s `an_owner_only_rewrite_clears_what_the_chown_would_before_it`).
+    /// A download over a setuid file under a new owner, with no `.mode()`:
+    /// the new content gets the old mode less what a `chown` clears, as a
+    /// `chown` of the old file would have left it. When that `chown` is
+    /// refused the step fails and the file is as it was, old content, mode
+    /// and owner (`file::copy`'s
+    /// `an_owner_only_rewrite_gives_the_mode_a_chown_would_leave`).
     #[test]
-    fn an_owner_only_download_clears_setuid_before_the_chown() {
+    fn an_owner_only_download_gives_the_mode_a_chown_would_leave() {
         let (base, _) = hello_server();
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"))
+            .owner(5, 6);
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file_mode("/opt/hello.txt", "old", 0o4755)
+                .with_chown_refused(),
+        );
+        let sys = fake_sys(&fake);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!(
+            (f.mode, f.uid, f.bytes.as_slice()),
+            (0o4755, 0, &b"old"[..])
+        );
+
         let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
             "/opt/hello.txt",
             "old",
             0o4755,
         ));
-        let sys = chown_refused_sys(&fake);
-        let op = Download::get(format!("{base}/hello.txt"))
-            .to("/opt/hello.txt")
-            .checksum(format!("sha256:{HELLO_SHA256}"))
-            .owner(5, 6);
+        let sys = fake_sys(&fake);
         let c = expect_change(&op, &sys);
-        let err = op.apply(&sys, c).unwrap_err().chain();
-        assert!(err.contains("Operation not permitted"), "{err}");
+        op.apply(&sys, c).unwrap();
         let f = fake.file("/opt/hello.txt").unwrap();
-        assert_eq!((f.mode, f.uid, f.bytes.as_slice()), (0o755, 0, HELLO));
+        assert_eq!(
+            (f.mode, f.uid, f.gid, f.bytes.as_slice()),
+            (0o755, 5, 6, HELLO)
+        );
     }
 
     #[test]
@@ -1383,6 +1587,323 @@ mod tests {
             )
         );
         assert_eq!(fake.content("/opt/hello.txt").unwrap(), "old");
+    }
+
+    /// Decision 26 on #87: a download that fails after `.backup(true)` took
+    /// its copy removes it, so a failed run leaves `dest` as it was and no
+    /// `.~rustible.` file beside it. Each way a streamed download fails:
+    /// a checksum mismatch at the body's end and a body over `.max_bytes()`
+    /// without a `Content-Length`, both in today's words; a body that ends
+    /// before its `Content-Length`; and an owner this identity may not give.
+    #[test]
+    fn a_failed_download_leaves_dest_as_it_was_and_no_backup() {
+        let s = super::super::test_server::serve(vec![
+            ("/hello.txt", 200, vec![], HELLO.to_vec()),
+            (
+                "/unsized",
+                200,
+                vec![("X-Omit-Length", String::new())],
+                vec![b'x'; 4096],
+            ),
+            (
+                "/cut",
+                200,
+                vec![("X-Declare-Length", "4096".into())],
+                vec![b'x'; 100],
+            ),
+        ]);
+        let want = "0".repeat(64);
+        let to = |path: &str| {
+            Download::get(s.url(path))
+                .to("/opt/hello.txt")
+                .force(true)
+                .backup(true)
+        };
+        let cases = [
+            (
+                to("/hello.txt").checksum(format!("sha256:{want}")),
+                format!(
+                    "GET {}: sha256 checksum mismatch: got {HELLO_SHA256}, want {want}; nothing written to /opt/hello.txt",
+                    s.url("/hello.txt")
+                ),
+                false,
+            ),
+            (
+                to("/unsized").max_bytes(100),
+                format!(
+                    "GET {}: the body is larger than the 100 byte limit; raise it with .max_bytes()",
+                    s.url("/unsized")
+                ),
+                false,
+            ),
+            (
+                to("/cut"),
+                format!("GET {}: reading the body: ", s.url("/cut")),
+                false,
+            ),
+            (
+                to("/hello.txt").owner(5, 6),
+                "Operation not permitted".into(),
+                true,
+            ),
+        ];
+        for (op, message, refuse_chown) in cases {
+            let fake = Fake::new()
+                .with_dir("/opt")
+                .with_file("/opt/hello.txt", "old");
+            let fake = Arc::new(if refuse_chown {
+                fake.with_chown_refused()
+            } else {
+                fake
+            });
+            let sys = fake_sys(&fake);
+            let c = expect_change(&op, &sys);
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(err.contains(&message), "{err}");
+            assert_eq!(fake.content("/opt/hello.txt").unwrap(), "old", "{message}");
+            assert_eq!(
+                sys.read_dir("/opt").unwrap(),
+                [PathBuf::from("/opt/hello.txt")],
+                "{message}"
+            );
+        }
+    }
+
+    /// The two messages a streamed failure keeps word for word are the
+    /// whole step error, not a part of one: what the step reports is the
+    /// body's own failure, not a write failure of `dest` wrapping it.
+    #[test]
+    fn a_streamed_failure_is_the_whole_error_in_todays_words() {
+        let s = super::super::test_server::serve(vec![
+            ("/hello.txt", 200, vec![], HELLO.to_vec()),
+            (
+                "/unsized",
+                200,
+                vec![("X-Omit-Length", String::new())],
+                vec![b'x'; 4096],
+            ),
+        ]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let want = "0".repeat(128);
+        let op = Download::get(s.url("/hello.txt"))
+            .to("/opt/x")
+            .checksum(format!("sha512:{want}"));
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert_eq!(
+            err,
+            format!(
+                "GET {}: sha512 checksum mismatch: got {}, want {want}; nothing written to /opt/x",
+                s.url("/hello.txt"),
+                digest(Algorithm::Sha512, HELLO)
+            )
+        );
+        let op = Download::get(s.url("/unsized")).to("/opt/x").max_bytes(100);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert_eq!(
+            err,
+            format!(
+                "GET {}: the body is larger than the 100 byte limit; raise it with .max_bytes()",
+                s.url("/unsized")
+            )
+        );
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
+    }
+
+    /// No limit unless one is set (decision 16 on #87). A head declaring a
+    /// body one byte over the gibibyte that was the default is not refused
+    /// on its `Content-Length`: the body is read, and this one, which ends
+    /// early, fails as a cut body does. And a body of several MiB, with no
+    /// `.max_bytes()`, is written whole.
+    #[test]
+    fn a_body_over_the_old_default_is_not_refused() {
+        let big: Vec<u8> = (0..(4 << 20) + 3).map(|i| (i % 251) as u8).collect();
+        let s = super::super::test_server::serve(vec![
+            (
+                "/huge",
+                200,
+                vec![("X-Declare-Length", ((1u64 << 30) + 1).to_string())],
+                b"the start of a very large body".to_vec(),
+            ),
+            ("/big", 200, vec![], big.clone()),
+        ]);
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = fake_sys(&fake);
+        let op = Download::get(s.url("/huge")).to("/opt/huge");
+        assert!(format!("{op:?}").contains("max_bytes: None"), "{op:?}");
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("reading the body"), "{err}");
+        assert!(!err.contains("limit"), "{err}");
+        assert!(fake.file("/opt/huge").is_none());
+
+        let op = Download::get(s.url("/big")).to("/opt/big");
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r.bytes, big.len() as u64);
+        assert_eq!(fake.file("/opt/big").unwrap().bytes, big);
+    }
+
+    /// `bytes` and `sha256` come from the body as it streamed, not from
+    /// reading `dest` back or from its `stat`: here the `stat` says 0 bytes,
+    /// as a `/proc` file's does, and `dest` is never read.
+    #[test]
+    fn the_report_comes_from_the_stream() {
+        let (base, _) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = sizeless_sys(&fake, "/opt/hello.txt");
+        let url = format!("{base}/hello.txt");
+        let op = Download::get(&url).to("/opt/hello.txt");
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r, report(&url, true));
+        assert_eq!(fake.reads(), vec![], "dest was not read back");
+
+        // With a checksum in another algorithm, the report still carries
+        // the SHA-256, and both come from the one pass.
+        let fake = Arc::new(Fake::new().with_dir("/opt"));
+        let sys = sizeless_sys(&fake, "/opt/hello.txt");
+        let sha512 = digest(Algorithm::Sha512, HELLO);
+        let op = Download::get(&url)
+            .to("/opt/hello.txt")
+            .checksum(format!("sha512:{sha512}"));
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(r, report(&url, true));
+        assert_eq!(fake.reads(), vec![], "dest was not read back");
+    }
+
+    /// A temporary directory for a test through the in-process helper,
+    /// removed when the guard drops.
+    struct Scratch<'a>(&'a System, PathBuf);
+
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.remove_all(&self.1);
+        }
+    }
+
+    fn scratch<'a>(sys: &'a System, name: &str) -> Scratch<'a> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustible-download-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        sys.mkdir_all(&dir).unwrap();
+        Scratch(sys, dir)
+    }
+
+    /// A body of several helper chunks.
+    fn multi_chunk() -> Vec<u8> {
+        use rustible_sdk::protocol::CHUNK_SIZE;
+        (0..3 * CHUNK_SIZE + 5).map(|i| (i % 253) as u8).collect()
+    }
+
+    /// Through a real escalation helper (in process, as this user, over a
+    /// temporary directory): a body of several helper chunks is downloaded
+    /// with a checksum and a mode, and the next `check` hashes it back
+    /// through the helper and is satisfied.
+    #[test]
+    fn a_download_through_the_helper_streams_a_multi_chunk_body() {
+        let content = multi_chunk();
+        let s = super::super::test_server::serve(vec![("/big", 200, vec![], content.clone())]);
+        let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
+        let dir = scratch(&sys, "checksum");
+        let dest = dir.1.join("big");
+        sys.write_atomic(&dest, b"old").unwrap();
+
+        let sha256 = digest(Algorithm::Sha256, &content);
+        let op = Download::get(s.url("/big"))
+            .to(&dest)
+            .checksum(format!("sha256:{sha256}"))
+            .mode(0o600)
+            .backup(true);
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(
+            (r.bytes, r.sha256.as_deref()),
+            (content.len() as u64, Some(sha256.as_str()))
+        );
+        assert_eq!(sys.read(&dest).unwrap(), content);
+        assert_eq!(sys.stat(&dest).unwrap().unwrap().mode & 0o7777, 0o600);
+        let backup = r.backup_path.expect("a backup");
+        assert_eq!(sys.read(&backup).unwrap(), b"old");
+        let Plan::Satisfied(again) = op.check(&sys).unwrap() else {
+            panic!("expected satisfied");
+        };
+        assert_eq!(again.sha256, Some(sha256));
+        assert_eq!(s.hits(), 1, "check never fetched");
+        assert_eq!(
+            sys.read_dir(&dir.1).unwrap().len(),
+            2,
+            "dest and its backup, nothing staged left beside them"
+        );
+    }
+
+    /// The same without `.checksum` (#82 asks for both): the body streams
+    /// through the helper into a new file, the report's digest is the
+    /// stream's, and the next `check` is satisfied without reading it.
+    /// `.force(true)` then streams it over the existing file. And a body
+    /// over `.max_bytes()`, with no `Content-Length` to refuse it early,
+    /// fails part way through the helper's write, leaving the file as it
+    /// was and nothing staged beside it.
+    #[test]
+    fn a_download_without_a_checksum_through_the_helper() {
+        let content = multi_chunk();
+        let s = super::super::test_server::serve(vec![
+            ("/big", 200, vec![], content.clone()),
+            (
+                "/unsized",
+                200,
+                vec![("X-Omit-Length", String::new())],
+                content.clone(),
+            ),
+        ]);
+        let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
+        let dir = scratch(&sys, "plain");
+        let dest = dir.1.join("big");
+
+        let op = Download::get(s.url("/big")).to(&dest).mode(0o640);
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        let sha256 = digest(Algorithm::Sha256, &content);
+        assert_eq!(
+            (r.bytes, r.sha256.as_deref()),
+            (content.len() as u64, Some(sha256.as_str()))
+        );
+        assert_eq!(sys.read(&dest).unwrap(), content);
+        assert_eq!(sys.stat(&dest).unwrap().unwrap().mode & 0o7777, 0o640);
+        let Plan::Satisfied(again) = op.check(&sys).unwrap() else {
+            panic!("expected satisfied");
+        };
+        assert_eq!((again.bytes, again.sha256), (content.len() as u64, None));
+
+        let forced = op.clone().force(true);
+        let c = expect_change(&forced, &sys);
+        assert_eq!(forced.apply(&sys, c).unwrap().bytes, content.len() as u64);
+        assert_eq!(s.hits(), 2);
+
+        let over = Download::get(s.url("/unsized"))
+            .to(&dest)
+            .force(true)
+            .max_bytes(content.len() as u64 - 1);
+        let c = expect_change(&over, &sys);
+        let err = over.apply(&sys, c).unwrap_err().chain();
+        assert_eq!(
+            err,
+            format!(
+                "GET {}: the body is larger than the {} byte limit; raise it with .max_bytes()",
+                s.url("/unsized"),
+                content.len() - 1
+            )
+        );
+        assert_eq!(sys.read(&dest).unwrap(), content);
+        assert_eq!(sys.read_dir(&dir.1).unwrap(), [dest]);
     }
 
     #[test]
