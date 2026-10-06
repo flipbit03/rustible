@@ -289,9 +289,8 @@ pub struct ExtractReport {
 /// **Limits.** The compressed archive is held in memory (zstd: the
 /// decompressed stream too), and so is each file member's data while it is
 /// written; this is for release tarballs, not backups. Under
-/// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
-/// helper in one frame of just under 48 MiB, so the archive and each
-/// member are limited to that size there. A sparse member's holes are
+/// `ctx.as_root()` or `ctx.as_user(..)` reads and writes cross the helper
+/// in chunks, so no other size limit applies there. A sparse member's holes are
 /// written as data, not kept as holes, so it takes its full real size on
 /// disk (and in memory while it is written).
 /// Files already in `dest` that the archive does not mention are left

@@ -3673,7 +3673,7 @@ mod tests {
             }
         }
         const GIB: u64 = 1 << 30;
-        let dir = tempfile::tempdir_in(std::env::var("MEASURE_DIR").unwrap_or(".".into())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let e = in_process(applying());
         for (name, backend) in [("Local", &Local as &dyn Backend), ("helper", &e)] {
             let f = dir.path().join(name);
