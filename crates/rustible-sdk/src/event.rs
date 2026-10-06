@@ -236,9 +236,10 @@ pub enum Event {
         /// already printed before this frame: the step's own `cmd` printed
         /// with it, and the stderr would show twice. Without an `id`, the
         /// step is named only by name, so it counts as printed only when
-        /// that step's command was this one. It is the only carrier
-        /// for a command that failed outside any step, such as the
-        /// playbook's own `ctx.sys()` call with `?`.
+        /// that step's command was this one; without `step`, never, since
+        /// neither reporter reads a name out of `error` for this. It is the
+        /// only carrier for a command that failed outside any step, such as
+        /// the playbook's own `ctx.sys()` call with `?`.
         #[serde(default)]
         cmd: Option<CmdFailed>,
     },
@@ -541,11 +542,13 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     {
                         cmd_block(&mut *w, c);
                     }
+                    // Read only to pair a command at `-v`, so not kept
+                    // below it.
                     self.failed.lock().unwrap().push(PrintedFailure {
                         id,
                         blocks,
                         name,
-                        cmd,
+                        cmd: cmd.filter(|_| self.verbosity >= 1),
                     });
                 }
                 r
@@ -618,26 +621,31 @@ impl<W: Write + Send> EventSink for Compact<W> {
     }
 }
 
-/// Whether `a` and `b` are one failed command: the same argv and status,
-/// and stderr the same once a frame's cut (a marker line, then the tail) is
-/// allowed for, so one is the end of the other. `rustible`'s renderer has
-/// its own copy.
+/// Whether `a` and `b` are one failed command: the same argv, status and
+/// signal, and the same stderr, unless one was cut to fit a frame, when
+/// what it kept has to be the end of the other. `rustible`'s renderer
+/// has its own copy.
 fn same_command(a: &CmdFailed, b: &CmdFailed) -> bool {
-    fn tail(stderr: &str) -> &str {
-        match stderr.split_once('\n') {
-            Some((first, rest))
-                if first.starts_with("… (")
-                    && first.ends_with(
-                        " earlier bytes of stderr not shown: more than one frame carries)",
-                    ) =>
-            {
-                rest
-            }
-            _ => stderr,
-        }
+    if (&a.argv, a.status, a.signal) != (&b.argv, b.status, b.signal) {
+        return false;
     }
-    let (x, y) = (tail(&a.stderr), tail(&b.stderr));
-    a.argv == b.argv && a.status == b.status && (x.ends_with(y) || y.ends_with(x))
+    match (cut_tail(&a.stderr), cut_tail(&b.stderr)) {
+        (None, None) => a.stderr == b.stderr,
+        (Some(x), None) => b.stderr.ends_with(x),
+        (None, Some(y)) => a.stderr.ends_with(y),
+        (Some(x), Some(y)) => x.ends_with(y) || y.ends_with(x),
+    }
+}
+
+/// What a stderr cut to fit a frame kept: everything after the marker line,
+/// whose count has to be a number. `None` for a stderr that was not cut,
+/// even one whose first line only looks like the marker.
+fn cut_tail(stderr: &str) -> Option<&str> {
+    let (first, rest) = stderr.split_once('\n')?;
+    let n = first
+        .strip_prefix("… (")?
+        .strip_suffix(" earlier bytes of stderr not shown: more than one frame carries)")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
 }
 
 /// Whether `d`'s full render says no more than the step line does: one line
@@ -1008,6 +1016,53 @@ mod tests {
         let out = feed(cut);
         assert_eq!(out.matches("still nope").count(), 1, "{out}");
         assert!(!out.contains("earlier bytes"), "{out}");
+    }
+
+    /// The same argv and status is not the same failure when the stderr
+    /// differs and neither copy was cut to fit a frame; a signal tells two
+    /// runs apart too. Each prints once.
+    #[test]
+    fn compact_needs_the_same_stderr_unless_one_was_cut() {
+        let run = |stderr: &str, signal: Option<i32>| CmdFailed {
+            argv: vec!["job".into()],
+            status: 3,
+            signal,
+            stderr: stderr.into(),
+        };
+        let feed = |caught: CmdFailed, returned: CmdFailed| {
+            let mut step = failed_step(1, "x");
+            if let Event::StepFinished { cmd, .. } = &mut step {
+                *cmd = Some(caught);
+            }
+            let mut frame = failed_frame(None, Some("x"));
+            if let Event::Failed { cmd, .. } = &mut frame {
+                *cmd = Some(returned);
+            }
+            print(1, vec![step, frame])
+        };
+        let out = feed(run("", None), run("disk full\n", None));
+        assert_eq!(out.matches("disk full").count(), 1, "{out}");
+        let out = feed(
+            run("Job failed\n", None),
+            run("warning: lock held\nJob failed\n", None),
+        );
+        assert_eq!(out.matches("Job failed").count(), 2, "{out}");
+        assert_eq!(out.matches("lock held").count(), 1, "{out}");
+        let out = feed(run("x\n", Some(9)), run("x\n", Some(15)));
+        assert_eq!(out.matches("$ job (exit 3)").count(), 2, "{out}");
+        let fake = "… (many earlier bytes of stderr not shown: more than one frame carries)";
+        let out = feed(run("tail\n", None), run(&format!("{fake}\ntail\n"), None));
+        assert_eq!(out.matches("many earlier").count(), 1, "{out}");
+    }
+
+    /// Below `-v` no command prints, so the printed history keeps none.
+    #[test]
+    fn compact_keeps_no_command_below_v() {
+        for (verbosity, kept) in [(0, false), (1, true)] {
+            let printer = Compact::new(Vec::new(), verbosity);
+            printer.emit(failed_step(1, "x"));
+            assert_eq!(printer.failed.lock().unwrap()[0].cmd.is_some(), kept);
+        }
     }
 
     #[test]
