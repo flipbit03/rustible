@@ -14,6 +14,8 @@ pub mod diff;
 pub mod error;
 pub mod event;
 pub mod facts;
+#[cfg(test)]
+mod freed;
 pub mod launch;
 pub mod op;
 pub mod protocol;

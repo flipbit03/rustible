@@ -92,7 +92,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{Backend, CmdSpec, Local, Output, Staged, Stat, WriteAttrs, coded, errno_of};
 use crate::launch::{self, Answer, Launch, Mode, Next};
 use crate::protocol::{CHUNK_SIZE, FrameTooLarge, MAX_FRAME, encode_frame, read_frame, write_body};
-use crate::secret::Secret;
+use crate::secret::{Secret, extend_wiping};
 
 /// The most streams a helper keeps open at once (`[ISSUE-85]`). A request
 /// that would open one more is refused, so a parent that forgets to close
@@ -2002,14 +2002,20 @@ impl Elevated {
         stdout: u64,
         stderr: u64,
     ) -> io::Result<Output> {
-        let total = usize::try_from(stdout + stderr)
-            .map_err(|_| io::Error::other("the command's output does not fit in memory"))?;
+        let size = |n: u64| {
+            usize::try_from(n)
+                .map_err(|_| io::Error::other("the command's output does not fit in memory"))
+        };
+        let (want_out, want_err) = (size(stdout)?, size(stderr)?);
+        // Each stream in a buffer of its own size, so neither grows nor
+        // carries the other's bytes in its spare room.
+        let (mut out, mut err) = (Vec::with_capacity(want_out), Vec::with_capacity(want_err));
         let mut held = Held::new(self, Some(handle), Release::Close);
-        let mut all = Vec::with_capacity(total);
         while let Some(h) = held.handle {
+            let got = out.len() + err.len();
             match self.call(HelperOp::ReadChunk {
                 handle: h,
-                offset: all.len() as u64,
+                offset: got as u64,
             })? {
                 HelperResponse::Data { handle, bytes } => {
                     if bytes.is_empty() && handle.is_some() {
@@ -2017,24 +2023,33 @@ impl Elevated {
                             "the helper sent an empty chunk of a command's output",
                         ));
                     }
-                    all.extend_from_slice(&bytes);
+                    if got + bytes.len() > want_out + want_err {
+                        return Err(io::Error::other(format!(
+                            "the helper sent more of a command's output than the {} bytes it \
+                             announced",
+                            want_out + want_err
+                        )));
+                    }
+                    let to_out = bytes.len().min(want_out - out.len());
+                    out.extend_from_slice(&bytes[..to_out]);
+                    err.extend_from_slice(&bytes[to_out..]);
                     held.handle = handle;
                 }
                 other => return Err(unexpected(&other)),
             }
         }
-        if all.len() != total {
+        if out.len() + err.len() != want_out + want_err {
             return Err(io::Error::other(format!(
-                "the helper sent {} bytes of a command's output, not the {total} it announced",
-                all.len()
+                "the helper sent {} bytes of a command's output, not the {} it announced",
+                out.len() + err.len(),
+                want_out + want_err
             )));
         }
-        let stderr = all.split_off(stdout as usize);
         Ok(Output {
             status,
             signal,
-            stdout: all,
-            stderr,
+            stdout: out,
+            stderr: err,
         })
     }
 }
@@ -2112,11 +2127,13 @@ struct HelperReader<'a> {
     offset: u64,
 }
 
-impl Read for HelperReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+impl HelperReader<'_> {
+    /// When the chunk held here is used up, fetch the next one; false at the
+    /// end of the file.
+    fn refill(&mut self) -> io::Result<bool> {
         while self.pos == self.buf.len() {
             let Some(handle) = self.held.handle else {
-                return Ok(0);
+                return Ok(false);
             };
             match self.held.e.call(HelperOp::ReadChunk {
                 handle,
@@ -2130,6 +2147,15 @@ impl Read for HelperReader<'_> {
                 }
                 other => return Err(unexpected(&other)),
             }
+        }
+        Ok(true)
+    }
+}
+
+impl Read for HelperReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if !self.refill()? {
+            return Ok(0);
         }
         let n = out.len().min(self.buf.len() - self.pos);
         out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
@@ -2151,10 +2177,19 @@ impl Drop for Elevated {
 }
 
 impl Backend for Elevated {
+    /// Grown through `extend_wiping`, so each buffer it outgrows is wiped:
+    /// `read_to_end`'s growth left a copy of the file so far in each one.
+    /// A file of one chunk is the size of its first chunk exactly.
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.reader(p)?.read_to_end(&mut out)?;
-        Ok(out)
+        let mut r = self.reader(p)?;
+        let mut out = Vec::with_capacity(r.buf.len());
+        loop {
+            extend_wiping(&mut out, &r.buf[r.pos..]);
+            r.pos = r.buf.len();
+            if !r.refill()? {
+                return Ok(out);
+            }
+        }
     }
 
     fn write(&self, p: &Path, mut bytes: &[u8]) -> io::Result<()> {
@@ -2623,6 +2658,29 @@ mod tests {
             // Fifty chunks a transfer, four transfers.
             assert_eq!(sizes.len(), 200, "{way}s");
         }
+    }
+
+    /// An escalated read leaves no copy of the file in freed memory, on
+    /// either side: not the chunks, not their base64, not the result as it
+    /// grows.
+    #[test]
+    fn an_escalated_read_leaves_no_copy_behind() {
+        let probe = crate::freed::exclusive();
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        let body = crate::freed::marked(5 * SMALL.chunk + 7);
+        std::fs::write(&f, &body).unwrap();
+        let left = probe.unwiped_frees(|| {
+            let mut got = e.read(&f).unwrap();
+            assert!(got == body);
+            got.zeroize();
+            // Room to spare, so `read_to_end` does not grow it.
+            let mut got = Zeroizing::new(Vec::with_capacity(2 * body.len()));
+            e.open_read(&f).unwrap().read_to_end(&mut got).unwrap();
+            assert!(*got == body);
+        });
+        assert_eq!(left, 0, "buffers freed with the file in them");
     }
 
     /// A reader that takes a few hundred bytes at a time, as a tar walk

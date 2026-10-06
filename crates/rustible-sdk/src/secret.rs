@@ -167,34 +167,22 @@ mod tests {
         assert_eq!(secret.len(), 0, "zeroize also truncates");
     }
 
-    /// Growing goes through `extend_wiping`: the content is whole, and the
-    /// buffer was replaced by one this function allocated (capacity at
-    /// least doubles), not reallocated by `Vec`, whose old buffer would be
-    /// freed unwiped. That the old buffer is wiped before it is freed is the
-    /// code above; reading freed memory to check it would be undefined
-    /// behaviour.
+    /// Growing leaves no copy behind: the test allocator looks at every
+    /// buffer freed while the secret grows from nothing, chunk by chunk, and
+    /// finds none still holding its bytes. `Vec`'s own growth (the
+    /// `extend_from_slice` this replaced) frees each outgrown buffer as it
+    /// was, and fails this.
     #[test]
-    fn a_secret_grows_by_replacing_its_buffer() {
-        let mut secret = Secret::new(Vec::with_capacity(4));
-        let mut want = Vec::new();
-        for i in 0..100u8 {
-            let chunk = [i; 7];
-            let before = secret.0.capacity();
-            secret.push(&chunk);
-            want.extend_from_slice(&chunk);
-            let after = secret.0.capacity();
-            assert!(
-                after == before || after >= 2 * before,
-                "{before} -> {after}"
-            );
-        }
-        assert_eq!(secret.as_bytes(), want.as_slice());
-
-        let mut buf = vec![1, 2];
-        buf.shrink_to_fit();
-        extend_wiping(&mut buf, &[3, 4, 5]);
-        assert_eq!(buf, [1, 2, 3, 4, 5]);
-        assert!(buf.capacity() >= 5);
+    fn a_secret_grows_without_leaving_a_copy() {
+        let probe = crate::freed::exclusive();
+        let left = probe.unwiped_frees(|| {
+            let mut secret = Secret::new(Vec::new());
+            for _ in 0..200 {
+                secret.push(crate::freed::MARKER);
+            }
+            assert_eq!(secret.len(), 3200);
+        });
+        assert_eq!(left, 0, "buffers freed with the secret in them");
     }
 
     #[test]

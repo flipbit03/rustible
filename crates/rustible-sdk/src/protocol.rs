@@ -320,7 +320,7 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<
 pub mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
     use zeroize::Zeroizing;
 
     /// Standard base64 with padding, emitted as a JSON string. The text is
@@ -341,31 +341,60 @@ pub mod b64 {
         s.serialize_str(text)
     }
 
-    /// Decodes the string back to bytes, borrowing it when the format
-    /// allows. Anything that is not valid standard base64 is a
-    /// deserialization error, so a mangled frame fails here rather than
-    /// producing truncated file contents.
+    /// Decodes the string back to bytes. Anything that is not valid
+    /// standard base64 is a deserialization error, so a mangled frame fails
+    /// here rather than producing truncated file contents.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let mut bytes = decode(d)?;
         Ok(std::mem::take(&mut *bytes))
     }
 
     /// Decode into a buffer allocated once at the decoded size, so it never
-    /// grows, and wiped on drop.
+    /// grows, and wiped on drop. The text is decoded where the format holds
+    /// it, the frame's own body for `serde_json::from_slice`, without an
+    /// owned copy in between; a format that can only hand over an owned
+    /// `String` gets it wiped once decoded.
     pub(crate) fn decode<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<Vec<u8>>, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        let mut out = Zeroizing::new(Vec::with_capacity(base64::decoded_len_estimate(text.len())));
-        STANDARD
-            .decode_vec(text.as_bytes(), &mut out)
-            .map_err(serde::de::Error::custom)?;
-        Ok(out)
+        d.deserialize_str(Text)
+    }
+
+    /// What [`decode`] hands the format.
+    struct Text;
+
+    impl Text {
+        fn decode<E: serde::de::Error>(text: &str) -> Result<Zeroizing<Vec<u8>>, E> {
+            let mut out =
+                Zeroizing::new(Vec::with_capacity(base64::decoded_len_estimate(text.len())));
+            STANDARD
+                .decode_vec(text.as_bytes(), &mut out)
+                .map_err(E::custom)?;
+            Ok(out)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Zeroizing<Vec<u8>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a base64 string")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Self::decode(text)
+        }
+
+        fn visit_string<E: serde::de::Error>(self, mut text: String) -> Result<Self::Value, E> {
+            let out = Self::decode(&text);
+            zeroize::Zeroize::zeroize(&mut text);
+            out
+        }
     }
 }
 
 /// Serde helper: a byte field held in a [`Zeroizing`] buffer, as a base64
-/// string: the same text as [`b64`], decoded straight into a buffer that is
-/// wiped on drop. For every field that carries a file's or a command's
-/// bytes. `#[serde(with = "b64_zeroizing")]`.
+/// string: the same text as [`b64`], decoded from where the format holds it
+/// straight into a buffer that is wiped on drop. For every field that
+/// carries a file's or a command's bytes. `#[serde(with = "b64_zeroizing")]`.
 pub(crate) mod b64_zeroizing {
     use serde::Deserializer;
     use zeroize::Zeroizing;
@@ -680,6 +709,35 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &up).unwrap();
         assert_eq!(&buf[4..], json.as_bytes());
+    }
+
+    /// Encoding and decoding a chunk frame leaves no copy of the chunk, as
+    /// bytes or as base64 text, in freed memory: the text is built in a
+    /// wiped buffer, the body is wiped as it grows, and decoding goes from
+    /// the frame's own (wiped) body to a wiped buffer without an owned copy
+    /// of the text in between.
+    #[test]
+    fn a_chunk_frame_leaves_no_copy_behind() {
+        let probe = crate::freed::exclusive();
+        let chunk: Zeroizing<Vec<u8>> = crate::freed::marked(100_000).into();
+        let left = probe.unwiped_frees(|| {
+            // Room for the frame, so the sink does not grow.
+            let mut buf = Zeroizing::new(Vec::with_capacity(200_000));
+            let down = Down::FileChunk {
+                req: 1,
+                offset: 0,
+                bytes: chunk.clone(),
+                last: true,
+            };
+            write_frame(&mut *buf, &down).unwrap();
+            drop(down);
+            let back: Down = read_frame(&mut buf.as_slice()).unwrap().unwrap();
+            let Down::FileChunk { bytes, .. } = back else {
+                panic!("not a chunk")
+            };
+            assert!(bytes == chunk);
+        });
+        assert_eq!(left, 0, "buffers freed with the chunk in them");
     }
 
     /// `encode_frame` gives the body `write_frame` sends, up to and
