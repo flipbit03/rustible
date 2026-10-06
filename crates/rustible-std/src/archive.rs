@@ -670,7 +670,8 @@ fn kind_label(kind: &Kind) -> &'static str {
 ///
 /// The `tar` crate returns a global header as an entry of its own, so its
 /// records are read as bytes and scanned for `GNU.sparse.`, without
-/// parsing. A member's own records the crate has already read and offers
+/// parsing; an `x` header ahead of it, which the crate attaches to it, is
+/// checked parsed, as a member's. A member's own records the crate has already read and offers
 /// only parsed, so a record it cannot parse is skipped, as the crate's own
 /// xattr extraction skips it, unlike GNU tar, which reads some of those
 /// (a sparse record there can go unseen; `[ISSUE-80]` has the shapes).
@@ -683,9 +684,26 @@ fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Opti
         entry
             .read_to_end(&mut records)
             .context("reading the archive's pax global header")?;
-        let sparse = records.windows(11).any(|w| w == b"GNU.sparse.");
-        return Ok(sparse
-            .then(|| "the archive's pax global header declares GNU sparse records".to_string()));
+        if records.windows(11).any(|w| w == b"GNU.sparse.") {
+            return Ok(Some(
+                "the archive's pax global header declares GNU sparse records".to_string(),
+            ));
+        }
+        // A held `x` header is attached to the next entry the crate
+        // returns, and a global header counts; GNU tar applies it to the
+        // member after. Read after the global header's own data, which
+        // `pax_extensions` would otherwise read in its place.
+        let attached = entry
+            .pax_extensions()
+            .context("reading the pax header ahead of the archive's global header")?
+            .is_some_and(|r| {
+                r.flatten()
+                    .any(|r| r.key_bytes().starts_with(b"GNU.sparse."))
+            });
+        return Ok(attached.then(|| {
+            "a pax header ahead of the archive's global header declares GNU sparse records"
+                .to_string()
+        }));
     }
     let Some(records) = entry
         .pax_extensions()
@@ -1935,6 +1953,45 @@ mod tests {
                     "the archive's pax global header declares GNU sparse records{UNSPARSE}"
                 )),
                 "{err}"
+            );
+        }
+    }
+
+    /// The `tar` crate attaches a held `x` header to the next entry it
+    /// returns, a global header included, where GNU tar applies it to the
+    /// member after. Sparse records arriving that way are refused too,
+    /// whether or not `.strip_components` drops the global header itself.
+    #[test]
+    fn sparse_records_in_a_pax_header_ahead_of_a_global_header_are_refused() {
+        let archive = raw_tar(&[
+            (
+                "PaxHeaders/f",
+                b'x',
+                &pax_record("GNU.sparse.major", b"1"),
+                "",
+            ),
+            (
+                "pax_global_header",
+                b'g',
+                &pax_record("comment", b"hello"),
+                "",
+            ),
+            ("d/f", b'0', b"data", ""),
+        ]);
+        let (_, sys) = sys_with(&archive);
+        for strip in [0, 1] {
+            let err = Extracted::from_path("/tmp/a.tar")
+                .to("/opt")
+                .strip_components(strip)
+                .check(&sys)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains(&format!(
+                    "a pax header ahead of the archive's global header declares GNU sparse \
+                     records{UNSPARSE}"
+                )),
+                "strip {strip}: {err}"
             );
         }
     }
