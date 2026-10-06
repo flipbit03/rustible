@@ -16,12 +16,18 @@
 //! run, cached on the second), and a system account with none, which gets a
 //! private per-run copy in the temp directory every time.
 //! `vagrant_escalate_user.rs` then launches a whole playbook as each of them.
+//!
+//! As the first of those accounts it also copies a 50 MiB file into its home
+//! and fetches it back, both larger than one frame of the escalation helper
+//! can carry, so they cross it in chunks (#86). The second run's `check`
+//! reads the 50 MiB copy back through the helper to report `ok`, and
+//! `vm-test.sh` compares what was fetched with what was generated.
 
 use std::time::Duration;
 
 use rustible::prelude::*;
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{apt, file, sysctl, systemd, user};
+use rustible_std::{apt, file, shell, sysctl, systemd, user};
 
 /// What the marker file says, so a second run has something to compare.
 const MARKER: &str = "written by rustible from dev/vagrant\n";
@@ -41,6 +47,19 @@ const NOHOME_DIR: &str = "/var/lib/rustible-nohome";
 
 /// What the `as_user` steps write, each as its own account.
 const AS_USER_MARKER: &str = "written by rustible's as_user helper\n";
+
+/// A file larger than one helper frame (decision 30 on #82), generated on
+/// the guest by root and readable by every account.
+const LARGE: &str = "/var/tmp/rustible-large";
+
+/// Its size, 50 MiB, and the line it repeats: `vm-test.sh` regenerates the
+/// same bytes to compare the fetched copy with.
+const LARGE_BYTES: u64 = 50 * 1024 * 1024;
+const LARGE_LINE: &str = "rustible streams this line";
+
+/// Where the fetched copy lands, in the workspace's ignored `out/`, as
+/// `<this>/<host>/large-copy`; `vm-test.sh` checks it and removes it.
+const FETCHED: &str = "out/vm-test/";
 
 #[rustible::vars]
 struct Vars {
@@ -87,6 +106,16 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     // owner is the proof of who wrote it.
     ctx.step("login home private", file::Attrs::at("/home/vagrant").mode(0o750))?;
     ctx.as_user(LOGIN_ACCOUNT).step(format!("marker as {LOGIN_ACCOUNT}"), file::Copy::from_str(AS_USER_MARKER).to(format!("/home/{LOGIN_ACCOUNT}/as-user-marker")).mode(0o600))?;
+
+    // 50 MiB through the helper, both ways: the copy reads and writes it in
+    // chunks, its second `check` reads both sides to compare them, and the
+    // fetch reads it again. Staged under a temporary name, so a generation
+    // cut short is not mistaken for a finished one by `creates`.
+    ctx.step("50 MiB file", shell::Command::sh(format!("yes '{LARGE_LINE}' | head -c {LARGE_BYTES} > {LARGE}.part && mv {LARGE}.part {LARGE}")).creates(LARGE))?;
+    let copy = format!("/home/{LOGIN_ACCOUNT}/large-copy");
+    let mut login = ctx.as_user(LOGIN_ACCOUNT);
+    login.step(format!("50 MiB copy as {LOGIN_ACCOUNT}"), file::Copy::from_local_path(LARGE).to(&copy))?;
+    login.fetch(&copy, FETCHED)?;
 
     // An account with no home at all: its helper runs from a private copy
     // in the temp directory, which removes itself.

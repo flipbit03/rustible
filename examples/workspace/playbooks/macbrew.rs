@@ -15,16 +15,32 @@
 //! which `brew::Absent` must take too, and pins it, which `brew::Absent` must
 //! refuse until it is unpinned. A removal run with both installed reports
 //! five `changed` and one `recovered`; the one after it, `ok`.
+//!
+//! Each install run also moves a 50 MiB file through `ctx.as_root()`, which
+//! from this unescalated playbook is the sudo helper: it is generated as
+//! root under a scratch directory, copied there with `file::Copy` (the
+//! second run's `check` reads both sides back through the helper to report
+//! `ok`), and fetched to the workspace's ignored `out/macbrew/`, where CI
+//! compares it with what was generated and removes it (#86). A removal run
+//! removes the scratch directory.
 
 use std::path::{Component, Path, PathBuf};
 
 use rustible::prelude::*;
 use rustible::sdk::backend::FileKind;
-use rustible_std::{brew, shell};
+use rustible_std::{brew, file, shell};
 
 /// The version the copied keg is filed under. Any directory in a rack is a
 /// version to Homebrew; this one cannot be mistaken for a real release.
 const COPY: &str = "0.0.0-rustible";
+
+/// Where the 50 MiB file and its copy live, root's, on this mac.
+const SCRATCH: &str = "/private/tmp/rustible-macbrew";
+
+/// Its size and the line it repeats, which CI regenerates to compare the
+/// fetched copy with.
+const LARGE_BYTES: u64 = 50 * 1024 * 1024;
+const LARGE_LINE: &str = "rustible streams this line";
 
 #[rustible::vars]
 struct Vars {
@@ -81,6 +97,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
                 out.installed, out.already_present
             ));
         }
+        large_file_as_root(ctx)?;
     } else {
         if !ctx.check_mode() {
             second_version_and_pin(ctx, &vars.package)?;
@@ -99,6 +116,40 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         if !ctx.check_mode() {
             ctx.log(format!("removed {:?}", out.removed));
         }
+        ctx.as_root().step(
+            format!("{SCRATCH} removed"),
+            file::Absent::at(SCRATCH).recursive(true),
+        )?;
+    }
+    Ok(())
+}
+
+/// 50 MiB through the sudo helper, both ways (decision 30 on #82): one
+/// frame of the helper carries less, so the copy, its comparison and the
+/// fetch all cross it in chunks. Generated under a temporary name, so a
+/// generation cut short is not mistaken for a finished one by `creates`.
+fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
+    let large = format!("{SCRATCH}/large");
+    let copy = format!("{SCRATCH}/large-copy");
+    let mut root = ctx.as_root();
+    root.step(
+        "50 MiB file, as root",
+        shell::Command::sh(format!(
+            "mkdir -p {SCRATCH} && yes '{LARGE_LINE}' | head -c {LARGE_BYTES} > {large}.part \
+             && mv {large}.part {large}"
+        ))
+        .creates(&large),
+    )?;
+    // A dry run on a mac that never had it has no source to compare.
+    if root.check_mode() && !root.sys().exists(&large)? {
+        return Ok(());
+    }
+    root.step(
+        "50 MiB copy, as root",
+        file::Copy::from_local_path(&large).to(&copy),
+    )?;
+    if !root.check_mode() {
+        root.fetch(&copy, "out/macbrew/")?;
     }
     Ok(())
 }

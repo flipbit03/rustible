@@ -286,6 +286,38 @@ assert_changed_something() {
     '
 }
 
+# vagrant.rs copies a 50 MiB file into rustible-login's home and fetches it
+# back as that account, through the escalation helper, to
+# out/vm-test/<host>/large-copy in the workspace (#86). After each of its
+# runs, every host that ran must have brought back exactly the bytes it
+# generated, with nothing staged left beside them. The files go after each
+# check, so each run proves its own fetch, and on exit, so none is left.
+fetched="$root/examples/workspace/out/vm-test"
+trap 'rm -rf "$fetched"' EXIT
+assert_fetched() {
+    local n=0 f
+    for f in "$fetched"/*/large-copy; do
+        [ -e "$f" ] || continue
+        n=$((n + 1))
+        # `|| true`: `yes` dies of SIGPIPE when `head` is done, which
+        # pipefail would report as the pipeline failing.
+        if ! (yes 'rustible streams this line' || true) | head -c 52428800 | cmp -s - "$f"; then
+            echo "$f: not the 50 MiB vagrant.rs generated" >&2
+            return 1
+        fi
+        if [ "$(ls -A "$(dirname "$f")")" != large-copy ]; then
+            echo "$(dirname "$f"): more than the fetched file: $(ls -A "$(dirname "$f")")" >&2
+            return 1
+        fi
+    done
+    if [ "$n" = 0 ]; then
+        echo "nothing fetched under $fetched" >&2
+        return 1
+    fi
+    rm -rf "$fetched"
+}
+rm -rf "$fetched"
+
 for playbook in "${playbooks[@]}"; do
     want=$(recovered_per_run "$playbook")
 
@@ -310,6 +342,11 @@ MSG
         echo "vm-test failed: the first run of $playbook did not recover exactly $want step(s) per host." >&2
         exit 1
     fi
+    if [ "$playbook" = vagrant ] && ! assert_fetched; then
+        echo >&2
+        echo "vm-test failed: the first run of $playbook did not fetch the 50 MiB file whole." >&2
+        exit 1
+    fi
 
     echo
     echo "==> $playbook, second run: must change nothing"
@@ -323,6 +360,11 @@ MSG
     if ! printf '%s\n' "$second" | assert_recovered "$want"; then
         echo >&2
         echo "vm-test failed: the second run of $playbook did not recover exactly $want step(s) per host." >&2
+        exit 1
+    fi
+    if [ "$playbook" = vagrant ] && ! assert_fetched; then
+        echo >&2
+        echo "vm-test failed: the second run of $playbook did not fetch the 50 MiB file whole." >&2
         exit 1
     fi
     echo
