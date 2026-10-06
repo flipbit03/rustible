@@ -231,7 +231,10 @@ impl Incoming {
     /// the server sends.
     pub(crate) fn body(self, max_bytes: Option<u64>) -> std::result::Result<Body, ReadError> {
         let what = self.what;
-        if let Some(max_bytes) = max_bytes
+        // A `HEAD` answer's `Content-Length` is the size of a body it does
+        // not send.
+        if !self.head
+            && let Some(max_bytes) = max_bytes
             && let Some(len) = self
                 .resp
                 .headers()

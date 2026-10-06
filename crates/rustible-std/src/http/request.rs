@@ -2360,6 +2360,12 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains(".max_bytes()"), "{e}");
+        // A `HEAD` answer declares the size of a body it does not send.
+        let r = Request::head(server.url("/big"))
+            .max_bytes(100)
+            .send()
+            .unwrap();
+        assert!(r.body.is_empty());
         assert_eq!(
             Request::get(server.url("/big"))
                 .max_bytes(4096)
