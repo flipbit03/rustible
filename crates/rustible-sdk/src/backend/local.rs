@@ -64,8 +64,12 @@ impl Local {
 ///   now the writer's. The existing file is found at commit, with a `stat`
 ///   that follows symlinks, so a change to it during the stream is kept,
 ///   writing at a link's path takes the target's mode and owner, and the
-///   rename replaces the link itself. A target removed during the stream
-///   leaves the new file at the 0600 it was staged at.
+///   rename replaces the link itself. So a symlink someone with write access
+///   to the directory plants at the target during the stream is followed,
+///   and the new file takes the mode, setuid included, of whatever it points
+///   at: the same class of trust as a link planted before the write began,
+///   over the longer window a stream gives. A target removed during the
+///   stream leaves the new file at the 0600 it was staged at.
 /// - **A new file** without attributes is left as created.
 ///
 /// The setuid and setgid bits go on last because a `chown` clears them: on
@@ -794,10 +798,12 @@ mod tests {
         }
     }
 
-    /// At the descriptor, at creation: `created` is read from the staged
-    /// file's descriptor before anything else touches it, so a staged file
-    /// made wider and narrowed afterwards (the window a racer used to open a
-    /// secret at 0644 and keep the descriptor) shows here.
+    /// At the descriptor: `created` is read from the staged file's
+    /// descriptor right after it is created, so a staged file made wider and
+    /// narrowed after that read (the window a racer used to open a secret at
+    /// 0644 and keep the descriptor) shows here. A change that narrowed it
+    /// before the read would not; `creation_mode` is what is created, and
+    /// its own test pins it.
     #[test]
     fn a_new_file_given_a_mode_is_created_at_0600() {
         let dir = tempfile::tempdir().unwrap();

@@ -38,8 +38,9 @@
 //! on (an error from the source being written, a reader dropped before its
 //! end). When the parent goes away mid-stream, the helper sees EOF, its
 //! table drops, and each staged write removes its temporary file. A helper
-//! killed mid-stream can leave one `.rustible-*` file beside the target, as
-//! a local write killed part way does; the target is untouched either way.
+//! killed mid-stream can leave one `.rustible-*` file per write stream it
+//! had open, each beside its target, as a local write killed part way
+//! does; the targets are untouched either way.
 //!
 //! ## What crosses, and what does not
 //!
@@ -2396,7 +2397,10 @@ impl Backend for Elevated {
             stdin: staged.as_ref().and_then(|s| s.handle),
         });
         // An answer means the helper took the staged stdin, whether or not
-        // the command started.
+        // the command started. An error may be the helper's answer, or this
+        // side refusing to send the request (too large to encode), which left
+        // the stdin staged; it is closed then, and closing one the helper
+        // already took is harmless.
         if resp.is_ok()
             && let Some(staged) = staged
         {
@@ -2761,6 +2765,9 @@ mod tests {
             let mut got = Zeroizing::new(Vec::with_capacity(2 * body.len()));
             e.open_read(&f).unwrap().read_to_end(&mut got).unwrap();
             assert!(*got == body);
+            // One more round trip, inside the window: the helper answers it
+            // only after it has dropped what it held for the last one.
+            e.stat(&f).unwrap();
         });
         assert_eq!(left, 0, "buffers freed with the file in them");
     }
@@ -3412,53 +3419,63 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("f");
         std::fs::write(&f, "before").unwrap();
-        let (req_r, mut req_w) = io::pipe().unwrap();
-        let (mut resp_r, resp_w) = io::pipe().unwrap();
-        let (done_tx, done) = mpsc::channel();
+        // The whole exchange on a thread, bounded: a helper that does not
+        // answer, or does not see EOF, would otherwise hang the suite.
+        let (finished_tx, finished) = mpsc::channel();
+        let (at, file) = (dir.path().to_path_buf(), f.clone());
         std::thread::spawn(move || {
-            let (mut rx, mut tx) = (req_r, resp_w);
-            let _ = done_tx.send(serve(&mut rx, &mut tx, Limits::REAL));
-        });
-        let send = |w: &mut io::PipeWriter, op| {
-            write_frame(
-                w,
-                &HelperRequest {
-                    checking: false,
-                    op,
+            let (req_r, mut req_w) = io::pipe().unwrap();
+            let (mut resp_r, resp_w) = io::pipe().unwrap();
+            let (done_tx, done) = mpsc::channel();
+            std::thread::spawn(move || {
+                let (mut rx, mut tx) = (req_r, resp_w);
+                let _ = done_tx.send(serve(&mut rx, &mut tx, Limits::REAL));
+            });
+            let send = |w: &mut io::PipeWriter, op| {
+                write_frame(
+                    w,
+                    &HelperRequest {
+                        checking: false,
+                        op,
+                    },
+                )
+                .unwrap()
+            };
+            send(
+                &mut req_w,
+                HelperOp::WriteBegin {
+                    path: file,
+                    attrs: None,
+                    bytes: Zeroizing::new(b"new ".to_vec()),
+                    last: false,
                 },
-            )
-            .unwrap()
-        };
-        send(
-            &mut req_w,
-            HelperOp::WriteBegin {
-                path: f.clone(),
-                attrs: None,
-                bytes: Zeroizing::new(b"new ".to_vec()),
-                last: false,
-            },
-        );
-        let Some(HelperResponse::Handle(handle)) = read_frame(&mut resp_r).unwrap() else {
-            panic!("no handle")
-        };
-        send(
-            &mut req_w,
-            HelperOp::WriteChunk {
-                handle,
-                offset: 4,
-                bytes: Zeroizing::new(b"content".to_vec()),
-                last: false,
-            },
-        );
-        assert!(matches!(
-            read_frame(&mut resp_r).unwrap(),
-            Some(HelperResponse::Unit)
-        ));
-        assert_eq!(staged_in(dir.path()).len(), 1);
-        drop(req_w);
-        // Bounded: a helper that does not see EOF would hang the suite.
-        done.recv_timeout(Duration::from_secs(30))
-            .expect("the helper did not end when its parent went away")
+            );
+            let Some(HelperResponse::Handle(handle)) = read_frame(&mut resp_r).unwrap() else {
+                panic!("no handle")
+            };
+            send(
+                &mut req_w,
+                HelperOp::WriteChunk {
+                    handle,
+                    offset: 4,
+                    bytes: Zeroizing::new(b"content".to_vec()),
+                    last: false,
+                },
+            );
+            assert!(matches!(
+                read_frame(&mut resp_r).unwrap(),
+                Some(HelperResponse::Unit)
+            ));
+            assert_eq!(staged_in(&at).len(), 1);
+            drop(req_w);
+            let served = done
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the helper did not end when its parent went away");
+            let _ = finished_tx.send(served);
+        });
+        finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the exchange with the helper hung or failed")
             .unwrap();
         assert!(staged_in(dir.path()).is_empty());
         assert_eq!(std::fs::read(&f).unwrap(), b"before");
