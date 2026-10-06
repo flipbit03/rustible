@@ -36,3 +36,7 @@ ruzstd.workspace = true
 # rustible -> rustible-std -> rustible cycle on crates.io (same as
 # rustible-macros).
 rustible = { path = "../rustible" }
+# archive.rs's tests build xz streams to extract. The encoder ships in the
+# same crate, behind a feature with no dependencies of its own; the library
+# links only the decoder.
+lzma-rust2 = { workspace = true, features = ["encoder"] }

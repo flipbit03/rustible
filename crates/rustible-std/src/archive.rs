@@ -402,12 +402,27 @@ impl Extracted {
         Ok((format, tar::Archive::new(reader)))
     }
 
+    /// Read a zstd stream on to its end once `tar` has stopped at the
+    /// archive's end marker, so the last frame's checksum is verified and
+    /// anything after the last frame is refused, as they were when the
+    /// stream was decoded whole. What is left is the tar's padding to its
+    /// record size, a few KiB at most. gzip and xz streams are left where
+    /// `tar` stopped, as before.
+    fn finish<R: Read>(&self, format: Format, archive: tar::Archive<R>) -> Result<()> {
+        if format == Format::TarZst {
+            std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+                .with_context(|| format!("{}: decompressing", self.src.display()))?;
+        }
+        Ok(())
+    }
+
     /// Everything the archive would create, entry by entry in archive order,
     /// or why it is refused.
     fn plan(&self, sys: &System) -> Result<(Format, Vec<PlannedEntry>)> {
         let (format, mut archive) = self.open(sys)?;
         let entries = walk(&mut archive, self.strip)
             .with_context(|| format!("{}: refusing to extract", self.src.display()))?;
+        self.finish(format, archive)?;
         let members: Vec<Member> = entries.iter().filter_map(|e| e.member.clone()).collect();
         self.check_destination(sys, &members)?;
         Ok((format, entries))
@@ -538,7 +553,12 @@ impl Extracted {
                         full.display()
                     );
                     if member.failed {
-                        return Err(e.context(format!("reading member {}", m.path.display())));
+                        return Err(e.context(format!(
+                            "reading member `{}` from the archive failed part way (truncated or \
+                             corrupt), and nothing was written at {}",
+                            m.path.display(),
+                            full.display()
+                        )));
                     }
                     return Err(e);
                 }
@@ -1140,7 +1160,7 @@ impl Op for Extracted {
         // go are the plan's. An archive swapped since `check` is caught at
         // the first entry that is not the one the plan has in that place,
         // so data is never written under another member's name.
-        let (_, mut archive) = self.open(sys)?;
+        let (format, mut archive) = self.open(sys)?;
         let mut planned = intent.entries.iter();
         let entries = archive
             .entries()
@@ -1174,6 +1194,7 @@ impl Op for Extracted {
              between check and apply",
             intent.src.display()
         );
+        self.finish(format, archive)?;
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
@@ -1195,7 +1216,9 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
+    use rustible_sdk::backend::{
+        AttrCall, Backend, CmdSpec, Fake, Output, ReadCall, Stat, WriteAttrs,
+    };
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -2676,5 +2699,459 @@ mod tests {
                 if msg.contains("creates marker /opt/hello/nope does not exist"))
         });
         assert!(warned, "{:?}", sink.events());
+    }
+
+    // ---- streaming: one path for every format (decision 29 on #88) ----
+
+    use rustible_sdk::protocol::CHUNK_SIZE;
+
+    /// The big member's size: over one helper chunk and over the zstd
+    /// decoder's look-ahead, and not a multiple of either.
+    const BIG: usize = 3 * CHUNK_SIZE / 2 + 7;
+
+    /// `n` bytes of numbered lines: compressible, so the encoders are quick,
+    /// and different at every offset, so a dropped, repeated or shifted
+    /// piece shows.
+    fn numbered(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n + 16);
+        let mut i = 0u64;
+        while out.len() < n {
+            out.extend_from_slice(format!("{i:015}\n").as_bytes());
+            i += 1;
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// One tree as a tar: a directory, a small file, a member of `big`
+    /// bytes, a hard link to the small file, a symlink, and a file after
+    /// them all.
+    fn tree_tar(big: usize) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let header = |ty: tar::EntryType, mode: u32, size: usize| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(ty);
+            h.set_mode(mode);
+            h.set_size(size as u64);
+            h.set_mtime(0);
+            h
+        };
+        let file = |b: &mut tar::Builder<Vec<u8>>, path: &str, mode: u32, data: &[u8]| {
+            let mut h = header(tar::EntryType::Regular, mode, data.len());
+            b.append_data(&mut h, path, data).unwrap();
+        };
+        let mut h = header(tar::EntryType::Directory, 0o755, 0);
+        b.append_data(&mut h, "m/", &[][..]).unwrap();
+        file(&mut b, "m/small", 0o644, b"small\n");
+        file(&mut b, "m/big", 0o640, &numbered(big));
+        let mut h = header(tar::EntryType::Link, 0o644, 0);
+        b.append_link(&mut h, "m/hard", "m/small").unwrap();
+        let mut h = header(tar::EntryType::Symlink, 0o777, 0);
+        b.append_link(&mut h, "m/link", "small").unwrap();
+        file(&mut b, "m/after", 0o600, b"after\n");
+        b.into_inner().unwrap()
+    }
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn xz(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0)).unwrap();
+        w.write_all(bytes).unwrap();
+        w.finish().unwrap()
+    }
+
+    /// One zstd frame, with its content checksum.
+    fn zst(bytes: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    /// A zstd skippable frame carrying `payload`.
+    fn skippable(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x50, 0x2a, 0x4d, 0x18];
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An encoder: bytes in, one frame of them out.
+    type Encode = fn(&[u8]) -> Vec<u8>;
+
+    /// The compressed formats, by the encoder that makes one frame (one
+    /// gzip member, one xz stream) of their kind.
+    fn encoders() -> [(Format, Encode); 3] {
+        [
+            (Format::TarGz, gz),
+            (Format::TarXz, xz),
+            (Format::TarZst, zst),
+        ]
+    }
+
+    /// Where the multi-frame cases cut the tar: inside the big member, at
+    /// no block or chunk boundary.
+    const CUT: usize = 3 * 512 + CHUNK_SIZE / 2 + 3;
+
+    /// Everything under `/opt` in `fake`: each path with its kind, its mode
+    /// and its content, or a link's target.
+    fn tree(fake: &Arc<Fake>) -> Vec<(PathBuf, String, u32, Vec<u8>)> {
+        let sys = fake_sys(fake);
+        let mut out = vec![];
+        let mut todo = vec![PathBuf::from("/opt")];
+        while let Some(dir) = todo.pop() {
+            for p in sys.read_dir(&dir).unwrap() {
+                let f = fake.file(&p).unwrap();
+                let body = match f.kind {
+                    FileKind::Dir => {
+                        todo.push(p.clone());
+                        vec![]
+                    }
+                    FileKind::Symlink => sys
+                        .read_link(&p)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                    _ => f.bytes,
+                };
+                out.push((p, format!("{:?}", f.kind), f.mode, body));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// `archive` extracted into an empty `/opt`, check then apply: the
+    /// `Fake`, the report, and the reads the extraction made (decision 28).
+    fn extract(archive: &[u8]) -> (Arc<Fake>, ExtractReport, Vec<ReadCall>) {
+        let (fake, sys) = sys_with(archive);
+        let planted = fake.reads().len();
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        let reads = fake.reads()[planted..].to_vec();
+        (fake, r, reads)
+    }
+
+    /// What extracting the plain tar gives: the tree every encoding of it
+    /// must give too, byte for byte.
+    fn plain_tree(tar: &[u8]) -> Vec<(PathBuf, String, u32, Vec<u8>)> {
+        let (fake, r, _) = extract(tar);
+        assert_eq!(
+            (r.format, r.files, r.dirs, r.symlinks),
+            (Some(Format::Tar), 4, 1, 1)
+        );
+        let t = tree(&fake);
+        assert_eq!(fake.file("/opt/m/big").unwrap().bytes, numbered(BIG));
+        assert_eq!(fake.content("/opt/m/hard").unwrap(), "small\n");
+        t
+    }
+
+    /// Every read an extraction made is a stream (`open_read`), never a
+    /// whole-file `read`: the archive twice, once by `check` and once by
+    /// `apply`, and the hard link's source once.
+    fn assert_streamed(reads: &[ReadCall], archive_len: usize) {
+        assert!(reads.iter().all(|r| r.streamed), "{reads:?}");
+        let archive: Vec<_> = reads
+            .iter()
+            .filter(|r| r.path == Path::new("/tmp/a.tar"))
+            .collect();
+        assert_eq!(archive.len(), 2, "{reads:?}");
+        assert!(
+            archive.iter().all(|r| r.bytes <= archive_len as u64),
+            "{reads:?}"
+        );
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|r| r.path == Path::new("/opt/m/small"))
+                .count(),
+            1,
+            "{reads:?}"
+        );
+    }
+
+    /// One frame, or one gzip member or xz stream, of a tar with a member
+    /// over one chunk: the same tree as the plain tar, byte for byte, every
+    /// read a stream.
+    #[test]
+    fn every_format_streams_a_member_over_one_chunk_byte_identical() {
+        let tar = tree_tar(BIG);
+        let want = plain_tree(&tar);
+        let (_, _, reads) = extract(&tar);
+        assert_streamed(&reads, tar.len());
+        for (format, encode) in encoders() {
+            let archive = encode(&tar);
+            let (fake, r, reads) = extract(&archive);
+            assert_eq!(r.format, Some(format));
+            // `small` and `after`, 6 bytes each, and `big`; a hard link
+            // adds nothing.
+            assert_eq!(r.bytes, (BIG + 12) as u64);
+            assert_eq!(tree(&fake), want, "{format:?}");
+            assert_streamed(&reads, archive.len());
+        }
+    }
+
+    /// Several frames, the tar cut between them inside the big member:
+    /// concatenated gzip members (`pigz`, `cat a.gz b.gz`), xz streams, and
+    /// zstd frames. Each is read to its end, not just to the end of its
+    /// first frame.
+    #[test]
+    fn every_format_reads_several_frames_byte_identical() {
+        let tar = tree_tar(BIG);
+        let want = plain_tree(&tar);
+        for (format, encode) in encoders() {
+            let archive = [encode(&tar[..CUT]), encode(&tar[CUT..])].concat();
+            let (fake, r, _) = extract(&archive);
+            assert_eq!(r.format, Some(format));
+            assert_eq!(tree(&fake), want, "{format:?}");
+            // Three frames, the middle one empty of tar but not of data.
+            let archive = [
+                encode(&tar[..512]),
+                encode(&tar[512..CUT]),
+                encode(&tar[CUT..]),
+            ]
+            .concat();
+            let (fake, _, _) = extract(&archive);
+            assert_eq!(tree(&fake), want, "{format:?}, three frames");
+        }
+    }
+
+    /// What lies between frames and is not data: a zstd skippable frame,
+    /// and xz's stream padding (zero bytes, a multiple of four). Skipped,
+    /// and the tree is the plain tar's.
+    #[test]
+    fn skippable_frames_and_stream_padding_are_skipped() {
+        let tar = tree_tar(BIG);
+        let want = plain_tree(&tar);
+        for archive in [
+            [
+                zst(&tar[..CUT]),
+                skippable(b"rustible"),
+                skippable(b""),
+                zst(&tar[CUT..]),
+            ]
+            .concat(),
+            // After the last frame too.
+            [zst(&tar), skippable(&[7; 300])].concat(),
+            [xz(&tar[..CUT]), vec![0; 8], xz(&tar[CUT..])].concat(),
+        ] {
+            let (fake, _, _) = extract(&archive);
+            assert_eq!(tree(&fake), want);
+        }
+        // A skippable frame cut short is refused, naming what is wrong.
+        let cut = [zst(&tar), skippable(&[7; 300])].concat();
+        let err = check_err(&cut[..cut.len() - 10]);
+        assert!(err.contains("zstd: truncated skippable frame"), "{err}");
+    }
+
+    /// The last frame's checksum is verified though `tar` stops reading at
+    /// the archive's end marker, ahead of it, and so is anything after the
+    /// last frame: both refused at `check`, as when the stream was decoded
+    /// whole.
+    #[test]
+    fn the_last_zstd_frame_is_read_to_its_checksum() {
+        let tar = tree_tar(BIG);
+        let mut bad = zst(&tar);
+        *bad.last_mut().unwrap() ^= 0xff;
+        let err = check_err(&bad);
+        assert!(
+            err.contains("/tmp/a.tar: decompressing: zstd: frame checksum mismatch"),
+            "{err}"
+        );
+        let trailing = [zst(&tar), b"junk".to_vec()].concat();
+        let err = check_err(&trailing);
+        assert!(err.contains("/tmp/a.tar: decompressing: zstd: "), "{err}");
+    }
+
+    /// An archive with no members, only the end marker, is refused in every
+    /// format, the same way it always was: a plain tar's first block is no
+    /// `ustar` header, so there is no format to name, and a compressed
+    /// one's stream holds no tar.
+    #[test]
+    fn an_empty_archive_is_refused_alike_in_every_format() {
+        let tar = tar::Builder::new(Vec::new()).into_inner().unwrap();
+        assert_eq!(tar, vec![0; 1024]);
+        let err = check_err(&tar);
+        assert!(
+            err.contains("/tmp/a.tar: not a recognised archive"),
+            "{err}"
+        );
+        for (format, encode) in encoders() {
+            let err = check_err(&encode(&tar));
+            assert!(
+                err.contains(&format!(
+                    "/tmp/a.tar: the {} stream does not contain a tar archive",
+                    format.name()
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// A stream cut inside the big member, in every format. `check` refuses
+    /// it, writing nothing. Swapped in after `check` instead, `apply`
+    /// extracts the members before the cut and fails at the cut one, which
+    /// leaves nothing at its path and nothing staged beside it.
+    #[test]
+    fn a_truncated_stream_writes_nothing_for_the_cut_member() {
+        // Big enough that the cut lands after the first of xz's LZMA2
+        // chunks (up to 2 MiB of output each, decoded whole), so `small`
+        // comes out of the cut stream in every format.
+        let tar = tree_tar(5 * CHUNK_SIZE + 7);
+        let plain: (Format, Encode) = (Format::Tar, |b| b.to_vec());
+        for (format, encode) in [plain].into_iter().chain(encoders()) {
+            let whole = encode(&tar);
+            let cut = &whole[..whole.len() * 3 / 4];
+
+            let err = check_err(cut);
+            assert!(err.contains("/tmp/a.tar"), "{format:?}: {err}");
+
+            let (fake, sys) = sys_with(&whole);
+            let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+            let c = expect_change(&op, &sys);
+            sys.write_atomic("/tmp/a.tar", cut).unwrap();
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(err.contains("member `m/big`"), "{format:?}: {err}");
+            assert!(
+                err.contains("nothing was written at /opt/m/big"),
+                "{format:?}: {err}"
+            );
+            assert_eq!(fake.content("/opt/m/small").unwrap(), "small\n");
+            assert_eq!(
+                sys.read_dir("/opt/m").unwrap(),
+                [PathBuf::from("/opt/m/small")],
+                "{format:?}: nothing at the cut member's path, nothing staged, nothing after it"
+            );
+        }
+    }
+
+    // ---- through a helper ----
+
+    /// `f` on a thread of its own, failing the test when it takes longer
+    /// than `secs`: a deadlock between the archive's reads and the members'
+    /// writes on one helper fails instead of hanging the suite.
+    fn bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(t) => t,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("not done after {secs} s: reads and writes deadlocked on the helper?")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the bounded body panicked; its message is above")
+            }
+        }
+    }
+
+    /// A system over a real escalation helper in this process, and a fresh
+    /// directory for it, removed when the guard drops.
+    fn helper_scratch(name: &str) -> (System, PathBuf, impl Drop) {
+        struct Cleanup(System, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.remove_all(&self.1);
+            }
+        }
+        let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustible-archive-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        sys.mkdir_all(dir.join("dest")).unwrap();
+        let guard = Cleanup(sys.clone(), dir.clone());
+        (sys, dir, guard)
+    }
+
+    /// Through one real escalation helper, as root's or a user's would be:
+    /// the archive is read with `open_read` while each member is written
+    /// with `write_from`, so the two streams alternate on the helper chunk
+    /// by chunk. A plain tar, which is itself several chunks, and a
+    /// `.tar.zst`, whose member is; each with a member of four chunks and
+    /// more, which comes out byte for byte, with its mode, and with nothing
+    /// staged left beside it.
+    #[test]
+    fn extracting_through_one_helper_interleaves_reads_and_writes() {
+        let big = 4 * CHUNK_SIZE + 9;
+        let tar = tree_tar(big);
+        for (name, archive) in [("plain.tar", tar.clone()), ("z.tar.zst", zst(&tar))] {
+            bounded(180, move || {
+                let (sys, dir, _guard) = helper_scratch("interleave");
+                let (src, dest) = (dir.join(name), dir.join("dest"));
+                sys.write_atomic(&src, &archive).unwrap();
+                let op = Extracted::from_path(&src).to(&dest).creates("m/after");
+                let c = expect_change(&op, &sys);
+                let r = op.apply(&sys, c).unwrap();
+                assert_eq!((r.files, r.bytes), (4, (big + 12) as u64), "{name}");
+                let m = dest.join("m");
+                assert_eq!(sys.read(m.join("big")).unwrap(), numbered(big), "{name}");
+                assert_eq!(sys.stat(m.join("big")).unwrap().unwrap().mode, 0o640);
+                assert_eq!(sys.read(m.join("hard")).unwrap(), b"small\n");
+                assert_eq!(sys.stat(m.join("after")).unwrap().unwrap().mode, 0o600);
+                assert_eq!(
+                    sys.read_link(m.join("link")).unwrap(),
+                    PathBuf::from("small")
+                );
+                let mut left = sys.read_dir(&m).unwrap();
+                left.sort();
+                assert_eq!(
+                    left,
+                    ["after", "big", "hard", "link", "small"].map(|n| m.join(n)),
+                    "{name}: nothing staged left beside the members"
+                );
+                assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+            });
+        }
+    }
+
+    /// A dry run through the helper reads an archive of several chunks
+    /// whole, to walk it, and reports `would change` with the counts. The
+    /// helper is left serving: a read, a write and a listing after it
+    /// still work (before #84 an answer over one frame killed it for the
+    /// run, so a dry run of a large archive as root failed every escalated
+    /// step after it). Nothing is written.
+    #[test]
+    fn a_dry_run_through_the_helper_reads_the_archive_in_chunks_and_leaves_it_serving() {
+        let big = 5 * CHUNK_SIZE + 3;
+        let tar = tree_tar(big);
+        assert!(tar.len() > 5 * CHUNK_SIZE);
+        bounded(180, move || {
+            let (sys, dir, _guard) = helper_scratch("dry");
+            let (src, dest) = (dir.join("a.tar"), dir.join("dest"));
+            sys.write_atomic(&src, &tar).unwrap();
+            let mut ctx = Ctx::new(
+                sys.clone().with_check_mode(true),
+                rustible_sdk::HostInfo::local(),
+            );
+            let step = ctx
+                .step("extract", Extracted::from_path(&src).to(&dest))
+                .unwrap();
+            assert!(step.changed && !step.is_available());
+            assert_eq!(
+                step.diff.as_ref().unwrap().short(),
+                format!(
+                    "extract {} (tar: 4 files, 1 dirs, 1 symlinks, {} bytes) into {}",
+                    src.display(),
+                    big + 12,
+                    dest.display()
+                )
+            );
+            assert_eq!(sys.read_dir(&dest).unwrap(), Vec::<PathBuf>::new());
+            assert_eq!(sys.read(&src).unwrap(), tar);
+            sys.write_atomic(dir.join("after"), b"still serving")
+                .unwrap();
+            assert_eq!(sys.read(dir.join("after")).unwrap(), b"still serving");
+        });
     }
 }
