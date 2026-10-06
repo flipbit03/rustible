@@ -130,8 +130,8 @@ pub struct AttrPlan {
     /// The permission bits wanted, file type bits already masked off.
     pub(crate) mode: Option<Wanted<u32>>,
     pub(crate) owner: Option<Wanted<Owner>>,
-    /// The path is a directory, whose setgid `chown` keeps: see
-    /// [`set_mode_and_owner`].
+    /// The path is a directory, whose mode is not cleared before the
+    /// `chown`: see [`set_mode_and_owner`].
     pub(crate) dir: bool,
 }
 
@@ -292,11 +292,14 @@ pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
 /// lose them. `keep_owner_and_mode` in the SDK's `Local` backend has the
 /// same shape. Without an owner, the mode is one call.
 ///
-/// A directory (`dir`) gets its full mode and then its owner, and nothing
-/// is cleared: `chown(2)` keeps setgid on a directory, and setuid means
-/// nothing on one on Linux. Clearing setgid first would let a file created
-/// in the directory before the third call take the creator's group, and a
-/// refused `chown` would leave the bit off.
+/// A directory (`dir`) gets its full mode first, nothing cleared, then its
+/// owner, then the full mode again only when it carries setuid or setgid.
+/// On Linux `chown(2)` keeps setgid on a directory, so clearing it first
+/// would only let a file created in the directory before the last call
+/// take the creator's group, and a refused `chown` would leave the bit off.
+/// Measured on macOS: `chown` clears setgid on directories too, even to
+/// the owner the directory already has, so the last call puts it back
+/// there. On Linux that call is idempotent.
 ///
 /// What this cannot close is the time before the first call: a new file
 /// exists at `0666 & ~umask`, and a rewrite carries the old mode, from the
@@ -309,17 +312,14 @@ pub(crate) fn set_mode_and_owner(
     mode: Option<u32>,
     owner: Option<Owner>,
 ) -> Result<()> {
-    let Some(o) = owner.filter(|_| !dir) else {
+    let Some(o) = owner else {
         if let Some(mode) = mode {
             sys.set_mode(path, mode)?;
-        }
-        if let Some(o) = owner {
-            sys.set_owner(path, o.uid, o.gid)?;
         }
         return Ok(());
     };
     if let Some(mode) = mode {
-        sys.set_mode(path, mode & !SETID)?;
+        sys.set_mode(path, if dir { mode } else { mode & !SETID })?;
     }
     sys.set_owner(path, o.uid, o.gid)?;
     if let Some(mode) = mode.filter(|m| m & SETID != 0) {
@@ -754,43 +754,50 @@ mod tests {
         assert_eq!(fake.attr_calls().len(), 1, "nothing asked, nothing set");
     }
 
-    /// A directory gets its full mode, then its owner, with nothing
-    /// cleared: `chown(2)` keeps setgid on a directory, so clearing it
-    /// first would only open a moment where a file created in it takes the
-    /// creator's group, and a refused `chown` would leave the bit off. A
+    /// A directory gets its full mode, then its owner, with nothing cleared,
+    /// then its full mode again only when it carries setuid or setgid. On
+    /// Linux `chown(2)` keeps setgid on a directory, so clearing it first
+    /// would only open a moment where a file created in it takes the
+    /// creator's group, and a refused `chown` would leave the bit off. On
+    /// macOS `chown` clears it on a directory too (measured), which the last
+    /// call puts back; the `Fake` models Linux, so here it is idempotent. A
     /// plan reads the kind from the `stat` it was given.
     #[test]
-    fn set_mode_and_owner_on_a_directory_sets_the_full_mode_then_the_owner() {
+    fn set_mode_and_owner_on_a_directory_sets_the_full_mode_around_the_owner() {
         let owner = Some(Owner { uid: 5, gid: 6 });
         let d = Stat {
             kind: FileKind::Dir,
             ..stat(0o755, 0, 0)
         };
-        let plan = plan_attrs(Some(&d), Some(0o2775), owner);
-        assert!(plan.dir && !plan_attrs(Some(&stat(0o755, 0, 0)), None, None).dir);
+        assert!(!plan_attrs(Some(&stat(0o755, 0, 0)), None, None).dir);
+        let chmod = |mode| AttrCall::Chmod {
+            path: "/d".into(),
+            mode,
+        };
+        let chown = AttrCall::Chown {
+            path: "/d".into(),
+            uid: 5,
+            gid: 6,
+        };
+        for (mode, calls) in [
+            (0o2775, vec![chmod(0o2775), chown.clone(), chmod(0o2775)]),
+            (0o0750, vec![chmod(0o0750), chown.clone()]),
+        ] {
+            let plan = plan_attrs(Some(&d), Some(mode), owner);
+            assert!(plan.dir);
+            let fake = Arc::new(Fake::new().with_dir("/d"));
+            let planted = fake.attr_calls().len();
+            plan.apply(&testing::fake_sys(&fake), Path::new("/d"))
+                .unwrap();
+            assert_eq!(fake.attr_calls()[planted..], calls, "{mode:04o}");
+            let f = fake.file("/d").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (mode, 5, 6), "{mode:04o}");
+        }
 
+        // Refused, the `chown` is not recorded: the mode was set whole
+        // before it and stays.
         let fake = Arc::new(Fake::new().with_dir("/d"));
         let planted = fake.attr_calls().len();
-        plan.apply(&testing::fake_sys(&fake), Path::new("/d"))
-            .unwrap();
-        assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                AttrCall::Chmod {
-                    path: "/d".into(),
-                    mode: 0o2775
-                },
-                AttrCall::Chown {
-                    path: "/d".into(),
-                    uid: 5,
-                    gid: 6
-                },
-            ]
-        );
-        let f = fake.file("/d").unwrap();
-        assert_eq!((f.mode, f.uid, f.gid), (0o2775, 5, 6));
-
-        let fake = Arc::new(Fake::new().with_dir("/d"));
         let err = set_mode_and_owner(
             &testing::chown_refused_sys(&fake),
             Path::new("/d"),
@@ -801,6 +808,7 @@ mod tests {
         .unwrap_err()
         .chain();
         assert!(err.contains("Operation not permitted"), "{err}");
+        assert_eq!(fake.attr_calls()[planted..], [chmod(0o2775)]);
         assert_eq!(fake.file("/d").unwrap().mode, 0o2775);
     }
 

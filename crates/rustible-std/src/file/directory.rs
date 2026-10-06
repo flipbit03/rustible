@@ -144,24 +144,27 @@ mod tests {
         (fake, planted)
     }
 
-    /// A setgid directory gets its full mode first and its owner after it
-    /// (issue #79). `chown(2)` keeps setgid on a directory, so clearing it
-    /// first would only open a moment where files created in it get the
-    /// creator's group, and a refused `chown` would leave the bit off. A
-    /// directory the op creates is treated the same.
+    /// A setgid directory gets its full mode first, its owner, then its
+    /// full mode again (issue #79). On Linux `chown(2)` keeps setgid on a
+    /// directory, so clearing it first would only open a moment where files
+    /// created in it get the creator's group, and a refused `chown` would
+    /// leave the bit off; on macOS `chown` clears it there too, and the last
+    /// call puts it back. A directory the op creates is treated the same.
     #[test]
-    fn a_setgid_directory_gets_its_full_mode_before_its_owner() {
+    fn a_setgid_directory_gets_its_full_mode_around_its_owner() {
         let calls = |path: &str| {
+            let chmod = AttrCall::Chmod {
+                path: path.into(),
+                mode: 0o2775,
+            };
             [
-                AttrCall::Chmod {
-                    path: path.into(),
-                    mode: 0o2775,
-                },
+                chmod.clone(),
                 AttrCall::Chown {
                     path: path.into(),
                     uid: 5,
                     gid: 6,
                 },
+                chmod,
             ]
         };
         let (fake, planted) = shared_dir(0o2775);
@@ -182,15 +185,23 @@ mod tests {
     }
 
     /// With the `chown` refused, a setgid directory keeps the bit: the step
-    /// fails with the mode already whole, rather than at 0775.
+    /// fails with the mode already whole, rather than at 0775, after one
+    /// `chmod` (the refused `chown` is not recorded).
     #[test]
     fn a_refused_chown_leaves_a_setgid_directory_setgid() {
-        let (fake, _) = shared_dir(0o2775);
+        let (fake, planted) = shared_dir(0o2775);
         let sys = chown_refused_sys(&fake);
         let op = Directory::at("/srv/shared").mode(0o2775).owner(5, 6);
         let c = expect_change(&op, &sys);
         let err = op.apply(&sys, c).unwrap_err().chain();
         assert!(err.contains("Operation not permitted"), "{err}");
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [AttrCall::Chmod {
+                path: "/srv/shared".into(),
+                mode: 0o2775
+            }]
+        );
         let d = fake.file("/srv/shared").unwrap();
         assert_eq!((d.mode, d.uid, d.gid), (0o2775, 0, 0));
     }

@@ -474,9 +474,10 @@ impl Extracted {
         // Every arm below defers the mode and the owner to the tail, where
         // `set_mode_and_owner` applies them in its order: for a file, the
         // mode without setuid and setgid, the owner, then the full mode; for
-        // a directory, the full mode, then the owner. Writing the mode
-        // inline would drop the setuid bit of a file member extracted with
-        // `.owner(..)`, since `chown(2)` clears it.
+        // a directory, the full mode, the owner, then the full mode again
+        // when it carries either. Writing the mode inline would drop the
+        // setuid bit of a member extracted with `.owner(..)`, since
+        // `chown(2)` clears it.
         let mut mode = Some(m.mode);
         let mut chown = true;
         match &m.kind {
@@ -1669,11 +1670,12 @@ mod tests {
         );
     }
 
-    /// A setgid directory member gets its full mode first and its owner
-    /// after it: `chown(2)` keeps setgid on a directory, so there is
-    /// nothing to clear, and a refused `chown` leaves the bit on.
+    /// A setgid directory member gets its full mode, its owner, then its
+    /// full mode again: nothing is cleared first, so a refused `chown`
+    /// leaves the bit on, and the last call puts it back where `chown`
+    /// clears it on a directory (macOS).
     #[test]
-    fn a_setgid_directory_member_gets_its_full_mode_before_its_owner() {
+    fn a_setgid_directory_member_gets_its_full_mode_around_its_owner() {
         let mut h = tar::Header::new_gnu();
         h.set_path("shared").unwrap();
         h.set_entry_type(tar::EntryType::Directory);
@@ -1699,6 +1701,10 @@ mod tests {
                     path: "/opt/shared".into(),
                     uid: 5,
                     gid: 6
+                },
+                AttrCall::Chmod {
+                    path: "/opt/shared".into(),
+                    mode: 0o2775
                 },
             ]
         );
