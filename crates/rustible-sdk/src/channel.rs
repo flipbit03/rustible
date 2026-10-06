@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::{Error, Result};
 use crate::protocol::{Down, Up, UpLink};
-use crate::stream::{Chunk, WorkspaceFiles, chunks};
+use crate::stream::{Chunk, FetchStaging, WorkspaceFiles, chunks};
 
 /// How many file frames may sit in the inbox before the reader thread
 /// stops taking them off the pipe. Chunks are 1 MiB, so this is the whole
@@ -130,8 +130,13 @@ fn frame_req(f: &Down) -> Option<u32> {
 enum Source {
     /// `--remote`: requests go up as frames, answers come through the inbox.
     Remote { up: Arc<dyn UpLink>, inbox: Inbox },
-    /// A local run: served in-process from a directory, same rules.
-    Local(WorkspaceFiles),
+    /// A local run: served in-process from a directory, same rules, fetches
+    /// staged as the orchestrator stages them; any still unfinished go when
+    /// the channel does.
+    Local {
+        files: WorkspaceFiles,
+        fetches: Mutex<FetchStaging>,
+    },
     /// Nothing behind the channel (tests).
     None,
 }
@@ -198,7 +203,10 @@ impl Channel {
     /// Files served from `root` in-process (a local run). `Feeder` still
     /// works for cancellation.
     pub fn local(files: WorkspaceFiles) -> (Arc<Channel>, Feeder) {
-        let ch = Self::with_source(Source::Local(files));
+        let ch = Self::with_source(Source::Local {
+            files,
+            fetches: Mutex::default(),
+        });
         (ch.clone(), Feeder(ch))
     }
 
@@ -293,7 +301,7 @@ impl Channel {
                 }
                 out
             }
-            Source::Local(files) => {
+            Source::Local { files, .. } => {
                 let f = files
                     .open(path)
                     .map_err(|reason| Error::msg(format!("`{path}` denied: {reason}")))?;
@@ -321,8 +329,10 @@ impl Channel {
                     last: chunk.last,
                 })
                 .map_err(|e| Error::msg(format!("sending `{dest}`: {e}"))),
-            Source::Local(files) => files
-                .write_chunk(dest, chunk.offset, &chunk.bytes)
+            Source::Local { files, fetches } => fetches
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .chunk(files, req, dest, chunk.offset, &chunk.bytes, chunk.last)
                 .map(|_| ())
                 .map_err(|reason| Error::msg(format!("`{dest}` denied: {reason}"))),
             Source::None => Err(Error::msg(format!(
@@ -536,6 +546,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("closed the channel"), "{err}");
+    }
+
+    /// A local run stages a fetch as the orchestrator does (decision 27):
+    /// chunks without `last` leave the destination as it was, with the new
+    /// content beside it until the channel goes, and then nothing; a fetch
+    /// that ends with `last` replaces the destination whole.
+    #[test]
+    fn a_local_fetch_replaces_its_destination_only_on_its_last_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/f"), b"previous").unwrap();
+        let names = || {
+            let mut n: Vec<String> = std::fs::read_dir(dir.path().join("out"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        let chunk = |offset: u64, bytes: &[u8], last: bool| Chunk {
+            offset,
+            bytes: bytes.to_vec().into(),
+            last,
+        };
+
+        let (ch, feeder) = Channel::local(WorkspaceFiles::new(dir.path()).unwrap());
+        ch.send_fetch(1, "out/f", &chunk(0, b"half ", false))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("out/f")).unwrap(),
+            b"previous"
+        );
+        assert_eq!(names().len(), 2, "{:?}", names());
+        drop((ch, feeder));
+        assert_eq!(names(), ["f"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("out/f")).unwrap(),
+            b"previous"
+        );
+
+        let (ch, _feeder) = Channel::local(WorkspaceFiles::new(dir.path()).unwrap());
+        ch.send_fetch(2, "out/f", &chunk(0, b"all ", false))
+            .unwrap();
+        ch.send_fetch(2, "out/f", &chunk(4, b"of it", true))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("out/f")).unwrap(),
+            b"all of it"
+        );
+        assert_eq!(names(), ["f"]);
     }
 
     #[test]

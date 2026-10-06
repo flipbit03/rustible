@@ -13,7 +13,6 @@
 
 mod create;
 mod describe;
-mod fetch;
 mod init;
 mod render;
 mod run;
@@ -258,6 +257,10 @@ fn main() {
             }
         }
     };
+    // `exit` runs no destructors, so a fetch a host task was part way
+    // through when the run stopped (a host task that panicked, say) would
+    // leave its temporary file beside its destination.
+    rustible_sdk::stream::remove_unfinished_fetches();
     std::process::exit(code as i32);
 }
 

@@ -29,14 +29,13 @@ use rustible_sdk::launch::{self, Answer, Launch, Mode, Next, Place, Spawn};
 use rustible_sdk::protocol::{Down, MAX_FRAME, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use rustible_sdk::secret::Secret;
-use rustible_sdk::stream::{WorkspaceFiles, chunks, run_dir_name};
+use rustible_sdk::stream::{FetchStaging, WorkspaceFiles, chunks, run_dir_name};
 use rustible_sdk::{HostInfo, InventoryLogin, LoginOverride};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::describe::{self, Cargo, Describe};
-use crate::fetch::Fetches;
 use crate::render::Renderer;
 use crate::transport::{KillTarget, Probe, SshTarget, Transport};
 use crate::usage;
@@ -611,6 +610,9 @@ pub async fn run(ws: &Workspace, inv: &Inventory, args: RunArgs) -> Result<u8> {
                      are left running, and an ssh master may persist for its ControlPersist \
                      window."
                 );
+                // No destructor runs past this, so the fetches every host
+                // is part way through are removed here.
+                rustible_sdk::stream::remove_unfinished_fetches();
                 std::process::exit(EXIT_FAILED as i32);
             }
         }
@@ -1189,7 +1191,7 @@ async fn drive_frames(
     let mut killed = false;
     // Fetches still waiting for their last chunk. Dropped when this returns,
     // however it returns, which removes their temporary files.
-    let mut fetches = Fetches::default();
+    let mut fetches = FetchStaging::default();
     loop {
         tokio::select! {
             frame = frames.recv() => {
@@ -1239,7 +1241,7 @@ async fn handle_frame(
     name: &str,
     up: Up,
     cancel_rx: &tokio::sync::watch::Receiver<bool>,
-    fetches: &mut Fetches,
+    fetches: &mut FetchStaging,
 ) -> Result<()> {
     match &up {
         Up::Hello { protocol, playbook } => {
