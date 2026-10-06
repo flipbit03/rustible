@@ -232,11 +232,11 @@ impl Fake {
     /// order the op made them. The final state is in [`Fake::file`]; this is
     /// for asserting on what was *asked*: that a step issued no `chown` when
     /// the owner was already right (one that changes the owner needs root;
-    /// one that doesn't is a needless call that also clears setuid), or that
-    /// it set the owner before the mode. A fixture's own `Backend::set_*`
-    /// calls are recorded too; take the length first to skip past them. The `chown` a rewrite does inside
-    /// [`Backend::write`] is the backend's own, not an op's call, and is not
-    /// recorded.
+    /// one that doesn't is a needless call that also clears setuid), or the
+    /// order of its `set_mode` and `set_owner` calls. A fixture's own
+    /// `Backend::set_*` calls are recorded too; take the length first to
+    /// skip past them. The `chown` a rewrite does inside [`Backend::write`]
+    /// is the backend's own, not an op's call, and is not recorded.
     pub fn attr_calls(&self) -> Vec<AttrCall> {
         self.attr_calls.lock().unwrap().clone()
     }

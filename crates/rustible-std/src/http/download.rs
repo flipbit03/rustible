@@ -1139,7 +1139,9 @@ mod tests {
 
     /// A download over a setuid file, under a new owner with
     /// `.mode(0o4755)`: the mode without the bit, the owner, then the full
-    /// mode, so the new content never carries setuid between the calls.
+    /// mode, so a refused `chown` would not leave the new content setuid
+    /// under the old owner. The rewrite itself still carries the old mode
+    /// until the first call; that window is #85's.
     #[test]
     fn a_download_under_a_new_owner_clears_setuid_before_the_chown() {
         let (base, _) = hello_server();
@@ -1180,6 +1182,30 @@ mod tests {
             (f.mode, f.uid, f.gid, f.bytes.as_slice()),
             (0o4755, 5, 6, HELLO)
         );
+    }
+
+    /// A download over a setuid file under a new owner, with no `.mode()`,
+    /// whose `chown` is refused: `apply` cleared setuid before the `chown`,
+    /// so the new content is not left setuid under the old owner
+    /// (`file::copy`'s `an_owner_only_rewrite_clears_what_the_chown_would_before_it`).
+    #[test]
+    fn an_owner_only_download_clears_setuid_before_the_chown() {
+        let (base, _) = hello_server();
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_file_mode(
+            "/opt/hello.txt",
+            "old",
+            0o4755,
+        ));
+        let sys = chown_refused_sys(&fake);
+        let op = Download::get(format!("{base}/hello.txt"))
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"))
+            .owner(5, 6);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        let f = fake.file("/opt/hello.txt").unwrap();
+        assert_eq!((f.mode, f.uid, f.bytes.as_slice()), (0o755, 0, HELLO));
     }
 
     #[test]

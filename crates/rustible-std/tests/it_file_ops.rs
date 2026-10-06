@@ -60,11 +60,12 @@ fn file_family_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 
     // Setuid survives a rewrite. On a real kernel every `chown` of a file
     // clears setuid, and setgid with group execute, even to the ids it
-    // already has. With `.mode().owner()`, `apply` sets both after the
-    // rewrite when the owner differs: the mode without setuid, the owner,
-    // then the full mode (`copy_rewrite_of_a_setuid_file_keeps_the_bit` and
-    // `copy_rewrite_under_a_new_owner_clears_setuid_before_the_chown` are
-    // the `Fake`'s half).
+    // already has. "suid v1" creates the file, so `apply` gives it the mode
+    // without setuid, the owner, then the full mode. "suid v2" rewrites it
+    // with both already right, so `apply` makes no attribute call and the
+    // rewrite alone keeps the bit (`copy_rewrite_of_a_setuid_file_keeps_the_bit`
+    // is the `Fake`'s half). A rewrite under a new owner is covered at T1
+    // only, by `copy_rewrite_under_a_new_owner_clears_setuid_before_the_chown`.
     let suid = "/etc/rustible-test/files/suid";
     changed_then_ok(ctx, "suid v1", || {
         file::Copy::from_str("v1\n")

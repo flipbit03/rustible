@@ -99,7 +99,7 @@ impl Op for Directory {
             bail!("{} exists and is not a directory", self.path.display())
         }
         let create = stat.is_none();
-        let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
+        let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner).on_a_directory();
         if !create && !attrs.differs() {
             return Ok(Plan::Satisfied(DirReport {
                 path: self.path.clone(),
@@ -129,10 +129,71 @@ impl Op for Directory {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{AttrCall, Backend, Fake};
 
-    use super::super::testing::{expect_change, fake_sys};
+    use super::super::testing::{chown_refused_sys, expect_change, fake_sys};
     use super::*;
+
+    /// `/srv/shared` at `mode`, owned by root, and the `attr_calls` offset
+    /// past the planting.
+    fn shared_dir(mode: u32) -> (Arc<Fake>, usize) {
+        let fake = Arc::new(Fake::new().with_dir("/srv/shared"));
+        fake.set_mode(std::path::Path::new("/srv/shared"), mode)
+            .unwrap();
+        let planted = fake.attr_calls().len();
+        (fake, planted)
+    }
+
+    /// A setgid directory gets its full mode first and its owner after it
+    /// (issue #79). `chown(2)` keeps setgid on a directory, so clearing it
+    /// first would only open a moment where files created in it get the
+    /// creator's group, and a refused `chown` would leave the bit off. A
+    /// directory the op creates is treated the same.
+    #[test]
+    fn a_setgid_directory_gets_its_full_mode_before_its_owner() {
+        let calls = |path: &str| {
+            [
+                AttrCall::Chmod {
+                    path: path.into(),
+                    mode: 0o2775,
+                },
+                AttrCall::Chown {
+                    path: path.into(),
+                    uid: 5,
+                    gid: 6,
+                },
+            ]
+        };
+        let (fake, planted) = shared_dir(0o2775);
+        let sys = fake_sys(&fake);
+        let op = Directory::at("/srv/shared").mode(0o2775).owner(5, 6);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.attr_calls()[planted..], calls("/srv/shared"));
+        let d = fake.file("/srv/shared").unwrap();
+        assert_eq!((d.mode, d.uid, d.gid), (0o2775, 5, 6));
+
+        let (fake, planted) = shared_dir(0o755);
+        let sys = fake_sys(&fake);
+        let op = Directory::at("/srv/shared/new").mode(0o2775).owner(5, 6);
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(fake.attr_calls()[planted..], calls("/srv/shared/new"));
+    }
+
+    /// With the `chown` refused, a setgid directory keeps the bit: the step
+    /// fails with the mode already whole, rather than at 0775.
+    #[test]
+    fn a_refused_chown_leaves_a_setgid_directory_setgid() {
+        let (fake, _) = shared_dir(0o2775);
+        let sys = chown_refused_sys(&fake);
+        let op = Directory::at("/srv/shared").mode(0o2775).owner(5, 6);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        let d = fake.file("/srv/shared").unwrap();
+        assert_eq!((d.mode, d.uid, d.gid), (0o2775, 0, 0));
+    }
 
     /// The two platform claims every portable op makes, in one place: it
     /// runs on a mac, and it refuses a platform nobody has claimed rather

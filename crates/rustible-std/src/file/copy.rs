@@ -287,10 +287,8 @@ impl Op for Copy {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{AttrCall, Fake};
     use rustible_sdk::event::Collect;
-
-    use rustible_sdk::backend::AttrCall;
 
     use super::super::testing::{chown_refused_sys, expect_change, fake_sys};
     use super::*;
@@ -586,9 +584,10 @@ mod tests {
     }
 
     /// A rewrite of a setuid file under a new owner, with `.mode(0o4755)`:
-    /// the bit goes before the `chown` and comes back after it, so the new
-    /// content never carries setuid between the two calls. No `chown` here
-    /// clears what the rewrite kept; the mode before it does.
+    /// the bit the rewrite kept is cleared before the `chown` and set again
+    /// after it, so a refused `chown` would not leave the new content
+    /// setuid under the old owner. The rewrite itself still carries the old
+    /// mode until the first call; that window is #85's.
     #[test]
     fn copy_rewrite_under_a_new_owner_clears_setuid_before_the_chown() {
         let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", 0o4755));
@@ -620,6 +619,43 @@ mod tests {
         );
         let f = fake.file("/usr/local/bin/x").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+    }
+
+    /// A rewrite under a new owner with no `.mode()`, whose `chown` is
+    /// refused: the rewrite kept setuid from the file it replaced, and
+    /// `apply` clears it before the `chown`, so the new content is not left
+    /// setuid under the old owner. It clears what a `chown` would: setuid,
+    /// and setgid with group execute. Setgid without it survives a real
+    /// `chown`, so it is kept. A `chown` that succeeds ends the same way.
+    #[test]
+    fn an_owner_only_rewrite_clears_what_the_chown_would_before_it() {
+        for (mode, left) in [
+            (0o4755, 0o755),
+            (0o2755, 0o755),
+            (0o6750, 0o750),
+            (0o2745, 0o2745),
+            (0o6745, 0o2745),
+        ] {
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", mode));
+            let op = Copy::from_str("v2\n").to("/usr/local/bin/x").owner(5, 6);
+            let sys = chown_refused_sys(&fake);
+            let c = expect_change(&op, &sys);
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(err.contains("Operation not permitted"), "{err}");
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!(
+                (f.mode, f.uid, f.bytes.as_slice()),
+                (left, 0, &b"v2\n"[..]),
+                "{mode:04o}"
+            );
+
+            let fake = Arc::new(Fake::new().with_file_mode("/usr/local/bin/x", "v1\n", mode));
+            let sys = fake_sys(&fake);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            let f = fake.file("/usr/local/bin/x").unwrap();
+            assert_eq!((f.mode, f.uid, f.gid), (left, 5, 6), "{mode:04o}");
+        }
     }
 
     #[test]
