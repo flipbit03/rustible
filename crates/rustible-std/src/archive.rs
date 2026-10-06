@@ -37,10 +37,11 @@ pub enum Format {
     TarGz,
     /// xz (magic `fd 37 7a 58 5a 00`), read with `lzma-rust2`.
     TarXz,
-    /// zstd (magic `28 b5 2f fd`), read frame by frame with `ruzstd` so
-    /// several frames, such as `cat` of several `.zst` files, are all
-    /// decoded, skippable frames between them are skipped, and each frame's
-    /// content checksum is verified when it has been read to its end. Decoded as it is read, like the others: memory is the
+    /// zstd (magic `28 b5 2f fd`, or a skippable frame's), read frame by
+    /// frame with `ruzstd` so several frames, such as `pzstd` writes (each
+    /// after a skippable frame) or `cat` of several `.zst` files make, are
+    /// all decoded, skippable frames are skipped, and each frame's content
+    /// checksum is verified when it has been read to its end. Decoded as it is read, like the others: memory is the
     /// frame's window, which the compressor chose (8 MiB at `zstd -19`;
     /// `ruzstd` refuses a window over 100 MiB), plus 1 MiB decoded ahead.
     TarZst,
@@ -72,7 +73,11 @@ pub fn detect_format(head: &[u8]) -> std::result::Result<Format, String> {
     if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
         return Ok(Format::TarXz);
     }
-    if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+    // A zstd frame, or a skippable frame (magic `0x184d2a50` to `5f`,
+    // little-endian), which `pzstd` writes ahead of every frame.
+    if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+        || (head.len() >= 4 && head[0] & 0xf0 == 0x50 && head[1..4] == [0x2a, 0x4d, 0x18])
+    {
         return Ok(Format::TarZst);
     }
     if is_tar_header(head) {
@@ -670,8 +675,8 @@ const ZSTD_AHEAD: usize = 1 << 20;
 /// Every frame of a zstd stream, decoded as it is read: skippable frames
 /// skipped, each frame's content checksum verified once it is read to its
 /// end. `ruzstd`'s own `StreamingDecoder` stops at the end of the first
-/// frame, and a stream may hold several, as `cat` of several `.zst` files
-/// does. Holds the
+/// frame, and a stream may hold several, as `pzstd` and `cat` of several
+/// `.zst` files write. Holds the
 /// frame's window (what the compressor chose, 8 MiB at `zstd -19`; `ruzstd`
 /// refuses a frame asking for more than 100 MiB) plus up to
 /// [`ZSTD_AHEAD`] decoded ahead of the reader.
@@ -1274,14 +1279,16 @@ mod tests {
     const TXZ: &[u8] = include_bytes!("../fixtures/archive/hello.tar.xz");
     const TZST: &[u8] = include_bytes!("../fixtures/archive/hello.tar.zst");
     const TZST_FRAMES: &[u8] = include_bytes!("../fixtures/archive/hello-frames.tar.zst");
+    const TZST_PZSTD: &[u8] = include_bytes!("../fixtures/archive/hello-pzstd.tar.zst");
 
-    fn all() -> [(&'static str, Format, &'static [u8]); 5] {
+    fn all() -> [(&'static str, Format, &'static [u8]); 6] {
         [
             ("/tmp/hello.tar", Format::Tar, TAR),
             ("/tmp/hello.tar.gz", Format::TarGz, TGZ),
             ("/tmp/hello.tar.xz", Format::TarXz, TXZ),
             ("/tmp/hello.tar.zst", Format::TarZst, TZST),
             ("/tmp/hello-frames.tar.zst", Format::TarZst, TZST_FRAMES),
+            ("/tmp/hello-pzstd.tar.zst", Format::TarZst, TZST_PZSTD),
         ]
     }
 
@@ -1351,6 +1358,17 @@ mod tests {
         assert_eq!(detect_format(TXZ), Ok(Format::TarXz));
         assert_eq!(detect_format(TZST), Ok(Format::TarZst));
         assert_eq!(detect_format(TZST_FRAMES), Ok(Format::TarZst));
+        // `pzstd` starts with a skippable frame; every skippable magic is
+        // one, and a neighbour of them is not.
+        assert_eq!(detect_format(TZST_PZSTD), Ok(Format::TarZst));
+        for low in [0x50, 0x5f] {
+            assert_eq!(
+                detect_format(&[low, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]),
+                Ok(Format::TarZst)
+            );
+        }
+        assert!(detect_format(&[0x60, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]).is_err());
+        assert!(detect_format(&[0x50, 0x2a, 0x4d]).is_err());
         assert!(
             detect_format(b"PK\x03\x04rest")
                 .unwrap_err()
@@ -2945,6 +2963,21 @@ mod tests {
         ] {
             let (fake, _, _) = extract(&archive);
             assert_eq!(tree(&fake), want);
+        }
+        // A skippable frame first, as `pzstd` writes, and nothing but
+        // skippable frames: the second is no empty archive but a stream
+        // with no tar in it, refused as such.
+        let (fake, _, _) = extract(&[skippable(b"pzstd"), zst(&tar)].concat());
+        assert_eq!(tree(&fake), want);
+        for lone in [
+            skippable(b"alone"),
+            [skippable(b""), skippable(&[1; 9])].concat(),
+        ] {
+            let err = check_err(&lone);
+            assert!(
+                err.contains("/tmp/a.tar: the tar.zst stream does not contain a tar archive"),
+                "{err}"
+            );
         }
         // A skippable frame cut short is refused, naming what is wrong.
         let cut = [zst(&tar), skippable(&[7; 300])].concat();

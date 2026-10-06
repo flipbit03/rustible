@@ -21,6 +21,10 @@ printf 'P*M\030\010\000\000\000rustible' > skip
 cat a.zst skip b.zst > hello-frames.tar.zst
 ```
 
+`hello-pzstd.tar.zst` is the same tar as `pzstd` 1.5.5 writes it, a
+skippable frame ahead of the zstd frame, which detection must take as
+zstd: `pzstd -q -19 -p 1 -c hello.tar > hello-pzstd.tar.zst`.
+
 ## `pax-sparse-*.tar` and `gnu-sparse.tar`
 
 One sparse file in each of GNU tar's three pax sparse formats, which
