@@ -255,7 +255,9 @@ pub struct ExtractReport {
 /// - sits under an earlier symlink member (a write through it would land
 ///   elsewhere);
 /// - is a hard link to something not extracted before it;
-/// - is a device, fifo or other special file.
+/// - is a device, fifo or other special file;
+/// - is a pax sparse member (GNU tar's `--format=posix -S`), which it cannot
+///   expand. An old-GNU sparse member (`--format=gnu -S`) extracts.
 ///
 /// It also refuses when `dest` is missing (vision 6.7: create it with
 /// [`crate::file::Directory`]) or not a directory, when a member's path is
@@ -269,8 +271,9 @@ pub struct ExtractReport {
 /// data from the archive once more (an archive changed since `check` is
 /// refused at the first member that differs), through `sys`: files with
 /// `write_atomic` and the archive's permission
-/// bits, directories with `mkdir_all`, symlinks replaced if present, hard
-/// links as copies of the already-extracted file. Ownership from the
+/// bits, directories with `mkdir_all`, symlinks made under a temporary name
+/// beside their path and renamed over whatever is there, hard links as
+/// copies of the already-extracted file. Ownership from the
 /// archive is ignored; `.owner(uid, gid)` sets one owner on every file and
 /// directory (not on symlinks). Modification times are not restored.
 ///
@@ -286,7 +289,9 @@ pub struct ExtractReport {
 /// written; this is for release tarballs, not backups. Under
 /// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
 /// helper in one frame of just under 48 MiB, so the archive and each
-/// member are limited to that size there.
+/// member are limited to that size there. A sparse member's holes are
+/// written as data, not kept as holes, so it takes its full real size on
+/// disk (and in memory while it is written).
 /// Files already in `dest` that the archive does not mention are left
 /// alone.
 #[derive(Debug, Clone)]
@@ -478,13 +483,16 @@ impl Extracted {
                 // The capacity is a hint from the archive's header, as
                 // `check` walked it. A base-256 `size` of 2^62 would ask for
                 // an allocation the process cannot survive (Rust aborts on
-                // allocation failure). `check` already refuses a member
-                // whose claim the stream cannot back, so through `apply`
-                // the size is bounded by the archive `check` read; the clamp
-                // stays as the guard that does not depend on that, pinned by
-                // `write_member_clamps_the_capacity_hint`. Reserve a small
-                // floor and let `read_to_end` grow it against the real
-                // stream.
+                // allocation failure). `check` reads no member data, so
+                // nothing bounds the size here: a plain member whose claim
+                // the stream cannot back is refused at `check`, but a GNU
+                // sparse member's real size comes from its sparse map, and
+                // its reader fills the holes with zeros up to that size
+                // whatever the archive holds. So the clamp is the guard,
+                // pinned by `write_member_clamps_the_capacity_hint`: reserve
+                // a small floor and let `read_to_end` grow it against the
+                // real stream. The whole member is still buffered, holes
+                // included; streaming it is #88.
                 let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
                 let mut bytes = Vec::with_capacity(hint);
                 data.read_to_end(&mut bytes)
@@ -521,10 +529,18 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                if sys.stat(&full)?.is_some() {
-                    sys.remove(&full)?;
+                // Made beside `full` under a temporary name and renamed over
+                // it, so whatever was at `full` stays there until the new link
+                // replaces it: a failed `symlink` leaves it as it was, and a
+                // failed `rename` takes the temporary link away again.
+                let mut tmp = full.clone().into_os_string();
+                tmp.push(format!(".rustible-tmp-{}", std::process::id()));
+                let tmp = PathBuf::from(tmp);
+                sys.symlink(target, &tmp)?;
+                if let Err(e) = sys.rename(&tmp, &full) {
+                    let _ = sys.remove(&tmp);
+                    return Err(e);
                 }
-                sys.symlink(target, &full)?;
                 // `set_mode` and `set_owner` follow links; neither is
                 // applied to a symlink member.
                 chown = false;
@@ -617,6 +633,35 @@ fn kind_label(kind: &Kind) -> &'static str {
     }
 }
 
+/// The name to show for `entry` when it is a pax sparse member, `None` for
+/// any other. GNU tar's `--format=posix -S` writes one in three formats
+/// (0.0, 0.1, 1.0), each marked by `GNU.sparse.*` records, and `tar`
+/// expands none of them: 0.0 lands at the right path with its holes
+/// squeezed out, 0.1 and 1.0 under `GNUSparseFile.<pid>/`, and 1.0 with the
+/// sparse map as text ahead of the data. 0.1 and 1.0 put a placeholder in
+/// the header and the real name in a `GNU.sparse.name` record, so that
+/// record is the name when there is one, and `raw`, the member's path,
+/// otherwise.
+fn pax_sparse_name<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Option<String>> {
+    let context = || format!("member `{}`: reading its pax records", raw.display());
+    let Some(records) = entry.pax_extensions().with_context(context)? else {
+        return Ok(None);
+    };
+    let mut sparse = false;
+    let mut name = None;
+    for record in records {
+        let record = record.with_context(context)?;
+        let key = record.key_bytes();
+        if key.starts_with(b"GNU.sparse.") {
+            sparse = true;
+            if key == b"GNU.sparse.name" {
+                name = Some(String::from_utf8_lossy(record.value_bytes()).into_owned());
+            }
+        }
+    }
+    Ok(sparse.then(|| name.unwrap_or_else(|| raw.display().to_string())))
+}
+
 /// Walk every member in order, validating paths and link targets, without
 /// reading any data. Errors name the member.
 fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<PlannedEntry>> {
@@ -629,11 +674,17 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
     let mut claimed: std::collections::BTreeMap<PathBuf, &'static str> =
         std::collections::BTreeMap::new();
     for entry in archive.entries().context("reading tar members")? {
-        let entry = entry.context("reading tar member")?;
+        let mut entry = entry.context("reading tar member")?;
         let raw = entry
             .path()
             .context("a member has a path that is not valid UTF-8")?
             .into_owned();
+        if let Some(name) = pax_sparse_name(&mut entry, &raw)? {
+            bail!(
+                "`{name}` is a pax sparse member, which `archive::Extracted` cannot expand; \
+                 recreate the archive with `--format=gnu`, or without `-S`"
+            );
+        }
         let normalised = validate_entry_path(&raw).map_err(Error::msg)?;
         let Some(path) = strip_components(&normalised, strip) else {
             out.push(PlannedEntry { raw, member: None });
@@ -914,7 +965,7 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::Fake;
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -1668,11 +1719,214 @@ mod tests {
         assert_eq!(fake.file("/opt/sparse").unwrap().bytes, want);
     }
 
+    // `fixtures/archive/pax-sparse-*.tar` and `gnu-sparse.tar`: one sparse
+    // file, `sparse`, in GNU tar's three pax sparse formats and as an
+    // old-GNU sparse member. 65536 bytes, `hello, sparse\n` at 32768 in a
+    // 4096-byte data block, holes around it. The README beside them has
+    // the commands.
+    const PAX_SPARSE: [(&str, &[u8]); 3] = [
+        (
+            "0.0",
+            include_bytes!("../fixtures/archive/pax-sparse-0.0.tar"),
+        ),
+        (
+            "0.1",
+            include_bytes!("../fixtures/archive/pax-sparse-0.1.tar"),
+        ),
+        (
+            "1.0",
+            include_bytes!("../fixtures/archive/pax-sparse-1.0.tar"),
+        ),
+    ];
+    const GNU_SPARSE: &[u8] = include_bytes!("../fixtures/archive/gnu-sparse.tar");
+
+    /// `tar` cannot expand a pax sparse member, and what it does instead is
+    /// silent: 0.0 lands at the right path with the holes squeezed out,
+    /// 0.1 and 1.0 under `GNUSparseFile.<pid>/`. Each is refused by
+    /// `check`, under `--check` too, naming the member by its real name and
+    /// not the header's `GNUSparseFile.<pid>/sparse` placeholder.
+    #[test]
+    fn pax_sparse_members_are_refused_at_check_naming_the_member() {
+        for (version, archive) in PAX_SPARSE {
+            let (fake, sys) = sys_with(archive);
+            for sys in [sys.clone(), sys.with_check_mode(true)] {
+                let err = Extracted::from_path("/tmp/a.tar")
+                    .to("/opt")
+                    .check(&sys)
+                    .unwrap_err()
+                    .chain();
+                assert!(
+                    err.contains(
+                        "/tmp/a.tar: refusing to extract: `sparse` is a pax sparse member, which \
+                         `archive::Extracted` cannot expand; recreate the archive with \
+                         `--format=gnu`, or without `-S`"
+                    ),
+                    "pax sparse {version}: {err}"
+                );
+            }
+            assert_eq!(sys_read_dir(&fake), Vec::<PathBuf>::new());
+        }
+    }
+
+    /// The same file as GNU tar writes it with `--format=gnu -S`, a type `S`
+    /// member, extracts in full: the holes come back as zeros.
+    #[test]
+    fn a_gnu_tar_old_gnu_sparse_member_extracts() {
+        let (fake, sys) = sys_with(GNU_SPARSE);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        assert_eq!(
+            c.diff().short(),
+            "extract /tmp/a.tar (tar: 1 files, 0 dirs, 0 symlinks, 65536 bytes) into /opt"
+        );
+        op.apply(&sys, c).unwrap();
+        let mut want = vec![0u8; 65536];
+        want[32768..32782].copy_from_slice(b"hello, sparse\n");
+        let got = fake.file("/opt/sparse").unwrap();
+        assert_eq!((got.mode, got.bytes == want), (0o644, true));
+    }
+
+    /// What `/opt` holds, read through the `Fake` itself.
+    fn sys_read_dir(fake: &Arc<Fake>) -> Vec<PathBuf> {
+        fake_sys(fake).read_dir("/opt").unwrap()
+    }
+
+    /// A `Fake` whose `symlink` or `rename` fails, as a full disk or a
+    /// read-only mount would. The `Fake` cannot fail either, so this wraps
+    /// it through [`System::new`]; everything else passes through.
+    struct Failing {
+        fake: Arc<Fake>,
+        symlink: bool,
+        rename: bool,
+    }
+
+    impl Failing {
+        fn sys(fake: &Arc<Fake>, symlink: bool, rename: bool) -> System {
+            let facts = fake_sys(fake).facts().clone();
+            let backend = Arc::new(Failing {
+                fake: fake.clone(),
+                symlink,
+                rename,
+            });
+            System::new(backend, facts, false, Arc::new(Collect::default()))
+        }
+
+        fn refused(what: &str, p: &Path) -> std::io::Error {
+            std::io::Error::other(format!("{what} {}: refused (test)", p.display()))
+        }
+    }
+
+    impl Backend for Failing {
+        fn read(&self, p: &Path) -> std::io::Result<Vec<u8>> {
+            self.fake.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            self.fake.write(p, bytes)
+        }
+        fn stat(&self, p: &Path) -> std::io::Result<Option<Stat>> {
+            self.fake.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> std::io::Result<Option<Stat>> {
+            self.fake.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> std::io::Result<()> {
+            self.fake.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> std::io::Result<()> {
+            self.fake.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> std::io::Result<()> {
+            self.fake.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.rename {
+                return Err(Self::refused("rename", to));
+            }
+            self.fake.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> std::io::Result<()> {
+            self.fake.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+            self.fake.set_owner(p, uid, gid)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.fake.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> std::io::Result<()> {
+            if self.symlink {
+                return Err(Self::refused("symlink", link));
+            }
+            self.fake.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> std::io::Result<PathBuf> {
+            self.fake.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.fake.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> std::io::Result<Output> {
+            self.fake.spawn(spec)
+        }
+    }
+
+    /// A symlink member is made under a temporary name and renamed over its
+    /// path, so the entry already there, a link or a file, is replaced
+    /// whole or not at all: a failed `symlink` leaves it untouched, and a
+    /// failed `rename` takes the temporary link away and leaves it too.
+    /// Removing the old entry first, as `apply` once did, loses it on
+    /// either failure.
+    #[test]
+    fn a_symlink_member_replaces_the_entry_there_whole_or_not_at_all() {
+        let archive = raw_tar(&[("link", b'2', b"", "new")]);
+        let planted = |old: &str| {
+            let fake = Fake::new()
+                .with_dir("/opt")
+                .with_file("/tmp/a.tar", &archive);
+            Arc::new(match old {
+                "symlink" => fake.with_symlink("/opt/link", "old"),
+                _ => fake.with_file("/opt/link", "old contents"),
+            })
+        };
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        for old in ["symlink", "file"] {
+            for (symlink, rename, refused) in [(true, false, "symlink"), (false, true, "rename")] {
+                let fake = planted(old);
+                let before = fake.file("/opt/link").unwrap();
+                let sys = Failing::sys(&fake, symlink, rename);
+                let c = expect_change(&op, &sys);
+                let err = op.apply(&sys, c).unwrap_err().chain();
+                assert!(err.contains(&format!("{refused} ")), "{err}");
+                assert!(err.contains("refused (test)"), "{err}");
+                let after = fake.file("/opt/link").unwrap();
+                assert_eq!(
+                    (after.kind, after.bytes),
+                    (before.kind, before.bytes),
+                    "{old} after a failed {refused}"
+                );
+                assert_eq!(
+                    sys_read_dir(&fake),
+                    vec![PathBuf::from("/opt/link")],
+                    "no temporary link left behind after a failed {refused}"
+                );
+            }
+            // Nothing failing: the link replaces the entry, and only the
+            // link is left.
+            let fake = planted(old);
+            let sys = fake_sys(&fake);
+            let c = expect_change(&op, &sys);
+            op.apply(&sys, c).unwrap();
+            assert_eq!(sys.read_link("/opt/link").unwrap(), PathBuf::from("new"));
+            assert_eq!(sys_read_dir(&fake), vec![PathBuf::from("/opt/link")]);
+        }
+    }
+
     /// The reservation `write_member` makes from a member's size is clamped,
-    /// whatever the size says. Through `apply` the size is bounded by what
-    /// `check` read, so this calls `write_member` directly with a claim of
-    /// 2^62. Without the clamp this test does not fail, it aborts the whole
-    /// test binary (Rust aborts on allocation failure).
+    /// whatever the size says. Through `apply` only a GNU sparse member can
+    /// carry a size its stream does not back, so this calls `write_member`
+    /// directly with a claim of 2^62. Without the clamp this test does not
+    /// fail, it aborts the whole test binary (Rust aborts on allocation
+    /// failure).
     #[test]
     fn write_member_clamps_the_capacity_hint() {
         let (fake, sys) = sys_with(&raw_tar(&[]));
