@@ -8,6 +8,11 @@
 //! bytes, never from its name, so `release.tgz` and `blob.bin` work alike
 //! and a mislabelled file is refused rather than misread.
 //!
+//! The archive is read and its members are written a chunk at a time, so
+//! an archive or a member of any size is extracted in a few MiB of memory,
+//! whatever the format and whether or not the step is escalated
+//! ([`Extracted`] has the details under **Memory**).
+//!
 //! An archive that is not a plain tarball (a URL, a zip) is somebody
 //! else's job: fetch with [`crate::http::Download`] first (vision 6.7).
 
@@ -15,16 +20,10 @@ use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
-use rustible_sdk::backend::FileKind;
+use rustible_sdk::backend::{FileKind, WriteAttrs};
 use rustible_sdk::prelude::*;
 
 use crate::file::{Owner, set_mode_and_owner};
-
-/// Ceiling on the buffer capacity reserved from a tar header's `size`
-/// field before a member is read. The field is attacker-controlled and
-/// unbounded, so it is a hint, not an allocation: `read_to_end` grows the
-/// buffer against the real stream from here.
-const READ_CAPACITY_CEILING: u64 = 1 << 20;
 
 /// A supported archive format, as detected from the first bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,10 +37,14 @@ pub enum Format {
     TarGz,
     /// xz (magic `fd 37 7a 58 5a 00`), read with `lzma-rust2`.
     TarXz,
-    /// zstd (magic `28 b5 2f fd`), read frame by frame with `ruzstd` so the
-    /// several frames `pzstd` and `zstd --rsyncable` write are all decoded
-    /// and their content checksums verified. The only format whose
-    /// decompressed stream is also held in memory in full.
+    /// zstd (magic `28 b5 2f fd`, or a skippable frame's), read frame by
+    /// frame with `ruzstd` so the several frames `pzstd` writes, each after
+    /// a skippable frame, or `cat` of several `.zst` files, are all decoded,
+    /// skippable frames are skipped,
+    /// and each frame's content checksum is verified when it has been read
+    /// to its end. Decoded as it is read, like the others: memory is the
+    /// frame's window, which the compressor chose (8 MiB at `zstd -19`;
+    /// `ruzstd` refuses a window over 100 MiB), plus 1 MiB decoded ahead.
     TarZst,
 }
 
@@ -163,7 +166,7 @@ pub fn validate_link_target(link: &Path, target: &Path) -> std::result::Result<(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     /// A regular file, which for tar also covers the contiguous and GNU
-    /// sparse entry types. `apply` writes it with `write_atomic`.
+    /// sparse entry types. `apply` streams it with `write_from`.
     File,
     /// A directory the archive names in its own right. `apply` creates it and
     /// any missing parent with `mkdir_all`.
@@ -187,8 +190,9 @@ pub struct Member {
     /// Content length as the archive declares it (the header's `size`,
     /// overridden by a pax `size` record or a GNU sparse map's real size),
     /// `0` for directories, symlinks and hard links. Attacker-controlled and
-    /// unverified, so it is only ever a capacity hint, capped at 1 MiB
-    /// before the real stream is read.
+    /// unverified, so it is only counted in the report: nothing is reserved
+    /// from it, and `apply` checks the stream against the length the
+    /// archive declares where it reads the member.
     pub size: u64,
 }
 
@@ -270,31 +274,49 @@ pub struct ExtractReport {
 ///
 /// **What `apply` does.** Writes each member `check` planned, reading its
 /// data from the archive once more (an archive changed since `check` is
-/// refused at the first member that differs), through `sys`: files with
-/// `write_atomic` and the archive's permission
-/// bits, directories with `mkdir_all`, symlinks made under a temporary name
+/// refused at the first member that differs), through `sys`: files
+/// streamed with `write_from` and the archive's permission bits,
+/// directories with `mkdir_all`, symlinks made under a temporary name
 /// beside their path and renamed over the file or link already there (a
 /// directory there is refused at `check`), hard links as copies of the
-/// already-extracted file. Ownership from the
+/// already-extracted file, streamed the same way. Ownership from the
 /// archive is ignored; `.owner(uid, gid)` sets one owner on every file and
 /// directory (not on symlinks). Modification times are not restored.
 ///
-/// A file member is read in full before anything is created for it. One
-/// whose data falls short of the length the archive declares for it (the
-/// archive was truncated or replaced since `check`) fails the step with
-/// nothing written at its path and no parent directory created for it, and
-/// a file already there is left as it was. Members extracted before it in
-/// the same run stay; the step is not rolled back.
+/// **Mode and owner before the rename.** A file member is staged beside
+/// its path, given its mode and the `.owner(..)` there, and only then
+/// renamed into place, so its content is never readable at a wider mode
+/// than the archive gives it, nor setuid under another owner, even for a
+/// moment. An owner the identity cannot give (no root) fails the step with
+/// nothing at that member's path. A directory gets its mode and owner once
+/// made.
 ///
-/// **Limits.** The compressed archive is held in memory (zstd: the
-/// decompressed stream too), and so is each file member's data while it is
-/// written; this is for release tarballs, not backups. Under
-/// `ctx.as_root()` or `ctx.as_user(..)` reads and writes cross the helper
-/// in chunks, so no other size limit applies there. A sparse member's
-/// holes are written as data, not kept as holes, so it takes its full real
-/// size on disk (and in memory while it is written).
-/// Files already in `dest` that the archive does not mention are left
-/// alone.
+/// **Atomicity: each member, not the archive.** A file member is written
+/// whole or not at all: one whose data ends before the length the archive
+/// declares for it (the archive was truncated or replaced since `check`),
+/// or whose compressed stream is corrupt, fails the step with nothing
+/// written at its path, no parent directory left that was made for it, and
+/// a file already there as it was. Members extracted before it in the same
+/// run stay; the step is not rolled back, as with GNU tar and Ansible's
+/// `unarchive`. The next run extracts the whole archive again, unless the
+/// `.creates` marker is among the members already written, so make the
+/// marker a member the archive lists last, or a path outside it.
+///
+/// **Memory.** Constant, about one chunk plus the decoder's state, for a
+/// plain tar and for gzip, xz and zstd alike, escalated or not: the archive
+/// is read a chunk at a time and each member is streamed to disk, never
+/// held whole. zstd's state is the frame's window (8 MiB at `zstd -19`;
+/// frames asking for over 100 MiB are refused), xz's its dictionary.
+///
+/// **Escalation.** Under `ctx.as_root()` or `ctx.as_user(..)` the archive is
+/// read, and its members are written, through that identity's one helper,
+/// interleaved a chunk at a time, so no size limit applies there either.
+///
+/// **Limits.** A sparse member's holes are written as data, not kept as
+/// holes, so it takes its full real size on disk; an old-GNU sparse member
+/// (`--format=gnu -S`) extracts that way, and a pax sparse one is refused
+/// at `check` (above). Files already in `dest` that the archive does not
+/// mention are left alone.
 #[derive(Debug, Clone)]
 pub struct Extracted {
     src: PathBuf,
@@ -348,27 +370,26 @@ impl Extracted {
         })
     }
 
-    fn open(&self, sys: &System) -> Result<(Format, tar::Archive<Box<dyn Read>>)> {
-        let bytes = sys
-            .read(&self.src)
+    /// The archive's tar stream, read through `sys` a few chunks at a time:
+    /// the first block is read to detect the format, then handed to the
+    /// decoder ahead of the rest of the file, so nothing is read twice and
+    /// nothing is held whole.
+    fn open<'s>(&self, sys: &'s System) -> Result<(Format, tar::Archive<Box<dyn Read + 's>>)> {
+        let mut file = sys
+            .open_read(&self.src)
             .with_context(|| format!("reading archive {}", self.src.display()))?;
-        let format = detect_format(&bytes)
-            .map_err(|e| Error::msg(format!("{}: {e}", self.src.display())))?;
-        let mut reader = decompress(format, bytes)
-            .with_context(|| format!("{}: decompressing", self.src.display()))?;
+        let head = read_head(&mut file)
+            .with_context(|| format!("reading archive {}", self.src.display()))?;
+        let format =
+            detect_format(&head).map_err(|e| Error::msg(format!("{}: {e}", self.src.display())))?;
+        let mut reader = decompress(format, Box::new(Cursor::new(head).chain(file)));
         if format != Format::Tar {
             // Look at the first block before handing over to `tar`, so a
             // gzipped text file gets a plain answer.
-            let mut head = vec![0u8; 512];
-            let mut n = 0;
-            while n < 512 {
-                match reader.read(&mut head[n..]) {
-                    Ok(0) => break,
-                    Ok(k) => n += k,
-                    Err(e) => bail!("{}: decompressing: {e}", self.src.display()),
-                }
-            }
-            head.truncate(n);
+            let head = match read_head(&mut reader) {
+                Ok(head) => head,
+                Err(e) => bail!("{}: decompressing: {e}", self.src.display()),
+            };
             if !is_tar_header(&head) {
                 bail!(
                     "{}: the {} stream does not contain a tar archive",
@@ -459,8 +480,9 @@ impl Extracted {
     /// Write one planned member. `data` is the member's stream from the
     /// archive and `declared` the length the archive gives it there (its
     /// header, a pax `size` record, or a sparse map's real size): a file
-    /// member is read in full and must come to exactly that length before
-    /// anything, its parent directories included, is created for it.
+    /// member is streamed into a staged file beside its path, which is
+    /// renamed over the path only once the stream has come to exactly that
+    /// length, so a member cut short writes nothing at its path.
     fn write_member(
         &self,
         sys: &System,
@@ -470,64 +492,70 @@ impl Extracted {
         data: &mut dyn Read,
     ) -> Result<()> {
         let full = dest.join(&m.path);
-        // Every arm below defers the mode and the owner to the tail, where
-        // `set_mode_and_owner` applies them in its order: for a file, the
-        // mode without setuid and setgid, the owner, then the full mode; for
-        // a directory, the full mode, the owner, then the full mode again
-        // when it carries either. Writing the mode inline would drop the
-        // setuid bit of a member extracted with `.owner(..)`, since
-        // `chown(2)` clears it.
-        let mut mode = Some(m.mode);
-        let mut chown = true;
+        // A file's mode and owner go to the staged file before the rename
+        // (decision 24 on #85), so its content is never readable wider than
+        // the member's mode, nor setuid under another owner, even for a
+        // moment. `write_from` sets them in `set_mode_and_owner`'s order.
+        let attrs = WriteAttrs {
+            mode: Some(m.mode),
+            owner: self.owner.map(|o| (o.uid, o.gid)),
+        };
         match &m.kind {
-            Kind::Dir => {
-                sys.mkdir_all(&full)?;
-            }
             Kind::File => {
-                // The capacity is a hint from the archive's header, as
-                // `check` walked it. A base-256 `size` of 2^62 would ask for
-                // an allocation the process cannot survive (Rust aborts on
-                // allocation failure). `check` reads no member data, so
-                // nothing bounds the size here: a plain member whose claim
-                // the stream cannot back is refused at `check`, but a GNU
-                // sparse member's real size comes from its sparse map, and
-                // its reader fills the holes with zeros up to that size
-                // whatever the archive holds. So the clamp is the guard,
-                // pinned by `write_member_clamps_the_capacity_hint`: reserve
-                // a small floor and let `read_to_end` grow it against the
-                // real stream. The whole member is still buffered, holes
-                // included; streaming it is #88.
-                let hint = m.size.min(READ_CAPACITY_CEILING) as usize;
-                let mut bytes = Vec::with_capacity(hint);
-                data.read_to_end(&mut bytes)
-                    .with_context(|| format!("reading member {}", m.path.display()))?;
-                // The member's reader stops where the archive does, without
-                // an error, so a stream that ends inside the member reads as
-                // a short file. Only the archive's own length for it says
-                // the data is all there; until it does, nothing is written.
-                // `write_atomic` then stages the bytes in a temporary file
-                // beside `full` and renames it over, so an existing file is
-                // replaced whole or not at all (issue #52).
-                ensure!(
-                    bytes.len() as u64 == declared,
-                    "member `{}` ends after {} of the {declared} bytes the archive declares for \
-                     it; the archive is truncated, or changed between check and apply, and \
-                     nothing was written at {}; run the step again once the archive is whole",
-                    m.path.display(),
-                    bytes.len(),
-                    full.display()
-                );
-                if let Some(parent) = full.parent() {
+                // The parents the archive implies for the member, made for
+                // the staged file and taken away again, if still empty, when
+                // the member is refused: a member that never lands leaves
+                // nothing behind (issue #52).
+                let made = self.missing_parents(sys, dest, &full)?;
+                if let Some(parent) = made.first() {
                     sys.mkdir_all(parent)?;
                 }
-                sys.write_atomic(&full, &bytes)?;
+                let mut member = Declared {
+                    data,
+                    declared,
+                    read: 0,
+                    short: false,
+                    failed: false,
+                };
+                let written = sys.write_from(&full, &mut member, Some(attrs));
+                if let Err(e) = written {
+                    for d in &made {
+                        let _ = sys.remove(d);
+                    }
+                    // The member's reader stops where the archive does,
+                    // without an error, so a stream that ends inside the
+                    // member reads as a short file. Only the archive's own
+                    // length for it says the data is all there; until it
+                    // does, the staged file is never renamed over `full`.
+                    ensure!(
+                        !member.short,
+                        "member `{}` ends after {} of the {declared} bytes the archive declares \
+                         for it; the archive is truncated, or changed between check and apply, \
+                         and nothing was written at {}; run the step again once the archive is \
+                         whole",
+                        m.path.display(),
+                        member.read,
+                        full.display()
+                    );
+                    if member.failed {
+                        return Err(e.context(format!("reading member {}", m.path.display())));
+                    }
+                    return Err(e);
+                }
+                return Ok(());
             }
             Kind::Hardlink(target) => {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                let bytes = sys.read(dest.join(target))?;
-                sys.write_atomic(&full, &bytes)?;
+                // A copy of the file extracted earlier, read and written a
+                // chunk at a time.
+                let src = sys.open_read(dest.join(target))?;
+                sys.write_from(&full, src, Some(attrs))?;
+                return Ok(());
+            }
+            Kind::Dir => {
+                sys.mkdir_all(&full)?;
             }
             Kind::Symlink(target) => {
                 if let Some(parent) = full.parent() {
@@ -558,12 +586,28 @@ impl Extracted {
                 })?;
                 // `set_mode` and `set_owner` follow links; neither is
                 // applied to a symlink member.
-                chown = false;
-                mode = None;
+                return Ok(());
             }
         }
-        let dir = matches!(m.kind, Kind::Dir);
-        set_mode_and_owner(sys, &full, dir, mode, self.owner.filter(|_| chown))
+        // A directory, made with `mkdir_all`: its full mode, its owner, then
+        // its full mode again when it carries setuid or setgid, which
+        // `chown` clears on a directory on macOS.
+        set_mode_and_owner(sys, &full, true, Some(m.mode), self.owner)
+    }
+
+    /// The directories between `dest` and `full` that do not exist yet,
+    /// deepest first: what `mkdir_all` of `full`'s parent would create.
+    fn missing_parents(&self, sys: &System, dest: &Path, full: &Path) -> Result<Vec<PathBuf>> {
+        let mut made = vec![];
+        let mut p = full.parent();
+        while let Some(dir) = p.filter(|d| d.starts_with(dest) && *d != dest) {
+            if sys.stat(dir)?.is_some() {
+                break;
+            }
+            made.push(dir.to_path_buf());
+            p = dir.parent();
+        }
+        Ok(made)
     }
 }
 
@@ -580,57 +624,158 @@ impl ExtractedBuilder {
     }
 }
 
-/// A reader of the tar stream inside `bytes`.
-fn decompress(format: Format, bytes: Vec<u8>) -> Result<Box<dyn Read>> {
-    Ok(match format {
-        Format::Tar => Box::new(Cursor::new(bytes)),
-        Format::TarGz => Box::new(flate2::read::MultiGzDecoder::new(Cursor::new(bytes))),
-        Format::TarXz => Box::new(lzma_rust2::XzReader::new(Cursor::new(bytes), true)),
-        Format::TarZst => Box::new(Cursor::new(zstd_decompress_all(&bytes)?)),
-    })
+/// The first tar block of `r`, or all of it when it is shorter: what
+/// [`detect_format`] and the tar check after decompression look at.
+fn read_head(r: &mut dyn Read) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::with_capacity(BLOCK);
+    r.take(BLOCK as u64).read_to_end(&mut head)?;
+    Ok(head)
 }
 
-/// Every frame of a zstd file, skippable frames skipped, content checksums
-/// verified. `ruzstd`'s streaming reader stops at the first frame, and
-/// `pzstd` and `zstd --rsyncable` write several.
-fn zstd_decompress_all(mut input: &[u8]) -> Result<Vec<u8>> {
-    use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
-    use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+/// One tar block, and the most of an archive read to detect its format.
+const BLOCK: usize = 512;
 
-    let mut out = Vec::new();
-    let mut dec = FrameDecoder::new();
-    while !input.is_empty() {
-        match dec.init(&mut input) {
-            Ok(()) => {}
-            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
-                length,
-                ..
-            })) => {
-                input = input
-                    .get(length as usize..)
-                    .ok_or_else(|| Error::msg("zstd: truncated skippable frame"))?;
-                continue;
-            }
-            Err(e) => bail!("zstd: {e}"),
-        }
-        while !dec.is_finished() {
-            dec.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1 << 20))
-                .map_err(|e| Error::msg(format!("zstd: {e}")))?;
-            if let Some(chunk) = dec.collect() {
-                out.extend_from_slice(&chunk);
-            }
-        }
-        if let Some(chunk) = dec.collect() {
-            out.extend_from_slice(&chunk);
-        }
-        if let (Some(want), Some(got)) =
-            (dec.get_checksum_from_data(), dec.get_calculated_checksum())
-            && want != got
-        {
-            bail!("zstd: frame checksum mismatch (got {got:08x}, want {want:08x})");
+/// A reader of the tar stream inside `raw`, decompressing as it is read.
+fn decompress<'a>(format: Format, raw: Box<dyn Read + 'a>) -> Box<dyn Read + 'a> {
+    match format {
+        Format::Tar => raw,
+        Format::TarGz => Box::new(flate2::read::MultiGzDecoder::new(raw)),
+        Format::TarXz => Box::new(lzma_rust2::XzReader::new(raw, true)),
+        Format::TarZst => Box::new(Zstd::new(raw)),
+    }
+}
+
+/// How much a zstd frame is decoded ahead of what is read from it, beyond
+/// the window the frame keeps.
+const ZSTD_AHEAD: usize = 1 << 20;
+
+/// Every frame of a zstd stream, decoded as it is read: skippable frames
+/// skipped, each frame's content checksum verified once it is read to its
+/// end. `ruzstd`'s own `StreamingDecoder` stops at the end of the first
+/// frame, and `pzstd` writes several, as does `cat` of several `.zst`
+/// files. Holds the
+/// frame's window (what the compressor chose, 8 MiB at `zstd -19`; `ruzstd`
+/// refuses a frame asking for more than 100 MiB) plus up to
+/// [`ZSTD_AHEAD`] decoded ahead of the reader.
+struct Zstd<R: Read> {
+    src: std::io::BufReader<R>,
+    dec: ruzstd::decoding::FrameDecoder,
+    /// A frame was begun and not yet read to its end.
+    in_frame: bool,
+}
+
+impl<R: Read> Zstd<R> {
+    fn new(src: R) -> Self {
+        Zstd {
+            src: std::io::BufReader::new(src),
+            dec: ruzstd::decoding::FrameDecoder::new(),
+            in_frame: false,
         }
     }
-    Ok(out)
+}
+
+/// A zstd failure as the reader reports it, prefixed so the step's error
+/// says which decoder spoke.
+fn zstd_error(e: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!("zstd: {e}"))
+}
+
+impl<R: Read> Read for Zstd<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+
+        use ruzstd::decoding::BlockDecodingStrategy;
+        use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.in_frame {
+                if self.dec.can_collect() > 0 {
+                    let n = self.dec.read(buf)?;
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                }
+                if !self.dec.is_finished() {
+                    self.dec
+                        .decode_blocks(&mut self.src, BlockDecodingStrategy::UptoBytes(ZSTD_AHEAD))
+                        .map_err(zstd_error)?;
+                    continue;
+                }
+                // The frame is decoded and read to its end, so the checksum
+                // covers every byte it produced.
+                if let (Some(want), Some(got)) = (
+                    self.dec.get_checksum_from_data(),
+                    self.dec.get_calculated_checksum(),
+                ) && want != got
+                {
+                    return Err(zstd_error(format!(
+                        "frame checksum mismatch (got {got:08x}, want {want:08x})"
+                    )));
+                }
+                self.in_frame = false;
+            }
+            // Between frames: the end of the stream, a skippable frame, or
+            // the next frame.
+            if self.src.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            match self.dec.init(&mut self.src) {
+                Ok(()) => self.in_frame = true,
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                    length,
+                    ..
+                })) => {
+                    let skipped = std::io::copy(
+                        &mut (&mut self.src).take(u64::from(length)),
+                        &mut std::io::sink(),
+                    )?;
+                    if skipped != u64::from(length) {
+                        return Err(zstd_error("truncated skippable frame"));
+                    }
+                }
+                Err(e) => return Err(zstd_error(e)),
+            }
+        }
+    }
+}
+
+/// A file member's data as `write_from` reads it, which fails rather than
+/// end before the length the archive declares for the member: the
+/// member's own reader stops where the archive does, without an error, and
+/// an error is what keeps the staged file from being renamed into place.
+struct Declared<'a> {
+    data: &'a mut dyn Read,
+    declared: u64,
+    /// Bytes read so far.
+    read: u64,
+    /// The data ended before `declared`.
+    short: bool,
+    /// Reading the archive failed (a corrupt or cut compressed stream).
+    failed: bool,
+}
+
+impl Read for Declared<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = match self.data.read(buf) {
+            Ok(n) => n,
+            Err(e) => {
+                self.failed |= e.kind() != std::io::ErrorKind::Interrupted;
+                return Err(e);
+            }
+        };
+        if n == 0 && !buf.is_empty() && self.read < self.declared {
+            self.short = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the member ends before its declared length",
+            ));
+        }
+        self.read += n as u64;
+        Ok(n)
+    }
 }
 
 /// Sixteen hex digits nobody can predict, for a temporary name. Each
@@ -1054,7 +1199,7 @@ mod tests {
     use rustible_sdk::event::Collect;
 
     use super::*;
-    use crate::file::testing::{expect_change, fake_sys};
+    use crate::file::testing::{Set, expect_change, fake_sys, staged};
 
     /// `archive::Extracted` claims a mac — it is a pure-Rust extractor
     /// writing through `sys`, and the macOS spike unpacked a tarball the
@@ -1586,7 +1731,8 @@ mod tests {
     /// A setuid member extracted with `.owner(..)` keeps the bit, and never
     /// carries it under the wrong owner: the mode without setuid, the
     /// owner, then the full mode, because `chown` clears setuid (the `Fake`
-    /// models it). The full mode set only before the owner leaves 0755.
+    /// models it). All three land on the staged file before it is renamed
+    /// into place (decision 24 on #85), none on the member's path after.
     #[test]
     fn a_setuid_member_keeps_the_bit_under_owner() {
         let (fake, sys) = sys_with(&one_member_tar("tool", 0o4755));
@@ -1597,28 +1743,16 @@ mod tests {
         let f = fake.file("/opt/tool").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
         assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                AttrCall::Chmod {
-                    path: "/opt/tool".into(),
-                    mode: 0o755
-                },
-                AttrCall::Chown {
-                    path: "/opt/tool".into(),
-                    uid: 5,
-                    gid: 6
-                },
-                AttrCall::Chmod {
-                    path: "/opt/tool".into(),
-                    mode: 0o4755
-                },
-            ]
+            staged(&fake, planted, "/opt/tool"),
+            [Set::Mode(0o755), Set::Owner(5, 6), Set::Mode(0o4755)]
         );
     }
 
     /// Every member under `.owner(..)` gets its mode before its owner
     /// (issue #79), directories included, and a mode without setuid or
-    /// setgid gets no third call. Without `.owner(..)`, one `chmod` each.
+    /// setgid gets no third call. A file gets them on its staged file
+    /// before the rename, a directory on itself once made. Without
+    /// `.owner(..)`, one `chmod` each.
     #[test]
     fn members_get_their_mode_before_their_owner() {
         let archive = raw_tar(&[("d", b'5', b"", ""), ("d/f", b'0', b"x", "")]);
@@ -1627,26 +1761,23 @@ mod tests {
         let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
         let intent = expect_change(&op, &sys);
         op.apply(&sys, intent).unwrap();
-        let mode_then_owner = |path: &str, mode| {
+        assert_eq!(
+            fake.attr_calls()[planted..planted + 2],
             [
                 AttrCall::Chmod {
-                    path: path.into(),
-                    mode,
+                    path: "/opt/d".into(),
+                    mode: 0o755
                 },
                 AttrCall::Chown {
-                    path: path.into(),
+                    path: "/opt/d".into(),
                     uid: 5,
-                    gid: 6,
+                    gid: 6
                 },
             ]
-        };
+        );
         assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                mode_then_owner("/opt/d", 0o755),
-                mode_then_owner("/opt/d/f", 0o644)
-            ]
-            .concat()
+            staged(&fake, planted + 2, "/opt/d/f"),
+            [Set::Mode(0o644), Set::Owner(5, 6)]
         );
 
         let (fake, sys) = sys_with(&archive);
@@ -1655,18 +1786,13 @@ mod tests {
         let intent = expect_change(&op, &sys);
         op.apply(&sys, intent).unwrap();
         assert_eq!(
-            fake.attr_calls()[planted..],
-            [
-                AttrCall::Chmod {
-                    path: "/opt/d".into(),
-                    mode: 0o755
-                },
-                AttrCall::Chmod {
-                    path: "/opt/d/f".into(),
-                    mode: 0o644
-                },
-            ]
+            fake.attr_calls()[planted..planted + 1],
+            [AttrCall::Chmod {
+                path: "/opt/d".into(),
+                mode: 0o755
+            }]
         );
+        assert_eq!(staged(&fake, planted + 1, "/opt/d/f"), [Set::Mode(0o644)]);
     }
 
     /// A setgid directory member gets its full mode, its owner, then its
@@ -1716,22 +1842,32 @@ mod tests {
     }
 
     /// A member wanted at 0600 whose `chown` is refused, as for an identity
-    /// without `CAP_CHOWN`, fails the step with the member already 0600,
-    /// not at the 0644 it was written with (issue #79).
+    /// without `CAP_CHOWN`, fails the step with nothing at its path: the
+    /// mode and owner are set on the staged file, which is never renamed
+    /// into place (decision 24 on #85; before it, issue #79 left the file
+    /// written, at 0600). The mode came first, so the staged file was never
+    /// wider than the member's mode either.
     #[test]
-    fn a_refused_chown_leaves_a_member_at_its_own_mode() {
+    fn a_refused_chown_writes_nothing_at_the_members_path() {
         let fake = Arc::new(
             Fake::new()
+                .with_chown_refused()
                 .with_dir("/opt")
                 .with_file("/tmp/a.tar", one_member_tar("key", 0o600)),
         );
-        let sys = crate::file::testing::chown_refused_sys(&fake);
+        let sys = fake_sys(&fake);
+        let planted = fake.attr_calls().len();
         let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
         let intent = expect_change(&op, &sys);
         let err = op.apply(&sys, intent).unwrap_err().chain();
         assert!(err.contains("Operation not permitted"), "{err}");
-        let f = fake.file("/opt/key").unwrap();
-        assert_eq!((f.mode, f.uid, f.gid), (0o600, 0, 0));
+        assert!(fake.file("/opt/key").is_none());
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
+        // The refused `chown` is recorded too, after the mode.
+        assert_eq!(
+            staged(&fake, planted, "/opt/key"),
+            [Set::Mode(0o600), Set::Owner(5, 6)]
+        );
     }
 
     /// `apply` writes the members `check` walked and reads only their data
@@ -1805,9 +1941,7 @@ mod tests {
         // The member `check` planned is 1536 bytes, as many as the cut
         // stream still holds, so only the length the archive declares where
         // `apply` reads it (2^62) tells the read apart from a complete one;
-        // the planned size would pass it. That planned size is also what
-        // `write_member` reserves from, so this does not reach the clamp:
-        // `write_member_clamps_the_capacity_hint` does.
+        // the planned size would pass it.
         let (fake, sys) = sys_with(&raw_tar(&[("sub/f", b'0', &[b'p'; 1536], "")]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let c = expect_change(&op, &sys);
@@ -2362,14 +2496,14 @@ mod tests {
         assert_eq!(sys_read_dir(&fake), vec![full]);
     }
 
-    /// The reservation `write_member` makes from a member's size is clamped,
-    /// whatever the size says. Through `apply` only a GNU sparse member can
-    /// carry a size its stream does not back, so this calls `write_member`
-    /// directly with a claim of 2^62. Without the clamp this test does not
-    /// fail, it aborts the whole test binary (Rust aborts on allocation
-    /// failure).
+    /// A member's size from `check` is only counted in the report, never
+    /// reserved: a claim of 2^62 bytes (through `apply` only a GNU sparse
+    /// member can carry one its stream does not back) streams the two
+    /// bytes the archive declares where `apply` reads it. Reserving from
+    /// the claim, as `apply` once did, aborts the whole test binary (Rust
+    /// aborts on allocation failure).
     #[test]
-    fn write_member_clamps_the_capacity_hint() {
+    fn write_member_reserves_nothing_from_the_planned_size() {
         let (fake, sys) = sys_with(&raw_tar(&[]));
         let op = Extracted::from_path("/tmp/a.tar").to("/opt");
         let member = Member {

@@ -283,7 +283,8 @@ pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
 /// write until the mode is set. An op that writes new content with
 /// `System::write_from` and its `WriteAttrs` has no such time, because the
 /// staged file gets its mode and owner before the rename; `file::Copy` and
-/// `http::Download` do, and `archive::Extracted` moves to it in #88.
+/// `http::Download` do, and so does `archive::Extracted` for its file
+/// members. Its directory members still come here.
 pub(crate) fn set_mode_and_owner(
     sys: &System,
     path: &Path,
