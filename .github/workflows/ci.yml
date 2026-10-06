@@ -172,7 +172,10 @@ jobs:
       # (escalation through the runner's sudo, files as root, TLS from the
       # target); and `macbrew` (Homebrew, which the runner ships, as the
       # login user because brew refuses root) installing twice and then
-      # removing twice.
+      # removing twice. The first removal copies the keg to a second version,
+      # which `brew::Absent` must take too, and pins the formula, which it
+      # must refuse (the `recovered` 1) before the unpin; the second finds
+      # nothing installed and is `ok`.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
@@ -191,7 +194,7 @@ jobs:
           run mac | tee /dev/stderr | grep -Eq '^runner +4 +1 +0 +0 +0 +0 +0$'
           run macbrew -v
           run macbrew | tee /dev/stderr | grep -Eq '^runner +1 +0 +0 +0 +0 +0 +0$'
-          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +0 +1 +0 +0 +0 +0 +0$'
+          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +0 +4 +0 +0 +0 +1 +0$'
           run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +1 +0 +0 +0 +0 +0 +0$'
 
   harness:

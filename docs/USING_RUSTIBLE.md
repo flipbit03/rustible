@@ -1060,6 +1060,8 @@ ensure!(f.has_pm(&Pm::Apt), "{} has {:?}", f.hostname, f.package_managers);
 cannot use `brew::Present`/`Absent` directly: run it unescalated or use
 `ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
 It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
+`brew::Absent` removes every installed version of a formula, and refuses a
+pinned one, under `--check` too: `brew unpin` it first.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
 mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
