@@ -1,17 +1,23 @@
 //! File streaming over the channel (vision doc 5.6): the orchestrator-side
 //! half. `WorkspaceFiles` serves `FileRequest`s from the workspace root and
-//! writes `FetchChunk`s under it, denying anything that resolves outside; the
-//! `chunks` iterator splits any reader into `CHUNK_SIZE` pieces. The binary's
+//! resolves where `FetchChunk`s go under it, denying anything that resolves
+//! outside; `FetchStaging` writes them there, each file renamed into place
+//! on its last chunk; the `chunks` iterator splits any reader into
+//! `CHUNK_SIZE` pieces. The binary's
 //! half (`ctx.local_file`, `ctx.local_secret`, `ctx.fetch`) lives in `ctx`.
 //!
 //! This lives in the SDK rather than the CLI so a local run (no orchestrator)
 //! serves files through exactly the same rules, and so the rules have one
 //! set of tests.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeSet, HashMap};
+use std::fs::{File, Permissions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
+use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 pub use crate::protocol::CHUNK_SIZE;
@@ -251,30 +257,176 @@ impl WorkspaceFiles {
         }
         Ok(real_parent.join(name))
     }
+}
 
-    /// Write one fetched chunk. Offset 0 creates or truncates the file; later
-    /// chunks must arrive in order.
-    pub fn write_chunk(&self, dest: &str, offset: u64, bytes: &[u8]) -> Result<PathBuf, String> {
-        let path = self.resolve_dest(dest)?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(offset == 0)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let len = f
-            .metadata()
-            .map(|m| m.len())
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if offset != len {
+/// The temporary files of every fetch this process is part way through, so
+/// [`remove_unfinished_fetches`] can reach them when no destructor will run.
+fn unfinished() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    static UNFINISHED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    UNFINISHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Remove the temporary file of every fetch in this process that has not had
+/// its last chunk. Dropping a [`FetchStaging`] already does this for its
+/// own; this is for a process about to exit without running destructors (a
+/// second ctrl-c, `std::process::exit`), so none is left beside its
+/// destination.
+pub fn remove_unfinished_fetches() {
+    remove_unfinished_under(Path::new("/"));
+}
+
+/// [`remove_unfinished_fetches`] for the temporary files under `dir` only,
+/// so a test does not reach another's.
+fn remove_unfinished_under(dir: &Path) {
+    let mut unfinished = unfinished();
+    let ours: Vec<PathBuf> = unfinished
+        .iter()
+        .filter(|p| p.starts_with(dir))
+        .cloned()
+        .collect();
+    for tmp in ours {
+        unfinished.remove(&tmp);
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+/// The receiving half of `ctx.fetch`, for the orchestrator and for a local
+/// run alike: each fetch's chunks are written to a `.rustible-*` file beside
+/// its destination, which is renamed over the destination only when the
+/// chunk marked `last` arrives. The destination is therefore always either
+/// what it held before or the whole new file: a fetch that stops part way,
+/// because the target's read failed or the run ended, leaves it as it was.
+/// Dropping this removes the temporary file of every fetch still in it.
+#[derive(Default)]
+pub struct FetchStaging {
+    pending: HashMap<u32, Staged>,
+}
+
+/// One fetch in flight.
+struct Staged {
+    /// Where it lands, resolved inside the workspace.
+    path: PathBuf,
+    /// `.rustible-<random>` beside `path`, removed when dropped; `None` once
+    /// it has been renamed into place.
+    tmp: Option<NamedTempFile>,
+    /// Bytes written so far, which the next chunk's offset must equal.
+    written: u64,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        // The file itself goes with the `NamedTempFile`, dropped after this.
+        if let Some(tmp) = &self.tmp {
+            unfinished().remove(tmp.path());
+        }
+    }
+}
+
+impl FetchStaging {
+    /// Write one chunk of request `req` toward `dest`, a path relative to
+    /// `files`' root. The first chunk, at offset 0, resolves `dest` (refusing
+    /// one that is a directory or anything else but a file or a symlink,
+    /// before a byte is staged) and creates the temporary file beside it.
+    /// On `last` the file is synced and renamed over the destination, and
+    /// its path and size come back; until then, `None`. Any refusal or
+    /// failure drops the fetch, its temporary file with it, and says why.
+    pub fn chunk(
+        &mut self,
+        files: &WorkspaceFiles,
+        req: u32,
+        dest: &str,
+        offset: u64,
+        bytes: &[u8],
+        last: bool,
+    ) -> Result<Option<(PathBuf, u64)>, String> {
+        let mut staged = match self.pending.remove(&req) {
+            Some(s) => s,
+            None if offset == 0 => Self::begin(files, dest)?,
+            None => {
+                return Err(format!(
+                    "`{dest}`: chunk at offset {offset} but nothing received before it"
+                ));
+            }
+        };
+        if offset != staged.written {
             return Err(format!(
-                "`{dest}`: chunk at offset {offset} but file has {len} bytes"
+                "`{dest}`: chunk at offset {offset} but {} bytes received so far",
+                staged.written
             ));
         }
-        f.seek(SeekFrom::Start(offset))
-            .and_then(|_| f.write_all(bytes))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(path)
+        let Some(tmp) = staged.tmp.as_mut() else {
+            unreachable!("a pending fetch has its temporary file")
+        };
+        tmp.write_all(bytes)
+            .map_err(|e| format!("{}: {e}", tmp.path().display()))?;
+        staged.written += bytes.len() as u64;
+        if !last {
+            self.pending.insert(req, staged);
+            return Ok(None);
+        }
+        let Some(tmp) = staged.tmp.take() else {
+            unreachable!("a pending fetch has its temporary file")
+        };
+        // Out of the registry only once it has been renamed, or removed with
+        // the `PersistError` it fails with: an exit during the sync still
+        // finds it there.
+        let tmp_path = tmp.path().to_path_buf();
+        let landed = match tmp.as_file().sync_all() {
+            Err(e) => Err(format!("{}: {e}", tmp_path.display())),
+            Ok(()) => tmp
+                .persist(&staged.path)
+                .map(drop)
+                .map_err(|e| format!("{}: {}", staged.path.display(), e.error)),
+        };
+        unfinished().remove(&tmp_path);
+        landed?;
+        Ok(Some((staged.path.clone(), staged.written)))
+    }
+
+    /// A temporary file beside `dest`'s resolved path, with the mode of the
+    /// file it replaces, or 0666 less the umask for a new one, which is what
+    /// a fetched file was created with when chunks were written in place.
+    fn begin(files: &WorkspaceFiles, dest: &str) -> Result<Staged, String> {
+        let path = files.resolve_dest(dest)?;
+        let mode = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => Some(m.permissions().mode() & 0o777),
+            Ok(m) if m.file_type().is_symlink() => None,
+            Ok(m) => {
+                let what = if m.is_dir() {
+                    "a directory"
+                } else {
+                    "not a regular file"
+                };
+                return Err(format!(
+                    "`{dest}` is {what} in the workspace; a fetch only replaces a file, \
+                     so move it away or fetch to another path"
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let dir = path.parent().unwrap_or(files.root());
+        let tmp = tempfile::Builder::new()
+            .prefix(".rustible-")
+            // Created with the mode it will have, so a 0600 file is never
+            // staged readable; set again below, since the umask applies.
+            .permissions(Permissions::from_mode(mode.unwrap_or(0o666)))
+            .tempfile_in(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        unfinished().insert(tmp.path().to_path_buf());
+        let staged = Staged {
+            path,
+            tmp: Some(tmp),
+            written: 0,
+        };
+        if let (Some(mode), Some(tmp)) = (mode, &staged.tmp) {
+            tmp.as_file()
+                .set_permissions(Permissions::from_mode(mode))
+                .map_err(|e| format!("{}: {e}", tmp.path().display()))?;
+        }
+        Ok(staged)
     }
 }
 
@@ -417,20 +569,143 @@ mod tests {
             !outside.path().join("deep").exists(),
             "a refused fetch created directories outside the workspace"
         );
+    }
 
-        ws.write_chunk("out/host", 0, b"abc").unwrap();
-        ws.write_chunk("out/host", 3, b"def").unwrap();
+    /// Everything in `dir`, by name, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A fetch replaces its destination only on its last chunk: before it,
+    /// the old file is whole and the new content sits in a `.rustible-*`
+    /// file beside it; after it, the new file is whole and nothing is
+    /// beside it.
+    #[test]
+    fn a_complete_fetch_replaces_the_destination_on_its_last_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/f"), b"old").unwrap();
+        let files = WorkspaceFiles::new(dir.path()).unwrap();
+        let mut fetches = FetchStaging::default();
+
         assert_eq!(
-            std::fs::read(dir.path().join("out/host")).unwrap(),
-            b"abcdef"
+            fetches.chunk(&files, 1, "out/f", 0, b"new ", false),
+            Ok(None)
         );
+        assert_eq!(
+            fetches.chunk(&files, 1, "out/f", 4, b"cont", false),
+            Ok(None)
+        );
+        assert_eq!(std::fs::read(dir.path().join("out/f")).unwrap(), b"old");
+        let out = names(&dir.path().join("out"));
         assert!(
-            ws.write_chunk("out/host", 2, b"x")
-                .unwrap_err()
-                .contains("offset")
+            out.len() == 2 && out[0].starts_with(".rustible-") && out[1] == "f",
+            "{out:?}"
         );
-        // Offset 0 starts over.
-        ws.write_chunk("out/host", 0, b"z").unwrap();
-        assert_eq!(std::fs::read(dir.path().join("out/host")).unwrap(), b"z");
+
+        let (path, n) = fetches
+            .chunk(&files, 1, "out/f", 8, b"ent", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((path.file_name().unwrap(), n), ("f".as_ref(), 11));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        assert_eq!(names(&dir.path().join("out")), ["f"]);
+        assert!(fetches.pending.is_empty());
+        assert!(
+            !unfinished().iter().any(|p| p.starts_with(files.root())),
+            "a fetch that landed is out of the registry"
+        );
+    }
+
+    /// A fetch that never gets its last chunk leaves the destination as it
+    /// was, and its temporary file goes when the `FetchStaging` is dropped,
+    /// or, for a process that exits without dropping it, with
+    /// `remove_unfinished_fetches` (here limited to this test's directory,
+    /// since the tests share the process). One that never had a destination
+    /// leaves nothing at all.
+    #[test]
+    fn an_unfinished_fetch_leaves_the_destination_and_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/f"), b"old").unwrap();
+        let files = WorkspaceFiles::new(dir.path()).unwrap();
+        let mut fetches = FetchStaging::default();
+        fetches
+            .chunk(&files, 1, "out/f", 0, b"partial", false)
+            .unwrap();
+        fetches
+            .chunk(&files, 2, "out/g", 0, b"partial", false)
+            .unwrap();
+        assert_eq!(names(&dir.path().join("out")).len(), 3);
+        drop(fetches);
+        assert_eq!(names(&dir.path().join("out")), ["f"]);
+        assert_eq!(std::fs::read(dir.path().join("out/f")).unwrap(), b"old");
+
+        let mut fetches = FetchStaging::default();
+        fetches
+            .chunk(&files, 3, "out/g", 0, b"partial", false)
+            .unwrap();
+        remove_unfinished_under(files.root());
+        assert_eq!(names(&dir.path().join("out")), ["f"]);
+        std::mem::forget(fetches);
+    }
+
+    /// A chunk out of order is refused and ends its fetch, temporary file
+    /// and all; so is a first chunk that does not start at 0, a destination
+    /// outside the workspace, and, at the first chunk, before anything is
+    /// staged, a destination that is a directory.
+    #[test]
+    fn a_chunk_out_of_order_or_onto_a_directory_ends_its_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = WorkspaceFiles::new(dir.path()).unwrap();
+        let mut fetches = FetchStaging::default();
+        fetches.chunk(&files, 1, "f", 0, b"abc", false).unwrap();
+        let err = fetches.chunk(&files, 1, "f", 5, b"x", true).unwrap_err();
+        assert_eq!(err, "`f`: chunk at offset 5 but 3 bytes received so far");
+        assert_eq!(names(dir.path()), Vec::<String>::new());
+        let err = fetches.chunk(&files, 1, "f", 3, b"x", true).unwrap_err();
+        assert!(err.contains("nothing received before it"), "{err}");
+        let err = fetches.chunk(&files, 2, "../f", 0, b"x", true).unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let err = fetches.chunk(&files, 3, "d", 0, b"x", false).unwrap_err();
+        assert!(err.contains("`d` is a directory in the workspace"), "{err}");
+        assert_eq!(names(dir.path()), ["d"]);
+        assert!(fetches.pending.is_empty());
+    }
+
+    /// The new file keeps the mode of the one it replaces, as the file
+    /// written in place used to, and a symlink planted at the destination
+    /// is replaced, not written through.
+    #[test]
+    fn a_fetch_keeps_the_mode_of_the_file_it_replaces_and_replaces_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, b"old").unwrap();
+        std::fs::set_permissions(&f, Permissions::from_mode(0o640)).unwrap();
+        let files = WorkspaceFiles::new(dir.path()).unwrap();
+        let mut fetches = FetchStaging::default();
+        fetches.chunk(&files, 1, "f", 0, b"new", true).unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read(&f).unwrap(), b"new");
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        fetches
+            .chunk(&files, 2, "link", 0, b"fetched", true)
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        let link = dir.path().join("link");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_file());
+        assert_eq!(std::fs::read(&link).unwrap(), b"fetched");
     }
 }
