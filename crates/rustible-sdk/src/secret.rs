@@ -79,10 +79,29 @@ impl Secret {
         self.0.is_empty()
     }
 
-    /// Append bytes (used while a secret streams in chunk by chunk).
+    /// Append bytes (used while a secret streams in chunk by chunk). The
+    /// buffer is wiped when it grows, so no copy of the bytes so far is left
+    /// in a freed allocation.
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(bytes);
+        extend_wiping(&mut self.0, bytes);
     }
+}
+
+/// `buf.extend_from_slice(bytes)`, except that when `buf` has to grow, the
+/// larger buffer is allocated here, the bytes are copied into it, and the old
+/// one is zeroized before it is freed. `Vec`'s own growth reallocates and
+/// frees the old buffer as it was, which leaves every byte so far behind in
+/// freed memory; this is how a zeroizing buffer grows without doing that.
+/// Capacity at least doubles, so the copies stay amortised.
+pub(crate) fn extend_wiping(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let need = buf.len() + bytes.len();
+    if need > buf.capacity() {
+        let mut grown = Vec::with_capacity(need.max(buf.capacity() * 2));
+        grown.extend_from_slice(buf);
+        let mut old = std::mem::replace(buf, grown);
+        old.zeroize();
+    }
+    buf.extend_from_slice(bytes);
 }
 
 /// Explicit early wipe; the same happens on drop.
@@ -146,6 +165,36 @@ mod tests {
         secret.zeroize();
         assert!(secret.as_bytes().iter().all(|&b| b == 0));
         assert_eq!(secret.len(), 0, "zeroize also truncates");
+    }
+
+    /// Growing goes through `extend_wiping`: the content is whole, and the
+    /// buffer was replaced by one this function allocated (capacity at
+    /// least doubles), not reallocated by `Vec`, whose old buffer would be
+    /// freed unwiped. That the old buffer is wiped before it is freed is the
+    /// code above; reading freed memory to check it would be undefined
+    /// behaviour.
+    #[test]
+    fn a_secret_grows_by_replacing_its_buffer() {
+        let mut secret = Secret::new(Vec::with_capacity(4));
+        let mut want = Vec::new();
+        for i in 0..100u8 {
+            let chunk = [i; 7];
+            let before = secret.0.capacity();
+            secret.push(&chunk);
+            want.extend_from_slice(&chunk);
+            let after = secret.0.capacity();
+            assert!(
+                after == before || after >= 2 * before,
+                "{before} -> {after}"
+            );
+        }
+        assert_eq!(secret.as_bytes(), want.as_slice());
+
+        let mut buf = vec![1, 2];
+        buf.shrink_to_fit();
+        extend_wiping(&mut buf, &[3, 4, 5]);
+        assert_eq!(buf, [1, 2, 3, 4, 5]);
+        assert!(buf.capacity() >= 5);
     }
 
     #[test]

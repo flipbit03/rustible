@@ -392,7 +392,10 @@ impl Backend for Local {
         // Feed stdin from a thread while the parent drains stdout/stderr: a
         // child that writes more than a pipe buffer before reading its input
         // would otherwise deadlock against our blocking write.
+        // The copy the thread owns is wiped when it is done: stdin may carry
+        // a secret (a password piped to `chpasswd`).
         let feeder = spec.stdin.clone().map(|input| {
+            let input = zeroize::Zeroizing::new(input);
             let mut stdin = child.stdin.take().expect("piped stdin");
             std::thread::spawn(move || {
                 // EPIPE (the child exited without reading) is not an error
