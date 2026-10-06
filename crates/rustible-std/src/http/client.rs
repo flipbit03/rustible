@@ -225,15 +225,18 @@ impl Incoming {
     }
 
     /// The body as it arrives, for a caller that streams it rather than
-    /// holding it. With a limit, a `Content-Length` above it fails here,
-    /// before the body is read, and a body without one, or one that lies,
-    /// fails as soon as a read passes it. Without one, a body is as large as
-    /// the server sends.
+    /// holding it; empty for an answer that has none (to a `HEAD`, or a
+    /// `1xx`, `204` or `304`). With a limit, a `Content-Length` above it
+    /// fails here, before the body is read, and a body without one, or one
+    /// that lies, fails as soon as a read passes it. Without one, a body is
+    /// as large as the server sends.
     pub(crate) fn body(self, max_bytes: Option<u64>) -> std::result::Result<Body, ReadError> {
         let what = self.what;
-        // A `HEAD` answer's `Content-Length` is the size of a body it does
-        // not send.
-        if !self.head
+        // An answer that has no body may still carry a `Content-Length`:
+        // a `HEAD`'s, a `304`'s and a `204`'s is the size of a body they do
+        // not send (RFC 9110 section 8.6).
+        let bodiless = self.head || matches!(self.status, 100..=199 | 204 | 304);
+        if !bodiless
             && let Some(max_bytes) = max_bytes
             && let Some(len) = self
                 .resp
@@ -248,7 +251,7 @@ impl Incoming {
             )));
         }
         Ok(Body {
-            reader: (!self.head).then(|| self.resp.into_body().into_reader()),
+            reader: (!bodiless).then(|| self.resp.into_body().into_reader()),
             what,
             max_bytes,
             read: 0,

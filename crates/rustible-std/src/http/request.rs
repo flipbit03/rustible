@@ -2360,12 +2360,36 @@ mod tests {
             "{e}"
         );
         assert!(!e.contains(".max_bytes()"), "{e}");
-        // A `HEAD` answer declares the size of a body it does not send.
+        // A `HEAD` answer declares the size of a body it does not send, and
+        // so may a `304` or a `204` (RFC 9110 section 8.6): no body to read
+        // is no body over the limit.
         let r = Request::head(server.url("/big"))
             .max_bytes(100)
             .send()
             .unwrap();
         assert!(r.body.is_empty());
+        let s = serve(vec![
+            (
+                "/not-modified",
+                304,
+                vec![("X-Declare-Length", "4096".into())],
+                vec![],
+            ),
+            (
+                "/no-content",
+                204,
+                vec![("X-Declare-Length", "4096".into())],
+                vec![],
+            ),
+        ]);
+        for (path, status) in [("/not-modified", 304), ("/no-content", 204)] {
+            let r = Request::get(s.url(path))
+                .status([status])
+                .max_bytes(100)
+                .send()
+                .unwrap();
+            assert_eq!((r.status, r.body.len()), (status, 0), "{path}");
+        }
         assert_eq!(
             Request::get(server.url("/big"))
                 .max_bytes(4096)
