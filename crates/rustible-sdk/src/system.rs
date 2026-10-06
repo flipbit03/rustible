@@ -376,8 +376,9 @@ impl System {
     /// an [`IoAt`] error naming the path: there is no "missing counts as
     /// empty" shortcut, so an op that tolerates absence asks
     /// [`System::exists`] first. Reading through a helper puts the file in
-    /// one frame, which caps it at
-    /// [`MAX_FRAME_PAYLOAD`](crate::protocol::MAX_FRAME_PAYLOAD).
+    /// one frame, base64-encoded, so a file whose encoding does not fit in
+    /// [`MAX_FRAME`](crate::protocol::MAX_FRAME) (one of about 48 MiB) is
+    /// refused there, and the helper goes on serving.
     pub fn read(&self, p: impl AsRef<Path>) -> Result<Vec<u8>> {
         let p = p.as_ref();
         self.backend.read(p).map_err(Self::io(p))

@@ -1356,7 +1356,8 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOw
             "protocol error: the binary announced a {len}-byte frame (limit {MAX_FRAME}); \
              either the stream is out of step, most often because the playbook printed to \
              stdout (use ctx.log instead), or the binary sent an event too large for one \
-             frame, such as a diff or a log line of tens of megabytes"
+             frame, such as a diff or a log line of tens of megabytes (shorten what the step \
+             logs or diffs)"
         );
     }
     let mut body = vec![0u8; len];

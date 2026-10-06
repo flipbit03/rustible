@@ -187,10 +187,12 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// The largest payload that survives a single frame: bytes travel as
 /// base64, so four bytes on the wire carry three of payload, and the JSON
-/// envelope needs a little room besides. A request that puts a whole file
-/// in one frame (`HelperOp::Write`) is refused above this before it is
-/// built; the helper refuses an answer over [`MAX_FRAME`] itself, so it
-/// never sends a frame the far end rejects.
+/// envelope needs a little room besides. Three things refuse above it
+/// before anything is built: a helper write (`HelperOp::Write`), a
+/// command's stdin through a helper (`HelperOp::Spawn`), and `ctx.fetch`
+/// under `as_user`/`as_root`. The helper itself refuses any answer whose
+/// encoding passes [`MAX_FRAME`], so it never sends a frame the far end
+/// rejects; for a read that is a file a little over this size.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 
 /// Serialize `msg` and write it as one length-prefixed frame, flushing
