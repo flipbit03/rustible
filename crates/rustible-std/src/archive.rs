@@ -37,12 +37,10 @@ pub enum Format {
     TarGz,
     /// xz (magic `fd 37 7a 58 5a 00`), read with `lzma-rust2`.
     TarXz,
-    /// zstd (magic `28 b5 2f fd`, or a skippable frame's), read frame by
-    /// frame with `ruzstd` so the several frames `pzstd` writes, each after
-    /// a skippable frame, or `cat` of several `.zst` files, are all decoded,
-    /// skippable frames are skipped,
-    /// and each frame's content checksum is verified when it has been read
-    /// to its end. Decoded as it is read, like the others: memory is the
+    /// zstd (magic `28 b5 2f fd`), read frame by frame with `ruzstd` so
+    /// several frames, such as `cat` of several `.zst` files, are all
+    /// decoded, skippable frames between them are skipped, and each frame's
+    /// content checksum is verified when it has been read to its end. Decoded as it is read, like the others: memory is the
     /// frame's window, which the compressor chose (8 MiB at `zstd -19`;
     /// `ruzstd` refuses a window over 100 MiB), plus 1 MiB decoded ahead.
     TarZst,
@@ -672,8 +670,8 @@ const ZSTD_AHEAD: usize = 1 << 20;
 /// Every frame of a zstd stream, decoded as it is read: skippable frames
 /// skipped, each frame's content checksum verified once it is read to its
 /// end. `ruzstd`'s own `StreamingDecoder` stops at the end of the first
-/// frame, and `pzstd` writes several, as does `cat` of several `.zst`
-/// files. Holds the
+/// frame, and a stream may hold several, as `cat` of several `.zst` files
+/// does. Holds the
 /// frame's window (what the compressor chose, 8 MiB at `zstd -19`; `ruzstd`
 /// refuses a frame asking for more than 100 MiB) plus up to
 /// [`ZSTD_AHEAD`] decoded ahead of the reader.
