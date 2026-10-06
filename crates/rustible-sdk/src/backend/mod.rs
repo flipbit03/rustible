@@ -11,11 +11,10 @@ pub(crate) use elevated::HelperGone;
 mod fake;
 mod local;
 
-pub use elevated::{
-    Elevated, HelperOp, HelperRequest, HelperResponse, Spawner, helper_argv, serve_helper,
-};
+pub use elevated::{Elevated, Spawner, helper_argv, serve_helper};
 pub use fake::{AttrCall, Fake, FakeFile};
 pub use local::Local;
+pub(crate) use local::Staged;
 
 /// What one path looks like on the target: the part of `stat(2)` the ops
 /// care about. Produced by [`Backend::stat`] and [`Backend::stat_follow`],
@@ -162,6 +161,52 @@ pub struct WriteAttrs {
     pub owner: Option<(u32, u32)>,
 }
 
+/// An `io::Error` worded here that keeps the errno of the failure it
+/// describes. `io::Error::new` drops the raw OS code, and the escalation
+/// helper sends the code across (`HelperResponse::Err`'s `code`) so the far
+/// side rebuilds the same kind; this keeps it through a rewording.
+#[derive(Debug)]
+pub(crate) struct Coded {
+    /// The errno.
+    pub(crate) errno: i32,
+    /// The whole message, which is what `Display` prints.
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Coded {}
+
+/// An error with `errno`'s kind and code and this message.
+pub(crate) fn coded(errno: i32, message: String) -> io::Error {
+    io::Error::new(
+        io::Error::from_raw_os_error(errno).kind(),
+        Coded { errno, message },
+    )
+}
+
+/// `e` reworded as `message`, keeping its errno when it has one and its
+/// kind either way.
+pub(crate) fn reworded(e: &io::Error, message: String) -> io::Error {
+    match errno_of(e) {
+        Some(errno) => coded(errno, message),
+        None => io::Error::new(e.kind(), message),
+    }
+}
+
+/// The errno `e` carries: the OS's own, or one kept by [`coded`].
+pub(crate) fn errno_of(e: &io::Error) -> Option<i32> {
+    e.raw_os_error().or_else(|| {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<Coded>())
+            .map(|c| c.errno)
+    })
+}
+
 /// One attribute call, in the order [`attr_steps`] gives them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttrStep {
@@ -201,9 +246,8 @@ pub(crate) fn attr_steps(mode: u32, owner: Option<(u32, u32)>) -> Vec<AttrStep> 
 /// is for tests, `Elevated` proxies every call to a `Local` inside a helper
 /// process running as another user (vision doc 7.2, 11.3).
 pub trait Backend: Send + Sync {
-    /// The whole file, in memory. There is no streaming read: through
-    /// [`Elevated`] the contents cross the helper boundary in a single
-    /// frame, so a file past that size is refused rather than truncated.
+    /// The whole file, in memory. Through [`Elevated`] it crosses the
+    /// helper boundary in chunks, so any size works.
     fn read(&self, p: &Path) -> io::Result<Vec<u8>>;
     /// Must be atomic (temp file + rename) and preserve mode/owner of an existing file.
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()>;

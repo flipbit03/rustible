@@ -375,10 +375,8 @@ impl System {
     /// The whole file, in memory, as bytes. A missing or unreadable file is
     /// an [`IoAt`] error naming the path: there is no "missing counts as
     /// empty" shortcut, so an op that tolerates absence asks
-    /// [`System::exists`] first. Reading through a helper puts the file in
-    /// one frame, base64-encoded, so a file whose encoding does not fit in
-    /// [`MAX_FRAME`](crate::protocol::MAX_FRAME) (one of about 48 MiB) is
-    /// refused there, and the helper goes on serving.
+    /// [`System::exists`] first. Through a helper the file crosses in chunks
+    /// of 1 MiB, so any size works; it is still whole in memory here.
     pub fn read(&self, p: impl AsRef<Path>) -> Result<Vec<u8>> {
         let p = p.as_ref();
         self.backend.read(p).map_err(Self::io(p))

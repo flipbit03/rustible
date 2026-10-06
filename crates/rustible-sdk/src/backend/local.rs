@@ -3,7 +3,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::{AttrStep, Backend, CmdSpec, FileKind, Output, Stat, WriteAttrs, attr_steps};
+use super::{AttrStep, Backend, CmdSpec, FileKind, Output, Stat, WriteAttrs, attr_steps, reworded};
 
 /// The production backend: real filesystem, real processes.
 pub struct Local;
@@ -101,6 +101,7 @@ pub(crate) struct Staged {
     /// Whether [`owner`](Self::owner) was asked for, so failing to give it
     /// fails the write, or kept from the file being replaced, best effort.
     owner_required: bool,
+    written: u64,
 }
 
 impl Staged {
@@ -146,12 +147,20 @@ impl Staged {
             mode,
             owner,
             owner_required,
+            written: 0,
         })
     }
 
     /// Append `bytes` to the staged content.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.tmp.write_all(bytes)
+        self.tmp.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// How many bytes have been staged so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
     }
 
     /// Sync, give the file its mode and owner, and rename it over the
@@ -176,8 +185,8 @@ impl Staged {
                 AttrStep::Mode(m) => {
                     f.set_permissions(std::fs::Permissions::from_mode(m))
                         .map_err(|e| match owned {
-                            Some((uid, gid)) => io::Error::new(
-                                e.kind(),
+                            Some((uid, gid)) => reworded(
+                                &e,
                                 format!(
                                     "gave the new file owner {uid}:{gid} but could not set its \
                                      mode to {m:04o} ({e}); setting setuid or setgid on a file \
@@ -191,8 +200,8 @@ impl Staged {
                     match std::os::unix::fs::fchown(f, Some(uid), Some(gid)) {
                         Ok(()) => owned = Some((uid, gid)),
                         Err(e) if self.owner_required => {
-                            return Err(io::Error::new(
-                                e.kind(),
+                            return Err(reworded(
+                                &e,
                                 format!(
                                     "could not give the new file owner {uid}:{gid} ({e}); \
                                      giving a file to another user takes root. The file was \

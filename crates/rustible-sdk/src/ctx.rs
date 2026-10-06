@@ -17,10 +17,9 @@ use crate::error::{Context as _, Error, OutputUnavailable, Result, StepFailed, c
 use crate::event::{Event, Level, Status, Summary, block_prefix};
 use crate::facts::Facts;
 use crate::op::{Applied, Intent, Op, Plan};
-use crate::protocol::MAX_FRAME_PAYLOAD;
 use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
-use crate::system::{Identity, Phase, System};
+use crate::system::{Phase, System};
 
 /// The inventory's view of the host this process is configuring: its name,
 /// the groups it inherits from, and the connection and escalation parameters
@@ -750,24 +749,9 @@ impl Ctx {
         } else {
             dest
         };
-        // `sys.read` puts the whole file in memory on this host, and an
-        // escalated read also puts it in one helper frame, base64-inflated
-        // by 4/3 against the frame ceiling. The helper refuses a file that
-        // does not fit, naming it; this refuses first in `fetch`'s own
-        // terms, with the remedy that fits a fetch (#84).
-        if let Some(st) = self.sys.stat_follow(remote)?
-            && matches!(self.sys.identity(), Identity::User(_))
-            && st.size > MAX_FRAME_PAYLOAD as u64
-        {
-            return Err(Error::msg(format!(
-                "fetching {}: {} bytes is more than an escalated read can carry \
-                 ({} bytes, the helper's frame limit); a file this large has to be \
-                 fetched without `as_user`/`as_root`, or copied to a readable path first",
-                remote.display(),
-                st.size,
-                MAX_FRAME_PAYLOAD
-            )));
-        }
+        // `sys.read` puts the whole file in memory on this host; through a
+        // helper it crosses in chunks, so an escalated fetch has no size
+        // limit either. Reading it as a stream is #86.
         let bytes = self
             .sys
             .read(remote)

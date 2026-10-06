@@ -10,6 +10,35 @@
 //! binary to that account's own cache, or a private per-run temp directory,
 //! and starts the helper from there ([`launch`](crate::launch), #62).
 //!
+//! ## Streams
+//!
+//! Requests and answers go in lockstep: one request, one answer, under the
+//! connection lock, and no request is sent before the previous one is
+//! answered. So there is no queue anywhere and nothing to correlate.
+//!
+//! Anything that can be large crosses in chunks of at most
+//! [`CHUNK_SIZE`](crate::protocol::CHUNK_SIZE) (1 MiB), one request per
+//! chunk, so every frame stays near 1.4 MiB whatever the size of the file:
+//! a file's contents, read or written, a directory's listing, a command's
+//! stdin and its output (`[ISSUE-85]`). A stream the helper keeps open
+//! between two requests is a *handle* in its table: an id the helper chose,
+//! naming a write staged beside its target, an open file, an open directory,
+//! a command's stdin or a finished command's output. The first request of a
+//! stream carries or returns the first chunk, so anything of one chunk or
+//! less is still exactly one round trip, and opens no handle at all. The
+//! connection lock is held per request, not per stream, so between two
+//! chunks any other primitive on the same identity may run: an archive read
+//! through [`Backend::open_read`] while each member is written through
+//! [`Backend::write_from`] alternates, chunk by chunk, on one helper.
+//!
+//! A write is staged by the same [`Staged`] writer `Local` uses and renamed
+//! over its target only after its last chunk, so a failure part way leaves
+//! the target as it was. The helper removes a stream whose request failed,
+//! and its temporary file with it; this side releases a stream it gives up
+//! on (an error from the source being written, a reader dropped before its
+//! end). When either process goes away mid-stream, the helper sees EOF,
+//! its table drops, and each staged write removes its temporary file.
+//!
 //! ## What crosses, and what does not
 //!
 //! The escalation password is never in an argument vector: `/proc` makes
@@ -20,19 +49,23 @@
 //! probe fails. It lives in a [`Secret`] the whole time, which zeroizes on
 //! drop and prints its length rather than its bytes.
 //!
-//! No message this module produces quotes file contents.
-//! [`HelperOp::label`] gives the primitive, its paths, and for a write the
-//! byte count: the contents may be a secret (`ctx.local_secret`), and these
-//! messages are rendered, logged and shipped to the orchestrator.
+//! No message this module produces quotes file contents, a command's stdin
+//! or its output. The label of a request gives the primitive, its paths,
+//! and for a chunk the byte count: the contents may be a secret
+//! (`ctx.local_secret`), and these messages are rendered, logged and
+//! shipped to the orchestrator. Every chunk is held in a buffer wiped on
+//! drop, on both sides.
+//!
+//! Paths travel as the bytes of the OS string, base64, so a name that is not
+//! UTF-8 works through a helper as it does on `Local`.
 //!
 //! Mutations are refused while the calling step is in its `check` phase, on
 //! both sides: the main process guards before it builds the request, and
 //! [`serve_helper`] refuses again after it arrives. The helper's copy is a
 //! second latch against an op that reaches around the first one, not a
-//! boundary against a hostile parent: it believes
-//! [`HelperRequest::checking`], and a parent that lies gets its mutation.
-//! That parent chose the helper's binary and its user, so it had the
-//! authority already.
+//! boundary against a hostile parent: it believes the request's `checking`
+//! flag, and a parent that lies gets its mutation. That parent chose the
+//! helper's binary and its user, so it had the authority already.
 //!
 //! Nothing here narrows what the helper may do. The far side is a full
 //! [`Local`] backend running as the target user, so a request is bounded by
@@ -44,175 +77,353 @@
 //! mail to root each time, and `pam_faillock` locking the account out after
 //! a handful.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
-use super::{Backend, CmdSpec, Local, Output, Stat};
+use super::{Backend, CmdSpec, Local, Output, Staged, Stat, WriteAttrs, coded, errno_of};
 use crate::launch::{self, Answer, Launch, Mode, Next};
-use crate::protocol::{
-    FrameTooLarge, MAX_FRAME, MAX_FRAME_PAYLOAD, encode_frame, read_frame, write_body,
-};
+use crate::protocol::{CHUNK_SIZE, FrameTooLarge, MAX_FRAME, encode_frame, read_frame, write_body};
 use crate::secret::Secret;
 
-/// One `Backend` primitive on the wire.
-///
-/// One variant per method of [`Backend`], carrying that method's arguments
-/// and nothing more. There is deliberately no variant the trait does not
-/// have: a helper offers the same surface as a local run, not a wider one.
-/// Paths travel exactly as the op wrote them, resolved on the helper's side.
+/// The most streams a helper keeps open at once (`[ISSUE-85]`). A request
+/// that would open one more is refused, so a parent that forgets to close
+/// its streams cannot run the helper out of descriptors or memory; closing
+/// one frees its slot. Far above what any op holds: an archive extraction
+/// holds two.
+const MAX_HANDLES: usize = 64;
+
+/// How large the helper lets a frame and a chunk be. Always [`Limits::REAL`]
+/// outside tests, which lower both so a test of a large file or a frame
+/// limit does not build megabytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// The largest frame either side writes: [`MAX_FRAME`].
+    pub(crate) frame: usize,
+    /// The most bytes in one chunk of a stream: [`CHUNK_SIZE`].
+    pub(crate) chunk: usize,
+}
+
+impl Limits {
+    /// The limits every real helper runs with.
+    pub(crate) const REAL: Limits = Limits {
+        frame: MAX_FRAME,
+        chunk: CHUNK_SIZE,
+    };
+}
+
+/// Paths on the helper's wire: the bytes of the OS string, base64. A JSON
+/// string cannot hold a name that is not UTF-8, and `Local` handles those, so
+/// the helper must too.
+mod wire_path {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+        crate::protocol::b64::serialize(p.as_os_str().as_bytes(), s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Ok(OsString::from_vec(crate::protocol::b64::deserialize(d)?).into())
+    }
+}
+
+/// [`wire_path`] for an optional path.
+mod wire_path_opt {
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(p: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+        match p {
+            Some(p) => super::wire_path::serialize(p, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<PathBuf>, D::Error> {
+        #[derive(Deserialize)]
+        struct Wrap(#[serde(with = "super::wire_path")] PathBuf);
+        Ok(Option::<Wrap>::deserialize(d)?.map(|w| w.0))
+    }
+}
+
+/// Optional bytes held in a zeroizing buffer, base64 on the wire.
+mod b64_zeroizing_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub(super) fn serialize<S: Serializer>(
+        bytes: &Option<Zeroizing<Vec<u8>>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        crate::protocol::b64_opt::serialize(bytes, s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, D::Error> {
+        #[derive(Deserialize)]
+        struct Wrap(#[serde(with = "crate::protocol::b64_zeroizing")] Zeroizing<Vec<u8>>);
+        Ok(Option::<Wrap>::deserialize(d)?.map(|w| w.0))
+    }
+}
+
+/// One directory entry's name on the wire, as [`wire_path`] carries it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HelperOp {
-    /// [`Backend::read`], answered with [`HelperResponse::Bytes`]. The file
-    /// crosses whole in one frame, base64-encoded, so one whose encoding
-    /// does not fit in `MAX_FRAME` (a file of about 48 MiB) cannot be read
-    /// through a helper at all: [`serve_helper`] refuses it, from its
-    /// `stat` when that already shows it too large, and [`Elevated`] names
-    /// the file and the account.
-    Read {
-        /// Read by the helper's user, so a file the main process cannot open
-        /// is still fine.
+pub(crate) struct Name(#[serde(with = "wire_path")] PathBuf);
+
+/// A [`CmdSpec`] on the helper's wire: its working directory as
+/// [`wire_path`] bytes, and its stdin, when it is small enough to ride in
+/// the request, in a zeroizing buffer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct WireCmd {
+    program: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    #[serde(with = "wire_path_opt")]
+    cwd: Option<PathBuf>,
+    #[serde(with = "b64_zeroizing_opt")]
+    stdin: Option<Zeroizing<Vec<u8>>>,
+    prefix: Vec<String>,
+}
+
+impl WireCmd {
+    /// `spec` for the wire, with its stdin only when `inline`: a larger one
+    /// has been staged in the helper already.
+    fn of(spec: &CmdSpec, inline: bool) -> WireCmd {
+        WireCmd {
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            cwd: spec.cwd.clone(),
+            stdin: if inline {
+                spec.stdin.as_ref().map(|s| Zeroizing::new(s.clone()))
+            } else {
+                None
+            },
+            prefix: spec.prefix.clone(),
+        }
+    }
+
+    /// The command to run, its stdin being `staged` when there is one. The
+    /// bytes move into the spec without a copy; whoever runs it wipes them.
+    fn into_spec(self, staged: Option<Zeroizing<Vec<u8>>>) -> CmdSpec {
+        CmdSpec {
+            program: self.program,
+            args: self.args,
+            env: self.env,
+            cwd: self.cwd,
+            stdin: staged
+                .or(self.stdin)
+                .map(|mut bytes| std::mem::take(&mut *bytes)),
+            prefix: self.prefix,
+        }
+    }
+
+    fn argv(&self) -> String {
+        self.prefix
+            .iter()
+            .chain([&self.program])
+            .chain(&self.args)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// One `Backend` primitive, or one step of a stream, on the wire. The
+/// helper's private format: both ends are always the same build
+/// (`[ISSUE-62]`), so nothing outside this crate names it (`[ISSUE-85]`).
+///
+/// There is deliberately no request the trait cannot reach: a helper offers
+/// the same surface as a local run, not a wider one. Paths travel exactly
+/// as the op wrote them, resolved on the helper's side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum HelperOp {
+    /// Open a file for reading and return its first chunk:
+    /// [`HelperResponse::Data`], with a handle only when there is more.
+    ReadBegin {
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
-    /// [`Backend::write`]. The only request that carries file contents, and
-    /// the reason [`HelperOp::label`] prints sizes instead of payloads.
-    Write {
-        /// Written with `Local`'s temp file and rename, so the helper's user
-        /// needs write permission on the parent directory, not just the file.
+    /// The chunk at `offset` of an open file, or of a finished command's
+    /// output: [`HelperResponse::Data`]. Positional, so the helper keeps no
+    /// cursor the two sides could disagree on. The stream ends, and its
+    /// handle with it, at the chunk that reaches the end.
+    ReadChunk { handle: u32, offset: u64 },
+    /// Stage a write of `path` with its first chunk. With `last` it is the
+    /// whole content, committed at once ([`HelperResponse::Unit`]);
+    /// otherwise the answer is the stream's [`HelperResponse::Handle`].
+    WriteBegin {
+        #[serde(with = "wire_path")]
         path: PathBuf,
-        /// The complete new contents. Base64 on the wire, and checked
-        /// against `MAX_FRAME_PAYLOAD` before the frame is built, so an
-        /// oversized write is refused by a message that names the file
-        /// rather than by the framing code, which does not know it.
-        #[serde(with = "crate::protocol::b64")]
-        bytes: Vec<u8>,
+        attrs: Option<WriteAttrs>,
+        #[serde(with = "crate::protocol::b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
+        last: bool,
     },
+    /// The next chunk of a staged write. `offset` must be what was written
+    /// so far, or the stream is abandoned with `EINVAL`. With `last`, the
+    /// write is committed: synced, given its mode and owner, renamed.
+    WriteChunk {
+        handle: u32,
+        offset: u64,
+        #[serde(with = "crate::protocol::b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
+        last: bool,
+    },
+    /// Abandon a staged write: its temporary file goes, the target stays as
+    /// it was. A handle that is not open is fine, so it is always safe.
+    WriteAbort { handle: u32 },
+    /// Release any stream. A handle that is not open is fine.
+    Close { handle: u32 },
     /// [`Backend::stat`]: `lstat`, so a symlink reports itself.
     Stat {
-        /// A path that is not there is not an error; the answer is
-        /// [`HelperResponse::Stat`] carrying `None`.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
     /// [`Backend::stat_follow`]: follows the link and reports what it lands
-    /// on.
+    /// on. A dangling link answers `None`, exactly as a missing path does.
     StatFollow {
-        /// A dangling link answers `None`, exactly as a missing path does.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
-    /// [`Backend::mkdir_all`].
+    /// [`Backend::mkdir_all`]. Every missing parent is created too, and all
+    /// of them belong to the helper's user with the helper's umask.
     MkdirAll {
-        /// The deepest directory. Every missing parent is created too, and
-        /// all of them belong to the helper's user with the helper's umask.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
     /// [`Backend::remove`]: one entry, and a populated directory is an
     /// error.
     Remove {
-        /// A path that is already gone succeeds, so removal is idempotent.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
     /// [`Backend::remove_all`]. The only recursive delete a helper will do,
     /// and so the one request where a wrong path costs a tree.
     RemoveAll {
-        /// The root of what goes, followed by everything under it.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
     /// [`Backend::rename`]. Both ends are the helper's, and it is one
     /// syscall, so it cannot cross filesystems.
     Rename {
-        /// Must exist.
+        #[serde(with = "wire_path")]
         from: PathBuf,
-        /// Replaced atomically if it exists.
+        #[serde(with = "wire_path")]
         to: PathBuf,
     },
-    /// [`Backend::set_mode`].
+    /// [`Backend::set_mode`], following a symlink.
     SetMode {
-        /// Followed if it is a symlink: the target's mode changes, not the
-        /// link's.
+        #[serde(with = "wire_path")]
         path: PathBuf,
-        /// Permission bits as `chmod` takes them (`0o644`), not a whole
-        /// `st_mode` with the file type in it.
         mode: u32,
     },
-    /// [`Backend::set_owner`]. Handing a file to a third user needs the
-    /// helper to be root; a helper running as an ordinary user can only fail
-    /// this, which is why ops that chown ask for `as_root` and not just
-    /// `as_user`.
+    /// [`Backend::set_owner`], following a symlink. Handing a file to a
+    /// third user needs the helper to be root.
     SetOwner {
-        /// Followed if it is a symlink: `chown(2)`, not `lchown(2)`.
+        #[serde(with = "wire_path")]
         path: PathBuf,
-        /// Numeric. Names are resolved before the request is built, never by
-        /// the helper.
         uid: u32,
-        /// Numeric, likewise.
         gid: u32,
     },
     /// [`Backend::copy`]. Both ends are on the target host and the bytes
-    /// never touch the wire, so copying a file as another user works at
-    /// sizes at which reading it would be refused.
+    /// never touch the wire. The copy is created new: an existing path, a
+    /// symlink included, is refused with `AlreadyExists` and left as it was.
+    /// Not atomic, but a failure part way removes what it created.
     Copy {
-        /// A regular file (symlinks followed), readable by the helper's
-        /// user. Anything else is refused before it is opened.
+        #[serde(with = "wire_path")]
         from: PathBuf,
-        /// Created new: an existing path, a symlink included, is refused
-        /// with `AlreadyExists` and left as it was. Not atomic, but a
-        /// failure part way removes what it created, so no half-written
-        /// copy is left behind.
+        #[serde(with = "wire_path")]
         to: PathBuf,
     },
-    /// [`Backend::symlink`]. Fails if `link` exists: there is no
-    /// replace-in-place primitive, so an op that wants one removes first.
+    /// [`Backend::symlink`]. Fails if `link` exists.
     Symlink {
-        /// What the link will point at. Never resolved and never checked, so
-        /// a link to something that does not exist yet is legal and is
-        /// usually the point.
+        #[serde(with = "wire_path")]
         target: PathBuf,
-        /// The link to create.
+        #[serde(with = "wire_path")]
         link: PathBuf,
     },
-    /// [`Backend::read_link`].
+    /// [`Backend::read_link`]. Failing rather than answering `None` is how a
+    /// caller learns `path` is not a link.
     ReadLink {
-        /// The link itself; nothing is followed. Failing rather than
-        /// answering `None` is how a caller learns `path` is not a link.
+        #[serde(with = "wire_path")]
         path: PathBuf,
     },
-    /// [`Backend::read_dir`]. The whole listing comes back in one frame, so
-    /// a directory whose listing does not fit is refused by
-    /// [`serve_helper`], naming the directory and how many entries it has.
-    ReadDir {
-        /// The directory. The answer holds full paths of the direct
-        /// children, sorted, not bare names and not the tree.
+    /// Open a directory and return the first batch of its entries' names:
+    /// [`HelperResponse::Names`], with a handle only when there is more.
+    ReadDirBegin {
+        #[serde(with = "wire_path")]
         path: PathBuf,
+    },
+    /// The next batch of an open directory's names. The stream ends, and
+    /// its handle with it, at the batch that reaches the end.
+    ReadDirChunk { handle: u32 },
+    /// Stage the first chunk of a command's stdin that is too large to ride
+    /// in its [`HelperOp::Spawn`]: [`HelperResponse::Handle`].
+    StdinBegin {
+        #[serde(with = "crate::protocol::b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
+    },
+    /// The next chunk of a staged stdin; `offset` must be what was staged
+    /// so far.
+    StdinChunk {
+        handle: u32,
+        offset: u64,
+        #[serde(with = "crate::protocol::b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
     },
     /// [`Backend::spawn`]. The command runs as the helper's user with no
-    /// further `sudo`, so [`CmdSpec::prefix`] is empty on this path;
-    /// `sys.cmd` only fills it in for a `Fake` system, which has no helper
-    /// to be the user for it. [`CmdSpec::stdin`] rides in the request and
-    /// counts against the frame limit, and the output comes back whole in
-    /// one frame: [`serve_helper`] refuses output that does not fit,
-    /// naming the command, and the helper stays usable.
-    Spawn(CmdSpec),
+    /// further `sudo`, so its prefix is empty on this path; `sys.cmd` only
+    /// fills it in for a `Fake` system. Its stdin rides in `cmd`, or was
+    /// staged as the stream `stdin`, which this consumes. Output of one
+    /// chunk or less comes back as [`HelperResponse::Output`]; more is kept
+    /// behind a handle ([`HelperResponse::OutputHandle`]) and read with
+    /// [`HelperOp::ReadChunk`].
+    Spawn { cmd: WireCmd, stdin: Option<u32> },
 }
 
 impl HelperOp {
-    /// The variant and the paths it touches, for messages. Never the bytes:
-    /// a `Write` carries file contents, which may be a secret
-    /// (`ctx.local_secret`) or 50 MB of them.
-    pub fn label(&self) -> String {
+    /// The request and the paths it touches, for messages. Never the bytes:
+    /// a chunk may be a secret (`ctx.local_secret`), so it is a count.
+    pub(crate) fn label(&self) -> String {
         let one = |verb: &str, p: &Path| format!("{verb} {}", p.display());
         let two =
             |verb: &str, a: &Path, b: &Path| format!("{verb} {} -> {}", a.display(), b.display());
         match self {
-            HelperOp::Read { path } => one("read", path),
-            HelperOp::Write { path, bytes } => {
-                format!("write {} ({} bytes)", path.display(), bytes.len())
+            HelperOp::ReadBegin { path } => one("read", path),
+            HelperOp::ReadChunk { handle, offset } => {
+                format!("read stream {handle} at {offset}")
             }
+            HelperOp::WriteBegin {
+                path, bytes, last, ..
+            } => {
+                let what = if *last { "" } else { "first " };
+                format!("write {} ({what}{} bytes)", path.display(), bytes.len())
+            }
+            HelperOp::WriteChunk {
+                handle,
+                offset,
+                bytes,
+                ..
+            } => format!("write stream {handle} ({} bytes at {offset})", bytes.len()),
+            HelperOp::WriteAbort { handle } => format!("abort write stream {handle}"),
+            HelperOp::Close { handle } => format!("close stream {handle}"),
             HelperOp::Stat { path } => one("stat", path),
             HelperOp::StatFollow { path } => one("stat_follow", path),
             HelperOp::MkdirAll { path } => one("mkdir_all", path),
@@ -228,42 +439,42 @@ impl HelperOp {
             HelperOp::Copy { from, to } => two("copy", from, to),
             HelperOp::Symlink { target, link } => two("symlink", link, target),
             HelperOp::ReadLink { path } => one("read_link", path),
-            HelperOp::ReadDir { path } => one("read_dir", path),
-            HelperOp::Spawn(spec) => format!("spawn {}", spec.argv().join(" ")),
-        }
-    }
-
-    /// The file bytes this op would put in a single frame, with the path
-    /// they belong to: for a command's stdin, the program. `None` for ops
-    /// whose request carries no payload.
-    ///
-    /// Every primitive is one request and one response, so a file crosses
-    /// the helper boundary whole. Bytes travel as base64, so the ceiling is
-    /// `MAX_FRAME_PAYLOAD`, well under the size of artifacts people copy.
-    /// Streaming the primitives would lift it; until then the limit is
-    /// reported up front rather than discovered inside the framing.
-    pub fn payload(&self) -> Option<(&Path, usize)> {
-        match self {
-            HelperOp::Write { path, bytes } => Some((path, bytes.len())),
-            HelperOp::Spawn(spec) => spec
-                .stdin
-                .as_ref()
-                .map(|b| (Path::new(&spec.program), b.len())),
-            _ => None,
+            HelperOp::ReadDirBegin { path } => one("read_dir", path),
+            HelperOp::ReadDirChunk { handle } => format!("read_dir stream {handle}"),
+            HelperOp::StdinBegin { bytes } => {
+                format!("stage stdin (first {} bytes)", bytes.len())
+            }
+            HelperOp::StdinChunk {
+                handle,
+                offset,
+                bytes,
+            } => format!(
+                "stage stdin stream {handle} ({} bytes at {offset})",
+                bytes.len()
+            ),
+            HelperOp::Spawn { cmd, .. } => format!("spawn {}", cmd.argv()),
         }
     }
 
     /// Mutations are refused by the helper while the main process is in a
     /// step's `check` phase: the guard holds on both sides (vision doc 11.3).
-    pub fn mutates(&self) -> bool {
+    /// Releasing a stream is never one, so it is always allowed, and neither
+    /// is staging a command's stdin, since commands are not guarded.
+    pub(crate) fn mutates(&self) -> bool {
         !matches!(
             self,
-            HelperOp::Read { .. }
+            HelperOp::ReadBegin { .. }
+                | HelperOp::ReadChunk { .. }
+                | HelperOp::WriteAbort { .. }
+                | HelperOp::Close { .. }
                 | HelperOp::Stat { .. }
                 | HelperOp::StatFollow { .. }
                 | HelperOp::ReadLink { .. }
-                | HelperOp::ReadDir { .. }
-                | HelperOp::Spawn(_)
+                | HelperOp::ReadDirBegin { .. }
+                | HelperOp::ReadDirChunk { .. }
+                | HelperOp::StdinBegin { .. }
+                | HelperOp::StdinChunk { .. }
+                | HelperOp::Spawn { .. }
         )
     }
 }
@@ -274,53 +485,64 @@ impl HelperOp {
 /// the connection lock across both halves, so a helper never has two of
 /// these in flight and never has to correlate them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HelperRequest {
+pub(crate) struct HelperRequest {
     /// True while the requesting step is in `check`; mutations are refused.
-    pub checking: bool,
-    /// The primitive to perform. Nothing else is negotiated: there is no
-    /// session, no state kept between requests, and no way to ask a helper
-    /// for something [`Backend`] does not have.
-    pub op: HelperOp,
+    pub(crate) checking: bool,
+    /// The primitive to perform, or the step of a stream.
+    pub(crate) op: HelperOp,
 }
 
 /// Helper -> main process.
 ///
 /// The request decides the shape: [`Elevated`] knows which variant each
-/// primitive should come back as and turns anything else into
+/// request should come back as and turns anything else into
 /// `unexpected helper response`, so a helper built from different source is
 /// a failed step rather than a misread value. [`Err`](Self::Err) can answer
 /// any request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HelperResponse {
-    /// The primitive succeeded and had nothing to return: the writes, the
-    /// removals, the rename, the mode and owner changes, the copy, the
-    /// symlink.
+pub(crate) enum HelperResponse {
+    /// Done, nothing to return.
     Unit,
-    /// A whole file, from [`HelperOp::Read`]. Base64 on the wire. A file too
-    /// large for a frame never comes back as this: [`serve_helper`] sends
-    /// an [`Err`](Self::Err) naming the file, its size and the account
-    /// instead.
-    Bytes(#[serde(with = "crate::protocol::b64")] Vec<u8>),
     /// From [`HelperOp::Stat`] or [`HelperOp::StatFollow`]. `None` means the
     /// path is not there, which is an answer and not a failure.
     Stat(Option<Stat>),
     /// A link target, from [`HelperOp::ReadLink`].
-    Path(PathBuf),
-    /// The direct children of a directory, from [`HelperOp::ReadDir`]. A
-    /// listing too large for a frame is an [`Err`](Self::Err) instead.
-    Paths(Vec<PathBuf>),
-    /// A finished command, from [`HelperOp::Spawn`]. A non-zero exit arrives
-    /// here and not in [`Err`](Self::Err): the command ran, and what it did
-    /// is the op's business. Output too large for a frame is an
-    /// [`Err`](Self::Err) instead.
+    Path(#[serde(with = "wire_path")] PathBuf),
+    /// A stream the helper now holds open.
+    Handle(u32),
+    /// A chunk of a file or of a command's output. `handle` is the stream
+    /// when there is more, and `None` once this chunk reached the end, at
+    /// which point the helper has released it.
+    Data {
+        handle: Option<u32>,
+        #[serde(with = "crate::protocol::b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
+    },
+    /// A batch of a directory's names, `handle` as for [`Data`](Self::Data).
+    Names {
+        handle: Option<u32>,
+        names: Vec<Name>,
+    },
+    /// A finished command whose output fits one chunk. A non-zero exit
+    /// arrives here and not in [`Err`](Self::Err): the command ran, and what
+    /// it did is the op's business.
     Output(Output),
-    /// The primitive failed, or the helper refused it. Carries no payload,
-    /// so nothing the op was writing can come back inside an error message.
+    /// A finished command whose output is larger, kept behind `handle` as
+    /// its stdout then its stderr, `stdout` and `stderr` bytes long.
+    OutputHandle {
+        handle: u32,
+        status: i32,
+        signal: Option<i32>,
+        stdout: u64,
+        stderr: u64,
+    },
+    /// The request failed, or the helper refused it. Carries no payload, so
+    /// nothing the op was writing can come back inside an error message.
     Err {
-        /// The OS errno when there was one, so `NotFound` and friends survive.
-        /// [`serve_helper`]'s own refusals of an answer set `EFBIG` (too
-        /// large for a frame) or `EILSEQ` (cannot be encoded), which tells
-        /// [`Elevated`] to name the request and the account in front.
+        /// The OS errno when there was one, so `NotFound` and friends
+        /// survive. [`serve_helper`]'s own refusals of an answer set `EFBIG`
+        /// (too large for a frame) or `EILSEQ` (cannot be encoded), which
+        /// tells [`Elevated`] to name the request and the account in front.
         code: Option<i32>,
         /// The `Display` of the helper's `io::Error`, or the refusal text
         /// [`serve_helper`] wrote. Rebuilt into an `io::Error` on the main
@@ -332,7 +554,7 @@ pub enum HelperResponse {
 impl HelperResponse {
     fn from_io(e: io::Error) -> Self {
         HelperResponse::Err {
-            code: e.raw_os_error(),
+            code: errno_of(&e),
             message: e.to_string(),
         }
     }
@@ -340,10 +562,36 @@ impl HelperResponse {
     fn into_io(self) -> io::Result<HelperResponse> {
         match self {
             HelperResponse::Err { code, message } => Err(match code {
-                Some(c) => io::Error::new(io::Error::from_raw_os_error(c).kind(), message),
+                Some(c) => coded(c, message),
                 None => io::Error::other(message),
             }),
             other => Ok(other),
+        }
+    }
+
+    /// The variant's name, for a message about an answer of the wrong
+    /// shape: never its contents, which may be a file's.
+    fn kind(&self) -> &'static str {
+        match self {
+            HelperResponse::Unit => "Unit",
+            HelperResponse::Stat(_) => "Stat",
+            HelperResponse::Path(_) => "Path",
+            HelperResponse::Handle(_) => "Handle",
+            HelperResponse::Data { .. } => "Data",
+            HelperResponse::Names { .. } => "Names",
+            HelperResponse::Output(_) => "Output",
+            HelperResponse::OutputHandle { .. } => "OutputHandle",
+            HelperResponse::Err { .. } => "Err",
+        }
+    }
+
+    /// Wipe the bytes a command printed once they are encoded: the one
+    /// answer whose payload is not already in a zeroizing buffer, because
+    /// [`Output`] is the public type every backend returns.
+    fn wipe(&mut self) {
+        if let HelperResponse::Output(o) = self {
+            o.stdout.zeroize();
+            o.stderr.zeroize();
         }
     }
 }
@@ -351,33 +599,33 @@ impl HelperResponse {
 /// Serve requests from `rx` on a `Local` backend until EOF. This is what
 /// `--helper` runs; tests run it on a pipe in a thread.
 ///
-/// A failed primitive is a [`HelperResponse::Err`] frame, not a return: the
-/// loop ends only when the far end closes the pipe, and the `io::Result`
-/// reports a broken channel rather than anything a playbook asked for. A
-/// request whose [`checking`](HelperRequest::checking) flag is set and whose
-/// op [`mutates`](HelperOp::mutates) is refused before it reaches the
-/// filesystem, and the refusal quotes [`HelperOp::label`], never a payload.
+/// A failed primitive is an error answer, not a return: the loop ends only
+/// when the far end closes the pipe, and the `io::Result` reports a broken
+/// channel rather than anything a playbook asked for. A request that
+/// mutates while its step is checking is refused before it reaches the
+/// filesystem, and the refusal quotes the request's label, never a payload.
+///
+/// The streams it holds open live in a table here, at most 64 of them. When
+/// the far end goes away, the loop ends and the table with it: every staged
+/// write removes its temporary file, and nothing is renamed.
 ///
 /// No frame this writes is larger than [`MAX_FRAME`], the most the far end
-/// reads. An answer that would be (a file, a command's output, a directory
-/// listing), or that cannot be encoded at all (a path that is not UTF-8),
-/// is replaced by a [`HelperResponse::Err`] saying why, so it is a refusal
-/// of that one request and the helper goes on serving. Sending it, or
-/// exiting, would leave a pipe the far end cannot read past, which is a
-/// dead helper for the rest of the run. A file whose size already rules it
-/// out is refused from its `stat`, without being read.
-///
-/// These refusals quote nothing from the request, so they fit a frame of
-/// any size that can carry the bare error. They carry a marker in
-/// [`code`](HelperResponse::Err::code), `EFBIG` for an answer too large and
-/// `EILSEQ` for one that cannot be encoded, and [`Elevated`] puts the
-/// request and the account in front of the message when it sees either.
+/// reads. Nothing it answers comes near that, since every bulk answer is a
+/// chunk of 1 MiB, but the check stays: an answer that would pass it, or
+/// that cannot be encoded at all, is replaced by an error saying why, so it
+/// is a refusal of that one request and the helper goes on serving. Sending
+/// it, or exiting, would leave a pipe the far end cannot read past, which is
+/// a dead helper for the rest of the run. These refusals quote nothing from
+/// the request, so they fit a frame of any size that can carry the bare
+/// error, and they carry a marker (`EFBIG` for an answer too large, `EILSEQ`
+/// for one that cannot be encoded) on which [`Elevated`] puts the request
+/// and the account in front of the message.
 ///
 /// `tx` is the frame stream and nothing else may write to it. Under
 /// `--helper` that is the process's stdout, which is why the helper's own
 /// diagnostics go to stderr.
 pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()> {
-    serve(rx, tx, MAX_FRAME)
+    serve(rx, tx, Limits::REAL)
 }
 
 /// The marker on a refusal of an answer too large for a frame.
@@ -390,12 +638,17 @@ fn unencodable_code() -> i32 {
     rustix::io::Errno::ILSEQ.raw_os_error()
 }
 
-/// [`serve_helper`], with the frame limit as a parameter, so a test can
-/// refuse an answer without building a frame of [`MAX_FRAME`] bytes.
-fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, max_frame: usize) -> io::Result<()> {
+/// [`serve_helper`], with the limits as a parameter, so a test can use
+/// small chunks and frames.
+fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, limits: Limits) -> io::Result<()> {
     let local = Local;
+    let mut table = Table::default();
     while let Some(req) = read_frame::<_, HelperRequest>(rx)? {
-        let resp = if req.checking && req.op.mutates() {
+        let mut resp = if req.checking && req.op.mutates() {
+            // A refused chunk ends its stream, as any failed one does.
+            if let HelperOp::WriteChunk { handle, .. } = &req.op {
+                table.streams.remove(handle);
+            }
             HelperResponse::Err {
                 code: None,
                 message: format!(
@@ -404,25 +657,26 @@ fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, max_frame: usize) -> io::Res
                 ),
             }
         } else {
-            answer(&local, &req.op, max_frame)
+            table
+                .answer(&local, req.op, limits)
+                .unwrap_or_else(HelperResponse::from_io)
         };
-        // A command's output is measured before it is encoded: encoding
-        // 100 MB of it only to refuse it would cost more than twice that
-        // again in the helper.
-        let over =
-            matches!(&resp, HelperResponse::Output(o) if encoded_output_len(o) > max_frame as u64);
-        let encoded = if over {
-            Ok(None)
-        } else {
-            encode_frame(&resp, max_frame)
-        };
+        let encoded = encode_frame(&resp, limits.frame);
+        resp.wipe();
         let body = match encoded {
             Ok(Some(body)) => body,
-            Ok(None) => refuse(too_large_code(), too_large(&resp, max_frame), max_frame)?,
+            Ok(None) => refuse(
+                too_large_code(),
+                format!(
+                    "the answer is more than one helper frame holds ({} bytes)",
+                    limits.frame
+                ),
+                limits.frame,
+            )?,
             Err(e) => refuse(
                 unencodable_code(),
                 format!("the helper's answer cannot be encoded: {e}"),
-                max_frame,
+                limits.frame,
             )?,
         };
         write_body(tx, &body)?;
@@ -430,68 +684,339 @@ fn serve<R: Read, W: Write>(rx: &mut R, tx: &mut W, max_frame: usize) -> io::Res
     Ok(())
 }
 
-/// Perform one primitive on `local` and wrap what it returned. A file that
-/// `stat` already shows too large for a frame is refused without being
-/// read.
-fn answer(local: &Local, op: &HelperOp, max_frame: usize) -> HelperResponse {
-    match op {
-        HelperOp::Read { path } => {
-            if let Ok(Some(st)) = local.stat_follow(path)
-                && st.kind == super::FileKind::File
-                && encoded_bytes_len(st.size) > max_frame as u64
-            {
-                return HelperResponse::Err {
-                    code: Some(too_large_code()),
-                    message: file_too_large(st.size, max_frame),
-                };
+/// One stream the helper holds open between requests.
+enum Stream {
+    /// A write staged beside its target.
+    Write(Staged),
+    /// A file open for reading, and where its own cursor is: a read at the
+    /// cursor is a plain `read`, which a FIFO needs, and any other is a
+    /// positional `pread`.
+    Read { file: std::fs::File, cursor: u64 },
+    /// A directory being listed.
+    Dir(std::iter::Peekable<std::fs::ReadDir>),
+    /// A command's stdin, staged until its `Spawn`.
+    Stdin(Zeroizing<Vec<u8>>),
+    /// A finished command's output, read as its stdout then its stderr.
+    Output {
+        stdout: Zeroizing<Vec<u8>>,
+        stderr: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl Stream {
+    /// Up to `chunk` bytes at `offset`, and whether they reach the end.
+    fn chunk_at(&mut self, offset: u64, chunk: usize) -> io::Result<(Zeroizing<Vec<u8>>, bool)> {
+        match self {
+            Stream::Read { file, cursor } => {
+                let mut buf = Zeroizing::new(vec![0u8; chunk]);
+                let mut n = 0;
+                while n < chunk {
+                    let at = offset + n as u64;
+                    let got = if at == *cursor {
+                        let got = retry(|| file.read(&mut buf[n..]))?;
+                        *cursor += got as u64;
+                        got
+                    } else {
+                        retry(|| file.read_at(&mut buf[n..], at))?
+                    };
+                    if got == 0 {
+                        break;
+                    }
+                    n += got;
+                }
+                buf.truncate(n);
+                // A full chunk may or may not be the last: one byte past it
+                // says, so a file of exactly one chunk is still one round
+                // trip. Something that cannot be read at an offset (a FIFO)
+                // is taken to have more, and its next chunk comes back empty.
+                let eof = n < chunk || matches!(file.read_at(&mut [0u8], offset + n as u64), Ok(0));
+                Ok((buf, eof))
             }
-            local
-                .read(path)
-                .map(HelperResponse::Bytes)
-                .unwrap_or_else(HelperResponse::from_io)
+            Stream::Output { stdout, stderr } => {
+                let total = (stdout.len() + stderr.len()) as u64;
+                let start = offset.min(total) as usize;
+                let end = (start + chunk).min(total as usize);
+                let mut buf = Zeroizing::new(Vec::with_capacity(end - start));
+                let split = stdout.len();
+                if start < split {
+                    buf.extend_from_slice(&stdout[start..end.min(split)]);
+                }
+                if end > split {
+                    buf.extend_from_slice(&stderr[start.max(split) - split..end - split]);
+                }
+                Ok((buf, end == total as usize))
+            }
+            _ => unreachable!("taken as a readable stream"),
         }
-        HelperOp::Write { path, bytes } => unit(local.write(path, bytes)),
-        HelperOp::Stat { path } => local
-            .stat(path)
-            .map(HelperResponse::Stat)
-            .unwrap_or_else(HelperResponse::from_io),
-        HelperOp::StatFollow { path } => local
-            .stat_follow(path)
-            .map(HelperResponse::Stat)
-            .unwrap_or_else(HelperResponse::from_io),
-        HelperOp::MkdirAll { path } => unit(local.mkdir_all(path)),
-        HelperOp::Remove { path } => unit(local.remove(path)),
-        HelperOp::RemoveAll { path } => unit(local.remove_all(path)),
-        HelperOp::Rename { from, to } => unit(local.rename(from, to)),
-        HelperOp::SetMode { path, mode } => unit(local.set_mode(path, *mode)),
-        HelperOp::SetOwner { path, uid, gid } => unit(local.set_owner(path, *uid, *gid)),
-        HelperOp::Copy { from, to } => unit(local.copy(from, to)),
-        HelperOp::Symlink { target, link } => unit(local.symlink(target, link)),
-        HelperOp::ReadLink { path } => local
-            .read_link(path)
-            .map(HelperResponse::Path)
-            .unwrap_or_else(HelperResponse::from_io),
-        HelperOp::ReadDir { path } => local
-            .read_dir(path)
-            .map(HelperResponse::Paths)
-            .unwrap_or_else(HelperResponse::from_io),
-        HelperOp::Spawn(spec) => local
-            .spawn(spec)
-            .map(HelperResponse::Output)
-            .unwrap_or_else(HelperResponse::from_io),
     }
+}
+
+/// `f`, retried while it is interrupted by a signal.
+fn retry(mut f: impl FnMut() -> io::Result<usize>) -> io::Result<usize> {
+    loop {
+        match f() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+/// The streams one helper holds open, by the handle it gave each.
+#[derive(Default)]
+struct Table {
+    streams: BTreeMap<u32, Stream>,
+    /// The last handle given out; the next is the next free one after it.
+    last: u32,
+}
+
+impl Table {
+    /// Refuse to open another stream when [`MAX_HANDLES`] are open.
+    fn room(&self) -> io::Result<()> {
+        if self.streams.len() < MAX_HANDLES {
+            return Ok(());
+        }
+        Err(coded(
+            rustix::io::Errno::MFILE.raw_os_error(),
+            format!(
+                "the helper already holds {MAX_HANDLES} open streams, the most it keeps at \
+                 once; one has to be finished or closed before another is opened"
+            ),
+        ))
+    }
+
+    /// Hold `stream` open and return its handle.
+    fn open(&mut self, stream: Stream) -> io::Result<u32> {
+        self.room()?;
+        loop {
+            self.last = self.last.wrapping_add(1);
+            if self.last != 0 && !self.streams.contains_key(&self.last) {
+                self.streams.insert(self.last, stream);
+                return Ok(self.last);
+            }
+        }
+    }
+
+    /// Take the open stream `handle` out of the table, when it is of the
+    /// kind `fits` accepts; `EBADF` otherwise, and the table as it was. The
+    /// caller puts it back when the stream goes on, so a stream whose
+    /// request failed is gone.
+    fn take(&mut self, handle: u32, what: &str, fits: fn(&Stream) -> bool) -> io::Result<Stream> {
+        match self.streams.get(&handle) {
+            Some(s) if fits(s) => Ok(self.streams.remove(&handle).expect("present")),
+            _ => Err(coded(
+                rustix::io::Errno::BADF.raw_os_error(),
+                format!(
+                    "the helper has no open {what} stream {handle}: it ended, failed, or was \
+                     never opened"
+                ),
+            )),
+        }
+    }
+
+    /// Perform one request on `local`.
+    fn answer(
+        &mut self,
+        local: &Local,
+        op: HelperOp,
+        limits: Limits,
+    ) -> io::Result<HelperResponse> {
+        Ok(match op {
+            HelperOp::ReadBegin { path } => {
+                let file = std::fs::File::open(&path)?;
+                let mut stream = Stream::Read { file, cursor: 0 };
+                let (bytes, eof) = stream.chunk_at(0, limits.chunk)?;
+                let handle = if eof { None } else { Some(self.open(stream)?) };
+                HelperResponse::Data { handle, bytes }
+            }
+            HelperOp::ReadChunk { handle, offset } => {
+                let mut stream = self.take(handle, "read", |s| {
+                    matches!(s, Stream::Read { .. } | Stream::Output { .. })
+                })?;
+                let (bytes, eof) = stream.chunk_at(offset, limits.chunk)?;
+                let handle = if eof {
+                    None
+                } else {
+                    self.streams.insert(handle, stream);
+                    Some(handle)
+                };
+                HelperResponse::Data { handle, bytes }
+            }
+            HelperOp::WriteBegin {
+                path,
+                attrs,
+                bytes,
+                last,
+            } => {
+                if !last {
+                    self.room()?;
+                }
+                let mut staged = Staged::begin(&path, attrs)?;
+                staged.write(&bytes)?;
+                if last {
+                    staged.commit()?;
+                    HelperResponse::Unit
+                } else {
+                    HelperResponse::Handle(self.open(Stream::Write(staged))?)
+                }
+            }
+            HelperOp::WriteChunk {
+                handle,
+                offset,
+                bytes,
+                last,
+            } => {
+                let Stream::Write(mut staged) =
+                    self.take(handle, "write", |s| matches!(s, Stream::Write(_)))?
+                else {
+                    unreachable!("taken as a write")
+                };
+                if offset != staged.written() {
+                    return Err(coded(
+                        rustix::io::Errno::INVAL.raw_os_error(),
+                        format!(
+                            "write stream {handle}: a chunk at offset {offset}, but {} bytes \
+                             were written so far; the write is abandoned and nothing was \
+                             replaced",
+                            staged.written()
+                        ),
+                    ));
+                }
+                staged.write(&bytes)?;
+                if last {
+                    staged.commit()?;
+                } else {
+                    self.streams.insert(handle, Stream::Write(staged));
+                }
+                HelperResponse::Unit
+            }
+            HelperOp::WriteAbort { handle } | HelperOp::Close { handle } => {
+                self.streams.remove(&handle);
+                HelperResponse::Unit
+            }
+            HelperOp::Stat { path } => HelperResponse::Stat(local.stat(&path)?),
+            HelperOp::StatFollow { path } => HelperResponse::Stat(local.stat_follow(&path)?),
+            HelperOp::MkdirAll { path } => unit(local.mkdir_all(&path))?,
+            HelperOp::Remove { path } => unit(local.remove(&path))?,
+            HelperOp::RemoveAll { path } => unit(local.remove_all(&path))?,
+            HelperOp::Rename { from, to } => unit(local.rename(&from, &to))?,
+            HelperOp::SetMode { path, mode } => unit(local.set_mode(&path, mode))?,
+            HelperOp::SetOwner { path, uid, gid } => unit(local.set_owner(&path, uid, gid))?,
+            HelperOp::Copy { from, to } => unit(local.copy(&from, &to))?,
+            HelperOp::Symlink { target, link } => unit(local.symlink(&target, &link))?,
+            HelperOp::ReadLink { path } => HelperResponse::Path(local.read_link(&path)?),
+            HelperOp::ReadDirBegin { path } => {
+                let mut dir = std::fs::read_dir(&path)?.peekable();
+                let names = batch(&mut dir, limits.chunk)?;
+                let handle = match dir.peek() {
+                    None => None,
+                    Some(_) => Some(self.open(Stream::Dir(dir))?),
+                };
+                HelperResponse::Names { handle, names }
+            }
+            HelperOp::ReadDirChunk { handle } => {
+                let Stream::Dir(mut dir) =
+                    self.take(handle, "read_dir", |s| matches!(s, Stream::Dir(_)))?
+                else {
+                    unreachable!("taken as a listing")
+                };
+                let names = batch(&mut dir, limits.chunk)?;
+                let handle = match dir.peek() {
+                    None => None,
+                    Some(_) => {
+                        self.streams.insert(handle, Stream::Dir(dir));
+                        Some(handle)
+                    }
+                };
+                HelperResponse::Names { handle, names }
+            }
+            HelperOp::StdinBegin { bytes } => {
+                HelperResponse::Handle(self.open(Stream::Stdin(bytes))?)
+            }
+            HelperOp::StdinChunk {
+                handle,
+                offset,
+                bytes,
+            } => {
+                let Stream::Stdin(mut staged) =
+                    self.take(handle, "stdin", |s| matches!(s, Stream::Stdin(_)))?
+                else {
+                    unreachable!("taken as stdin")
+                };
+                if offset != staged.len() as u64 {
+                    return Err(coded(
+                        rustix::io::Errno::INVAL.raw_os_error(),
+                        format!(
+                            "stdin stream {handle}: a chunk at offset {offset}, but {} bytes \
+                             were staged so far; the stdin is abandoned",
+                            staged.len()
+                        ),
+                    ));
+                }
+                crate::secret::extend_wiping(&mut staged, &bytes);
+                self.streams.insert(handle, Stream::Stdin(staged));
+                HelperResponse::Unit
+            }
+            HelperOp::Spawn { cmd, stdin } => {
+                let staged = match stdin {
+                    Some(handle) => {
+                        match self.take(handle, "stdin", |s| matches!(s, Stream::Stdin(_)))? {
+                            Stream::Stdin(bytes) => Some(bytes),
+                            _ => unreachable!("taken as stdin"),
+                        }
+                    }
+                    None => None,
+                };
+                let mut spec = cmd.into_spec(staged);
+                let ran = local.spawn(&spec);
+                spec.stdin.zeroize();
+                let mut out = ran?;
+                if out.stdout.len() + out.stderr.len() <= limits.chunk
+                    && encoded_output_len(&out) <= limits.frame as u64
+                {
+                    return Ok(HelperResponse::Output(out));
+                }
+                let (stdout, stderr) = (out.stdout.len() as u64, out.stderr.len() as u64);
+                let handle = self.open(Stream::Output {
+                    stdout: Zeroizing::new(std::mem::take(&mut out.stdout)),
+                    stderr: Zeroizing::new(std::mem::take(&mut out.stderr)),
+                })?;
+                HelperResponse::OutputHandle {
+                    handle,
+                    status: out.status,
+                    signal: out.signal,
+                    stdout,
+                    stderr,
+                }
+            }
+        })
+    }
+}
+
+/// The next names of `dir`, as many as fit in `budget` bytes of encoded
+/// answer, and at least one when there is one.
+fn batch(dir: &mut std::iter::Peekable<std::fs::ReadDir>, budget: usize) -> io::Result<Vec<Name>> {
+    let mut names = Vec::new();
+    let mut size = 0;
+    while let Some(next) = dir.peek() {
+        // Its base64, its quotes and a comma.
+        let cost = match next {
+            Ok(entry) => base64_len(entry.file_name().len() as u64) as usize + 3,
+            Err(_) => 0,
+        };
+        if !names.is_empty() && size + cost > budget {
+            break;
+        }
+        let entry = dir.next().expect("peeked")?;
+        names.push(Name(entry.file_name().into()));
+        size += cost;
+    }
+    Ok(names)
 }
 
 /// The length of `size` bytes in base64: four characters for every three
 /// bytes or part of three.
 fn base64_len(size: u64) -> u64 {
     size.div_ceil(3) * 4
-}
-
-/// The encoded length of a [`HelperResponse::Bytes`] carrying `size` bytes:
-/// their base64 inside `{"Bytes":"…"}`.
-fn encoded_bytes_len(size: u64) -> u64 {
-    base64_len(size) + r#"{"Bytes":""}"#.len() as u64
 }
 
 /// The encoded length of a [`HelperResponse::Output`] carrying `o`, exactly,
@@ -527,44 +1052,6 @@ fn refuse(code: i32, message: String, max_frame: usize) -> io::Result<Zeroizing<
     )))
 }
 
-/// Why `resp` was refused, in the terms the request asked for, and what to
-/// do instead. Never a byte of the answer, and nothing from the request:
-/// [`Elevated`] names the request and the account in front of it.
-fn too_large(resp: &HelperResponse, max_frame: usize) -> String {
-    let frame = format!("more than one helper frame holds ({max_frame} bytes)");
-    match resp {
-        HelperResponse::Bytes(b) => file_too_large(b.len() as u64, max_frame),
-        HelperResponse::Output(o) => {
-            let ended = match o.signal {
-                Some(sig) => format!("it was killed by signal {sig}"),
-                None => format!("it exited {}", o.status),
-            };
-            format!(
-                "{ended} and wrote {} bytes to stdout and {} to stderr, which \
-                 base64-encoded is {frame}; redirect its output to a file in the command \
-                 (`sh -c '… > /path'`) and read that file",
-                o.stdout.len(),
-                o.stderr.len()
-            )
-        }
-        HelperResponse::Paths(p) => format!(
-            "the directory has {} entries, a listing {frame}; listing a directory this \
-             large has to be done without `as_user`/`as_root`",
-            p.len()
-        ),
-        _ => format!("the answer is {frame}"),
-    }
-}
-
-/// Why a file of `size` bytes cannot be read through a helper.
-fn file_too_large(size: u64, max_frame: usize) -> String {
-    format!(
-        "the file is {size} bytes, which base64-encoded is more than one helper frame \
-         holds ({max_frame} bytes); reading a file this large has to be done without \
-         `as_user`/`as_root`"
-    )
-}
-
 /// `s`, or its first `max` bytes (backed off to a character boundary) and
 /// an ellipsis. Messages quote a request's label through this, so an argv
 /// of a megabyte does not become a message of one.
@@ -579,9 +1066,8 @@ fn cut(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-fn unit(r: io::Result<()>) -> HelperResponse {
+fn unit(r: io::Result<()>) -> io::Result<HelperResponse> {
     r.map(|()| HelperResponse::Unit)
-        .unwrap_or_else(HelperResponse::from_io)
 }
 
 /// The command line that starts a helper as `user` through `method`
@@ -1159,13 +1645,15 @@ impl Connection {
 /// never reaches costs nothing and `sudo` is never asked about an identity
 /// nobody used.
 ///
-/// It narrows nothing. The far side is a full [`Local`] running as that
-/// user, so a request is bounded by that user's permissions and by nothing
-/// this type adds. What it does add is refusals: a mutation while the step
-/// is checking, a request larger than one frame or that cannot be encoded,
-/// an answer of either kind (the helper refuses it, and goes on serving),
-/// and every primitive after the first failure. Only the last is a latch;
-/// the others refuse one request.
+/// It narrows nothing, and it limits no size. The far side is a full
+/// [`Local`] running as that user, so a request is bounded by that user's
+/// permissions and by nothing this type adds, and a file, a listing or a
+/// command's input and output of any size crosses in chunks of 1 MiB (see
+/// the module doc). What it does add is refusals: a mutation while the step
+/// is checking, a request larger than one frame or that cannot be encoded
+/// (a command line of tens of megabytes), and every primitive after the
+/// first failure of the helper itself. Only the last is a latch; the others
+/// refuse one request.
 pub struct Elevated {
     user: String,
     spawner: Option<Spawner>,
@@ -1180,6 +1668,17 @@ pub struct Elevated {
     failed: Mutex<Option<HelperGone>>,
     /// The largest request frame sent: [`MAX_FRAME`], lowered by tests.
     max_frame: usize,
+    /// The most bytes this side puts in one chunk of a write or of a
+    /// command's stdin: [`CHUNK_SIZE`], lowered by tests.
+    chunk: usize,
+}
+
+/// A mutex's guard whether or not another thread panicked holding it. The
+/// state behind these locks is a connection and a latch, both still
+/// meaningful after a panic elsewhere, and cleanup that runs while
+/// unwinding must not panic again.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Elevated {
@@ -1198,6 +1697,7 @@ impl Elevated {
             conn: Mutex::new(None),
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
+            chunk: CHUNK_SIZE,
         }
     }
 
@@ -1225,7 +1725,34 @@ impl Elevated {
             })),
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
+            chunk: CHUNK_SIZE,
         }
+    }
+
+    /// An `Elevated` over [`serve_helper`] running on a thread of this
+    /// process, joined to it by two pipes: a real helper loop and a real
+    /// [`Local`], as this process's own user, without `sudo`. `wrap_tx` and
+    /// `wrap_rx` may put something between this side and the pipes, which
+    /// is how a test watches the frames. The thread ends when this is
+    /// dropped and the helper sees EOF.
+    #[cfg(test)]
+    pub(crate) fn in_process_with(
+        user: &str,
+        phase: Arc<AtomicU8>,
+        limits: Limits,
+        wrap_tx: impl FnOnce(io::PipeWriter) -> Box<dyn Write + Send>,
+        wrap_rx: impl FnOnce(io::PipeReader) -> Box<dyn Read + Send>,
+    ) -> io::Result<Elevated> {
+        let (req_r, req_w) = io::pipe()?;
+        let (resp_r, resp_w) = io::pipe()?;
+        std::thread::spawn(move || {
+            let (mut rx, mut tx) = (req_r, resp_w);
+            let _ = serve(&mut rx, &mut tx, limits);
+        });
+        let mut e = Elevated::connected(user, wrap_tx(req_w), wrap_rx(resp_r), phase);
+        e.max_frame = limits.frame;
+        e.chunk = limits.chunk;
+        Ok(e)
     }
 
     /// The user the helper runs as, as messages name it. Never the calling
@@ -1237,8 +1764,21 @@ impl Elevated {
     }
 
     fn call(&self, op: HelperOp) -> io::Result<HelperResponse> {
+        self.call_with(op, true)
+    }
+
+    /// Release a stream this side is giving up on, best effort: an error is
+    /// ignored, no helper is spawned for it, and a poisoned lock is not a
+    /// panic, so it is safe from a `Drop` that runs while unwinding.
+    fn release(&self, op: HelperOp) {
+        let _ = self.call_with(op, false);
+    }
+
+    /// Send `op` and return the answer. Spawns the helper when there is none
+    /// and `spawn` allows.
+    fn call_with(&self, op: HelperOp, spawn: bool) -> io::Result<HelperResponse> {
         let checking = self.phase.load(Ordering::SeqCst) == crate::system::Phase::Checking as u8;
-        if let Some(first) = self.failed.lock().unwrap().as_ref() {
+        if let Some(first) = lock(&self.failed).as_ref() {
             return Err(io::Error::other(HelperGone {
                 what: format!(
                     "the helper running as `{}` failed earlier and is not retried: {}",
@@ -1250,26 +1790,6 @@ impl Elevated {
         // A request's label is quoted in front of every refusal below; cut,
         // so an argv of megabytes does not become a message of megabytes.
         let label = cut(&op.label(), 512);
-        if let Some((path, len)) = op.payload()
-            && len > MAX_FRAME_PAYLOAD
-        {
-            return Err(io::Error::other(match &op {
-                HelperOp::Spawn(_) => format!(
-                    "{label} as `{}`: its stdin is {len} bytes, more than one helper frame \
-                     can carry ({MAX_FRAME_PAYLOAD} bytes); have the command read input \
-                     this large from a file on the target instead",
-                    self.user
-                ),
-                _ => format!(
-                    "{}: {len} bytes is more than one helper frame can carry \
-                     ({MAX_FRAME_PAYLOAD} bytes); running as `{}` sends the whole file in \
-                     one request, so a file this large has to be handled without \
-                     `as_user`/`as_root`",
-                    cut(&path.display().to_string(), 512),
-                    self.user
-                ),
-            }));
-        }
         // Encoded before anything is written, so a request that cannot be
         // sent is refused with the stream intact: no shutdown, no latch.
         let req = HelperRequest { checking, op };
@@ -1280,7 +1800,7 @@ impl Elevated {
                     "{label} as `{}`: the request is more than one helper frame holds \
                      ({} bytes) once encoded; a request this large cannot be sent through \
                      `as_user`/`as_root`, so pass large input to a command in a file on the \
-                     target rather than in its arguments or stdin",
+                     target or on its stdin rather than in its arguments",
                     self.user, self.max_frame
                 )));
             }
@@ -1291,11 +1811,12 @@ impl Elevated {
                 )));
             }
         };
-        let mut guard = self.conn.lock().unwrap();
+        let mut guard = lock(&self.conn);
         if guard.is_none() {
             let spawner = self
                 .spawner
                 .as_ref()
+                .filter(|_| spawn)
                 .ok_or_else(|| io::Error::other("helper connection is closed"))?;
             *guard = Some(self.latch(spawner.spawn(&self.user))?);
         }
@@ -1331,6 +1852,7 @@ impl Elevated {
                 c.shutdown();
             }
         }
+        drop(guard);
         match self.latch(resp)? {
             // The helper's own refusals of an answer quote nothing from the
             // request (see `serve_helper`); this side names it, and the
@@ -1348,10 +1870,7 @@ impl Elevated {
                     "" => "refused: the answer cannot be encoded",
                     m => m,
                 };
-                Err(io::Error::new(
-                    io::Error::from_raw_os_error(code).kind(),
-                    format!("{label} as `{}`: {reason}", self.user),
-                ))
+                Err(coded(code, format!("{label} as `{}`: {reason}", self.user)))
             }
             other => other.into_io(),
         }
@@ -1361,7 +1880,7 @@ impl Elevated {
     /// spawning another helper.
     fn latch<T>(&self, r: io::Result<T>) -> io::Result<T> {
         if let Err(e) = &r {
-            let mut f = self.failed.lock().unwrap();
+            let mut f = lock(&self.failed);
             if f.is_none() {
                 *f = Some(
                     HelperGone::inside(e)
@@ -1379,20 +1898,254 @@ impl Elevated {
     fn expect_unit(&self, op: HelperOp) -> io::Result<()> {
         match self.call(op)? {
             HelperResponse::Unit => Ok(()),
-            other => Err(unexpected(other)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Open `p` for reading through the helper: its first chunk comes back
+    /// with the open, so a file of one chunk or less is one round trip and
+    /// leaves nothing open.
+    fn reader(&self, p: &Path) -> io::Result<HelperReader<'_>> {
+        match self.call(HelperOp::ReadBegin { path: p.into() })? {
+            HelperResponse::Data { handle, bytes } => Ok(HelperReader {
+                offset: bytes.len() as u64,
+                buf: bytes,
+                pos: 0,
+                held: Held::new(self, handle, Release::Close),
+            }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Write what `src` yields to `p`, chunk by chunk: each chunk is filled
+    /// whole before it is sent, and one byte past it is read first, so the
+    /// last chunk is known to be the last and a file of one chunk or less is
+    /// one request. The lock is taken per request and never while `src` is
+    /// read, so `src` may be a reader on this same helper. An error from
+    /// `src` abandons the write and is returned as it was.
+    fn write_stream(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64> {
+        let chunk = self.chunk;
+        let mut buf = Zeroizing::new(Vec::with_capacity(chunk + 1));
+        fill(src, &mut buf, chunk + 1)?;
+        let n = buf.len().min(chunk);
+        let last = buf.len() <= chunk;
+        let begin = HelperOp::WriteBegin {
+            path: p.into(),
+            attrs,
+            bytes: Zeroizing::new(buf[..n].to_vec()),
+            last,
+        };
+        if last {
+            self.expect_unit(begin)?;
+            return Ok(n as u64);
+        }
+        let handle = match self.call(begin)? {
+            HelperResponse::Handle(h) => h,
+            other => return Err(unexpected(&other)),
+        };
+        let held = Held::new(self, Some(handle), Release::Abort);
+        let mut offset = n as u64;
+        buf.drain(..n);
+        loop {
+            fill(src, &mut buf, chunk + 1)?;
+            let n = buf.len().min(chunk);
+            let last = buf.len() <= chunk;
+            self.expect_unit(HelperOp::WriteChunk {
+                handle,
+                offset,
+                bytes: Zeroizing::new(buf[..n].to_vec()),
+                last,
+            })?;
+            offset += n as u64;
+            if last {
+                held.done();
+                return Ok(offset);
+            }
+            buf.drain(..n);
+        }
+    }
+
+    /// Stage `input` in the helper as a command's stdin, chunk by chunk,
+    /// and return the stream holding it.
+    fn stage_stdin(&self, input: &[u8]) -> io::Result<Held<'_>> {
+        let mut parts = input.chunks(self.chunk);
+        let first = parts.next().unwrap_or_default();
+        let handle = match self.call(HelperOp::StdinBegin {
+            bytes: Zeroizing::new(first.to_vec()),
+        })? {
+            HelperResponse::Handle(h) => h,
+            other => return Err(unexpected(&other)),
+        };
+        let held = Held::new(self, Some(handle), Release::Close);
+        let mut offset = first.len() as u64;
+        for part in parts {
+            self.expect_unit(HelperOp::StdinChunk {
+                handle,
+                offset,
+                bytes: Zeroizing::new(part.to_vec()),
+            })?;
+            offset += part.len() as u64;
+        }
+        Ok(held)
+    }
+
+    /// A finished command's output kept behind `handle`, read back whole.
+    fn output(
+        &self,
+        handle: u32,
+        status: i32,
+        signal: Option<i32>,
+        stdout: u64,
+        stderr: u64,
+    ) -> io::Result<Output> {
+        let total = usize::try_from(stdout + stderr)
+            .map_err(|_| io::Error::other("the command's output does not fit in memory"))?;
+        let mut held = Held::new(self, Some(handle), Release::Close);
+        let mut all = Vec::with_capacity(total);
+        while let Some(h) = held.handle {
+            match self.call(HelperOp::ReadChunk {
+                handle: h,
+                offset: all.len() as u64,
+            })? {
+                HelperResponse::Data { handle, bytes } => {
+                    if bytes.is_empty() && handle.is_some() {
+                        return Err(io::Error::other(
+                            "the helper sent an empty chunk of a command's output",
+                        ));
+                    }
+                    all.extend_from_slice(&bytes);
+                    held.handle = handle;
+                }
+                other => return Err(unexpected(&other)),
+            }
+        }
+        if all.len() != total {
+            return Err(io::Error::other(format!(
+                "the helper sent {} bytes of a command's output, not the {total} it announced",
+                all.len()
+            )));
+        }
+        let stderr = all.split_off(stdout as usize);
+        Ok(Output {
+            status,
+            signal,
+            stdout: all,
+            stderr,
+        })
+    }
+}
+
+/// Read from `src` until `buf` holds `want` bytes or `src` ends. `buf`'s
+/// capacity is at least `want`, so it does not grow, and an interrupted
+/// read is retried.
+fn fill(src: &mut dyn Read, buf: &mut Vec<u8>, want: usize) -> io::Result<()> {
+    let mut filled = buf.len();
+    buf.resize(want, 0);
+    while filled < want {
+        match src.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                buf.truncate(filled);
+                return Err(e);
+            }
+        }
+    }
+    buf.truncate(filled);
+    Ok(())
+}
+
+/// How [`Held`] lets go of a stream.
+#[derive(Clone, Copy)]
+enum Release {
+    /// [`HelperOp::WriteAbort`]: a staged write, which leaves nothing.
+    Abort,
+    /// [`HelperOp::Close`]: anything else.
+    Close,
+}
+
+/// A stream the helper holds open for this side, released when this side
+/// lets go of it before its end (an error, a panic, a reader dropped half
+/// way), and forgotten once the helper has ended it.
+struct Held<'a> {
+    e: &'a Elevated,
+    handle: Option<u32>,
+    release: Release,
+}
+
+impl<'a> Held<'a> {
+    fn new(e: &'a Elevated, handle: Option<u32>, release: Release) -> Self {
+        Held { e, handle, release }
+    }
+
+    /// The stream ended as it should: nothing to release.
+    fn done(mut self) {
+        self.handle = None;
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.e.release(match self.release {
+                Release::Abort => HelperOp::WriteAbort { handle },
+                Release::Close => HelperOp::Close { handle },
+            });
         }
     }
 }
 
-fn unexpected(r: HelperResponse) -> io::Error {
-    io::Error::other(format!("unexpected helper response {r:?}"))
+/// [`Backend::open_read`] through a helper: one request per chunk, the lock
+/// taken per request and released between them, and each chunk's remainder
+/// kept here, so a reader that takes 512 bytes at a time (a tar header) does
+/// not cost a round trip each.
+struct HelperReader<'a> {
+    held: Held<'a>,
+    buf: Zeroizing<Vec<u8>>,
+    pos: usize,
+    /// Bytes received so far, which is the next chunk's offset.
+    offset: u64,
+}
+
+impl Read for HelperReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        while self.pos == self.buf.len() {
+            let Some(handle) = self.held.handle else {
+                return Ok(0);
+            };
+            match self.held.e.call(HelperOp::ReadChunk {
+                handle,
+                offset: self.offset,
+            })? {
+                HelperResponse::Data { handle, bytes } => {
+                    self.offset += bytes.len() as u64;
+                    self.buf = bytes;
+                    self.pos = 0;
+                    self.held.handle = handle;
+                }
+                other => return Err(unexpected(&other)),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+fn unexpected(r: &HelperResponse) -> io::Error {
+    io::Error::other(format!("unexpected helper response {}", r.kind()))
 }
 
 impl Drop for Elevated {
     fn drop(&mut self) {
-        if let Ok(mut g) = self.conn.lock()
-            && let Some(c) = g.take()
-        {
+        if let Some(c) = lock(&self.conn).take() {
             c.shutdown();
         }
     }
@@ -1400,30 +2153,26 @@ impl Drop for Elevated {
 
 impl Backend for Elevated {
     fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
-        match self.call(HelperOp::Read { path: p.into() })? {
-            HelperResponse::Bytes(b) => Ok(b),
-            other => Err(unexpected(other)),
-        }
+        let mut out = Vec::new();
+        self.reader(p)?.read_to_end(&mut out)?;
+        Ok(out)
     }
 
-    fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
-        self.expect_unit(HelperOp::Write {
-            path: p.into(),
-            bytes: bytes.to_vec(),
-        })
+    fn write(&self, p: &Path, mut bytes: &[u8]) -> io::Result<()> {
+        self.write_stream(p, &mut bytes, None).map(drop)
     }
 
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
         match self.call(HelperOp::Stat { path: p.into() })? {
             HelperResponse::Stat(s) => Ok(s),
-            other => Err(unexpected(other)),
+            other => Err(unexpected(&other)),
         }
     }
 
     fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
         match self.call(HelperOp::StatFollow { path: p.into() })? {
             HelperResponse::Stat(s) => Ok(s),
-            other => Err(unexpected(other)),
+            other => Err(unexpected(&other)),
         }
     }
 
@@ -1478,54 +2227,175 @@ impl Backend for Elevated {
     fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
         match self.call(HelperOp::ReadLink { path: p.into() })? {
             HelperResponse::Path(p) => Ok(p),
-            other => Err(unexpected(other)),
+            other => Err(unexpected(&other)),
         }
     }
 
+    /// Batch by batch, each about a chunk of encoded names, then sorted as
+    /// `Local` sorts them: a listing of one batch is one round trip.
     fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
-        match self.call(HelperOp::ReadDir { path: p.into() })? {
-            HelperResponse::Paths(v) => Ok(v),
-            other => Err(unexpected(other)),
+        let mut out = Vec::new();
+        let mut held = Held::new(self, None, Release::Close);
+        let mut next = HelperOp::ReadDirBegin { path: p.into() };
+        loop {
+            match self.call(next)? {
+                HelperResponse::Names { handle, names } => {
+                    out.extend(names.into_iter().map(|n| p.join(n.0)));
+                    held.handle = handle;
+                }
+                other => return Err(unexpected(&other)),
+            }
+            match held.handle {
+                Some(handle) => next = HelperOp::ReadDirChunk { handle },
+                None => break,
+            }
         }
+        out.sort();
+        Ok(out)
     }
 
+    /// A stdin larger than one chunk is staged in the helper first, chunk by
+    /// chunk; output larger than one comes back the same way. Either is one
+    /// round trip when it is small.
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
-        match self.call(HelperOp::Spawn(spec.clone()))? {
+        let staged = match &spec.stdin {
+            Some(input) if input.len() > self.chunk => Some(self.stage_stdin(input)?),
+            _ => None,
+        };
+        let resp = self.call(HelperOp::Spawn {
+            cmd: WireCmd::of(spec, staged.is_none()),
+            stdin: staged.as_ref().and_then(|s| s.handle),
+        });
+        // An answer means the helper took the staged stdin, whether or not
+        // the command started.
+        if resp.is_ok()
+            && let Some(staged) = staged
+        {
+            staged.done();
+        }
+        match resp? {
             HelperResponse::Output(o) => Ok(o),
-            other => Err(unexpected(other)),
+            HelperResponse::OutputHandle {
+                handle,
+                status,
+                signal,
+                stdout,
+                stderr,
+            } => self.output(handle, status, signal, stdout, stderr),
+            other => Err(unexpected(&other)),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::backend::FileKind;
     use crate::protocol::write_frame;
     use crate::system::Phase;
-    use std::collections::BTreeMap;
 
-    /// An in-process helper: `serve_helper` on a thread, joined by two pipes.
+    fn applying() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(Phase::Applying as u8))
+    }
+
+    /// An in-process helper with the real limits.
     fn in_process(phase: Arc<AtomicU8>) -> Elevated {
-        in_process_within(phase, MAX_FRAME)
+        in_process_within(phase, Limits::REAL)
     }
 
-    /// [`in_process`], with a helper that refuses answers over `max_frame`
-    /// bytes, so a test can be refused without building 64 MiB frames.
-    fn in_process_within(phase: Arc<AtomicU8>, max_frame: usize) -> Elevated {
-        let (req_r, req_w) = io::pipe().unwrap();
-        let (resp_r, resp_w) = io::pipe().unwrap();
-        std::thread::spawn(move || {
-            let (mut rx, mut tx) = (req_r, resp_w);
-            serve(&mut rx, &mut tx, max_frame).unwrap();
-        });
-        Elevated::connected("tester", Box::new(req_w), Box::new(resp_r), phase)
+    /// An in-process helper, both sides at `limits`.
+    fn in_process_within(phase: Arc<AtomicU8>, limits: Limits) -> Elevated {
+        Elevated::in_process_with("tester", phase, limits, |w| Box::new(w), |r| Box::new(r))
+            .unwrap()
     }
 
-    /// The frame limit the oversized-answer tests give their helper: small
-    /// enough that a test's file, output or listing passes it cheaply, and
-    /// large enough for any refusal.
-    const SMALL_FRAME: usize = 16 * 1024;
+    /// Small chunks, so a test of a file of several chunks writes kilobytes;
+    /// and a frame they fit in with room to spare.
+    const SMALL: Limits = Limits {
+        frame: 16 * 1024,
+        chunk: 4096,
+    };
+
+    /// The frames that went one way through a pipe, as their lengths, read
+    /// off the bytes as they pass whatever size the writes and reads are.
+    #[derive(Default)]
+    struct FrameLog {
+        prefix: Vec<u8>,
+        remaining: usize,
+        sizes: Vec<usize>,
+    }
+
+    impl FrameLog {
+        fn feed(&mut self, mut bytes: &[u8]) {
+            while !bytes.is_empty() {
+                if self.remaining == 0 {
+                    let take = (4 - self.prefix.len()).min(bytes.len());
+                    self.prefix.extend_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
+                    if self.prefix.len() == 4 {
+                        let len = u32::from_be_bytes(self.prefix[..].try_into().unwrap());
+                        self.sizes.push(len as usize);
+                        self.remaining = len as usize;
+                        self.prefix.clear();
+                    }
+                } else {
+                    let take = self.remaining.min(bytes.len());
+                    self.remaining -= take;
+                    bytes = &bytes[take..];
+                }
+            }
+        }
+    }
+
+    type Log = Arc<Mutex<FrameLog>>;
+
+    /// A pipe end that records the frames through it.
+    struct Recorded<T> {
+        inner: T,
+        log: Log,
+    }
+
+    impl<W: Write> Write for Recorded<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.log.lock().unwrap().feed(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl<R: Read> Read for Recorded<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.log.lock().unwrap().feed(&buf[..n]);
+            Ok(n)
+        }
+    }
+
+    /// An in-process helper at `limits` whose requests and answers are
+    /// recorded.
+    fn recorded(limits: Limits) -> (Elevated, Log, Log) {
+        let (requests, answers) = (Log::default(), Log::default());
+        let (rq, an) = (requests.clone(), answers.clone());
+        let e = Elevated::in_process_with(
+            "tester",
+            applying(),
+            limits,
+            move |w| Box::new(Recorded { inner: w, log: rq }),
+            move |r| Box::new(Recorded { inner: r, log: an }),
+        )
+        .unwrap();
+        (e, requests, answers)
+    }
+
+    fn frames(log: &Log) -> usize {
+        log.lock().unwrap().sizes.len()
+    }
 
     /// A shell command, as `sys.cmd` would build it.
     fn sh(script: &str) -> CmdSpec {
@@ -1539,25 +2409,36 @@ mod tests {
         }
     }
 
-    /// Create an empty file named `caf\xe9`, not UTF-8, in `dir`, and say
-    /// whether that worked. A filesystem that only stores UTF-8 names
-    /// refuses it with `EILSEQ` (APFS on a mac does): no listing there can
-    /// hold such a name, so the answer that cannot be encoded never arises,
-    /// and a test of it skips that case and says so on stderr.
-    fn plant_a_name_that_is_not_utf8(dir: &Path) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-        let name = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
-        match std::fs::write(&name, b"") {
-            Ok(()) => true,
-            Err(e) if e.raw_os_error() == Some(unencodable_code()) => {
-                eprintln!(
-                    "note: skipping the listing that cannot be encoded: this filesystem \
-                     refuses a name that is not UTF-8 ({e})"
-                );
-                false
-            }
-            Err(e) => panic!("creating {}: {e}", name.display()),
-        }
+    /// `n` bytes that are not a repeated pattern, so a chunk out of place or
+    /// a byte lost shows.
+    fn data(n: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_u32;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// The `.rustible-*` temporary files in `dir`.
+    fn staged_in(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().as_bytes().starts_with(b".rustible-"))
+            .collect()
+    }
+
+    /// The errno an error from the helper carries.
+    fn errno(e: &io::Error) -> Option<i32> {
+        errno_of(e)
+    }
+
+    fn ebadf() -> Option<i32> {
+        Some(rustix::io::Errno::BADF.raw_os_error())
     }
 
     /// `stat`, `read` and `write` still work on `e`, in a fresh directory:
@@ -1571,10 +2452,27 @@ mod tests {
         assert_eq!(e.stat(&f).unwrap().unwrap().size, 10);
     }
 
+    /// The helper holds no stream: all [`MAX_HANDLES`] can be opened, and
+    /// not one more. Each is a read of a file of two chunks, closed again
+    /// when the readers drop.
+    fn holds_no_stream(e: &Elevated, chunk: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("two-chunks");
+        std::fs::write(&f, data(chunk + 1)).unwrap();
+        let readers: Vec<_> = (0..MAX_HANDLES).map(|_| e.reader(&f).unwrap()).collect();
+        assert!(readers.iter().all(|r| r.held.handle.is_some()));
+        let Err(full) = e.reader(&f) else {
+            panic!("a stream past the cap was opened")
+        };
+        assert!(
+            full.to_string().contains("already holds 64 open streams"),
+            "{full}"
+        );
+    }
+
     #[test]
     fn primitives_round_trip_through_the_helper_loop() {
-        let phase = Arc::new(AtomicU8::new(Phase::Idle as u8));
-        let e = in_process(phase.clone());
+        let e = in_process(Arc::new(AtomicU8::new(Phase::Idle as u8)));
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("sub/x.txt");
 
@@ -1628,75 +2526,830 @@ mod tests {
 
         let missing = e.read(&dir.path().join("nope")).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound, "{missing}");
+        let not_a_dir = e.read_dir(&dir.path().join("nope")).unwrap_err();
+        assert_eq!(not_a_dir.kind(), io::ErrorKind::NotFound, "{not_a_dir}");
 
-        let out = e
-            .spawn(&CmdSpec {
-                program: "sh".into(),
-                args: vec!["-c".into(), "cat; echo err >&2; exit 3".into()],
-                env: BTreeMap::new(),
-                cwd: None,
-                stdin: Some(b"in\x00put".to_vec()),
-                prefix: vec![],
-            })
-            .unwrap();
+        let mut cmd = sh("cat; echo err >&2; exit 3");
+        cmd.stdin = Some(b"in\x00put".to_vec());
+        let out = e.spawn(&cmd).unwrap();
         assert_eq!(
             (out.status, &out.stdout[..], out.stderr_str().trim()),
             (3, &b"in\x00put"[..], "err")
         );
     }
 
+    /// Files of 0, `chunk - 1`, `chunk`, `chunk + 1` and several chunks
+    /// round-trip byte for byte, and one of a chunk or less is exactly one
+    /// request and one answer each way: the first request of a stream
+    /// carries or returns the first chunk, and one byte past it says
+    /// whether it was the last.
+    #[test]
+    fn files_of_every_size_round_trip_and_a_small_one_is_one_round_trip() {
+        let chunk = SMALL.chunk;
+        let (e, requests, answers) = recorded(SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        for n in [0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk + 5] {
+            let f = dir.path().join(format!("f{n}"));
+            let body = data(n);
+            let before = frames(&requests);
+            e.write(&f, &body).unwrap();
+            let writes = frames(&requests) - before;
+            assert_eq!(std::fs::read(&f).unwrap(), body, "{n} bytes written");
+
+            let before = frames(&requests);
+            assert_eq!(e.read(&f).unwrap(), body, "{n} bytes read");
+            let reads = frames(&requests) - before;
+            let want = n.div_ceil(chunk).max(1);
+            assert_eq!((writes, reads), (want, want), "{n} bytes");
+        }
+        assert_eq!(frames(&requests), frames(&answers));
+        assert!(staged_in(dir.path()).is_empty());
+        holds_no_stream(&e, chunk);
+    }
+
+    /// A reader that takes a few hundred bytes at a time, as a tar walk
+    /// does, costs one request per chunk, not one per read: each chunk's
+    /// remainder is kept on this side.
+    #[test]
+    fn the_reader_keeps_each_chunks_remainder() {
+        let chunk = SMALL.chunk;
+        let (e, requests, _) = recorded(SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        let body = data(5 * chunk + 100);
+        std::fs::write(&f, &body).unwrap();
+        let mut r = e.reader(&f).unwrap();
+        let mut got = Vec::new();
+        let mut piece = [0u8; 512];
+        loop {
+            let n = r.read(&mut piece).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&piece[..n]);
+        }
+        assert_eq!(got, body);
+        assert_eq!(frames(&requests), 6);
+        assert_eq!(r.held.handle, None, "ended with its last chunk");
+    }
+
+    /// A reader dropped half way closes its stream, so the helper's table is
+    /// empty again; a write that fails half way aborts its own.
+    #[test]
+    fn a_stream_given_up_half_way_is_released() {
+        let chunk = SMALL.chunk;
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, data(3 * chunk)).unwrap();
+        for _ in 0..2 * MAX_HANDLES {
+            let mut r = e.reader(&f).unwrap();
+            r.read_exact(&mut [0u8; 10]).unwrap();
+        }
+        for _ in 0..2 * MAX_HANDLES {
+            let mut failing = io::Cursor::new(data(2 * chunk + 2)).chain(Failing);
+            assert!(
+                e.write_stream(&dir.path().join("w"), &mut failing, None)
+                    .is_err()
+            );
+        }
+        // A listing given up on: the guard `read_dir` holds, dropped with
+        // the stream still open.
+        let listed = dir.path().join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        for i in 0..200 {
+            std::fs::write(listed.join(format!("{i:0>96}")), b"").unwrap();
+        }
+        for _ in 0..2 * MAX_HANDLES {
+            let HelperResponse::Names { handle, .. } = e
+                .call(HelperOp::ReadDirBegin {
+                    path: listed.clone(),
+                })
+                .unwrap()
+            else {
+                panic!("not names")
+            };
+            assert!(handle.is_some(), "the listing fit one batch");
+            drop(Held::new(&e, handle, Release::Close));
+        }
+        holds_no_stream(&e, chunk);
+        assert!(!dir.path().join("w").exists());
+        assert!(staged_in(dir.path()).is_empty());
+    }
+
+    /// A source that fails when it is read.
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("the source broke"))
+        }
+    }
+
+    /// A source that yields `body` and then fails at its end, as a reader
+    /// that checks a digest at EOF does.
+    struct FailsAtEof(io::Cursor<Vec<u8>>);
+
+    impl Read for FailsAtEof {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "checksum mismatch at the end",
+                )),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// A source that fails part way, or only at its end, writes nothing: the
+    /// target keeps its content, nothing is left beside it, the error is the
+    /// source's own, and the helper goes on serving. Small and large, new
+    /// file and rewrite.
+    #[test]
+    fn a_source_that_fails_writes_nothing() {
+        let chunk = SMALL.chunk;
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, "before").unwrap();
+        let new = dir.path().join("new");
+        for n in [10, chunk + 1, 3 * chunk] {
+            for p in [&old, &new] {
+                let mut part_way = io::Cursor::new(data(n)).chain(Failing);
+                let err = e.write_stream(p, &mut part_way, None).unwrap_err();
+                assert_eq!(err.to_string(), "the source broke");
+
+                let mut at_eof = FailsAtEof(io::Cursor::new(data(n)));
+                let err = e.write_stream(p, &mut at_eof, None).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(err.to_string(), "checksum mismatch at the end");
+            }
+        }
+        assert_eq!(std::fs::read(&old).unwrap(), b"before");
+        assert!(!new.exists());
+        assert!(staged_in(dir.path()).is_empty());
+        still_serves(&e);
+    }
+
+    /// Through the helper, a rewrite's content and a new file given
+    /// attributes are staged at 0600 between two chunks; the target is the
+    /// old one until the last chunk, then the new one with its mode.
+    #[test]
+    fn a_staged_write_is_0600_between_two_chunks_through_the_helper() {
+        let chunk = SMALL.chunk;
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, "before").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let new = dir.path().join("new");
+        let attrs = WriteAttrs {
+            mode: Some(0o640),
+            owner: None,
+        };
+
+        /// Yields `body`, and once it is past the first chunk and the one
+        /// byte read ahead of it (so the helper has staged the first
+        /// chunk), records the staged file's mode at every read.
+        struct Watching<'a> {
+            body: io::Cursor<Vec<u8>>,
+            dir: &'a Path,
+            target: &'a Path,
+            after: u64,
+            seen: Vec<(u32, Vec<u8>)>,
+        }
+        impl Read for Watching<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.body.position() >= self.after {
+                    let tmp = staged_in(self.dir);
+                    assert_eq!(tmp.len(), 1, "{tmp:?}");
+                    let mode = std::fs::metadata(&tmp[0]).unwrap().permissions().mode() & 0o7777;
+                    let target = std::fs::read(self.target).unwrap_or_default();
+                    self.seen.push((mode, target));
+                }
+                self.body.read(buf)
+            }
+        }
+
+        for (p, attrs, mode) in [(&old, None, 0o644), (&new, Some(attrs), 0o640)] {
+            let body = data(3 * chunk);
+            let before = std::fs::read(p).unwrap_or_default();
+            let mut src = Watching {
+                body: io::Cursor::new(body.clone()),
+                dir: dir.path(),
+                target: p,
+                after: chunk as u64 + 1,
+                seen: Vec::new(),
+            };
+            e.write_stream(p, &mut src, attrs).unwrap();
+            assert!(src.seen.len() >= 2, "{}", src.seen.len());
+            for (seen, target) in &src.seen {
+                assert_eq!(*seen, 0o600, "{}", p.display());
+                assert_eq!(*target, before, "replaced before the last chunk");
+            }
+            assert_eq!(std::fs::read(p).unwrap(), body);
+            assert_eq!(
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
+        assert!(staged_in(dir.path()).is_empty());
+    }
+
+    /// A read and a write on one helper interleave chunk by chunk: the
+    /// write's source is a reader on the same helper, so each chunk read is
+    /// a request between two chunks written. Holding the connection for a
+    /// whole stream would deadlock here, so it is bounded.
+    #[test]
+    fn a_read_and_a_write_interleave_on_one_helper() {
+        let (tx, rx) = mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        let body = data(10 * SMALL.chunk + 7);
+        std::fs::write(&src, &body).unwrap();
+        let (s, d) = (src.clone(), dst.clone());
+        std::thread::spawn(move || {
+            let (e, requests, _) = recorded(SMALL);
+            let written = e
+                .write_stream(&d, &mut e.reader(&s).unwrap(), None)
+                .unwrap();
+            let _ = tx.send((written, frames(&requests)));
+        });
+        let (written, requests) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a read and a write on one helper deadlocked");
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(std::fs::read(&dst).unwrap(), body);
+        // Eleven chunks each way.
+        assert_eq!(requests, 22);
+    }
+
+    /// A listing of several batches comes back whole, in `Local`'s order,
+    /// and the names that are not UTF-8 among them; one of a single batch is
+    /// one request.
+    #[test]
+    fn a_listing_of_several_batches_comes_back_whole_and_sorted() {
+        let (e, requests, _) = recorded(SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("{i:0>96}")), b"").unwrap();
+        }
+        plant_a_name_that_is_not_utf8(dir.path());
+        let got = e.read_dir(dir.path()).unwrap();
+        assert_eq!(got, Local.read_dir(dir.path()).unwrap());
+        assert!(got.len() >= 300);
+        assert!(frames(&requests) > 4, "{} requests", frames(&requests));
+
+        let small = dir.path().join("small");
+        std::fs::create_dir(&small).unwrap();
+        std::fs::write(small.join("a"), b"").unwrap();
+        let before = frames(&requests);
+        assert_eq!(e.read_dir(&small).unwrap(), [small.join("a")]);
+        assert_eq!(frames(&requests) - before, 1);
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(e.read_dir(&empty).unwrap().is_empty());
+        holds_no_stream(&e, SMALL.chunk);
+    }
+
+    /// The bytes of a name that is not UTF-8.
+    const BAD: &[u8] = b"bad\xff";
+
+    /// Create an empty file named `bad\xff`, not UTF-8, in `dir`, and say
+    /// whether that worked. A filesystem that only stores UTF-8 names
+    /// refuses it with `EILSEQ` (APFS on a mac does): a test of such names
+    /// skips there and says so on stderr.
+    fn plant_a_name_that_is_not_utf8(dir: &Path) -> bool {
+        let name = dir.join(std::ffi::OsStr::from_bytes(BAD));
+        match std::fs::write(&name, b"") {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(unencodable_code()) => {
+                eprintln!(
+                    "note: skipping a name that is not UTF-8: this filesystem refuses one ({e})"
+                );
+                false
+            }
+            Err(e) => panic!("creating {}: {e}", name.display()),
+        }
+    }
+
+    /// A name that is not UTF-8 works through a helper as it does on
+    /// `Local`: listed, stat'ed, read, written and renamed, since paths
+    /// cross as bytes.
+    #[test]
+    fn a_name_that_is_not_utf8_works_through_the_helper() {
+        let e = in_process(applying());
+        let dir = tempfile::tempdir().unwrap();
+        if !plant_a_name_that_is_not_utf8(dir.path()) {
+            return;
+        }
+        let bad = dir.path().join(std::ffi::OsStr::from_bytes(BAD));
+        assert_eq!(e.read_dir(dir.path()).unwrap(), std::slice::from_ref(&bad));
+        assert_eq!(e.stat(&bad).unwrap().unwrap().kind, FileKind::File);
+        e.write(&bad, b"through the helper").unwrap();
+        assert_eq!(e.read(&bad).unwrap(), b"through the helper");
+        let link = dir.path().join(std::ffi::OsStr::from_bytes(b"link\xfe"));
+        e.symlink(&bad, &link).unwrap();
+        assert_eq!(e.read_link(&link).unwrap(), bad);
+        let sub = dir.path().join(std::ffi::OsStr::from_bytes(b"sub\xfe"));
+        e.mkdir_all(&sub).unwrap();
+        let mut cmd = sh("pwd");
+        cmd.cwd = Some(sub.clone());
+        let out = e.spawn(&cmd).unwrap();
+        assert_eq!(out.stdout, [sub.as_os_str().as_bytes(), b"\n"].concat());
+    }
+
     #[test]
     fn helper_refuses_mutations_while_checking() {
         let phase = Arc::new(AtomicU8::new(Phase::Checking as u8));
-        let e = in_process(phase.clone());
+        let e = in_process_within(phase.clone(), SMALL);
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x");
-        let err = e.write(&f, b"hunter2-the-secret").unwrap_err();
-        assert!(err.to_string().contains("mutation during check"), "{err}");
-        // The message names the write and its size, never the bytes: a write
-        // can carry a secret, and this message is rendered and logged.
-        assert!(err.to_string().contains("18 bytes"), "{err}");
-        assert!(!err.to_string().contains("hunter2"), "{err}");
-        assert!(
-            !err.to_string().contains("104"),
-            "byte values leaked: {err}"
-        );
-        assert!(!f.exists());
-        // Reads and spawns are fine while checking.
+        // One chunk and several: refused at the first, naming the write and
+        // its size, never the bytes: a write can carry a secret, and this
+        // message is rendered and logged.
+        for (secret, label) in [
+            (b"hunter2-the-secret".to_vec(), "(18 bytes)"),
+            (b"hunter2-the-secret".repeat(1000), "(first 4096 bytes)"),
+        ] {
+            let err = e.write(&f, &secret).unwrap_err().to_string();
+            assert!(err.contains("mutation during check"), "{err}");
+            assert!(
+                err.contains(&format!("write {} {label}", f.display())),
+                "{err}"
+            );
+            assert!(!err.contains("hunter2"), "{err}");
+            assert!(!err.contains("104"), "byte values leaked: {err}");
+            assert!(!f.exists());
+        }
+        // Reads, listings, commands and releasing are fine while checking.
         assert_eq!(e.stat(&f).unwrap(), None);
+        assert!(e.read_dir(dir.path()).unwrap().is_empty());
+        assert!(e.spawn(&sh("true")).unwrap().success());
+        e.expect_unit(HelperOp::Close { handle: 9 }).unwrap();
+        e.expect_unit(HelperOp::WriteAbort { handle: 9 }).unwrap();
+
+        // A chunk of a write begun before the check started is refused too,
+        // and the refusal ends the stream: the temporary file goes.
         phase.store(Phase::Applying as u8, Ordering::SeqCst);
+        let HelperResponse::Handle(handle) = e
+            .call(HelperOp::WriteBegin {
+                path: f.clone(),
+                attrs: None,
+                bytes: Zeroizing::new(b"hunter2".to_vec()),
+                last: false,
+            })
+            .unwrap()
+        else {
+            panic!("no handle")
+        };
+        assert_eq!(staged_in(dir.path()).len(), 1);
+        phase.store(Phase::Checking as u8, Ordering::SeqCst);
+        let chunk = |last| HelperOp::WriteChunk {
+            handle,
+            offset: 7,
+            bytes: Zeroizing::new(b"-the-secret".to_vec()),
+            last,
+        };
+        let err = e.call(chunk(true)).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "mutation during check refused by helper: write stream {handle} (11 bytes at 7)"
+            )
+        );
+        assert!(staged_in(dir.path()).is_empty());
+        phase.store(Phase::Applying as u8, Ordering::SeqCst);
+        assert_eq!(errno(&e.call(chunk(true)).unwrap_err()), ebadf());
+        assert!(!f.exists());
         e.write(&f, b"x").unwrap();
         assert!(f.exists());
     }
 
+    /// A stream the helper does not hold is `EBADF` for every request that
+    /// needs one, and closing or aborting it is fine: release is
+    /// idempotent. A stream of another kind is not taken for one.
     #[test]
-    fn helper_argv_shapes() {
-        let exe = Path::new("/tmp/bin");
-        assert_eq!(
-            helper_argv("sudo", "root", exe, false).unwrap(),
-            ["sudo", "-n", "-u", "root", "/tmp/bin", "--helper"]
-        );
-        assert_eq!(
-            helper_argv("sudo", "postgres", exe, true).unwrap(),
-            [
-                "sudo", "-S", "-p", "", "-u", "postgres", "/tmp/bin", "--helper"
-            ]
-        );
-        assert_eq!(
-            helper_argv("doas", "root", exe, false).unwrap(),
-            ["doas", "-n", "-u", "root", "/tmp/bin", "--helper"]
-        );
-        assert!(helper_argv("doas", "root", exe, true).is_err());
-        assert!(
-            helper_argv("none", "root", exe, false)
-                .unwrap_err()
-                .to_string()
-                .contains("none")
-        );
-        assert!(helper_argv("pkexec", "root", exe, false).is_err());
+    fn an_unknown_handle_is_ebadf_and_releasing_one_is_fine() {
+        let e = in_process(applying());
+        let z = || Zeroizing::new(b"x".to_vec());
+        for op in [
+            HelperOp::ReadChunk {
+                handle: 42,
+                offset: 0,
+            },
+            HelperOp::WriteChunk {
+                handle: 42,
+                offset: 0,
+                bytes: z(),
+                last: true,
+            },
+            HelperOp::ReadDirChunk { handle: 42 },
+            HelperOp::StdinChunk {
+                handle: 42,
+                offset: 0,
+                bytes: z(),
+            },
+            HelperOp::Spawn {
+                cmd: WireCmd::of(&sh("true"), true),
+                stdin: Some(42),
+            },
+        ] {
+            let label = op.label();
+            let err = e.call(op).unwrap_err();
+            assert_eq!(errno(&err), ebadf(), "{label}: {err}");
+            assert!(err.to_string().contains("stream 42"), "{err}");
+        }
+        e.expect_unit(HelperOp::WriteAbort { handle: 42 }).unwrap();
+        e.expect_unit(HelperOp::Close { handle: 42 }).unwrap();
+
+        // A staged stdin is not a write, and stays as it was.
+        let HelperResponse::Handle(stdin) = e.call(HelperOp::StdinBegin { bytes: z() }).unwrap()
+        else {
+            panic!("no handle")
+        };
+        let err = e
+            .call(HelperOp::WriteChunk {
+                handle: stdin,
+                offset: 0,
+                bytes: z(),
+                last: true,
+            })
+            .unwrap_err();
+        assert_eq!(errno(&err), ebadf());
+        let mut cat = sh("cat");
+        cat.stdin = None;
+        let HelperResponse::Output(o) = e
+            .call(HelperOp::Spawn {
+                cmd: WireCmd::of(&cat, true),
+                stdin: Some(stdin),
+            })
+            .unwrap()
+        else {
+            panic!("no output")
+        };
+        assert_eq!(o.stdout, b"x");
+        still_serves(&e);
     }
 
-    /// A command run through the helper with a large stdin, against a child
+    /// A chunk at the wrong offset is refused as invalid input, and the
+    /// stream is gone with its temporary file: the target never changes.
+    #[test]
+    fn a_chunk_at_the_wrong_offset_abandons_the_write() {
+        let e = in_process(applying());
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, "before").unwrap();
+        let HelperResponse::Handle(handle) = e
+            .call(HelperOp::WriteBegin {
+                path: f.clone(),
+                attrs: None,
+                bytes: Zeroizing::new(b"12345".to_vec()),
+                last: false,
+            })
+            .unwrap()
+        else {
+            panic!("no handle")
+        };
+        let chunk = |offset| HelperOp::WriteChunk {
+            handle,
+            offset,
+            bytes: Zeroizing::new(b"678".to_vec()),
+            last: true,
+        };
+        let err = e.call(chunk(4)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "write stream {handle}: a chunk at offset 4, but 5 bytes were written so \
+                 far; the write is abandoned and nothing was replaced"
+            )
+        );
+        assert!(staged_in(dir.path()).is_empty());
+        assert_eq!(errno(&e.call(chunk(5)).unwrap_err()), ebadf());
+        assert_eq!(std::fs::read(&f).unwrap(), b"before");
+    }
+
+    /// At most 64 streams are open at once: the 65th open is refused naming
+    /// the cap, of whatever kind, and closing one frees a slot. A request
+    /// that opens nothing (a small file, a whole write) still works when the
+    /// table is full.
+    #[test]
+    fn the_65th_stream_is_refused_and_closing_one_frees_a_slot() {
+        let e = in_process_within(applying(), SMALL);
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, data(2 * SMALL.chunk)).unwrap();
+        let mut readers: Vec<_> = (0..MAX_HANDLES).map(|_| e.reader(&big).unwrap()).collect();
+        let full = |r: io::Result<HelperResponse>| {
+            let err = r.unwrap_err();
+            assert_eq!(
+                errno(&err),
+                Some(rustix::io::Errno::MFILE.raw_os_error()),
+                "{err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "the helper already holds 64 open streams, the most it keeps at once; one \
+                 has to be finished or closed before another is opened"
+            );
+        };
+        full(e.call(HelperOp::ReadBegin { path: big.clone() }));
+        full(e.call(HelperOp::WriteBegin {
+            path: dir.path().join("w"),
+            attrs: None,
+            bytes: Zeroizing::new(b"x".to_vec()),
+            last: false,
+        }));
+        full(e.call(HelperOp::StdinBegin {
+            bytes: Zeroizing::new(b"x".to_vec()),
+        }));
+        assert!(staged_in(dir.path()).is_empty());
+        // What opens nothing goes through.
+        e.write(&dir.path().join("small"), b"small").unwrap();
+        assert_eq!(e.read(&dir.path().join("small")).unwrap(), b"small");
+
+        readers.pop();
+        let mut again = e.reader(&big).unwrap();
+        let mut all = Vec::new();
+        again.read_to_end(&mut all).unwrap();
+        assert_eq!(all.len(), 2 * SMALL.chunk);
+        drop(readers);
+        holds_no_stream(&e, SMALL.chunk);
+    }
+
+    /// The parent going away part way through a write (its pipe closed
+    /// after a chunk, no commit) leaves no temporary file and the target as
+    /// it was: the helper sees EOF, and its table drops.
+    #[test]
+    fn a_parent_gone_mid_write_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        std::fs::write(&f, "before").unwrap();
+        let (req_r, mut req_w) = io::pipe().unwrap();
+        let (mut resp_r, resp_w) = io::pipe().unwrap();
+        let helper = std::thread::spawn(move || {
+            let (mut rx, mut tx) = (req_r, resp_w);
+            serve(&mut rx, &mut tx, Limits::REAL)
+        });
+        let send = |w: &mut io::PipeWriter, op| {
+            write_frame(
+                w,
+                &HelperRequest {
+                    checking: false,
+                    op,
+                },
+            )
+            .unwrap()
+        };
+        send(
+            &mut req_w,
+            HelperOp::WriteBegin {
+                path: f.clone(),
+                attrs: None,
+                bytes: Zeroizing::new(b"new ".to_vec()),
+                last: false,
+            },
+        );
+        let Some(HelperResponse::Handle(handle)) = read_frame(&mut resp_r).unwrap() else {
+            panic!("no handle")
+        };
+        send(
+            &mut req_w,
+            HelperOp::WriteChunk {
+                handle,
+                offset: 4,
+                bytes: Zeroizing::new(b"content".to_vec()),
+                last: false,
+            },
+        );
+        assert!(matches!(
+            read_frame(&mut resp_r).unwrap(),
+            Some(HelperResponse::Unit)
+        ));
+        assert_eq!(staged_in(dir.path()).len(), 1);
+        drop(req_w);
+        helper.join().unwrap().unwrap();
+        assert!(staged_in(dir.path()).is_empty());
+        assert_eq!(std::fs::read(&f).unwrap(), b"before");
+    }
+
+    /// A command's stdin larger than one chunk is staged in the helper and
+    /// reaches the child byte for byte; output larger than one chunk on
+    /// stdout and stderr comes back whole; a small command is one round
+    /// trip.
+    #[test]
+    fn a_commands_large_stdin_and_output_cross_in_chunks() {
+        let chunk = SMALL.chunk;
+        let (e, requests, _) = recorded(SMALL);
+        let input = data(5 * chunk + 3);
+        let mut cat = sh("cat; cat /dev/null >&2");
+        cat.stdin = Some(input.clone());
+        let out = e.spawn(&cat).unwrap();
+        assert_eq!((out.status, out.stdout.len()), (0, input.len()));
+        assert!(out.stdout == input, "stdout differs");
+
+        let out = e
+            .spawn(&sh(
+                "head -c 9000 /dev/zero; head -c 10000 /dev/zero | tr '\\0' e >&2; exit 4",
+            ))
+            .unwrap();
+        assert_eq!(out.status, 4);
+        assert_eq!(out.stdout, vec![0u8; 9000]);
+        assert_eq!(out.stderr, vec![b'e'; 10000]);
+
+        let mut small = sh("cat");
+        small.stdin = Some(b"small".to_vec());
+        let before = frames(&requests);
+        assert_eq!(e.spawn(&small).unwrap().stdout, b"small");
+        assert_eq!(frames(&requests) - before, 1);
+        holds_no_stream(&e, chunk);
+    }
+
+    /// Output is answered whole when its frame fits the limit exactly, and
+    /// kept behind a handle one byte under it (#97's leftover nit: a `>=`
+    /// in place of the `>` survived the suite).
+    #[test]
+    fn output_that_fits_the_frame_exactly_is_answered_whole() {
+        let spec = sh("head -c 100 /dev/zero; printf xy >&2; exit 2");
+        let o = Output {
+            status: 2,
+            signal: None,
+            stdout: vec![0; 100],
+            stderr: b"xy".to_vec(),
+        };
+        let exact = encoded_output_len(&o) as usize;
+        for (frame, whole) in [(exact, true), (exact - 1, false)] {
+            let mut rx = Vec::new();
+            write_frame(
+                &mut rx,
+                &HelperRequest {
+                    checking: false,
+                    op: HelperOp::Spawn {
+                        cmd: WireCmd::of(&spec, true),
+                        stdin: None,
+                    },
+                },
+            )
+            .unwrap();
+            let mut tx = Vec::new();
+            serve(&mut &rx[..], &mut tx, Limits { frame, chunk: 4096 }).unwrap();
+            let resp: HelperResponse = read_frame(&mut &tx[..]).unwrap().unwrap();
+            match resp {
+                HelperResponse::Output(got) if whole => {
+                    assert_eq!(
+                        (got.stdout, got.stderr),
+                        (o.stdout.clone(), o.stderr.clone())
+                    )
+                }
+                HelperResponse::OutputHandle {
+                    status: 2,
+                    stdout: 100,
+                    stderr: 2,
+                    ..
+                } if !whole => {}
+                other => panic!("frame {frame}: {other:?}"),
+            }
+        }
+    }
+
+    /// Every frame `serve` writes is within its limit, whatever the
+    /// answer: chunks of a large file, batches of a large listing, a
+    /// command's large output, a check-mode refusal quoting an absurd path,
+    /// a command whose argv alone is larger than a frame. The requests go
+    /// in as one stream and the answers are read back frame by frame from
+    /// what `serve` wrote, so a frame over the limit is caught here, not by
+    /// a reader that gives up on it.
+    #[test]
+    fn no_frame_the_helper_writes_is_over_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, data(20000)).unwrap();
+        let listed = dir.path().join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        for i in 0..200 {
+            std::fs::write(listed.join(format!("{i:0>96}")), b"").unwrap();
+        }
+        let absurd = dir.path().join("a".repeat(SMALL.frame));
+        let mut long_argv = sh("head -c 20000 /dev/zero");
+        long_argv.args.push("y".repeat(SMALL.frame));
+
+        let requests = [
+            (false, HelperOp::ReadBegin { path: big.clone() }),
+            (false, HelperOp::ReadDirBegin { path: listed }),
+            (
+                false,
+                HelperOp::Spawn {
+                    cmd: WireCmd::of(&sh("head -c 20000 /dev/zero"), true),
+                    stdin: None,
+                },
+            ),
+            (true, HelperOp::Remove { path: absurd }),
+            (
+                false,
+                HelperOp::Spawn {
+                    cmd: WireCmd::of(&long_argv, true),
+                    stdin: None,
+                },
+            ),
+        ];
+        let mut rx = Vec::new();
+        for (checking, op) in requests {
+            write_frame(&mut rx, &HelperRequest { checking, op }).unwrap();
+        }
+        let mut tx = Vec::new();
+        serve(&mut &rx[..], &mut tx, SMALL).unwrap();
+
+        let mut answers = Vec::new();
+        let mut stream = &tx[..];
+        while !stream.is_empty() {
+            let len = u32::from_be_bytes(stream[..4].try_into().unwrap()) as usize;
+            assert!(
+                len <= SMALL.frame,
+                "a {len}-byte frame, answer {}",
+                answers.len()
+            );
+            answers.push(serde_json::from_slice::<HelperResponse>(&stream[4..4 + len]).unwrap());
+            stream = &stream[4 + len..];
+        }
+        assert_eq!(answers.len(), 5, "{answers:?}");
+        assert!(
+            matches!(&answers[0], HelperResponse::Data { handle: Some(_), bytes } if bytes.len() == SMALL.chunk)
+        );
+        assert!(matches!(
+            &answers[1],
+            HelperResponse::Names {
+                handle: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &answers[2],
+            HelperResponse::OutputHandle { stdout: 20000, .. }
+        ));
+        // A check-mode refusal over the limit only because of the path it
+        // quotes is refused in its turn, quoting nothing.
+        let HelperResponse::Err {
+            code: Some(code),
+            message,
+        } = &answers[3]
+        else {
+            panic!("{:?}", answers[3])
+        };
+        assert_eq!(*code, too_large_code());
+        assert_eq!(
+            message,
+            "the answer is more than one helper frame holds (16384 bytes)"
+        );
+        assert!(matches!(
+            &answers[4],
+            HelperResponse::OutputHandle { stdout: 20000, .. }
+        ));
+    }
+
+    /// The refusal of an answer fits a frame of a couple of kilobytes
+    /// whatever the request said, since it quotes nothing from the request:
+    /// here a chunk larger than the frame, for a path of control characters.
+    #[test]
+    fn the_refusal_fits_a_small_frame_whatever_the_request_said() {
+        let limit = 2500;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("\x01".repeat(200));
+        std::fs::write(&f, data(5000)).unwrap();
+        let mut rx = Vec::new();
+        write_frame(
+            &mut rx,
+            &HelperRequest {
+                checking: false,
+                op: HelperOp::ReadBegin { path: f },
+            },
+        )
+        .unwrap();
+        let mut tx = Vec::new();
+        serve(
+            &mut &rx[..],
+            &mut tx,
+            Limits {
+                frame: limit,
+                chunk: 4096,
+            },
+        )
+        .unwrap();
+        let len = u32::from_be_bytes(tx[..4].try_into().unwrap()) as usize;
+        assert!(len <= limit, "a {len}-byte frame");
+        let resp: HelperResponse = serde_json::from_slice(&tx[4..]).unwrap();
+        let HelperResponse::Err { message, .. } = resp else {
+            panic!("{resp:?}")
+        };
+        assert_eq!(
+            message,
+            "the answer is more than one helper frame holds (2500 bytes)"
+        );
+    }
+
+    /// A command through the helper with a large stdin, against a child
     /// that fills its stdout pipe before reading a byte of its input. The
     /// helper executes through `Local`, so this pins the escalated path to
     /// `Local::spawn`'s threaded feeder: with a blocking inline write the
@@ -1706,18 +3359,11 @@ mod tests {
     fn a_command_through_the_helper_does_not_deadlock_on_large_stdin() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
-            let e = in_process(phase);
-            // 1 MiB in, and the child writes 1 MiB out before it reads.
-            let input = vec![b'x'; 1024 * 1024];
-            let spec = CmdSpec {
-                program: "sh".into(),
-                args: vec!["-c".into(), "yes hello | head -c 1048576; wc -c".into()],
-                env: Default::default(),
-                cwd: None,
-                stdin: Some(input),
-                prefix: vec![],
-            };
+            let e = in_process(applying());
+            // 3 MiB in, staged in chunks, and the child writes 1 MiB out
+            // before it reads.
+            let mut spec = sh("yes hello | head -c 1048576; wc -c");
+            spec.stdin = Some(vec![b'x'; 3 * 1024 * 1024]);
             let out = e.spawn(&spec);
             let _ = done_tx.send(out);
         });
@@ -1727,7 +3373,7 @@ mod tests {
             .expect("spawn through the helper");
         assert_eq!(out.status, 0);
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.ends_with("1048576\n"), "{}", &text[text.len() - 40..]);
+        assert!(text.ends_with("3145728\n"), "{}", &text[text.len() - 40..]);
     }
 
     /// A command's variables cross to the helper and reach the child. The
@@ -1737,235 +3383,11 @@ mod tests {
     /// for an `as_user` target (#55).
     #[test]
     fn a_commands_env_reaches_the_child_through_the_helper() {
-        let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
-        let e = in_process(phase);
-        let out = e
-            .spawn(&CmdSpec {
-                program: "sh".into(),
-                args: vec!["-c".into(), "printf %s \"$XDG_RUNTIME_DIR\"".into()],
-                env: BTreeMap::from([("XDG_RUNTIME_DIR".into(), "/run/user/1002".into())]),
-                cwd: None,
-                stdin: None,
-                prefix: vec![],
-            })
-            .unwrap();
+        let e = in_process(applying());
+        let mut spec = sh("printf %s \"$XDG_RUNTIME_DIR\"");
+        spec.env = BTreeMap::from([("XDG_RUNTIME_DIR".into(), "/run/user/1002".into())]);
+        let out = e.spawn(&spec).unwrap();
         assert_eq!((out.status, out.stdout_str()), (0, "/run/user/1002".into()));
-    }
-
-    #[test]
-    fn an_oversized_write_is_refused_before_it_reaches_the_wire() {
-        let phase = Arc::new(AtomicU8::new(Phase::Applying as u8));
-        let e = in_process(phase);
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("big");
-        // One byte over what a frame can carry. The refusal has to name the
-        // file, both numbers and the identity, because the failure it
-        // replaces was "frame of N bytes exceeds limit" from inside the
-        // framing, which named none of them.
-        let too_big = vec![0u8; MAX_FRAME_PAYLOAD + 1];
-        let err = e.write(&f, &too_big).unwrap_err().to_string();
-        assert!(err.contains(&f.display().to_string()), "{err}");
-        assert!(err.contains(&(MAX_FRAME_PAYLOAD + 1).to_string()), "{err}");
-        assert!(err.contains(&MAX_FRAME_PAYLOAD.to_string()), "{err}");
-        assert!(err.contains("tester"), "{err}");
-        assert!(!f.exists(), "the write reached the helper anyway");
-
-        // The helper is still usable: this is a refusal, not a failure.
-        e.write(&f, b"small").unwrap();
-        assert_eq!(e.read(&f).unwrap(), b"small");
-    }
-
-    /// Output larger than a frame is refused by the helper, naming the
-    /// command, both sizes and the account, with what to do instead; and the
-    /// same `Elevated` goes on serving. Before #84 the helper sent the frame
-    /// anyway, the main side could not read past it, and every later
-    /// primitive on that identity failed with a message about a file.
-    #[test]
-    fn oversized_command_output_is_refused_and_the_helper_survives() {
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
-        let err = e
-            .spawn(&sh("head -c 20000 /dev/zero; echo oops >&2"))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "spawn sh -c head -c 20000 /dev/zero; echo oops >&2 as `tester`: it exited 0 \
-             and wrote 20000 bytes to stdout and 5 to stderr, which base64-encoded is more than one \
-             helper frame holds (16384 bytes); redirect its output to a file in the \
-             command (`sh -c '… > /path'`) and read that file"
-        );
-        still_serves(&e);
-        // And a command whose output fits still comes back whole.
-        let out = e.spawn(&sh("head -c 1000 /dev/zero")).unwrap();
-        assert_eq!(out.stdout, vec![0u8; 1000]);
-    }
-
-    /// A file larger than a frame is refused by the helper, naming the file,
-    /// its size and the account; the helper stays usable. This is the read
-    /// that used to kill a helper for the rest of the run.
-    #[test]
-    fn an_oversized_read_is_refused_and_the_helper_survives() {
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
-        let dir = tempfile::tempdir().unwrap();
-        let big = dir.path().join("big");
-        std::fs::write(&big, vec![b'x'; 20000]).unwrap();
-        let err = e.read(&big).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge, "{err}");
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "read {} as `tester`: the file is 20000 bytes, which base64-encoded is more \
-                 than one helper frame holds (16384 bytes); reading a file this large has \
-                 to be done without `as_user`/`as_root`",
-                big.display()
-            )
-        );
-        still_serves(&e);
-        // The same file, smaller, reads.
-        std::fs::write(&big, b"small").unwrap();
-        assert_eq!(e.read(&big).unwrap(), b"small");
-    }
-
-    /// A listing larger than a frame is refused like a file is, naming the
-    /// directory and how many entries it has.
-    #[test]
-    fn an_oversized_listing_is_refused_and_the_helper_survives() {
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
-        let dir = tempfile::tempdir().unwrap();
-        for i in 0..200 {
-            std::fs::write(dir.path().join(format!("{i:0>96}")), b"").unwrap();
-        }
-        let err = e.read_dir(dir.path()).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            format!(
-                "read_dir {} as `tester`: the directory has 200 entries, a listing more \
-                 than one helper frame holds (16384 bytes); listing a directory this large \
-                 has to be done without `as_user`/`as_root`",
-                dir.path().display()
-            )
-        );
-        still_serves(&e);
-    }
-
-    /// Every frame `serve` writes is within its limit, whatever the answer:
-    /// a file, a command's output and a listing over it (`Bytes`, `Output`,
-    /// `Paths`), a check-mode refusal quoting an absurd path, a command whose
-    /// argv alone is larger than a frame, and a listing that cannot be
-    /// encoded. The requests go in as one stream and the answers are read
-    /// back frame by frame from what `serve` wrote, so a frame over the limit
-    /// is caught here, not by a reader that gives up on it. Each refusal
-    /// carries its marker and quotes nothing from the request.
-    #[test]
-    fn no_frame_the_helper_writes_is_over_its_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let big = dir.path().join("big");
-        std::fs::write(&big, vec![b'x'; 20000]).unwrap();
-        let small = dir.path().join("small");
-        std::fs::write(&small, b"small").unwrap();
-        let listed = dir.path().join("listed");
-        std::fs::create_dir(&listed).unwrap();
-        for i in 0..200 {
-            std::fs::write(listed.join(format!("{i:0>96}")), b"").unwrap();
-        }
-        let absurd = dir.path().join("a".repeat(SMALL_FRAME));
-        let mut long_argv = sh("head -c 20000 /dev/zero");
-        long_argv.args.push("y".repeat(SMALL_FRAME));
-        let odd = dir.path().join("odd");
-        std::fs::create_dir(&odd).unwrap();
-        let odd_listing = plant_a_name_that_is_not_utf8(&odd);
-
-        let mut requests = vec![
-            (false, HelperOp::Read { path: big.clone() }),
-            (false, HelperOp::Read { path: small }),
-            (false, HelperOp::ReadDir { path: listed }),
-            (false, HelperOp::Spawn(sh("head -c 20000 /dev/zero"))),
-            (false, HelperOp::Spawn(sh("printf ok"))),
-            (true, HelperOp::Remove { path: absurd }),
-            (false, HelperOp::Spawn(long_argv)),
-        ];
-        if odd_listing {
-            requests.push((false, HelperOp::ReadDir { path: odd }));
-        }
-        let mut rx = Vec::new();
-        for (checking, op) in requests {
-            write_frame(&mut rx, &HelperRequest { checking, op }).unwrap();
-        }
-        let mut tx = Vec::new();
-        serve(&mut &rx[..], &mut tx, SMALL_FRAME).unwrap();
-
-        let mut answers = Vec::new();
-        let mut stream = &tx[..];
-        while !stream.is_empty() {
-            let len = u32::from_be_bytes(stream[..4].try_into().unwrap()) as usize;
-            assert!(
-                len <= SMALL_FRAME,
-                "a {len}-byte frame, answer {}",
-                answers.len()
-            );
-            let resp: HelperResponse = serde_json::from_slice(&stream[4..4 + len]).unwrap();
-            answers.push(resp);
-            stream = &stream[4 + len..];
-        }
-        // A refusal: its marker, and a message quoting nothing of the
-        // request (no path, no argv).
-        let refusal = |r: &HelperResponse, marker: i32| match r {
-            HelperResponse::Err {
-                code: Some(code),
-                message,
-            } if *code == marker => {
-                assert!(
-                    !message.contains(&dir.path().display().to_string()),
-                    "{message}"
-                );
-                assert!(
-                    !message.contains("yyy") && !message.contains("head -c"),
-                    "{message}"
-                );
-                message.clone()
-            }
-            other => panic!("expected a refusal marked {marker}, got {other:?}"),
-        };
-        let big_answer = too_large_code();
-        assert_eq!(answers.len(), 7 + usize::from(odd_listing), "{answers:?}");
-        assert!(refusal(&answers[0], big_answer).starts_with("the file is 20000 bytes"));
-        assert!(matches!(&answers[1], HelperResponse::Bytes(b) if b == b"small"));
-        assert!(refusal(&answers[2], big_answer).starts_with("the directory has 200 entries"));
-        assert!(refusal(&answers[3], big_answer).starts_with("it exited 0 and wrote 20000 bytes"));
-        assert!(matches!(&answers[4], HelperResponse::Output(o) if o.stdout == b"ok"));
-        // A check-mode refusal over the limit only because of the path it
-        // quotes is refused in its turn, quoting nothing.
-        assert_eq!(
-            refusal(&answers[5], big_answer),
-            "the answer is more than one helper frame holds (16384 bytes)"
-        );
-        assert!(refusal(&answers[6], big_answer).starts_with("it exited 0 and wrote 20000 bytes"));
-        if odd_listing {
-            assert!(
-                refusal(&answers[7], unencodable_code())
-                    .starts_with("the helper's answer cannot be encoded: ")
-            );
-        }
-    }
-
-    /// The refusal for a command's stdin larger than a frame names the
-    /// command and the account, not a file, and nothing reaches the helper.
-    #[test]
-    fn an_oversized_stdin_is_refused_naming_the_command() {
-        let e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
-        let mut spec = sh("cat > /dev/null");
-        spec.stdin = Some(vec![0u8; MAX_FRAME_PAYLOAD + 1]);
-        let err = e.spawn(&spec).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            format!(
-                "spawn sh -c cat > /dev/null as `tester`: its stdin is {} bytes, more than \
-                 one helper frame can carry ({MAX_FRAME_PAYLOAD} bytes); have the command \
-                 read input this large from a file on the target instead",
-                MAX_FRAME_PAYLOAD + 1
-            )
-        );
-        still_serves(&e);
     }
 
     /// A frame over the limit from the helper's side cannot be an answer any
@@ -1983,7 +3405,7 @@ mod tests {
             "tester",
             Box::new(io::sink()),
             Box::new(io::Cursor::new(prefix.to_be_bytes().to_vec())),
-            Arc::new(AtomicU8::new(Phase::Applying as u8)),
+            applying(),
         );
         let err = e.read(Path::new("/etc/shadow")).unwrap_err().to_string();
         assert_eq!(
@@ -2009,106 +3431,12 @@ mod tests {
         );
     }
 
-    /// A file the helper can see is too large is refused from its size,
-    /// without being read: reading it whole and base64-encoding it only to
-    /// refuse it costs more than twice its size in memory, and a large
-    /// enough file gets the helper killed, which is the latch again. The
-    /// file is sparse and unreadable, so reading it would fail differently.
-    #[test]
-    fn a_file_too_large_for_a_frame_is_refused_without_reading_it() {
-        use std::os::unix::fs::PermissionsExt;
-        if rustix::process::geteuid().is_root() {
-            // Permissions do not stop root, and the point is that nothing
-            // is read.
-            return;
-        }
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
-        let dir = tempfile::tempdir().unwrap();
-        let big = dir.path().join("big");
-        let f = std::fs::File::create(&big).unwrap();
-        f.set_len(1 << 30).unwrap();
-        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let err = e.read(&big).unwrap_err().to_string();
-        assert!(
-            err.starts_with(&format!(
-                "read {} as `tester`: the file is 1073741824 bytes",
-                big.display()
-            )),
-            "{err}"
-        );
-        still_serves(&e);
-    }
-
-    /// The refusal of a command's output says how the command ended, since
-    /// whoever reads it cannot see the output to tell.
-    #[test]
-    fn the_output_refusal_says_how_the_command_ended() {
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
-        let exited = e
-            .spawn(&sh("head -c 20000 /dev/zero; exit 3"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            exited.contains("as `tester`: it exited 3 and wrote 20000 bytes to stdout"),
-            "{exited}"
-        );
-        let killed = e
-            .spawn(&sh("head -c 20000 /dev/zero; kill -9 $$"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            killed.contains("as `tester`: it was killed by signal 9 and wrote 20000 bytes"),
-            "{killed}"
-        );
-        still_serves(&e);
-    }
-
-    /// A listing holding a name that is not UTF-8 cannot be put in a frame
-    /// (paths travel as JSON strings). That is a refusal of the one request,
-    /// naming it: the helper does not exit, and the identity is not latched.
-    #[test]
-    fn an_answer_that_cannot_be_encoded_is_refused_and_the_helper_survives() {
-        let e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
-        let dir = tempfile::tempdir().unwrap();
-        if !plant_a_name_that_is_not_utf8(dir.path()) {
-            return;
-        }
-        let err = e.read_dir(dir.path()).unwrap_err().to_string();
-        assert!(
-            err.starts_with(&format!(
-                "read_dir {} as `tester`: the helper's answer cannot be encoded: ",
-                dir.path().display()
-            )),
-            "{err}"
-        );
-        assert!(!err.contains("failed earlier"), "{err}");
-        still_serves(&e);
-    }
-
-    /// A request naming a path that is not UTF-8 fails to encode before a
-    /// byte is written, so the stream is intact: the request is refused and
-    /// the helper is neither shut down nor latched.
-    #[test]
-    fn a_request_that_cannot_be_encoded_is_refused_without_latching() {
-        use std::os::unix::ffi::OsStrExt;
-        let e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
-        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/caf\xe9"));
-        let err = e.stat(odd).unwrap_err().to_string();
-        assert!(
-            err.starts_with("stat /tmp/caf\u{fffd} as `tester`: the request cannot be encoded: "),
-            "{err}"
-        );
-        assert!(e.stat(Path::new("/tmp")).unwrap().is_some());
-        still_serves(&e);
-    }
-
-    /// A request larger than a frame, though its stdin alone is within the
-    /// payload cap, is refused before a byte is written: the stream is
-    /// intact, so the helper is neither shut down nor latched. The message
-    /// names the command, cut short, and the account.
+    /// A request larger than a frame is refused before a byte is written:
+    /// the stream is intact, so the helper is neither shut down nor latched.
+    /// The message names the command, cut short, and the account.
     #[test]
     fn an_oversized_request_is_refused_without_latching() {
-        let mut e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
+        let mut e = in_process(applying());
         e.max_frame = 128 * 1024;
         let mut spec = sh("cat > /dev/null");
         spec.args.push("y".repeat(100 * 1024));
@@ -2160,8 +3488,16 @@ mod tests {
     /// bare marker, and the main side still says what was refused and why.
     #[test]
     fn a_bare_refusal_still_says_what_was_refused() {
-        // Room for `{"Err":{"code":27,"message":""}}` and not much more.
-        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), 50);
+        // Room for `{"Err":{"code":27,"message":""}}` and not much more, on
+        // the helper's side only.
+        let mut e = in_process_within(
+            applying(),
+            Limits {
+                frame: 50,
+                chunk: CHUNK_SIZE,
+            },
+        );
+        e.max_frame = MAX_FRAME;
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("f");
         std::fs::write(&f, vec![b'x'; 1000]).unwrap();
@@ -2175,32 +3511,15 @@ mod tests {
         );
     }
 
-    /// The refusal fits a frame of a couple of kilobytes whatever the
-    /// request said, since it quotes nothing from the request: here an argv
-    /// of control characters, which JSON escapes to six bytes each.
+    /// An answer of the wrong shape is reported by its variant's name, never
+    /// its contents, which may be a file's.
     #[test]
-    fn the_refusal_fits_a_small_frame_whatever_the_request_said() {
-        let limit = 2500;
-        let mut spec = sh("head -c 20000 /dev/zero");
-        spec.args.push("\x01".repeat(600));
-        let mut rx = Vec::new();
-        write_frame(
-            &mut rx,
-            &HelperRequest {
-                checking: false,
-                op: HelperOp::Spawn(spec),
-            },
-        )
-        .unwrap();
-        let mut tx = Vec::new();
-        serve(&mut &rx[..], &mut tx, limit).unwrap();
-        let len = u32::from_be_bytes(tx[..4].try_into().unwrap()) as usize;
-        assert!(len <= limit, "a {len}-byte frame");
-        let resp: HelperResponse = serde_json::from_slice(&tx[4..]).unwrap();
-        let HelperResponse::Err { message, .. } = resp else {
-            panic!("{resp:?}")
-        };
-        assert!(message.contains("wrote 20000 bytes to stdout"), "{message}");
+    fn an_unexpected_answer_quotes_nothing() {
+        let err = unexpected(&HelperResponse::Data {
+            handle: None,
+            bytes: Zeroizing::new(b"hunter2".to_vec()),
+        });
+        assert_eq!(err.to_string(), "unexpected helper response Data");
     }
 
     /// An `Elevated` whose "helper" printed to stderr and exited without
@@ -2240,6 +3559,7 @@ mod tests {
             conn: Mutex::new(Some(conn)),
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
+            chunk: CHUNK_SIZE,
         }
     }
 
