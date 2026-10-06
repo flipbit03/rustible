@@ -36,8 +36,10 @@
 //! the target as it was. The helper removes a stream whose request failed,
 //! and its temporary file with it; this side releases a stream it gives up
 //! on (an error from the source being written, a reader dropped before its
-//! end). When either process goes away mid-stream, the helper sees EOF,
-//! its table drops, and each staged write removes its temporary file.
+//! end). When the parent goes away mid-stream, the helper sees EOF, its
+//! table drops, and each staged write removes its temporary file. A helper
+//! killed mid-stream can leave one `.rustible-*` file beside the target, as
+//! a local write killed part way does; the target is untouched either way.
 //!
 //! ## What crosses, and what does not
 //!

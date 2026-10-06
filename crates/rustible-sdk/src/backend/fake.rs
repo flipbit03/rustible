@@ -274,7 +274,9 @@ impl Fake {
     /// is the backend's own, not an op's call, and is not recorded; the
     /// attributes a [`Backend::write_from`] was given are recorded, on the
     /// staged `.rustible-fake-<n>` path beside the target, before the
-    /// rename that puts it in place.
+    /// rename that puts it in place. Those calls include what the write
+    /// keeps: a rewrite given only a mode also records a `chown` to the
+    /// owner it keeps, as `Local` makes one.
     pub fn attr_calls(&self) -> Vec<AttrCall> {
         self.attr_calls.lock().unwrap().clone()
     }

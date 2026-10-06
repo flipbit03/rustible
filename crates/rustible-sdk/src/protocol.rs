@@ -196,8 +196,9 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// envelope needs a little room besides. Nothing is limited to it any more:
 /// a file, a listing and a command's stdin and output cross the escalation
 /// helper in chunks of [`CHUNK_SIZE`] (#85), as the main channel's files
-/// always did. The helper still refuses any answer whose encoding passes
-/// [`MAX_FRAME`], so it never sends a frame the far end rejects.
+/// always did, and only tests use this now. The helper still refuses any
+/// answer whose encoding passes [`MAX_FRAME`], so it never sends a frame the
+/// far end rejects.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 
 /// Serialize `msg` and write it as one length-prefixed frame, flushing
