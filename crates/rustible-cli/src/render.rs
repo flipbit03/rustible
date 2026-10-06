@@ -48,7 +48,8 @@ struct HostState {
     /// without printing it twice. Only when the frame's chain is that one:
     /// a `.context(..)` the playbook added on the way out was not printed.
     /// The failed command printed with the chain either way, so a frame
-    /// for the same step does not print its own.
+    /// for the same step does not print its own; it is kept at `-v` only,
+    /// the one verbosity that prints it.
     shown: Vec<Shown>,
 }
 
@@ -152,10 +153,12 @@ impl<W: Write> Renderer<W> {
             for l in p.after {
                 self.line(host, &l);
             }
+            // Read only to pair a command at `-v`, so not kept below it.
+            let cmd = if self.verbosity >= 1 { p.cmd } else { None };
             self.state(host).shown.push(Shown {
                 key: p.key,
                 chain: p.chain,
-                cmd: p.cmd,
+                cmd,
             });
         }
     }
@@ -320,7 +323,10 @@ impl<W: Write> Renderer<W> {
                 error,
                 cmd,
             } => {
-                let (step, error) = split_step(step.as_deref(), error);
+                // Only the frame's own field names a step for its command,
+                // never a name read out of the chain, as in `Compact`.
+                let field = step.as_deref();
+                let (step, error) = split_step(field, error);
                 // The failed step this frame closes, when it names one of
                 // this run's: by id, blocks and name together (see `FailKey`).
                 let key = match (id, step) {
@@ -350,7 +356,7 @@ impl<W: Write> Renderer<W> {
                 // failure can borrow, so the command must be the same too.
                 let printed = match &key {
                     Some(k) => pending.is_none() && st.shown.iter().any(|o| o.key == *k),
-                    None => step.is_some_and(|s| {
+                    None => field.is_some_and(|s| {
                         st.shown.iter().any(|o| {
                             o.key.step == s
                                 && o.key.blocks == *blocks
@@ -464,26 +470,31 @@ fn argv_text(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// Whether `a` and `b` are one failed command: the same argv and status,
-/// and stderr the same once a frame's cut (a marker line, then the tail) is
-/// allowed for, so one is the end of the other. The SDK's `Compact` has its
-/// own copy.
+/// Whether `a` and `b` are one failed command: the same argv, status and
+/// signal, and the same stderr, unless one was cut to fit a frame, when
+/// what it kept has to be the end of the other. The SDK's `Compact`
+/// has its own copy.
 fn same_command(a: &CmdFailed, b: &CmdFailed) -> bool {
-    fn tail(stderr: &str) -> &str {
-        match stderr.split_once('\n') {
-            Some((first, rest))
-                if first.starts_with("… (")
-                    && first.ends_with(
-                        " earlier bytes of stderr not shown: more than one frame carries)",
-                    ) =>
-            {
-                rest
-            }
-            _ => stderr,
-        }
+    if (&a.argv, a.status, a.signal) != (&b.argv, b.status, b.signal) {
+        return false;
     }
-    let (x, y) = (tail(&a.stderr), tail(&b.stderr));
-    a.argv == b.argv && a.status == b.status && (x.ends_with(y) || y.ends_with(x))
+    match (cut_tail(&a.stderr), cut_tail(&b.stderr)) {
+        (None, None) => a.stderr == b.stderr,
+        (Some(x), None) => b.stderr.ends_with(x),
+        (None, Some(y)) => a.stderr.ends_with(y),
+        (Some(x), Some(y)) => x.ends_with(y) || y.ends_with(x),
+    }
+}
+
+/// What a stderr cut to fit a frame kept: everything after the marker line,
+/// whose count has to be a number. `None` for a stderr that was not cut,
+/// even one whose first line only looks like the marker.
+fn cut_tail(stderr: &str) -> Option<&str> {
+    let (first, rest) = stderr.split_once('\n')?;
+    let n = first
+        .strip_prefix("… (")?
+        .strip_suffix(" earlier bytes of stderr not shown: more than one frame carries)")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
 }
 
 /// Where a step failed, after `FAILED at`: its block path as the step line
@@ -1423,6 +1434,83 @@ web1    4        1             0        0       0          2         0
         let out = feed(cut);
         assert_eq!(out.matches("still nope").count(), 1, "{out}");
         assert!(!out.contains("earlier bytes"), "{out}");
+    }
+
+    /// The same argv and status is not the same failure when the stderr
+    /// differs and neither copy was cut to fit a frame: an empty stderr,
+    /// or one that is the end of the other, is a different run of the
+    /// command. Each prints once. A signal tells two runs apart too, and a
+    /// line that only looks like the trim marker is stderr like any other.
+    #[test]
+    fn a_frame_without_an_id_needs_the_same_stderr_unless_one_was_cut() {
+        let run = |stderr: &str, signal: Option<i32>| CmdFailed {
+            argv: vec!["job".into()],
+            status: 3,
+            signal,
+            stderr: stderr.into(),
+        };
+        let feed = |caught: CmdFailed, returned: CmdFailed| {
+            render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                let mut step = failing(1, "x", "`job` exited 3");
+                if let Event::StepFinished { cmd, .. } = &mut step {
+                    *cmd = Some(caught);
+                }
+                r.event("local", &step);
+                r.event("local", &step_started(2, "next"));
+                r.event("local", &step_finished(2, "next", Status::Ok));
+                let mut frame = failed_frame(Some("x"), None, "step `x`: `job` exited 3");
+                if let Event::Failed { cmd, .. } = &mut frame {
+                    *cmd = Some(returned);
+                }
+                r.event("local", &frame);
+            })
+        };
+        let out = feed(run("", None), run("disk full\n", None));
+        assert_eq!(out.matches("disk full").count(), 1, "{out}");
+        let out = feed(
+            run("Job failed\n", None),
+            run("warning: lock held\nJob failed\n", None),
+        );
+        assert_eq!(out.matches("Job failed").count(), 2, "{out}");
+        assert_eq!(out.matches("lock held").count(), 1, "{out}");
+        let out = feed(run("x\n", Some(9)), run("x\n", Some(15)));
+        assert_eq!(out.matches("$ job (exit 3)").count(), 2, "{out}");
+        let fake = "… (many earlier bytes of stderr not shown: more than one frame carries)";
+        let out = feed(run("tail\n", None), run(&format!("{fake}\ntail\n"), None));
+        assert_eq!(out.matches("many earlier").count(), 1, "{out}");
+    }
+
+    /// A frame with no `step` field is not paired with a printed step by
+    /// a name read out of its chain text, here or in `Compact`: its
+    /// command prints with it.
+    #[test]
+    fn a_frame_without_a_step_field_prints_its_command() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    None,
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(out.matches("still nope").count(), 2, "{out}");
+    }
+
+    /// Below `-v` no command prints, so the printed history keeps none.
+    #[test]
+    fn the_printed_history_keeps_no_command_below_v() {
+        for (verbosity, kept) in [(0, false), (1, true)] {
+            let mut r = Renderer::new(Vec::new(), &["local".into()], verbosity);
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event("local", &step_started(2, "next"));
+            assert_eq!(r.state("local").shown[0].cmd.is_some(), kept);
+        }
     }
 
     /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
