@@ -1,7 +1,7 @@
 //! The only thing that touches reality. One method per primitive.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,11 @@ pub(crate) use elevated::HelperGone;
 mod fake;
 mod local;
 
-pub use elevated::{
-    Elevated, HelperOp, HelperRequest, HelperResponse, Spawner, helper_argv, serve_helper,
-};
-pub use fake::{AttrCall, Fake, FakeFile};
+pub(crate) use elevated::Limits;
+pub use elevated::{Elevated, Spawner, helper_argv, serve_helper};
+pub use fake::{AttrCall, Fake, FakeFile, ReadCall};
 pub use local::Local;
+pub(crate) use local::Staged;
 
 /// What one path looks like on the target: the part of `stat(2)` the ops
 /// care about. Produced by [`Backend::stat`] and [`Backend::stat_follow`],
@@ -141,16 +141,148 @@ impl Output {
     }
 }
 
+/// The mode and owner a streamed write gives its file, applied to the staged
+/// temporary file **before** it is renamed over the target, so the new
+/// content is never readable at a wider mode than asked and never setuid
+/// with the wrong owner, even for a moment.
+///
+/// A field left `None` keeps what a write without attributes would give: a
+/// rewrite keeps the existing file's mode or owner, a new file gets the mode
+/// any newly created file gets (0666 minus the umask) and the writer's
+/// owner. A requested owner that cannot be given (`EPERM`, unprivileged)
+/// fails the write and leaves the target as it was; an owner kept from the
+/// existing file is best effort, as for [`Backend::write`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteAttrs {
+    /// Permission bits as `chmod` takes them, setuid, setgid and sticky
+    /// included: `0o600`, `0o4755`. Anything above `0o7777` is ignored.
+    pub mode: Option<u32>,
+    /// Numeric `(uid, gid)`, both of them, as [`Backend::set_owner`] takes
+    /// them. Handing a file to another user needs root.
+    pub owner: Option<(u32, u32)>,
+}
+
+/// An `io::Error` worded here that keeps the errno of the failure it
+/// describes. `io::Error::new` drops the raw OS code, and the escalation
+/// helper sends the code across (`HelperResponse::Err`'s `code`) so the far
+/// side rebuilds the same kind; this keeps it through a rewording.
+#[derive(Debug)]
+pub(crate) struct Coded {
+    /// The errno.
+    pub(crate) errno: i32,
+    /// The whole message, which is what `Display` prints.
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Coded {}
+
+/// An error with `errno`'s kind and code and this message.
+pub(crate) fn coded(errno: i32, message: String) -> io::Error {
+    io::Error::new(
+        io::Error::from_raw_os_error(errno).kind(),
+        Coded { errno, message },
+    )
+}
+
+/// `e` reworded as `message`, keeping its errno when it has one and its
+/// kind either way.
+pub(crate) fn reworded(e: &io::Error, message: String) -> io::Error {
+    match errno_of(e) {
+        Some(errno) => coded(errno, message),
+        None => io::Error::new(e.kind(), message),
+    }
+}
+
+/// The errno `e` carries: the OS's own, or one kept by [`coded`].
+pub(crate) fn errno_of(e: &io::Error) -> Option<i32> {
+    e.raw_os_error().or_else(|| {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<Coded>())
+            .map(|c| c.errno)
+    })
+}
+
+/// One attribute call, in the order [`attr_steps`] gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttrStep {
+    /// `chmod` to these bits.
+    Mode(u32),
+    /// `chown` to these ids.
+    Owner(u32, u32),
+}
+
+/// The calls that give a regular file `mode` and, when there is one,
+/// `owner`, in the one order that is safe (`[ISSUE-51]`, `[ISSUE-79]`):
+///
+/// 1. the mode **without** setuid and setgid, while the writer still owns
+///    the file, so a root without `CAP_FOWNER` can still do it, and the
+///    content is never setuid to the writer when it is about to belong to
+///    someone else;
+/// 2. the owner;
+/// 3. the full mode again, only when it carries setuid or setgid: every
+///    successful `chown` of a non-directory clears setuid, and setgid with
+///    group execute, on Linux (`[FAKE-CHOWN]`).
+///
+/// Without an owner it is the one `chmod`. Directories have their own order
+/// (`file::set_mode_and_owner` in `rustible-std`); nothing that calls this
+/// writes one.
+pub(crate) fn attr_steps(mode: u32, owner: Option<(u32, u32)>) -> Vec<AttrStep> {
+    let Some((uid, gid)) = owner else {
+        return vec![AttrStep::Mode(mode)];
+    };
+    let mut steps = vec![AttrStep::Mode(mode & !0o6000), AttrStep::Owner(uid, gid)];
+    if mode & 0o6000 != 0 {
+        steps.push(AttrStep::Mode(mode));
+    }
+    steps
+}
+
 /// One method per primitive, nothing clever. `Local` is production, `Fake`
 /// is for tests, `Elevated` proxies every call to a `Local` inside a helper
 /// process running as another user (vision doc 7.2, 11.3).
 pub trait Backend: Send + Sync {
-    /// The whole file, in memory. There is no streaming read: through
-    /// [`Elevated`] the contents cross the helper boundary in a single
-    /// frame, so a file past that size is refused rather than truncated.
+    /// The whole file, in memory. Through [`Elevated`] it crosses the
+    /// helper boundary in chunks, so any size works.
     fn read(&self, p: &Path) -> io::Result<Vec<u8>>;
     /// Must be atomic (temp file + rename) and preserve mode/owner of an existing file.
     fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()>;
+    /// Like [`write`](Backend::write), from a reader: what `src` yields is
+    /// staged beside `p` and renamed over it only once `src` reaches its
+    /// end without an error, then the number of bytes is returned. An error
+    /// from `src` (including one that a reader checking a digest returns at
+    /// its end) leaves `p` as it was and nothing beside it, and is returned
+    /// as `src` gave it, not reworded as a failure of `p`.
+    ///
+    /// `attrs` are applied to the staged file before the rename
+    /// ([`WriteAttrs`]), so the content is never visible at a wider mode,
+    /// or setuid with the wrong owner. `None` is [`write`](Backend::write)'s
+    /// behaviour.
+    ///
+    /// The content streams: `Local` writes as it reads, and [`Elevated`]
+    /// sends it to its helper a chunk at a time, taking its connection only
+    /// per chunk, so `src` may itself read through the same helper. No
+    /// default implementation, so a backend cannot quietly buffer the whole
+    /// file.
+    fn write_from(
+        &self,
+        p: &Path,
+        src: &mut dyn Read,
+        attrs: Option<WriteAttrs>,
+    ) -> io::Result<u64>;
+    /// A reader over the file at `p`, symlinks followed, as
+    /// [`read`](Backend::read) without holding the whole file. Whatever `p`
+    /// is gets opened and read, as `read` and `cat` do: a FIFO blocks for a
+    /// writer, and `/dev/zero` never ends. Through [`Elevated`] each chunk is
+    /// one request and no lock is held between them, so other primitives on
+    /// the same identity may run while the reader is alive; dropping it
+    /// before its end releases what the helper held for it.
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn Read + Send + '_>>;
     /// `lstat`: a symlink reports `FileKind::Symlink`.
     fn stat(&self, p: &Path) -> io::Result<Option<Stat>>;
     /// `stat`: follows symlinks, so a link to a directory reports `Dir`.
@@ -201,4 +333,28 @@ pub trait Backend: Send + Sync {
     /// [`Output::status`], and only being unable to start the child at all
     /// is an `Err`.
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without an owner, one `chmod`. With one, the mode without setuid and
+    /// setgid, the owner, and the full mode again only when it carries
+    /// either; sticky is not cleared by a `chown`, so it is no reason for a
+    /// third call.
+    #[test]
+    fn attr_steps_put_setuid_and_setgid_after_the_owner() {
+        use AttrStep::{Mode, Owner};
+        assert_eq!(attr_steps(0o4755, None), [Mode(0o4755)]);
+        for (mode, steps) in [
+            (0o600, vec![Mode(0o600), Owner(5, 6)]),
+            (0o1755, vec![Mode(0o1755), Owner(5, 6)]),
+            (0o4755, vec![Mode(0o755), Owner(5, 6), Mode(0o4755)]),
+            (0o2750, vec![Mode(0o750), Owner(5, 6), Mode(0o2750)]),
+            (0o6755, vec![Mode(0o755), Owner(5, 6), Mode(0o6755)]),
+        ] {
+            assert_eq!(attr_steps(mode, Some((5, 6))), steps, "{mode:o}");
+        }
+    }
 }

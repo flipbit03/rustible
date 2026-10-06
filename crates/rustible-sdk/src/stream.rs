@@ -12,6 +12,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use zeroize::Zeroizing;
+
 pub use crate::protocol::CHUNK_SIZE;
 
 /// One piece of a streamed file.
@@ -21,8 +23,9 @@ pub struct Chunk {
     /// arrive in order, so a consumer that keeps a running total can reject
     /// a gap; [`write_chunks`] does exactly that.
     pub offset: u64,
-    /// Up to [`CHUNK_SIZE`] bytes, and fewer only in the last chunk.
-    pub bytes: Vec<u8>,
+    /// Up to [`CHUNK_SIZE`] bytes, and fewer only in the last chunk. Wiped on
+    /// drop: a chunk may be part of a secret (`ctx.local_secret`).
+    pub bytes: Zeroizing<Vec<u8>>,
     /// The final chunk of this file. Exactly one chunk of a stream carries
     /// it, and a receiver uses it rather than a byte count to know the file
     /// is complete.
@@ -90,7 +93,7 @@ impl<R: Read> Iterator for Chunks<R> {
         if self.done {
             return None;
         }
-        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut buf = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
         let mut filled = 0;
         while filled < CHUNK_SIZE {
             match self.r.read(&mut buf[filled..]) {
@@ -350,7 +353,7 @@ mod tests {
         assert_eq!(out, data);
         let bad = Chunk {
             offset: 999,
-            bytes: vec![],
+            bytes: Vec::new().into(),
             last: true,
         };
         assert!(write_chunks(&mut out, &bad, 0).is_err());

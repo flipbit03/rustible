@@ -16,8 +16,11 @@
 //!
 //! Byte fields (file chunks, command stdin) travel as base64 strings: a JSON
 //! array of numbers would cost 3.5x the payload, base64 costs 1.33x, and the
-//! frame stays printable. Every frame body is zeroized after decoding so a
-//! secret chunk or an escalation password does not linger in freed memory.
+//! frame stays printable. Every frame body is zeroized after decoding, and
+//! wiped as it grows while it is encoded, so a secret chunk or an escalation
+//! password does not linger in freed memory. The chunk fields themselves
+//! ([`Down::FileChunk`], [`Up::FetchChunk`]) are zeroizing buffers, and the
+//! base64 text of a byte field is built in one as well.
 
 use std::io::{self, Read, Write};
 
@@ -103,9 +106,11 @@ pub enum Down {
         /// arrive in order, so the receiver appends; the offset is what
         /// lets it check that assumption.
         offset: u64,
-        /// Up to [`CHUNK_SIZE`] bytes of the file, base64 on the wire.
-        #[serde(with = "b64")]
-        bytes: Vec<u8>,
+        /// Up to [`CHUNK_SIZE`] bytes of the file, base64 on the wire, held
+        /// in a buffer wiped on drop: the file may be a secret
+        /// (`ctx.local_secret`).
+        #[serde(with = "b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
         /// Set on the final chunk. Exactly one chunk per `req` carries it,
         /// unless the request ended in a [`Down::FileDenied`] instead;
         /// after either the id is finished and must not be reused.
@@ -173,13 +178,28 @@ pub enum Up {
         /// Byte offset to write this chunk at. The orchestrator seeks, so a
         /// chunk that arrives out of order still lands correctly.
         offset: u64,
-        /// Up to [`CHUNK_SIZE`] bytes, base64 on the wire.
-        #[serde(with = "b64")]
-        bytes: Vec<u8>,
+        /// Up to [`CHUNK_SIZE`] bytes, base64 on the wire, held in a buffer
+        /// wiped on drop.
+        #[serde(with = "b64_zeroizing")]
+        bytes: Zeroizing<Vec<u8>>,
         /// Set on the final chunk of this fetch. That is when the
         /// orchestrator counts the file as written and reports it.
         last: bool,
     },
+}
+
+impl Up {
+    /// About what this frame encodes to, for [`encode_frame_sized`]: the
+    /// base64 of a fetched chunk and its envelope, and nothing for the rest,
+    /// which are small or of a size not worth guessing.
+    fn size_hint(&self) -> usize {
+        match self {
+            Up::FetchChunk { dest, bytes, .. } => {
+                bytes.len().div_ceil(3) * 4 + dest.len() * 2 + 128
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// A 1 MiB chunk of base64 plus JSON framing fits with room to spare.
@@ -187,12 +207,12 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// The largest payload that survives a single frame: bytes travel as
 /// base64, so four bytes on the wire carry three of payload, and the JSON
-/// envelope needs a little room besides. Three things refuse above it
-/// before anything is built: a helper write (`HelperOp::Write`), a
-/// command's stdin through a helper (`HelperOp::Spawn`), and `ctx.fetch`
-/// under `as_user`/`as_root`. The helper itself refuses any answer whose
-/// encoding passes [`MAX_FRAME`], so it never sends a frame the far end
-/// rejects; for a read that is a file a little over this size.
+/// envelope needs a little room besides. Nothing is limited to it any more:
+/// a file, a listing and a command's stdin and output cross the escalation
+/// helper in chunks of [`CHUNK_SIZE`] (#85), as the main channel's files
+/// always did, and only tests use this now. The helper still refuses any
+/// answer whose encoding passes [`MAX_FRAME`], so it never sends a frame the
+/// far end rejects.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 
 /// Serialize `msg` and write it as one length-prefixed frame, flushing
@@ -220,11 +240,26 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()>
 /// `limit` bytes. Serializing stops as soon as the limit is passed, so the
 /// body of a refused answer never grows past it.
 ///
-/// The body is held in `Zeroizing` memory, as [`write_frame`]'s is.
+/// The body is held in `Zeroizing` memory, as [`write_frame`]'s is, and
+/// each time it grows the buffer it outgrew is wiped before it is freed.
 /// Errors only if the value will not serialize.
 pub(crate) fn encode_frame<T: Serialize>(
     msg: &T,
     limit: usize,
+) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    encode_frame_sized(msg, limit, 0)
+}
+
+/// [`encode_frame`], with room for `reserve` bytes made up front: the
+/// encoded size a caller expects, so a frame carrying a chunk is built in one
+/// buffer of about its size instead of one that doubles its way there (each
+/// time copying, and wiping, what it held), the last time at the closing
+/// quote. The reserve is capped at `limit`; an estimate that is short only
+/// costs a growth.
+pub(crate) fn encode_frame_sized<T: Serialize>(
+    msg: &T,
+    limit: usize,
+    reserve: usize,
 ) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     struct Capped {
         body: Zeroizing<Vec<u8>>,
@@ -237,7 +272,7 @@ pub(crate) fn encode_frame<T: Serialize>(
                 self.over = true;
                 return Err(io::Error::other("over the frame limit"));
             }
-            self.body.extend_from_slice(buf);
+            crate::secret::extend_wiping(&mut self.body, buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -245,7 +280,7 @@ pub(crate) fn encode_frame<T: Serialize>(
         }
     }
     let mut out = Capped {
-        body: Zeroizing::new(Vec::new()),
+        body: Zeroizing::new(Vec::with_capacity(reserve.min(limit))),
         limit,
         over: false,
     };
@@ -314,22 +349,93 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<Option<
 pub mod b64 {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
+    use zeroize::Zeroizing;
 
-    /// Standard base64 with padding, emitted as a JSON string.
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&STANDARD.encode(bytes))
+    /// Standard base64 with padding, emitted as a JSON string. The text is
+    /// built in a buffer of exactly its size that is wiped once written, so
+    /// encoding a secret leaves no copy of it behind.
+    pub fn serialize<S: Serializer, T: AsRef<[u8]> + ?Sized>(
+        bytes: &T,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let bytes = bytes.as_ref();
+        let len = base64::encoded_len(bytes.len(), true)
+            .ok_or_else(|| serde::ser::Error::custom("too large to encode as base64"))?;
+        let mut text = Zeroizing::new(vec![0u8; len]);
+        let written = STANDARD
+            .encode_slice(bytes, &mut text)
+            .map_err(serde::ser::Error::custom)?;
+        let text = std::str::from_utf8(&text[..written]).map_err(serde::ser::Error::custom)?;
+        s.serialize_str(text)
     }
 
-    /// Decodes the string back to bytes, borrowing it when the format
-    /// allows. Anything that is not valid standard base64 is a
-    /// deserialization error, so a mangled frame fails here rather than
-    /// producing truncated file contents.
+    /// Decodes the string back to bytes. Anything that is not valid
+    /// standard base64 is a deserialization error, so a mangled frame fails
+    /// here rather than producing truncated file contents.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        STANDARD
-            .decode(text.as_bytes())
-            .map_err(serde::de::Error::custom)
+        let mut bytes = decode(d)?;
+        Ok(std::mem::take(&mut *bytes))
+    }
+
+    /// Decode into a buffer allocated once at the decoded size, so it never
+    /// grows, and wiped on drop. The text is decoded where the format holds
+    /// it, the frame's own body for `serde_json::from_slice`, without an
+    /// owned copy in between; a format that can only hand over an owned
+    /// `String` gets it wiped once decoded.
+    pub(crate) fn decode<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<Vec<u8>>, D::Error> {
+        d.deserialize_str(Text)
+    }
+
+    /// What [`decode`] hands the format.
+    struct Text;
+
+    impl Text {
+        fn decode<E: serde::de::Error>(text: &str) -> Result<Zeroizing<Vec<u8>>, E> {
+            let mut out =
+                Zeroizing::new(Vec::with_capacity(base64::decoded_len_estimate(text.len())));
+            STANDARD
+                .decode_vec(text.as_bytes(), &mut out)
+                .map_err(E::custom)?;
+            Ok(out)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Zeroizing<Vec<u8>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a base64 string")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Self::decode(text)
+        }
+
+        fn visit_string<E: serde::de::Error>(self, mut text: String) -> Result<Self::Value, E> {
+            let out = Self::decode(&text);
+            zeroize::Zeroize::zeroize(&mut text);
+            out
+        }
+    }
+}
+
+/// Serde helper: a byte field held in a [`Zeroizing`] buffer, as a base64
+/// string: the same text as [`b64`], decoded from where the format holds it
+/// straight into a buffer that is wiped on drop. For every field that
+/// carries a file's or a command's bytes. `#[serde(with = "b64_zeroizing")]`.
+pub(crate) mod b64_zeroizing {
+    use serde::Deserializer;
+    use zeroize::Zeroizing;
+
+    pub(crate) use super::b64::serialize;
+
+    /// [`b64::deserialize`](super::b64::deserialize) into a zeroizing
+    /// buffer.
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Zeroizing<Vec<u8>>, D::Error> {
+        super::b64::decode(d)
     }
 }
 
@@ -340,7 +446,10 @@ pub mod b64_opt {
     /// `None` becomes JSON `null`, `Some` a base64 string. Pair it with
     /// `#[serde(default)]` so an older peer that omits the field decodes as
     /// `None` instead of failing.
-    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer, T: AsRef<[u8]>>(
+        bytes: &Option<T>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         match bytes {
             Some(b) => super::b64::serialize(b, s),
             None => s.serialize_none(),
@@ -500,8 +609,10 @@ fn escaped_char_len(c: char) -> usize {
 
 impl<W: Write + Send> UpLink for FrameSink<W> {
     fn send(&self, up: &Up) -> io::Result<()> {
+        let body = encode_frame_sized(up, u32::MAX as usize, up.size_hint())?
+            .ok_or_else(|| io::Error::other("frame too large"))?;
         let mut w = self.0.lock().unwrap();
-        write_frame(&mut *w, up)
+        write_body(&mut *w, &body)
     }
 }
 
@@ -515,7 +626,7 @@ mod tests {
         let down = Down::FileChunk {
             req: 7,
             offset: 1024,
-            bytes: bytes.clone(),
+            bytes: bytes.clone().into(),
             last: true,
         };
         let mut buf = Vec::new();
@@ -532,7 +643,7 @@ mod tests {
                 last,
             } => {
                 assert_eq!((req, offset, last), (7, 1024, true));
-                assert_eq!(b, bytes);
+                assert_eq!(*b, bytes);
             }
             other => panic!("{other:?}"),
         }
@@ -592,6 +703,74 @@ mod tests {
         }
     }
 
+    /// The chunk-carrying frames of the main channel hold their bytes in
+    /// zeroizing buffers (#85), and their JSON is what it was before, byte
+    /// for byte: the expected strings below were captured from the plain
+    /// `Vec<u8>` fields, so an orchestrator and a binary built either side of
+    /// the change agree and `PROTOCOL_VERSION` did not move.
+    #[test]
+    fn chunk_frames_json_is_byte_identical_to_the_plain_vec_encoding() {
+        let down = Down::FileChunk {
+            req: 7,
+            offset: 1024,
+            bytes: b"hello\x00\xff".to_vec().into(),
+            last: true,
+        };
+        let json = r#"{"FileChunk":{"req":7,"offset":1024,"bytes":"aGVsbG8A/w==","last":true}}"#;
+        assert_eq!(serde_json::to_string(&down).unwrap(), json);
+        let Down::FileChunk { bytes, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not FileChunk")
+        };
+        assert_eq!(&bytes[..], b"hello\x00\xff");
+
+        let up = Up::FetchChunk {
+            req: 3,
+            dest: "out/h/f".into(),
+            offset: 0,
+            bytes: b"\x01\x02\x03secret".to_vec().into(),
+            last: false,
+        };
+        let json = r#"{"FetchChunk":{"req":3,"dest":"out/h/f","offset":0,"bytes":"AQIDc2VjcmV0","last":false}}"#;
+        assert_eq!(serde_json::to_string(&up).unwrap(), json);
+        let Up::FetchChunk { bytes, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("not FetchChunk")
+        };
+        assert_eq!(&bytes[..], b"\x01\x02\x03secret");
+        // And through a frame, as the channel sends them.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &up).unwrap();
+        assert_eq!(&buf[4..], json.as_bytes());
+    }
+
+    /// Encoding and decoding a chunk frame leaves no copy of the chunk, as
+    /// bytes or as base64 text, in freed memory: the text is built in a
+    /// wiped buffer, the body is wiped as it grows, and decoding goes from
+    /// the frame's own (wiped) body to a wiped buffer without an owned copy
+    /// of the text in between.
+    #[test]
+    fn a_chunk_frame_leaves_no_copy_behind() {
+        let probe = crate::freed::exclusive();
+        let chunk: Zeroizing<Vec<u8>> = crate::freed::marked(100_000).into();
+        let left = probe.unwiped_frees(|| {
+            // Room for the frame, so the sink does not grow.
+            let mut buf = Zeroizing::new(Vec::with_capacity(200_000));
+            let down = Down::FileChunk {
+                req: 1,
+                offset: 0,
+                bytes: chunk.clone(),
+                last: true,
+            };
+            write_frame(&mut *buf, &down).unwrap();
+            drop(down);
+            let back: Down = read_frame(&mut buf.as_slice()).unwrap().unwrap();
+            let Down::FileChunk { bytes, .. } = back else {
+                panic!("not a chunk")
+            };
+            assert!(bytes == chunk);
+        });
+        assert_eq!(left, 0, "buffers freed with the chunk in them");
+    }
+
     /// `encode_frame` gives the body `write_frame` sends, up to and
     /// including its limit, and `None` one byte past it.
     #[test]
@@ -599,7 +778,7 @@ mod tests {
         let msg = Down::FileChunk {
             req: 1,
             offset: 0,
-            bytes: vec![7; 3000],
+            bytes: vec![7; 3000].into(),
             last: true,
         };
         let mut framed = Vec::new();

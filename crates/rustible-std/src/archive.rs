@@ -289,11 +289,10 @@ pub struct ExtractReport {
 /// **Limits.** The compressed archive is held in memory (zstd: the
 /// decompressed stream too), and so is each file member's data while it is
 /// written; this is for release tarballs, not backups. Under
-/// `ctx.as_root()` or `ctx.as_user(..)` every read and write crosses the
-/// helper in one frame of just under 48 MiB, so the archive and each
-/// member are limited to that size there. A sparse member's holes are
-/// written as data, not kept as holes, so it takes its full real size on
-/// disk (and in memory while it is written).
+/// `ctx.as_root()` or `ctx.as_user(..)` reads and writes cross the helper
+/// in chunks, so no other size limit applies there. A sparse member's
+/// holes are written as data, not kept as holes, so it takes its full real
+/// size on disk (and in memory while it is written).
 /// Files already in `dest` that the archive does not mention are left
 /// alone.
 #[derive(Debug, Clone)]
@@ -1051,7 +1050,7 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat};
+    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -2216,6 +2215,18 @@ mod tests {
         fn write(&self, p: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Self::name_max(p)?;
             self.fake.write(p, bytes)
+        }
+        fn write_from(
+            &self,
+            p: &Path,
+            src: &mut dyn std::io::Read,
+            attrs: Option<WriteAttrs>,
+        ) -> std::io::Result<u64> {
+            Self::name_max(p)?;
+            self.fake.write_from(p, src, attrs)
+        }
+        fn open_read(&self, p: &Path) -> std::io::Result<Box<dyn std::io::Read + Send + '_>> {
+            self.fake.open_read(p)
         }
         fn stat(&self, p: &Path) -> std::io::Result<Option<Stat>> {
             self.fake.stat(p)

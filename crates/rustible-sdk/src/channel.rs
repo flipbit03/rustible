@@ -396,7 +396,7 @@ mod tests {
                 feeder.feed(Down::FileChunk {
                     req: 1,
                     offset: i as u64,
-                    bytes: vec![b'x'],
+                    bytes: vec![b'x'].into(),
                     last: i + 1 == total,
                 });
                 fed_w.fetch_add(1, Ordering::SeqCst);
@@ -436,7 +436,7 @@ mod tests {
         feeder.feed(Down::FileChunk {
             req: 1,
             offset: 0,
-            bytes: vec![b'x'],
+            bytes: vec![b'x'].into(),
             last: false,
         });
         let err = ch
@@ -453,7 +453,7 @@ mod tests {
                 f.feed(Down::FileChunk {
                     req: 1,
                     offset: i as u64,
-                    bytes: vec![b'x'],
+                    bytes: vec![b'x'].into(),
                     last: false,
                 });
             }
@@ -484,31 +484,31 @@ mod tests {
         feeder.feed(Down::FileChunk {
             req: 2,
             offset: 0,
-            bytes: b"two".to_vec(),
+            bytes: b"two".to_vec().into(),
             last: true,
         });
         feeder.feed(Down::FileChunk {
             req: 1,
             offset: 0,
-            bytes: b"on".to_vec(),
+            bytes: b"on".to_vec().into(),
             last: false,
         });
         feeder.feed(Down::FileChunk {
             req: 1,
             offset: 2,
-            bytes: b"e".to_vec(),
+            bytes: b"e".to_vec().into(),
             last: true,
         });
         let mut got = Vec::new();
         ch.stream_file("files/one", &mut |c| {
-            got.extend(c.bytes);
+            got.extend_from_slice(&c.bytes);
             Ok(())
         })
         .unwrap();
         assert_eq!(got, b"one");
         let mut got = Vec::new();
         ch.stream_file("files/two", &mut |c| {
-            got.extend(c.bytes);
+            got.extend_from_slice(&c.bytes);
             Ok(())
         })
         .unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let (ch, _feeder) = Channel::local(WorkspaceFiles::new(dir.path()).unwrap());
         let mut got = Vec::new();
         ch.stream_file("f.txt", &mut |c| {
-            got.extend(c.bytes);
+            got.extend_from_slice(&c.bytes);
             Ok(())
         })
         .unwrap();
@@ -556,7 +556,7 @@ mod tests {
             "out/h",
             &Chunk {
                 offset: 0,
-                bytes: b"host".to_vec(),
+                bytes: b"host".to_vec().into(),
                 last: true,
             },
         )

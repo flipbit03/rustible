@@ -1,12 +1,15 @@
 //! The op's handle to the machine. Concrete struct over a swappable backend.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::backend::{Backend, CmdSpec, Elevated, Fake, HelperGone, Local, Output, Spawner, Stat};
+use crate::backend::{
+    Backend, CmdSpec, Elevated, Fake, HelperGone, Limits, Local, Output, Spawner, Stat, WriteAttrs,
+};
 use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
@@ -215,6 +218,41 @@ impl System {
         self
     }
 
+    /// A system whose every primitive goes through a real escalation helper
+    /// ([`serve_helper`](crate::backend::serve_helper) on a thread of this
+    /// process, over two pipes) as this process's own user: the whole helper
+    /// protocol, with a real `Local` behind it, and no `sudo`. For a test
+    /// that has to run an op through a helper, such as one proving that its
+    /// reads and writes interleave on one helper without deadlocking. The
+    /// helper shares this system's phase cell, so the check-mode guard holds
+    /// on both sides as in a real run. The facts are this machine's, and the
+    /// identity is the process's own.
+    #[doc(hidden)]
+    pub fn in_process_helper(sink: SharedSink) -> Result<System> {
+        Self::over_helper(sink, |phase| {
+            Elevated::in_process_with(
+                "in-process",
+                phase,
+                Limits::REAL,
+                |w| Box::new(w),
+                |r| Box::new(r),
+            )
+        })
+    }
+
+    /// A system over the helper `make` builds around this system's phase
+    /// cell.
+    pub(crate) fn over_helper(
+        sink: SharedSink,
+        make: impl FnOnce(Arc<AtomicU8>) -> std::io::Result<Elevated>,
+    ) -> Result<System> {
+        let local: Arc<dyn Backend> = Arc::new(Local);
+        let facts = Facts::gather(&*local);
+        let mut sys = Self::new(local, facts, false, sink);
+        sys.backend = Arc::new(make(sys.phase.clone())?);
+        Ok(sys)
+    }
+
     /// Fake backend for tests. Facts default to a plausible Debian box; use
     /// `with_facts` to change them.
     pub fn fake(fake: Arc<Fake>, sink: SharedSink) -> Self {
@@ -375,13 +413,30 @@ impl System {
     /// The whole file, in memory, as bytes. A missing or unreadable file is
     /// an [`IoAt`] error naming the path: there is no "missing counts as
     /// empty" shortcut, so an op that tolerates absence asks
-    /// [`System::exists`] first. Reading through a helper puts the file in
-    /// one frame, base64-encoded, so a file whose encoding does not fit in
-    /// [`MAX_FRAME`](crate::protocol::MAX_FRAME) (one of about 48 MiB) is
-    /// refused there, and the helper goes on serving.
+    /// [`System::exists`] first. Through a helper the file crosses in chunks
+    /// of 1 MiB, so any size works; it is still whole in memory here.
     pub fn read(&self, p: impl AsRef<Path>) -> Result<Vec<u8>> {
         let p = p.as_ref();
         self.backend.read(p).map_err(Self::io(p))
+    }
+
+    /// A reader over the file at `p`, symlinks followed: [`System::read`]
+    /// without holding the whole file, so an op can hash, compare or copy a
+    /// file of any size in a few chunks' memory. An error opening it, or
+    /// reading from it later, is an [`IoAt`] naming the path.
+    ///
+    /// Through a helper each chunk is one request, and the reader holds
+    /// nothing between them, so the step may go on using this identity
+    /// while it reads; dropping it before its end releases the helper's
+    /// stream. Whatever `p` is gets read, as `cat` does: a FIFO waits for a
+    /// writer and `/dev/zero` never ends. Allowed inside `check`.
+    pub fn open_read(&self, p: impl AsRef<Path>) -> Result<Box<dyn Read + Send + '_>> {
+        let p = p.as_ref();
+        let inner = self.backend.open_read(p).map_err(Self::io(p))?;
+        Ok(Box::new(PathReader {
+            inner,
+            path: p.to_path_buf(),
+        }))
     }
 
     /// The whole file as text. Errors with `not utf-8` on bytes that are
@@ -439,6 +494,49 @@ impl System {
         self.backend.write(p, bytes).map_err(Self::io(p))?;
         self.debug(format!("wrote {} ({} bytes)", p.display(), bytes.len()));
         Ok(())
+    }
+
+    /// Write what `src` yields to `p`, atomically, and return how many bytes
+    /// that was: [`System::write_atomic`] for content that is read rather
+    /// than held, so a file of any size is written in a few chunks' memory,
+    /// escalated or not.
+    ///
+    /// Staged beside `p` and renamed over it only once `src` reaches its
+    /// end. An error from `src`, such as a reader that checks a digest and
+    /// fails at its end, leaves `p` as it was and nothing beside it, and
+    /// comes back as `src` gave it, not as a failure of `p`. `attrs` are the
+    /// mode and owner the file is given before the rename ([`WriteAttrs`]),
+    /// so new content is never readable at a wider mode, or setuid with the
+    /// wrong owner, even for a moment; a requested owner that cannot be
+    /// given fails the write and leaves `p` as it was. `None` keeps an
+    /// existing file's mode and owner, exactly as `write_atomic` does.
+    ///
+    /// `src` may read through this same identity's helper: an archive read
+    /// with [`System::open_read`] and written member by member, as root,
+    /// alternates on one helper chunk by chunk.
+    ///
+    /// Refused with [`MutationDuringCheck`] inside `check`. Logs the path and
+    /// byte count at debug level.
+    pub fn write_from(
+        &self,
+        p: impl AsRef<Path>,
+        mut src: impl Read,
+        attrs: Option<WriteAttrs>,
+    ) -> Result<u64> {
+        let p = p.as_ref();
+        self.guard_mutation(p)?;
+        let mut src = Watched {
+            inner: &mut src,
+            failed: false,
+        };
+        match self.backend.write_from(p, &mut src, attrs) {
+            Ok(n) => {
+                self.debug(format!("wrote {} ({n} bytes)", p.display()));
+                Ok(n)
+            }
+            Err(e) if src.failed => Err(e.into()),
+            Err(e) => Err(Self::io(p)(e)),
+        }
     }
 
     /// Create `p` and every missing parent. Succeeds when `p` is already a
@@ -634,6 +732,51 @@ impl System {
     }
 }
 
+/// The source of a [`System::write_from`], noting whether it failed, so its
+/// error goes back as it was rather than as a failure of the destination.
+struct Watched<'a> {
+    inner: &'a mut dyn Read,
+    failed: bool,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).inspect_err(|e| {
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                self.failed = true;
+            }
+        })
+    }
+}
+
+/// [`System::open_read`]'s reader: errors name the path, as
+/// [`System::read`]'s do.
+struct PathReader<'a> {
+    inner: Box<dyn Read + Send + 'a>,
+    path: PathBuf,
+}
+
+impl Read for PathReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::Interrupted {
+                return source;
+            }
+            // A dead helper's report is already whole (see `System::io`).
+            if let Some(gone) = HelperGone::inside(&source) {
+                return std::io::Error::other(format!("{}: {gone}", self.path.display()));
+            }
+            std::io::Error::new(
+                source.kind(),
+                IoAt {
+                    path: self.path.clone(),
+                    source,
+                },
+            )
+        })
+    }
+}
+
 /// Builder returned by `sys.cmd()`.
 pub struct Cmd {
     sys: System,
@@ -773,6 +916,233 @@ mod tests {
         assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
         let sys = sys.with_escalation("sudo", None);
         assert_eq!(spawner(&sys).note.as_deref(), Some("the login user `x`"));
+    }
+
+    // ---- streaming: write_from and open_read (#85) ----
+
+    /// Small chunks, so a test of a file of several chunks writes kilobytes.
+    const SMALL: Limits = Limits {
+        frame: 16 * 1024,
+        chunk: 4096,
+    };
+
+    /// A system over an in-process helper at `limits`.
+    fn helper_sys(limits: Limits) -> System {
+        System::over_helper(Arc::new(Collect::default()), |phase| {
+            Elevated::in_process_with("tester", phase, limits, |w| Box::new(w), |r| Box::new(r))
+        })
+        .unwrap()
+    }
+
+    /// `n` bytes that are not a repeated pattern.
+    fn data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// The `.rustible-*` entries beside `dir`'s files, on disk.
+    fn staged_in(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".rustible-")
+            })
+            .collect()
+    }
+
+    /// Escalated, `read`, `write_atomic`, `write_from` and `open_read` carry
+    /// files of 0 bytes, one under a chunk, a chunk, one over and several
+    /// chunks, byte for byte. (The same at the real 1 MiB chunk and over
+    /// 48 MiB is `a_file_over_48_mib_crosses_the_helper_in_bounded_frames`
+    /// in the helper's tests.)
+    #[test]
+    fn escalated_reads_and_writes_carry_any_size() {
+        let sys = helper_sys(SMALL);
+        let c = SMALL.chunk;
+        let dir = tempfile::tempdir().unwrap();
+        for n in [0, c - 1, c, c + 1, 3 * c + 1] {
+            let body = data(n);
+            let a = dir.path().join(format!("atomic{n}"));
+            sys.write_atomic(&a, &body).unwrap();
+            assert_eq!(sys.read(&a).unwrap(), body, "{n}");
+
+            let f = dir.path().join(format!("from{n}"));
+            let written = sys.write_from(&f, body.as_slice(), None).unwrap();
+            assert_eq!(written, n as u64);
+            let mut back = Vec::new();
+            sys.open_read(&f).unwrap().read_to_end(&mut back).unwrap();
+            assert_eq!(back, body, "{n}");
+        }
+        assert!(staged_in(dir.path()).is_empty());
+    }
+
+    /// A source that fails when it is read.
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the source broke"))
+        }
+    }
+
+    /// A source that yields its bytes and then fails at its end, as a
+    /// reader checking a digest does.
+    struct FailsAtEof(std::io::Cursor<Vec<u8>>);
+
+    impl Read for FailsAtEof {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checksum mismatch",
+                )),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// On every backend, a source that fails part way or only at its end
+    /// writes nothing: the file there keeps its content, nothing is left
+    /// beside it, and the error is the source's own, not one about the
+    /// path.
+    #[test]
+    fn a_failing_source_writes_nothing_on_any_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        std::fs::write(&old, "before").unwrap();
+        let fake = Arc::new(Fake::new().with_dir("/d").with_file("/d/old", "before"));
+        let cases: [(System, PathBuf); 3] = [
+            (
+                System::local(false, Arc::new(Collect::default())),
+                old.clone(),
+            ),
+            (helper_sys(SMALL), old.clone()),
+            (fake_sys(&fake), PathBuf::from("/d/old")),
+        ];
+        for (sys, p) in cases {
+            let new = p.with_file_name("new");
+            for n in [10, 3 * SMALL.chunk] {
+                for target in [&p, &new] {
+                    let part_way = std::io::Cursor::new(data(n)).chain(Failing);
+                    let err = sys.write_from(target, part_way, None).unwrap_err();
+                    assert_eq!(err.chain(), "the source broke");
+
+                    let at_eof = FailsAtEof(std::io::Cursor::new(data(n)));
+                    let attrs = Some(WriteAttrs {
+                        mode: Some(0o600),
+                        owner: None,
+                    });
+                    let err = sys.write_from(target, at_eof, attrs).unwrap_err();
+                    assert_eq!(err.chain(), "checksum mismatch");
+                }
+            }
+            assert_eq!(sys.read(&p).unwrap(), b"before");
+            assert!(!sys.exists(&new).unwrap());
+        }
+        assert!(staged_in(dir.path()).is_empty());
+        assert_eq!(
+            fake.read_dir(Path::new("/d")).unwrap(),
+            [PathBuf::from("/d/old")]
+        );
+        // A failure of the destination is about the destination.
+        let err = System::local(false, Arc::new(Collect::default()))
+            .write_from(dir.path().join("no/such/dir/f"), &b"x"[..], None)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.starts_with(&format!("{}: ", dir.path().join("no/such/dir/f").display())),
+            "{err}"
+        );
+    }
+
+    /// `write_from` is a mutation, refused inside `check` before the source
+    /// is read; `open_read` is a read, allowed there. Escalated, the helper
+    /// shares the phase, so a write that reaches around `System` is refused
+    /// by the helper too, naming the write and its size and quoting none of
+    /// its bytes.
+    #[test]
+    fn write_from_is_refused_while_checking_and_open_read_is_not() {
+        let fake = Arc::new(Fake::new().with_file("/f", "content"));
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("f");
+        std::fs::write(&on_disk, "content").unwrap();
+        for (sys, p, helper) in [
+            (fake_sys(&fake), PathBuf::from("/f"), false),
+            (helper_sys(SMALL), on_disk.clone(), true),
+        ] {
+            sys.set_phase(Phase::Checking);
+            let err = sys.write_from(&p, Failing, None).unwrap_err().to_string();
+            assert!(err.contains("during check()"), "{err}");
+            let mut back = String::new();
+            sys.open_read(&p)
+                .unwrap()
+                .read_to_string(&mut back)
+                .unwrap();
+            assert_eq!(back, "content");
+            if helper {
+                let secret = b"hunter2-the-secret".repeat(1000);
+                let err = sys
+                    .backend
+                    .write_from(&p, &mut secret.as_slice(), None)
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!(
+                        "mutation during check refused by helper: write {} (first 4096 bytes)",
+                        p.display()
+                    )
+                );
+            }
+            sys.set_phase(Phase::Idle);
+            assert_eq!(sys.read(&p).unwrap(), b"content");
+        }
+    }
+
+    /// The constructor a test in another crate uses to run an op through a
+    /// helper: a real helper loop and a real `Local` behind `System`, sharing
+    /// its phase.
+    #[test]
+    fn in_process_helper_runs_every_primitive_through_a_helper() {
+        let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f");
+        sys.write_from(&f, &b"through the helper"[..], None)
+            .unwrap();
+        assert_eq!(sys.read(&f).unwrap(), b"through the helper");
+        sys.set_phase(Phase::Checking);
+        let err = sys.backend.write(&f, b"x").unwrap_err().to_string();
+        assert!(
+            err.starts_with("mutation during check refused by helper"),
+            "{err}"
+        );
+    }
+
+    /// Opening a file that is not there, and failing to read one that is,
+    /// both name the path.
+    #[test]
+    fn open_read_errors_name_the_path() {
+        let fake = Arc::new(Fake::new());
+        let err = match fake_sys(&fake).open_read("/nope") {
+            Err(e) => e.chain(),
+            Ok(_) => panic!("opened"),
+        };
+        assert!(err.starts_with("/nope: "), "{err}");
+
+        // A directory opens and then fails to read, on Linux.
+        if cfg!(target_os = "linux") {
+            let dir = tempfile::tempdir().unwrap();
+            let sys = System::local(false, Arc::new(Collect::default()));
+            let mut r = sys.open_read(dir.path()).unwrap();
+            let err = r.read(&mut [0u8; 8]).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("{}: ", dir.path().display())),
+                "{err}"
+            );
+        }
     }
 
     // ---- backup (issue #75) ----

@@ -79,10 +79,29 @@ impl Secret {
         self.0.is_empty()
     }
 
-    /// Append bytes (used while a secret streams in chunk by chunk).
+    /// Append bytes (used while a secret streams in chunk by chunk). The
+    /// buffer is wiped when it grows, so no copy of the bytes so far is left
+    /// in a freed allocation.
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(bytes);
+        extend_wiping(&mut self.0, bytes);
     }
+}
+
+/// `buf.extend_from_slice(bytes)`, except that when `buf` has to grow, the
+/// larger buffer is allocated here, the bytes are copied into it, and the old
+/// one is zeroized before it is freed. `Vec`'s own growth reallocates and
+/// frees the old buffer as it was, which leaves every byte so far behind in
+/// freed memory; this is how a zeroizing buffer grows without doing that.
+/// Capacity at least doubles, so the copies stay amortised.
+pub(crate) fn extend_wiping(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let need = buf.len() + bytes.len();
+    if need > buf.capacity() {
+        let mut grown = Vec::with_capacity(need.max(buf.capacity() * 2));
+        grown.extend_from_slice(buf);
+        let mut old = std::mem::replace(buf, grown);
+        old.zeroize();
+    }
+    buf.extend_from_slice(bytes);
 }
 
 /// Explicit early wipe; the same happens on drop.
@@ -146,6 +165,24 @@ mod tests {
         secret.zeroize();
         assert!(secret.as_bytes().iter().all(|&b| b == 0));
         assert_eq!(secret.len(), 0, "zeroize also truncates");
+    }
+
+    /// Growing leaves no copy behind: the test allocator looks at every
+    /// buffer freed while the secret grows from nothing, chunk by chunk, and
+    /// finds none still holding its bytes. `Vec`'s own growth (the
+    /// `extend_from_slice` this replaced) frees each outgrown buffer as it
+    /// was, and fails this.
+    #[test]
+    fn a_secret_grows_without_leaving_a_copy() {
+        let probe = crate::freed::exclusive();
+        let left = probe.unwiped_frees(|| {
+            let mut secret = Secret::new(Vec::new());
+            for _ in 0..200 {
+                secret.push(crate::freed::MARKER);
+            }
+            assert_eq!(secret.len(), 3200);
+        });
+        assert_eq!(left, 0, "buffers freed with the secret in them");
     }
 
     #[test]

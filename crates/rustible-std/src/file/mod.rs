@@ -505,7 +505,7 @@ pub(crate) mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
+    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
     use rustible_sdk::prelude::*;
 
@@ -532,6 +532,17 @@ pub(crate) mod testing {
         }
         fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
             self.0.write(p, bytes)
+        }
+        fn write_from(
+            &self,
+            p: &Path,
+            src: &mut dyn io::Read,
+            attrs: Option<WriteAttrs>,
+        ) -> io::Result<u64> {
+            self.0.write_from(p, src, attrs)
+        }
+        fn open_read(&self, p: &Path) -> io::Result<Box<dyn io::Read + Send + '_>> {
+            self.0.open_read(p)
         }
         fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
             self.0.stat(p)
