@@ -202,7 +202,7 @@ jobs:
           # What `ctx.fetch` brought back through the sudo helper is the
           # 50 MiB macbrew.rs generated, and nothing was left beside it.
           fetched=examples/workspace/out/macbrew/runner
-          (yes 'rustible streams this line' || true) | head -c 52428800 | cmp - "$fetched/large-copy"
+          (yes 'rustible streams this line' 2>/dev/null || true) | head -c 52428800 | cmp - "$fetched/large-copy"
           test "$(ls -A "$fetched")" = large-copy
           rm -rf examples/workspace/out/macbrew
           run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +0 +6 +0 +0 +0 +1 +0$'

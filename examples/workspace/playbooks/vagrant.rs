@@ -112,10 +112,15 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     // fetch reads it again. Staged under a temporary name, so a generation
     // cut short is not mistaken for a finished one by `creates`.
     ctx.step("50 MiB file", shell::Command::sh(format!("yes '{LARGE_LINE}' | head -c {LARGE_BYTES} > {LARGE}.part && mv {LARGE}.part {LARGE}")).creates(LARGE))?;
-    let copy = format!("/home/{LOGIN_ACCOUNT}/large-copy");
-    let mut login = ctx.as_user(LOGIN_ACCOUNT);
-    login.step(format!("50 MiB copy as {LOGIN_ACCOUNT}"), file::Copy::from_local_path(LARGE).to(&copy))?;
-    login.fetch(&copy, FETCHED)?;
+    // A dry run on a guest that never had it has no source to compare.
+    if !(ctx.check_mode() && !ctx.sys().exists(LARGE)?) {
+        let copy = format!("/home/{LOGIN_ACCOUNT}/large-copy");
+        let mut login = ctx.as_user(LOGIN_ACCOUNT);
+        login.step(format!("50 MiB copy as {LOGIN_ACCOUNT}"), file::Copy::from_local_path(LARGE).to(&copy))?;
+        if !login.check_mode() {
+            login.fetch(&copy, FETCHED)?;
+        }
+    }
 
     // An account with no home at all: its helper runs from a private copy
     // in the temp directory, which removes itself.

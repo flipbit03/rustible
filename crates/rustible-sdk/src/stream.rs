@@ -1,7 +1,9 @@
 //! File streaming over the channel (vision doc 5.6): the orchestrator-side
 //! half. `WorkspaceFiles` serves `FileRequest`s from the workspace root and
-//! writes `FetchChunk`s under it, denying anything that resolves outside; the
-//! `chunks` iterator splits any reader into `CHUNK_SIZE` pieces. The binary's
+//! resolves where `FetchChunk`s go under it, denying anything that resolves
+//! outside; `FetchStaging` writes them there, each file renamed into place
+//! on its last chunk; the `chunks` iterator splits any reader into
+//! `CHUNK_SIZE` pieces. The binary's
 //! half (`ctx.local_file`, `ctx.local_secret`, `ctx.fetch`) lives in `ctx`.
 //!
 //! This lives in the SDK rather than the CLI so a local run (no orchestrator)
