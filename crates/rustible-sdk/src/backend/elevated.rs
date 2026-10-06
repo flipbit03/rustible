@@ -55,7 +55,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, CmdSpec, Local, Output, Stat};
 use crate::launch::{self, Answer, Launch, Mode, Next};
-use crate::protocol::{FrameTooLarge, MAX_FRAME_PAYLOAD, read_frame, write_frame};
+use crate::protocol::{
+    FrameTooLarge, MAX_FRAME, MAX_FRAME_PAYLOAD, encode_frame, read_frame, write_body, write_frame,
+};
 use crate::secret::Secret;
 
 /// One `Backend` primitive on the wire.
@@ -68,7 +70,8 @@ use crate::secret::Secret;
 pub enum HelperOp {
     /// [`Backend::read`], answered with [`HelperResponse::Bytes`]. The file
     /// crosses whole in one frame, so one larger than `MAX_FRAME_PAYLOAD`
-    /// cannot be read through a helper at all.
+    /// cannot be read through a helper at all: [`serve_helper`] answers it
+    /// with a refusal naming the file, its size and the account.
     Read {
         /// Read by the helper's user, so a file the main process cannot open
         /// is still fine.
@@ -151,10 +154,13 @@ pub enum HelperOp {
     /// never touch the wire, so copying a file as another user works at
     /// sizes at which reading it would be refused.
     Copy {
-        /// Must exist and be readable by the helper's user.
+        /// A regular file (symlinks followed), readable by the helper's
+        /// user. Anything else is refused before it is opened.
         from: PathBuf,
-        /// Created or truncated. Not atomic, so a reader can catch it half
-        /// written.
+        /// Created new: an existing path, a symlink included, is refused
+        /// with `AlreadyExists` and left as it was. Not atomic, but a
+        /// failure part way removes what it created, so no half-written
+        /// copy is left behind.
         to: PathBuf,
     },
     /// [`Backend::symlink`]. Fails if `link` exists: there is no
@@ -173,7 +179,9 @@ pub enum HelperOp {
         /// answering `None` is how a caller learns `path` is not a link.
         path: PathBuf,
     },
-    /// [`Backend::read_dir`]. The whole listing comes back in one frame.
+    /// [`Backend::read_dir`]. The whole listing comes back in one frame, so
+    /// a directory whose listing does not fit is refused by
+    /// [`serve_helper`], naming the directory and how many entries it has.
     ReadDir {
         /// The directory. The answer holds full paths of the direct
         /// children, sorted, not bare names and not the tree.
@@ -183,7 +191,9 @@ pub enum HelperOp {
     /// further `sudo`, so [`CmdSpec::prefix`] is empty on this path;
     /// `sys.cmd` only fills it in for a `Fake` system, which has no helper
     /// to be the user for it. [`CmdSpec::stdin`] rides in the request and
-    /// counts against the frame limit.
+    /// counts against the frame limit, and the output comes back whole in
+    /// one frame: [`serve_helper`] refuses output that does not fit,
+    /// naming the command, and the helper stays usable.
     Spawn(CmdSpec),
 }
 
@@ -221,7 +231,8 @@ impl HelperOp {
     }
 
     /// The file bytes this op would put in a single frame, with the path
-    /// they belong to. `None` for ops whose request carries no payload.
+    /// they belong to: for a command's stdin, the program. `None` for ops
+    /// whose request carries no payload.
     ///
     /// Every primitive is one request and one response, so a file crosses
     /// the helper boundary whole. Bytes travel as base64, so the ceiling is
@@ -282,20 +293,23 @@ pub enum HelperResponse {
     /// removals, the rename, the mode and owner changes, the copy, the
     /// symlink.
     Unit,
-    /// A whole file, from [`HelperOp::Read`]. Base64 on the wire; a file too
-    /// large for a frame fails inside the framing, and [`Elevated`] rewrites
-    /// that failure to name the file and the identity.
+    /// A whole file, from [`HelperOp::Read`]. Base64 on the wire. A file too
+    /// large for a frame never comes back as this: [`serve_helper`] sends
+    /// an [`Err`](Self::Err) naming the file, its size and the account
+    /// instead.
     Bytes(#[serde(with = "crate::protocol::b64")] Vec<u8>),
     /// From [`HelperOp::Stat`] or [`HelperOp::StatFollow`]. `None` means the
     /// path is not there, which is an answer and not a failure.
     Stat(Option<Stat>),
     /// A link target, from [`HelperOp::ReadLink`].
     Path(PathBuf),
-    /// The direct children of a directory, from [`HelperOp::ReadDir`].
+    /// The direct children of a directory, from [`HelperOp::ReadDir`]. A
+    /// listing too large for a frame is an [`Err`](Self::Err) instead.
     Paths(Vec<PathBuf>),
     /// A finished command, from [`HelperOp::Spawn`]. A non-zero exit arrives
     /// here and not in [`Err`](Self::Err): the command ran, and what it did
-    /// is the op's business.
+    /// is the op's business. Output too large for a frame is an
+    /// [`Err`](Self::Err) instead.
     Output(Output),
     /// The primitive failed, or the helper refused it. Carries no payload,
     /// so nothing the op was writing can come back inside an error message.
@@ -338,10 +352,31 @@ impl HelperResponse {
 /// op [`mutates`](HelperOp::mutates) is refused before it reaches the
 /// filesystem, and the refusal quotes [`HelperOp::label`], never a payload.
 ///
+/// No frame this writes is larger than [`MAX_FRAME`], the most the far end
+/// reads. An answer that would be (a file, a command's output, a directory
+/// listing) is replaced by a [`HelperResponse::Err`] naming the request, its
+/// size and the account the helper runs as, so an oversized answer is a
+/// refusal of that one request and the helper goes on serving. Sending it
+/// would leave a frame on the pipe the far end cannot read past, which is
+/// a dead helper for the rest of the run.
+///
 /// `tx` is the frame stream and nothing else may write to it. Under
 /// `--helper` that is the process's stdout, which is why the helper's own
 /// diagnostics go to stderr.
 pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()> {
+    serve(rx, tx, MAX_FRAME, account_name)
+}
+
+/// [`serve_helper`], with the frame limit and the account its refusals
+/// name as parameters, so a test can refuse an answer without building a
+/// frame of [`MAX_FRAME`] bytes, and name the account its `Elevated` was
+/// given.
+fn serve<R: Read, W: Write>(
+    rx: &mut R,
+    tx: &mut W,
+    max_frame: usize,
+    account: impl Fn() -> String,
+) -> io::Result<()> {
     let local = Local;
     while let Some(req) = read_frame::<_, HelperRequest>(rx)? {
         let resp = if req.checking && req.op.mutates() {
@@ -353,45 +388,131 @@ pub fn serve_helper<R: Read, W: Write>(rx: &mut R, tx: &mut W) -> io::Result<()>
                 ),
             }
         } else {
-            match req.op {
-                HelperOp::Read { path } => local
-                    .read(&path)
-                    .map(HelperResponse::Bytes)
-                    .unwrap_or_else(HelperResponse::from_io),
-                HelperOp::Write { path, bytes } => unit(local.write(&path, &bytes)),
-                HelperOp::Stat { path } => local
-                    .stat(&path)
-                    .map(HelperResponse::Stat)
-                    .unwrap_or_else(HelperResponse::from_io),
-                HelperOp::StatFollow { path } => local
-                    .stat_follow(&path)
-                    .map(HelperResponse::Stat)
-                    .unwrap_or_else(HelperResponse::from_io),
-                HelperOp::MkdirAll { path } => unit(local.mkdir_all(&path)),
-                HelperOp::Remove { path } => unit(local.remove(&path)),
-                HelperOp::RemoveAll { path } => unit(local.remove_all(&path)),
-                HelperOp::Rename { from, to } => unit(local.rename(&from, &to)),
-                HelperOp::SetMode { path, mode } => unit(local.set_mode(&path, mode)),
-                HelperOp::SetOwner { path, uid, gid } => unit(local.set_owner(&path, uid, gid)),
-                HelperOp::Copy { from, to } => unit(local.copy(&from, &to)),
-                HelperOp::Symlink { target, link } => unit(local.symlink(&target, &link)),
-                HelperOp::ReadLink { path } => local
-                    .read_link(&path)
-                    .map(HelperResponse::Path)
-                    .unwrap_or_else(HelperResponse::from_io),
-                HelperOp::ReadDir { path } => local
-                    .read_dir(&path)
-                    .map(HelperResponse::Paths)
-                    .unwrap_or_else(HelperResponse::from_io),
-                HelperOp::Spawn(spec) => local
-                    .spawn(&spec)
-                    .map(HelperResponse::Output)
-                    .unwrap_or_else(HelperResponse::from_io),
+            answer(&local, &req.op)
+        };
+        let body = match encode_frame(&resp, max_frame)? {
+            Some(body) => body,
+            None => {
+                let refusal = HelperResponse::Err {
+                    code: None,
+                    message: too_large(&req.op, &resp, max_frame, &account()),
+                };
+                drop(resp);
+                encode_frame(&refusal, max_frame)?.ok_or_else(|| {
+                    io::Error::other(format!(
+                        "a refusal does not fit in a {max_frame}-byte frame"
+                    ))
+                })?
             }
         };
-        write_frame(tx, &resp)?;
+        write_body(tx, &body)?;
     }
     Ok(())
+}
+
+/// Perform one primitive on `local` and wrap what it returned.
+fn answer(local: &Local, op: &HelperOp) -> HelperResponse {
+    match op {
+        HelperOp::Read { path } => local
+            .read(path)
+            .map(HelperResponse::Bytes)
+            .unwrap_or_else(HelperResponse::from_io),
+        HelperOp::Write { path, bytes } => unit(local.write(path, bytes)),
+        HelperOp::Stat { path } => local
+            .stat(path)
+            .map(HelperResponse::Stat)
+            .unwrap_or_else(HelperResponse::from_io),
+        HelperOp::StatFollow { path } => local
+            .stat_follow(path)
+            .map(HelperResponse::Stat)
+            .unwrap_or_else(HelperResponse::from_io),
+        HelperOp::MkdirAll { path } => unit(local.mkdir_all(path)),
+        HelperOp::Remove { path } => unit(local.remove(path)),
+        HelperOp::RemoveAll { path } => unit(local.remove_all(path)),
+        HelperOp::Rename { from, to } => unit(local.rename(from, to)),
+        HelperOp::SetMode { path, mode } => unit(local.set_mode(path, *mode)),
+        HelperOp::SetOwner { path, uid, gid } => unit(local.set_owner(path, *uid, *gid)),
+        HelperOp::Copy { from, to } => unit(local.copy(from, to)),
+        HelperOp::Symlink { target, link } => unit(local.symlink(target, link)),
+        HelperOp::ReadLink { path } => local
+            .read_link(path)
+            .map(HelperResponse::Path)
+            .unwrap_or_else(HelperResponse::from_io),
+        HelperOp::ReadDir { path } => local
+            .read_dir(path)
+            .map(HelperResponse::Paths)
+            .unwrap_or_else(HelperResponse::from_io),
+        HelperOp::Spawn(spec) => local
+            .spawn(spec)
+            .map(HelperResponse::Output)
+            .unwrap_or_else(HelperResponse::from_io),
+    }
+}
+
+/// What [`serve`] sends instead of `resp`, an answer to `op` larger than a
+/// `max_frame`-byte frame: the request, the answer's size in the terms the
+/// request asked for, the account, and what to do instead. Never a byte of
+/// the answer itself. The request's label is cut to a few hundred bytes,
+/// so an absurdly long argv or path cannot make the refusal too large in
+/// its turn.
+fn too_large(op: &HelperOp, resp: &HelperResponse, max_frame: usize, account: &str) -> String {
+    let label = cut(&op.label(), 512);
+    let frame = format!("more than one helper frame holds ({max_frame} bytes)");
+    match resp {
+        HelperResponse::Bytes(b) => format!(
+            "{label} as `{account}`: the file is {} bytes, which base64-encoded is {frame}; \
+             reading a file this large has to be done without `as_user`/`as_root`",
+            b.len()
+        ),
+        HelperResponse::Output(o) => format!(
+            "{label} as `{account}` wrote {} bytes to stdout and {} to stderr, which \
+             base64-encoded is {frame}; redirect its output to a file in the command \
+             (`sh -c '… > /path'`) and read that file",
+            o.stdout.len(),
+            o.stderr.len()
+        ),
+        HelperResponse::Paths(p) => format!(
+            "{label} as `{account}`: the directory has {} entries, a listing {frame}; \
+             listing a directory this large has to be done without `as_user`/`as_root`",
+            p.len()
+        ),
+        _ => format!("{label} as `{account}`: the answer is {frame}"),
+    }
+}
+
+/// `s`, or its first `max` bytes (backed off to a character boundary) and
+/// an ellipsis.
+fn cut(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// The account this process runs as, as a helper's refusals name it: the
+/// name `/etc/passwd` gives the effective uid, else `$USER`, which `sudo`
+/// and `doas` set to the account they switch to (a mac's `/etc/passwd`
+/// lists only its system accounts), else the uid written out. Only asked
+/// for when there is a refusal to word.
+fn account_name() -> String {
+    let uid = rustix::process::geteuid().as_raw();
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| {
+            passwd.lines().find_map(|l| {
+                let mut it = l.split(':');
+                let name = it.next()?;
+                let _pw = it.next()?;
+                let id: u32 = it.next()?.parse().ok()?;
+                (id == uid).then(|| name.to_string())
+            })
+        })
+        .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
+        .unwrap_or_else(|| uid.to_string())
 }
 
 fn unit(r: io::Result<()>) -> HelperResponse {
@@ -974,8 +1095,9 @@ impl Connection {
 ///
 /// It narrows nothing. The far side is a full [`Local`] running as that
 /// user, so a request is bounded by that user's permissions and by nothing
-/// this type adds. What it does add is three refusals: a mutation while the
-/// step is checking, a payload larger than one frame, and every primitive
+/// this type adds. What it does add is four refusals: a mutation while the
+/// step is checking, a request or an answer larger than one frame (the
+/// helper refuses the answer, and goes on serving), and every primitive
 /// after the first failure.
 pub struct Elevated {
     user: String,
@@ -1057,14 +1179,23 @@ impl Elevated {
         if let Some((path, len)) = op.payload()
             && len > MAX_FRAME_PAYLOAD
         {
-            return Err(io::Error::other(format!(
-                "{}: {len} bytes is more than one helper frame can carry ({} bytes); \
-                 running as `{}` sends the whole file in one request, so a file this \
-                 large has to be handled without `as_user`/`as_root`",
-                path.display(),
-                MAX_FRAME_PAYLOAD,
-                self.user
-            )));
+            return Err(io::Error::other(match &op {
+                HelperOp::Spawn(_) => format!(
+                    "{} as `{}`: its stdin is {len} bytes, more than one helper frame can \
+                     carry ({MAX_FRAME_PAYLOAD} bytes); have the command read input this \
+                     large from a file on the target instead",
+                    op.label(),
+                    self.user
+                ),
+                _ => format!(
+                    "{}: {len} bytes is more than one helper frame can carry \
+                     ({MAX_FRAME_PAYLOAD} bytes); running as `{}` sends the whole file in \
+                     one request, so a file this large has to be handled without \
+                     `as_user`/`as_root`",
+                    path.display(),
+                    self.user
+                ),
+            }));
         }
         let mut guard = self.conn.lock().unwrap();
         if guard.is_none() {
@@ -1080,19 +1211,22 @@ impl Elevated {
         let resp = conn.call(&req).map_err(|e| {
             // The typed signal, not the message: `protocol.rs` is free to
             // reword the framing error without silently degrading this
-            // refusal back into it.
-            if e.get_ref()
+            // report back into it.
+            match e
+                .get_ref()
                 .and_then(|inner| inner.downcast_ref::<FrameTooLarge>())
-                .is_some()
             {
-                io::Error::other(format!(
-                    "{label}: the helper's answer is larger than one frame can carry \
-                     ({MAX_FRAME_PAYLOAD} bytes of payload); reading a file this large \
-                     as `{}` is not supported, do it without `as_user`/`as_root`",
-                    self.user
-                ))
-            } else {
-                e
+                // The helper refuses an answer this large rather than send
+                // it (`serve`), so this one is not an answer: the stream is
+                // out of step, and the latch below is the right response.
+                Some(big) => io::Error::other(format!(
+                    "{label}: the helper running as `{}` sent a frame of {} bytes, more \
+                     than the {MAX_FRAME} a frame may hold; a helper refuses an answer \
+                     that large instead of sending it, so the stream between the two is \
+                     corrupt",
+                    self.user, big.len
+                )),
+                None => e,
             }
         });
         if resp.is_err() {
@@ -1255,13 +1389,48 @@ mod tests {
 
     /// An in-process helper: `serve_helper` on a thread, joined by two pipes.
     fn in_process(phase: Arc<AtomicU8>) -> Elevated {
+        in_process_within(phase, MAX_FRAME)
+    }
+
+    /// [`in_process`], with a helper that refuses answers over `max_frame`
+    /// bytes, so a test can be refused without building 64 MiB frames. Its
+    /// refusals name `tester`, the account the `Elevated` is given.
+    fn in_process_within(phase: Arc<AtomicU8>, max_frame: usize) -> Elevated {
         let (req_r, req_w) = io::pipe().unwrap();
         let (resp_r, resp_w) = io::pipe().unwrap();
         std::thread::spawn(move || {
             let (mut rx, mut tx) = (req_r, resp_w);
-            serve_helper(&mut rx, &mut tx).unwrap();
+            serve(&mut rx, &mut tx, max_frame, || "tester".into()).unwrap();
         });
         Elevated::connected("tester", Box::new(req_w), Box::new(resp_r), phase)
+    }
+
+    /// The frame limit the oversized-answer tests give their helper: small
+    /// enough that a test's file, output or listing passes it cheaply, and
+    /// large enough for any refusal.
+    const SMALL_FRAME: usize = 16 * 1024;
+
+    /// A shell command, as `sys.cmd` would build it.
+    fn sh(script: &str) -> CmdSpec {
+        CmdSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: BTreeMap::new(),
+            cwd: None,
+            stdin: None,
+            prefix: vec![],
+        }
+    }
+
+    /// `stat`, `read` and `write` still work on `e`, in a fresh directory:
+    /// the helper answered the refusal before and is serving after it.
+    fn still_serves(e: &Elevated) {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("after");
+        assert_eq!(e.stat(&f).unwrap(), None);
+        e.write(&f, b"still here").unwrap();
+        assert_eq!(e.read(&f).unwrap(), b"still here");
+        assert_eq!(e.stat(&f).unwrap().unwrap().size, 10);
     }
 
     #[test]
@@ -1468,17 +1637,203 @@ mod tests {
         assert_eq!(e.read(&f).unwrap(), b"small");
     }
 
-    /// A response too large for a frame gets the friendly refusal, which
-    /// names the file, the limit and the identity, rather than the framing
-    /// error. The detection is on the typed
-    /// [`FrameTooLarge`](crate::protocol::FrameTooLarge) signal, so the
-    /// wording of the framing error is free to change.
+    /// Output larger than a frame is refused by the helper, naming the
+    /// command, both sizes and the account, with what to do instead; and the
+    /// same `Elevated` goes on serving. Before #84 the helper sent the frame
+    /// anyway, the main side could not read past it, and every later
+    /// primitive on that identity failed with a message about a file.
     #[test]
-    fn an_oversized_response_gets_the_friendly_refusal() {
+    fn oversized_command_output_is_refused_and_the_helper_survives() {
+        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
+        let err = e
+            .spawn(&sh("head -c 20000 /dev/zero; echo oops >&2"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "spawn sh -c head -c 20000 /dev/zero; echo oops >&2 as `tester` wrote 20000 \
+             bytes to stdout and 5 to stderr, which base64-encoded is more than one \
+             helper frame holds (16384 bytes); redirect its output to a file in the \
+             command (`sh -c '… > /path'`) and read that file"
+        );
+        still_serves(&e);
+        // And a command whose output fits still comes back whole.
+        let out = e.spawn(&sh("head -c 1000 /dev/zero")).unwrap();
+        assert_eq!(out.stdout, vec![0u8; 1000]);
+    }
+
+    /// A file larger than a frame is refused by the helper, naming the file,
+    /// its size and the account; the helper stays usable. This is the read
+    /// that used to kill a helper for the rest of the run.
+    #[test]
+    fn an_oversized_read_is_refused_and_the_helper_survives() {
+        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'x'; 20000]).unwrap();
+        let err = e.read(&big).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other, "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "read {} as `tester`: the file is 20000 bytes, which base64-encoded is more \
+                 than one helper frame holds (16384 bytes); reading a file this large has \
+                 to be done without `as_user`/`as_root`",
+                big.display()
+            )
+        );
+        still_serves(&e);
+        // The same file, smaller, reads.
+        std::fs::write(&big, b"small").unwrap();
+        assert_eq!(e.read(&big).unwrap(), b"small");
+    }
+
+    /// A listing larger than a frame is refused like a file is, naming the
+    /// directory and how many entries it has.
+    #[test]
+    fn an_oversized_listing_is_refused_and_the_helper_survives() {
+        let e = in_process_within(Arc::new(AtomicU8::new(Phase::Applying as u8)), SMALL_FRAME);
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            std::fs::write(dir.path().join(format!("{i:0>96}")), b"").unwrap();
+        }
+        let err = e.read_dir(dir.path()).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "read_dir {} as `tester`: the directory has 200 entries, a listing more \
+                 than one helper frame holds (16384 bytes); listing a directory this large \
+                 has to be done without `as_user`/`as_root`",
+                dir.path().display()
+            )
+        );
+        still_serves(&e);
+    }
+
+    /// Every frame `serve` writes is within its limit, whatever the answer:
+    /// a file, a command's output and a listing over it (`Bytes`, `Output`,
+    /// `Paths`), a refusal quoting an absurd path, and a refusal for a command
+    /// whose argv alone is larger than a frame. The requests go in as one
+    /// stream and the answers are read back frame by frame from what `serve`
+    /// wrote, so a frame over the limit is caught here, not by a reader that
+    /// gives up on it.
+    #[test]
+    fn no_frame_the_helper_writes_is_over_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'x'; 20000]).unwrap();
+        let small = dir.path().join("small");
+        std::fs::write(&small, b"small").unwrap();
+        let listed = dir.path().join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        for i in 0..200 {
+            std::fs::write(listed.join(format!("{i:0>96}")), b"").unwrap();
+        }
+        let absurd = dir.path().join("a".repeat(SMALL_FRAME));
+        let mut long_argv = sh("head -c 20000 /dev/zero");
+        long_argv.args.push("y".repeat(SMALL_FRAME));
+
+        let requests = [
+            (false, HelperOp::Read { path: big.clone() }),
+            (false, HelperOp::Read { path: small }),
+            (false, HelperOp::ReadDir { path: listed }),
+            (false, HelperOp::Spawn(sh("head -c 20000 /dev/zero"))),
+            (false, HelperOp::Spawn(sh("printf ok"))),
+            (true, HelperOp::Remove { path: absurd }),
+            (false, HelperOp::Spawn(long_argv)),
+        ];
+        let mut rx = Vec::new();
+        for (checking, op) in requests {
+            write_frame(&mut rx, &HelperRequest { checking, op }).unwrap();
+        }
+        let mut tx = Vec::new();
+        serve(&mut &rx[..], &mut tx, SMALL_FRAME, || "tester".into()).unwrap();
+
+        let mut answers = Vec::new();
+        let mut stream = &tx[..];
+        while !stream.is_empty() {
+            let len = u32::from_be_bytes(stream[..4].try_into().unwrap()) as usize;
+            assert!(
+                len <= SMALL_FRAME,
+                "a {len}-byte frame, answer {}",
+                answers.len()
+            );
+            let resp: HelperResponse = serde_json::from_slice(&stream[4..4 + len]).unwrap();
+            answers.push(resp);
+            stream = &stream[4 + len..];
+        }
+        let err = |r: &HelperResponse| match r {
+            HelperResponse::Err {
+                code: None,
+                message,
+            } => message.clone(),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(answers.len(), 7, "{answers:?}");
+        let read = err(&answers[0]);
+        assert!(
+            read.starts_with(&format!(
+                "read {} as `tester`: the file is 20000 bytes",
+                big.display()
+            )),
+            "{read}"
+        );
+        assert!(matches!(&answers[1], HelperResponse::Bytes(b) if b == b"small"));
+        assert!(err(&answers[2]).contains("the directory has 200 entries"));
+        assert!(err(&answers[3]).contains("wrote 20000 bytes to stdout"));
+        assert!(matches!(&answers[4], HelperResponse::Output(o) if o.stdout == b"ok"));
+        // A refusal over the limit only because of the path it quotes is
+        // refused in its turn, quoting the path cut short.
+        let quoted = err(&answers[5]);
+        assert!(quoted.starts_with("remove "), "{quoted}");
+        assert!(
+            quoted.contains(
+                "… as `tester`: the answer is more than one helper frame holds (16384 bytes)"
+            ),
+            "{quoted}"
+        );
+        let spawn = err(&answers[6]);
+        assert!(
+            spawn.starts_with("spawn sh -c head -c 20000 /dev/zero yyy"),
+            "{spawn}"
+        );
+        assert!(
+            spawn.contains("… as `tester` wrote 20000 bytes to stdout"),
+            "{spawn}"
+        );
+    }
+
+    /// The refusal for a command's stdin larger than a frame names the
+    /// command and the account, not a file, and nothing reaches the helper.
+    #[test]
+    fn an_oversized_stdin_is_refused_naming_the_command() {
+        let e = in_process(Arc::new(AtomicU8::new(Phase::Applying as u8)));
+        let mut spec = sh("cat > /dev/null");
+        spec.stdin = Some(vec![0u8; MAX_FRAME_PAYLOAD + 1]);
+        let err = e.spawn(&spec).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "spawn sh -c cat > /dev/null as `tester`: its stdin is {} bytes, more than \
+                 one helper frame can carry ({MAX_FRAME_PAYLOAD} bytes); have the command \
+                 read input this large from a file on the target instead",
+                MAX_FRAME_PAYLOAD + 1
+            )
+        );
+        still_serves(&e);
+    }
+
+    /// A frame over the limit from the helper's side cannot be an answer any
+    /// more, since the helper refuses those itself: it is a stream out of
+    /// step, reported as one, and the helper is not used again. The
+    /// detection is on the typed [`FrameTooLarge`] signal, so the wording of
+    /// the framing error is free to change.
+    #[test]
+    fn a_frame_over_the_limit_is_a_corrupt_stream_and_is_latched() {
         // A "helper" that answers every request with a length prefix one
         // byte over the frame ceiling. Nothing else has to be there: the
         // read fails on the prefix, before a body is allocated.
-        let prefix = u32::try_from(crate::protocol::MAX_FRAME + 1).unwrap();
+        let prefix = u32::try_from(MAX_FRAME + 1).unwrap();
         let e = Elevated::connected(
             "tester",
             Box::new(io::sink()),
@@ -1486,11 +1841,37 @@ mod tests {
             Arc::new(AtomicU8::new(Phase::Applying as u8)),
         );
         let err = e.read(Path::new("/etc/shadow")).unwrap_err().to_string();
-        assert!(err.contains("/etc/shadow"), "{err}");
-        assert!(err.contains(&MAX_FRAME_PAYLOAD.to_string()), "{err}");
-        assert!(err.contains("tester"), "{err}");
-        assert!(err.contains("as_user"), "{err}");
-        assert!(!err.contains("exceeds limit"), "raw framing error: {err}");
+        assert_eq!(
+            err,
+            format!(
+                "read /etc/shadow: the helper running as `tester` sent a frame of {} bytes, \
+                 more than the {MAX_FRAME} a frame may hold; a helper refuses an answer that \
+                 large instead of sending it, so the stream between the two is corrupt",
+                MAX_FRAME + 1
+            )
+        );
+        let again = e.stat(Path::new("/etc/hostname")).unwrap_err().to_string();
+        assert!(
+            again.contains("failed earlier and is not retried"),
+            "{again}"
+        );
+        assert!(
+            again.contains("stream between the two is corrupt"),
+            "{again}"
+        );
+    }
+
+    /// The account a real helper's refusals name is the one `id -un` gives
+    /// for this process.
+    #[test]
+    fn the_account_named_is_the_effective_users() {
+        let Ok(out) = Command::new("id").arg("-un").output() else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        assert_eq!(account_name(), String::from_utf8_lossy(&out.stdout).trim());
     }
 
     /// An `Elevated` whose "helper" printed to stderr and exited without

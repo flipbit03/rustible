@@ -187,9 +187,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// The largest payload that survives a single frame: bytes travel as
 /// base64, so four bytes on the wire carry three of payload, and the JSON
-/// envelope needs a little room besides. Anything that puts a whole file
-/// in one frame (`HelperResponse::Bytes`, and so every escalated read)
-/// must refuse above this rather than build a frame the far end rejects.
+/// envelope needs a little room besides. A request that puts a whole file
+/// in one frame (`HelperOp::Write`) is refused above this before it is
+/// built; the helper refuses an answer over [`MAX_FRAME`] itself, so it
+/// never sends a frame the far end rejects.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 
 /// Serialize `msg` and write it as one length-prefixed frame, flushing
@@ -200,14 +201,66 @@ pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME / 4 * 3 - 64 * 1024;
 /// body is held in `Zeroizing` memory, so a frame carrying a secret or a
 /// file chunk is wiped rather than left in the freed allocation.
 ///
+/// It does not check [`MAX_FRAME`]. A producer that can build an answer
+/// larger than its peer reads, the helper, encodes with a limit first and
+/// refuses the answer instead of sending it.
+///
 /// Callers have to serialize their own access to `w`: two frames written
 /// concurrently would interleave. [`FrameSink`] is the wrapper that does
 /// this for the binary's stdout.
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
-    let body = Zeroizing::new(serde_json::to_vec(msg).map_err(io::Error::other)?);
+    let body =
+        encode_frame(msg, u32::MAX as usize)?.ok_or_else(|| io::Error::other("frame too large"))?;
+    write_body(w, &body)
+}
+
+/// Serialize `msg` as a frame body, or `None` when it would be more than
+/// `limit` bytes. Serializing stops as soon as the limit is passed, so the
+/// body of a refused answer never grows past it.
+///
+/// The body is held in `Zeroizing` memory, as [`write_frame`]'s is.
+/// Errors only if the value will not serialize.
+pub(crate) fn encode_frame<T: Serialize>(
+    msg: &T,
+    limit: usize,
+) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+    struct Capped {
+        body: Zeroizing<Vec<u8>>,
+        limit: usize,
+        over: bool,
+    }
+    impl Write for Capped {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.body.len() + buf.len() > self.limit {
+                self.over = true;
+                return Err(io::Error::other("over the frame limit"));
+            }
+            self.body.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Capped {
+        body: Zeroizing::new(Vec::new()),
+        limit,
+        over: false,
+    };
+    match serde_json::to_writer(&mut out, msg) {
+        Ok(()) => Ok(Some(out.body)),
+        Err(_) if out.over => Ok(None),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// Write a body [`encode_frame`] produced as one length-prefixed frame,
+/// and flush. Errors if it does not fit in the `u32` length, or on the
+/// write itself.
+pub(crate) fn write_body<W: Write>(w: &mut W, body: &[u8]) -> io::Result<()> {
     let len = u32::try_from(body.len()).map_err(|_| io::Error::other("frame too large"))?;
     w.write_all(&len.to_be_bytes())?;
-    w.write_all(&body)?;
+    w.write_all(body)?;
     w.flush()
 }
 
@@ -217,8 +270,9 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()>
 /// a caller that has a better refusal to offer can recognise this case with
 /// `err.get_ref().and_then(|e| e.downcast_ref::<FrameTooLarge>())` instead
 /// of matching on the message text. The
-/// [`Elevated`](crate::backend::Elevated) backend does exactly that, to say
-/// which file was too large to read as another user.
+/// [`Elevated`](crate::backend::Elevated) backend does exactly that: its
+/// helper refuses an answer this large before sending it, so seeing one
+/// means the stream is corrupt, and it says so.
 #[derive(Debug, thiserror::Error)]
 #[error("frame of {len} bytes exceeds limit")]
 pub struct FrameTooLarge {
@@ -534,6 +588,27 @@ mod tests {
                 serde_json::to_value(e).unwrap()
             );
         }
+    }
+
+    /// `encode_frame` gives the body `write_frame` sends, up to and
+    /// including its limit, and `None` one byte past it.
+    #[test]
+    fn encode_frame_refuses_only_past_its_limit() {
+        let msg = Down::FileChunk {
+            req: 1,
+            offset: 0,
+            bytes: vec![7; 3000],
+            last: true,
+        };
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &msg).unwrap();
+        let len = framed.len() - 4;
+        let body = encode_frame(&msg, len).unwrap().expect("fits exactly");
+        assert_eq!(&body[..], &framed[4..]);
+        assert!(encode_frame(&msg, len - 1).unwrap().is_none());
+        let mut written = Vec::new();
+        write_body(&mut written, &body).unwrap();
+        assert_eq!(written, framed);
     }
 
     #[test]
