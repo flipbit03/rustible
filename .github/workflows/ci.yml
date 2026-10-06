@@ -175,7 +175,8 @@ jobs:
       # removing twice. The first removal copies the keg to a second version,
       # which `brew::Absent` must take too, and pins the formula, which it
       # must refuse (the `recovered` 1) before the unpin; the second finds
-      # nothing installed and is `ok`.
+      # nothing installed and is `ok`. A removal that left a version behind
+      # makes the second report `changed`.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail

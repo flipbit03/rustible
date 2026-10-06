@@ -22,7 +22,10 @@
 //!
 //! Known gap, older than the Cellar read: an alias or an old name of a
 //! formula never matches its rack, so [`Present`] installs it on every run
-//! (#72).
+//! (#72). The pin check shares it: Homebrew pins under the formula's current
+//! name (`formula_pin.rb` L15), and [`Absent`] looks under the rack's, so a
+//! formula installed under an old name and pinned under its new one is not
+//! seen as pinned.
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -513,14 +516,19 @@ pub struct Absent {
 
 impl Absent {
     /// Ensure none of `names` is installed. A name that is not there is `ok`.
+    /// A name given twice counts once.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Absent {
-            names: names.into_iter().map(Into::into).collect(),
+        let mut unique: Vec<String> = vec![];
+        for name in names.into_iter().map(Into::into) {
+            if !unique.contains(&name) {
+                unique.push(name);
+            }
         }
+        Absent { names: unique }
     }
 }
 
@@ -583,14 +591,28 @@ impl Op for Absent {
         // without a word (`uninstall.rb` L32-43 never asks `pinned?`), so the
         // refusal brew gives without `--force` is made here instead, in a
         // dry run too: the pin is the operator's, set on purpose.
+        let mut pinned = vec![];
         for rack in &have {
             if is_symlink(sys, &pin_link(Path::new(&brew), &rack.name))? {
-                let name = &rack.name;
-                bail!(
-                    "`{name}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
-                     formula. Run `brew unpin {name}` first, or drop it from the step."
-                );
+                pinned.push(rack.name.as_str());
             }
+        }
+        match pinned.as_slice() {
+            [] => {}
+            [name] => bail!(
+                "`{name}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
+                 formula. Run `brew unpin {name}` first, or drop it from the step."
+            ),
+            names => bail!(
+                "{} are pinned (`brew pin`); `brew::Absent` will not remove a pinned formula. \
+                 Run `brew unpin {}` first, or drop them from the step.",
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                names.join(" ")
+            ),
         }
         let mut report = RemoveReport::default();
         let mut gone = vec![];
@@ -775,6 +797,13 @@ mod tests {
         assert_eq!(
             pin_link(Path::new("/usr/local/bin/brew"), "ninvaders"),
             PathBuf::from("/usr/local/var/homebrew/pinned/ninvaders")
+        );
+        assert_eq!(
+            pin_link(
+                Path::new("/home/linuxbrew/.linuxbrew/bin/brew"),
+                "ninvaders"
+            ),
+            PathBuf::from("/home/linuxbrew/.linuxbrew/var/homebrew/pinned/ninvaders")
         );
     }
 
@@ -1255,6 +1284,62 @@ mod tests {
             }
         }
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// Several pinned formulae in one step are refused together, every one
+    /// named, with the one `brew unpin` that clears them all; a formula in
+    /// the step that is not pinned is not named.
+    #[test]
+    fn absent_names_every_pinned_formula_in_one_refusal() {
+        let fake = mac_fake(&[
+            ("ninvaders", &["0.1.1"]),
+            ("agg", &["1.7.0"]),
+            ("cowsay", &["3.04"]),
+        ]);
+        fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
+            .unwrap();
+        for name in ["ninvaders", "agg"] {
+            fake.symlink(
+                &Path::new("../../../Cellar").join(name),
+                &Path::new("/opt/homebrew/var/homebrew/pinned").join(name),
+            )
+            .unwrap();
+        }
+        let err = Absent::new(["ninvaders", "cowsay", "agg"])
+            .check(&mac_sys(&fake))
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "`ninvaders`, `agg` are pinned (`brew pin`); `brew::Absent` will not remove a \
+                 pinned formula. Run `brew unpin ninvaders agg` first, or drop them from the step."
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("cowsay"), "{err}");
+    }
+
+    /// A name given twice is one formula: once in the diff, once on
+    /// `brew uninstall`'s command line, and once per version in the report.
+    #[test]
+    fn absent_counts_a_repeated_name_once() {
+        let fake = mac_fake(&[("ninvaders", &["0.1.1"])]);
+        let s = mac_sys(&fake);
+        let op = Absent::new(["ninvaders", "agg", "ninvaders", "agg"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "brew formulae:\n  ninvaders: installed 0.1.1 -> absent\n"
+        );
+        let r = op.apply(&s, c).unwrap();
+        assert_eq!(
+            fake.argvs(),
+            vec![vec![BREW, "uninstall", "--force", "--formula", "ninvaders"]]
+        );
+        assert_eq!(r.removed.len(), 1);
+        assert_eq!(r.already_absent, vec!["agg".to_string()]);
     }
 
     /// A pin left on a formula that is not installed refuses nothing: there
