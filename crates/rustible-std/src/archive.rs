@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use rustible_sdk::backend::FileKind;
 use rustible_sdk::prelude::*;
 
-use crate::file::Owner;
+use crate::file::{Owner, set_mode_and_owner};
 
 /// Ceiling on the buffer capacity reserved from a tar header's `size`
 /// field before a member is read. The field is attacker-controlled and
@@ -471,10 +471,11 @@ impl Extracted {
         data: &mut dyn Read,
     ) -> Result<()> {
         let full = dest.join(&m.path);
-        // `chown(2)` clears setuid/setgid on non-directories, so every arm
-        // below defers `set_mode` to the tail and the owner is applied
-        // first. Writing the mode inline would drop the setuid bit of a
-        // member extracted with `.owner(..)`.
+        // Every arm below defers the mode and the owner to the tail, where
+        // `set_mode_and_owner` applies them in its order: the mode without
+        // setuid and setgid, the owner, then the full mode. Writing the mode
+        // inline would drop the setuid bit of a member extracted with
+        // `.owner(..)`, since `chown(2)` clears it.
         let mut mode = Some(m.mode);
         let mut chown = true;
         match &m.kind {
@@ -560,13 +561,7 @@ impl Extracted {
                 mode = None;
             }
         }
-        if chown && let Some(o) = self.owner {
-            sys.set_owner(&full, o.uid, o.gid)?;
-        }
-        if let Some(mode) = mode {
-            sys.set_mode(&full, mode)?;
-        }
-        Ok(())
+        set_mode_and_owner(sys, &full, mode, self.owner.filter(|_| chown))
     }
 }
 
@@ -1053,7 +1048,7 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat};
+    use rustible_sdk::backend::{AttrCall, Backend, CmdSpec, Fake, Output, Stat};
     use rustible_sdk::event::Collect;
 
     use super::*;
@@ -1571,27 +1566,124 @@ mod tests {
         assert!(err.contains("EOF"), "{err}");
     }
 
-    /// A setuid member extracted with `.owner(..)` keeps the bit: the owner
-    /// is set before the mode, because `chown` clears setuid (the `Fake`
-    /// models it). The other order leaves 0755.
-    #[test]
-    fn a_setuid_member_keeps_the_bit_under_owner() {
+    /// A tar of one regular member `name` holding `#!`, at `mode`.
+    fn one_member_tar(name: &str, mode: u32) -> Vec<u8> {
         let mut h = tar::Header::new_gnu();
-        h.set_path("tool").unwrap();
+        h.set_path(name).unwrap();
         h.set_entry_type(tar::EntryType::Regular);
-        h.set_mode(0o4755);
+        h.set_mode(mode);
         h.set_size(2);
         h.set_cksum();
         let mut archive = h.as_bytes().to_vec();
         archive.extend_from_slice(b"#!");
         archive.resize(1024, 0);
         archive.extend_from_slice(&[0u8; 1024]);
-        let (fake, sys) = sys_with(&archive);
+        archive
+    }
+
+    /// A setuid member extracted with `.owner(..)` keeps the bit, and never
+    /// carries it under the wrong owner: the mode without setuid, the
+    /// owner, then the full mode, because `chown` clears setuid (the `Fake`
+    /// models it). The full mode set only before the owner leaves 0755.
+    #[test]
+    fn a_setuid_member_keeps_the_bit_under_owner() {
+        let (fake, sys) = sys_with(&one_member_tar("tool", 0o4755));
+        let planted = fake.attr_calls().len();
         let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
         let intent = expect_change(&op, &sys);
         op.apply(&sys, intent).unwrap();
         let f = fake.file("/opt/tool").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o4755, 5, 6));
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/opt/tool".into(),
+                    mode: 0o755
+                },
+                AttrCall::Chown {
+                    path: "/opt/tool".into(),
+                    uid: 5,
+                    gid: 6
+                },
+                AttrCall::Chmod {
+                    path: "/opt/tool".into(),
+                    mode: 0o4755
+                },
+            ]
+        );
+    }
+
+    /// Every member under `.owner(..)` gets its mode before its owner
+    /// (issue #79), directories included, and a mode without setuid or
+    /// setgid gets no third call. Without `.owner(..)`, one `chmod` each.
+    #[test]
+    fn members_get_their_mode_before_their_owner() {
+        let archive = raw_tar(&[("d", b'5', b"", ""), ("d/f", b'0', b"x", "")]);
+        let (fake, sys) = sys_with(&archive);
+        let planted = fake.attr_calls().len();
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
+        let intent = expect_change(&op, &sys);
+        op.apply(&sys, intent).unwrap();
+        let mode_then_owner = |path: &str, mode| {
+            [
+                AttrCall::Chmod {
+                    path: path.into(),
+                    mode,
+                },
+                AttrCall::Chown {
+                    path: path.into(),
+                    uid: 5,
+                    gid: 6,
+                },
+            ]
+        };
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                mode_then_owner("/opt/d", 0o755),
+                mode_then_owner("/opt/d/f", 0o644)
+            ]
+            .concat()
+        );
+
+        let (fake, sys) = sys_with(&archive);
+        let planted = fake.attr_calls().len();
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let intent = expect_change(&op, &sys);
+        op.apply(&sys, intent).unwrap();
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: "/opt/d".into(),
+                    mode: 0o755
+                },
+                AttrCall::Chmod {
+                    path: "/opt/d/f".into(),
+                    mode: 0o644
+                },
+            ]
+        );
+    }
+
+    /// A member wanted at 0600 whose `chown` is refused, as for an identity
+    /// without `CAP_CHOWN`, fails the step with the member already 0600,
+    /// not at the 0644 it was written with (issue #79).
+    #[test]
+    fn a_refused_chown_leaves_a_member_at_its_own_mode() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file("/tmp/a.tar", one_member_tar("key", 0o600)),
+        );
+        let sys = crate::file::testing::chown_refused_sys(&fake);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt").owner(5, 6);
+        let intent = expect_change(&op, &sys);
+        let err = op.apply(&sys, intent).unwrap_err().chain();
+        assert!(err.contains("Operation not permitted"), "{err}");
+        let f = fake.file("/opt/key").unwrap();
+        assert_eq!((f.mode, f.uid, f.gid), (0o600, 0, 0));
     }
 
     /// `apply` writes the members `check` walked and reads only their data

@@ -142,9 +142,9 @@ fn extracted_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
 
     // A setuid member keeps its bit when `.owner` is also set. On Linux
     // `chown(2)` clears setuid and setgid on anything that is not a
-    // directory, so this only holds if the owner is applied before the
-    // mode. With the two swapped the file below comes out 0o755 and the
-    // step still reports success, which is the whole danger.
+    // directory, so this only holds if the full mode is set again after
+    // the owner. Set only before it, the file below comes out 0o755 and
+    // the step still reports success, which is the whole danger.
     let suid_src = format!("{work}/suid.tar");
     let suid_dest = format!("{work}/suid");
     ctx.sys().write_atomic(
