@@ -25,7 +25,7 @@ use rustible_cli::inventory::{
 };
 use rustible_sdk::event::Event;
 use rustible_sdk::launch::{self, Answer, Launch, Mode, Next, Place, Spawn};
-use rustible_sdk::protocol::{Down, PROTOCOL_VERSION, Up};
+use rustible_sdk::protocol::{Down, MAX_FRAME, PROTOCOL_VERSION, Up};
 use rustible_sdk::runtime::{self, HostCheck, HostVars};
 use rustible_sdk::secret::Secret;
 use rustible_sdk::stream::{WorkspaceFiles, chunks, run_dir_name};
@@ -1334,11 +1334,10 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
     Ok(())
 }
 
-/// Same ceiling the SDK's framing uses. A playbook that writes to stdout
-/// desyncs the stream, and four bytes of prose read as a huge length; a cap
-/// turns that into a protocol error instead of an allocation.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
-
+/// Capped at the SDK's own `MAX_FRAME`, the one its framing trims a failed
+/// command's stderr to fit. A playbook that writes to stdout desyncs the
+/// stream, and four bytes of prose read as a huge length; the cap turns that
+/// into a protocol error instead of an allocation.
 async fn read_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     r: &mut R,
 ) -> Result<Option<T>> {

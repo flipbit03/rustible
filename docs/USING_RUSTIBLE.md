@@ -1265,7 +1265,8 @@ Each step is a line:
 [web1]  nginx.conf .............................................. changed         +3 -1 lines
 ```
 
-`-v` adds diffs and facts. `-vv` adds every command executed.
+`-v` adds diffs, facts, and a failed command's stderr, caught or not. `-vv`
+adds every command executed.
 
 Every run ends with one row per host:
 

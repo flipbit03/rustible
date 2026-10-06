@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
 
+use rustible_sdk::CmdFailed;
 use rustible_sdk::event::{Event, Level, Status, Summary, block_prefix};
 
 /// Column the status starts in on a step line, counted from the start of the
@@ -46,7 +47,18 @@ struct HostState {
     /// error the playbook kept and returned after other steps) closes it
     /// without printing it twice. Only when the frame's chain is that one:
     /// a `.context(..)` the playbook added on the way out was not printed.
-    shown: Vec<(FailKey, String)>,
+    /// The failed command printed with the chain either way, so a frame
+    /// for the same step does not print its own; it is kept at `-v` only,
+    /// the one verbosity that prints it.
+    shown: Vec<Shown>,
+}
+
+/// A failed step's reason as `flush` printed it, and the command printed
+/// under it.
+struct Shown {
+    key: FailKey,
+    chain: String,
+    cmd: Option<CmdFailed>,
 }
 
 /// Which failed step a chain or a `Failed` frame belongs to: its id, block
@@ -65,6 +77,8 @@ struct FailKey {
 struct PendingFail {
     key: FailKey,
     chain: String,
+    /// The failed command in the chain, if any, printed under it at `-v`.
+    cmd: Option<CmdFailed>,
     /// Lines from outside any step that arrived while the chain was held
     /// back, typically the playbook's own word on the failure it caught
     /// (`ctx.warn(format!("skipping: {e:#}"))`). They print after the chain,
@@ -133,10 +147,33 @@ impl<W: Write> Renderer<W> {
                     p.chain
                 ),
             );
+            if let Some(c) = &p.cmd {
+                self.cmd_block(host, c);
+            }
             for l in p.after {
                 self.line(host, &l);
             }
-            self.state(host).shown.push((p.key, p.chain));
+            // Read only to pair a command at `-v`, so not kept below it.
+            let cmd = if self.verbosity >= 1 { p.cmd } else { None };
+            self.state(host).shown.push(Shown {
+                key: p.key,
+                chain: p.chain,
+                cmd,
+            });
+        }
+    }
+
+    /// The failed command under its `FAILED` line at `-v`: `$ argv (exit
+    /// N)`, then its stderr. Printed once per failure, wherever its chain is.
+    fn cmd_block(&mut self, host: &str, c: &CmdFailed) {
+        if self.verbosity >= 1 {
+            self.line(
+                host,
+                &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
+            );
+            for l in c.stderr.lines() {
+                self.line(host, &format!("    {l}"));
+            }
         }
     }
 
@@ -199,6 +236,7 @@ impl<W: Write> Renderer<W> {
                 status,
                 diff,
                 note,
+                cmd,
                 ..
             } => {
                 let mut tail = String::new();
@@ -215,6 +253,7 @@ impl<W: Write> Renderer<W> {
                                 step: name.clone(),
                             },
                             chain: chain.clone(),
+                            cmd: cmd.clone(),
                             after: vec![],
                         });
                     }
@@ -284,7 +323,10 @@ impl<W: Write> Renderer<W> {
                 error,
                 cmd,
             } => {
-                let (step, error) = split_step(step.as_deref(), error);
+                // Only the frame's own field names a step for its command,
+                // never a name read out of the chain, as in `Compact`.
+                let field = step.as_deref();
+                let (step, error) = split_step(field, error);
                 // The failed step this frame closes, when it names one of
                 // this run's: by id, blocks and name together (see `FailKey`).
                 let key = match (id, step) {
@@ -306,12 +348,30 @@ impl<W: Write> Renderer<W> {
                 // repeated, but never ambiguous. So is a reason the playbook
                 // added words to with `.context(..)`, which were not above.
                 let st = self.state(host);
+                // Its chain printed before this frame, and its command with
+                // it, when a later step began or just now by the flush. A
+                // frame that took the held chain prints the command, even
+                // beside a twin from another `Ctx` printed with the same key.
+                // One with no id names the step only by name, which another
+                // failure can borrow, so the command must be the same too.
+                let printed = match &key {
+                    Some(k) => pending.is_none() && st.shown.iter().any(|o| o.key == *k),
+                    None => field.is_some_and(|s| {
+                        st.shown.iter().any(|o| {
+                            o.key.step == s
+                                && o.key.blocks == *blocks
+                                && o.cmd
+                                    .as_ref()
+                                    .zip(cmd.as_ref())
+                                    .is_some_and(|(a, b)| same_command(a, b))
+                        })
+                    }),
+                };
                 let shown = key.as_ref().is_some_and(|k| {
-                    st.shown.iter().any(|(o, chain)| o == k && *chain == *error)
-                        && !st
-                            .shown
-                            .iter()
-                            .any(|(o, _)| o.step == k.step && o.blocks == k.blocks && o.id != k.id)
+                    st.shown.iter().any(|o| o.key == *k && o.chain == *error)
+                        && !st.shown.iter().any(|o| {
+                            o.key.step == k.step && o.key.blocks == k.blocks && o.key.id != k.id
+                        })
                 });
                 let text = match (step, shown) {
                     // Printed already, when a later step began; this line
@@ -321,16 +381,8 @@ impl<W: Write> Renderer<W> {
                     (None, _) => format!("FAILED: {error}"),
                 };
                 self.line(host, &text);
-                if self.verbosity >= 1
-                    && let Some(c) = cmd
-                {
-                    self.line(
-                        host,
-                        &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
-                    );
-                    for l in c.stderr.lines() {
-                        self.line(host, &format!("    {l}"));
-                    }
+                if !printed && let Some(c) = cmd {
+                    self.cmd_block(host, c);
                 }
                 // The reason first, then what the playbook printed after
                 // it, as for a failure it caught.
@@ -416,6 +468,33 @@ fn argv_text(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether `a` and `b` are one failed command: the same argv, status and
+/// signal, and the same stderr, unless one was cut to fit a frame, when
+/// what it kept has to be the end of the other. The SDK's `Compact`
+/// has its own copy.
+fn same_command(a: &CmdFailed, b: &CmdFailed) -> bool {
+    if (&a.argv, a.status, a.signal) != (&b.argv, b.status, b.signal) {
+        return false;
+    }
+    match (cut_tail(&a.stderr), cut_tail(&b.stderr)) {
+        (None, None) => a.stderr == b.stderr,
+        (Some(x), None) => b.stderr.ends_with(x),
+        (None, Some(y)) => a.stderr.ends_with(y),
+        (Some(x), Some(y)) => x.ends_with(y) || y.ends_with(x),
+    }
+}
+
+/// What a stderr cut to fit a frame kept: everything after the marker line,
+/// whose count has to be a number. `None` for a stderr that was not cut,
+/// even one whose first line only looks like the marker.
+fn cut_tail(stderr: &str) -> Option<&str> {
+    let (first, rest) = stderr.split_once('\n')?;
+    let n = first
+        .strip_prefix("… (")?
+        .strip_suffix(" earlier bytes of stderr not shown: more than one frame carries)")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
 }
 
 /// Where a step failed, after `FAILED at`: its block path as the step line
@@ -586,6 +665,7 @@ mod tests {
             diff: None,
             note: None,
             elapsed_ms: 3,
+            cmd: None,
         }
     }
 
@@ -1058,6 +1138,381 @@ web1    4        1             0        0       0          2         0
         }
     }
 
+    // ---- the failed command ----
+
+    fn sh_failed() -> CmdFailed {
+        CmdFailed {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo nope >&2; exit 3".into(),
+            ],
+            status: 3,
+            signal: None,
+            stderr: "nope\nstill nope\n".into(),
+        }
+    }
+
+    /// `failing`, with the failed command and a diff of two lines.
+    fn failing_cmd(id: u32, name: &str) -> Event {
+        let mut ev = failing(id, name, "`/bin/sh -c echo nope >&2; exit 3` exited 3");
+        if let Event::StepFinished { cmd, diff, .. } = &mut ev {
+            *cmd = Some(sh_failed());
+            *diff = Some(rustible_sdk::Diff::summary("PATCH http://h/x\n{}"));
+        }
+        ev
+    }
+
+    fn failed_frame_cmd(step: Option<&str>, id: Option<u32>, error: &str) -> Event {
+        let mut ev = failed_frame(step, id, error);
+        if let Event::Failed { cmd, .. } = &mut ev {
+            *cmd = Some(sh_failed());
+        }
+        ev
+    }
+
+    const STEP_X: &str = "\
+[local]  x ....................................................... FAILED          PATCH http://h/x …
+[local]      | PATCH http://h/x
+[local]      | {}
+";
+
+    const CMD: &str = "\
+[local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)
+[local]      nope
+[local]      still nope
+";
+
+    /// A failure the playbook caught shows its command and stderr at `-v`,
+    /// after its reason and before what the playbook said about it: the
+    /// step line, its diff, the reason, the command, then the warning.
+    /// Below `-v`, the reason alone.
+    #[test]
+    fn a_caught_failure_shows_its_command_at_v() {
+        let feed = |r: &mut Renderer<Vec<u8>>| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &Event::Log {
+                    level: Level::Warn,
+                    msg: "skipping x".into(),
+                },
+            );
+            r.event("local", &step_started(2, "next"));
+            r.event("local", &step_finished(2, "next", Status::Ok));
+        };
+        let reason = "[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n";
+        let rest = "\
+[local]    WARNING: skipping x
+[local]  next .................................................... ok
+";
+        assert_eq!(render(1, feed), format!("{STEP_X}{reason}{CMD}{rest}"));
+        let step_line = STEP_X.lines().next().unwrap();
+        assert_eq!(render(0, feed), format!("{step_line}\n{reason}{rest}"));
+    }
+
+    /// The failure that escaped: the `Failed` frame takes the held reason
+    /// and prints the command with it, once, though both the step and the
+    /// frame carry it.
+    #[test]
+    fn an_escaped_failure_shows_its_command_once() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    Some(1),
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(
+            out,
+            format!(
+                "{STEP_X}[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n{CMD}"
+            )
+        );
+    }
+
+    /// An error the playbook kept and returned after other steps: the
+    /// command printed with the reason when the next step began, so the
+    /// frame prints neither again. With context the playbook added on the
+    /// way out, the frame prints the reason again for its new words, but
+    /// the command still only once.
+    #[test]
+    fn a_reason_above_shows_its_command_once() {
+        for (error, closing) in [
+            (
+                "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                "[local]  FAILED: `x` (reason above)\n",
+            ),
+            (
+                "deploying: step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                "[local]  FAILED at `x`: deploying: `/bin/sh -c echo nope >&2; exit 3` exited 3\n",
+            ),
+        ] {
+            let out = render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                r.event("local", &failing_cmd(1, "x"));
+                r.event("local", &step_started(2, "cleanup"));
+                r.event("local", &step_finished(2, "cleanup", Status::Ok));
+                r.event("local", &failed_frame_cmd(Some("x"), Some(1), error));
+            });
+            assert_eq!(
+                out,
+                format!(
+                    "{STEP_X}[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n\
+                     {CMD}\
+                     [local]  cleanup ................................................. ok\n\
+                     {closing}"
+                )
+            );
+            assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        }
+    }
+
+    /// A command that failed outside any step, the playbook's own
+    /// `ctx.sys()` call with `?`: no step carries it, so the `Failed` frame
+    /// prints it.
+    #[test]
+    fn a_command_failing_outside_any_step_shows_it_from_the_frame() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "first"));
+            r.event("local", &step_finished(1, "first", Status::Ok));
+            r.event(
+                "local",
+                &failed_frame_cmd(None, None, "`/bin/sh -c echo nope >&2; exit 3` exited 3"),
+            );
+        });
+        assert_eq!(
+            out,
+            format!(
+                "[local]  first ................................................... ok\n\
+                 [local]  FAILED: `/bin/sh -c echo nope >&2; exit 3` exited 3\n{CMD}"
+            )
+        );
+    }
+
+    /// A twin of the failed step, same id, name and blocks from a second
+    /// `Ctx`, was caught and printed its command. The run's own step then
+    /// escapes: its `Failed` frame takes the held reason, and prints its own
+    /// command with it, once, beside the twin's. (The reason is word for
+    /// word the twin's, so the line points above, as it did before.)
+    #[test]
+    fn an_escaped_failure_beside_a_caught_twin_shows_its_command_once() {
+        let with_stderr = |mut ev: Event, stderr: &str| {
+            if let Event::StepFinished { cmd: Some(c), .. } | Event::Failed { cmd: Some(c), .. } =
+                &mut ev
+            {
+                c.stderr = stderr.into();
+            }
+            ev
+        };
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &with_stderr(failing_cmd(1, "x"), "BBB\n"));
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &with_stderr(failing_cmd(1, "x"), "AAA\n"));
+            r.event(
+                "local",
+                &with_stderr(
+                    failed_frame_cmd(
+                        Some("x"),
+                        Some(1),
+                        "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                    ),
+                    "AAA\n",
+                ),
+            );
+        });
+        assert_eq!(out.matches("BBB").count(), 1, "{out}");
+        assert_eq!(out.matches("AAA").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  FAILED: `x` (reason above)\n\
+                 [local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)\n\
+                 [local]      AAA\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A frame naming the step but not its id (an error another `Ctx`
+    /// returned, or one the runtime could not pair) leaves the held reason
+    /// to print on its own, command and all; the frame does not print the
+    /// same command again under its own line.
+    #[test]
+    fn a_frame_without_an_id_does_not_repeat_the_held_steps_command() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        let reason = "[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n";
+        assert_eq!(out, format!("{STEP_X}{reason}{CMD}{reason}"));
+    }
+
+    /// The same id-less frame after a later step ran: the reason printed
+    /// with its command when that step began, so the frame still does not
+    /// print the command again.
+    #[test]
+    fn a_frame_without_an_id_does_not_repeat_a_command_printed_earlier() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event("local", &step_started(2, "next"));
+            r.event("local", &step_finished(2, "next", Status::Ok));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    Some("x"),
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  next .................................................... ok\n\
+                 [local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A frame naming a step only by name is not that step's failure when
+    /// its command is another: the playbook caught `x` (command A), then a
+    /// command outside any step failed (B) and was returned under `x`'s
+    /// name. Both commands print, once each. The same command, its stderr
+    /// cut to fit the frame, is still the same, and is not repeated.
+    #[test]
+    fn a_frame_without_an_id_prints_a_different_command() {
+        let other = CmdFailed {
+            argv: vec!["false".into()],
+            status: 1,
+            signal: None,
+            stderr: "BBB\n".into(),
+        };
+        let feed = |frame_cmd: CmdFailed| {
+            render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                r.event("local", &failing_cmd(1, "x"));
+                r.event("local", &step_started(2, "next"));
+                r.event("local", &step_finished(2, "next", Status::Ok));
+                let mut frame = failed_frame(Some("x"), None, "step `x`: `false` exited 1");
+                if let Event::Failed { cmd, .. } = &mut frame {
+                    *cmd = Some(frame_cmd);
+                }
+                r.event("local", &frame);
+            })
+        };
+        let out = feed(other);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(
+            out.ends_with(
+                "[local]  FAILED at `x`: `false` exited 1\n\
+                 [local]    $ false (exit 1)\n\
+                 [local]      BBB\n"
+            ),
+            "{out}"
+        );
+        let mut cut = sh_failed();
+        cut.stderr = "… (5 earlier bytes of stderr not shown: more than one frame carries)\n\
+                      still nope\n"
+            .into();
+        let out = feed(cut);
+        assert_eq!(out.matches("still nope").count(), 1, "{out}");
+        assert!(!out.contains("earlier bytes"), "{out}");
+    }
+
+    /// The same argv and status is not the same failure when the stderr
+    /// differs and neither copy was cut to fit a frame: an empty stderr,
+    /// or one that is the end of the other, is a different run of the
+    /// command. Each prints once. A signal tells two runs apart too, and a
+    /// line that only looks like the trim marker is stderr like any other.
+    #[test]
+    fn a_frame_without_an_id_needs_the_same_stderr_unless_one_was_cut() {
+        let run = |stderr: &str, signal: Option<i32>| CmdFailed {
+            argv: vec!["job".into()],
+            status: 3,
+            signal,
+            stderr: stderr.into(),
+        };
+        let feed = |caught: CmdFailed, returned: CmdFailed| {
+            render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                let mut step = failing(1, "x", "`job` exited 3");
+                if let Event::StepFinished { cmd, .. } = &mut step {
+                    *cmd = Some(caught);
+                }
+                r.event("local", &step);
+                r.event("local", &step_started(2, "next"));
+                r.event("local", &step_finished(2, "next", Status::Ok));
+                let mut frame = failed_frame(Some("x"), None, "step `x`: `job` exited 3");
+                if let Event::Failed { cmd, .. } = &mut frame {
+                    *cmd = Some(returned);
+                }
+                r.event("local", &frame);
+            })
+        };
+        let out = feed(run("", None), run("disk full\n", None));
+        assert_eq!(out.matches("disk full").count(), 1, "{out}");
+        let out = feed(
+            run("Job failed\n", None),
+            run("warning: lock held\nJob failed\n", None),
+        );
+        assert_eq!(out.matches("Job failed").count(), 2, "{out}");
+        assert_eq!(out.matches("lock held").count(), 1, "{out}");
+        let out = feed(run("x\n", Some(9)), run("x\n", Some(15)));
+        assert_eq!(out.matches("$ job (exit 3)").count(), 2, "{out}");
+        let fake = "… (many earlier bytes of stderr not shown: more than one frame carries)";
+        let out = feed(run("tail\n", None), run(&format!("{fake}\ntail\n"), None));
+        assert_eq!(out.matches("many earlier").count(), 1, "{out}");
+    }
+
+    /// A frame with no `step` field is not paired with a printed step by
+    /// a name read out of its chain text, here or in `Compact`: its
+    /// command prints with it.
+    #[test]
+    fn a_frame_without_a_step_field_prints_its_command() {
+        let out = render(1, |r| {
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event(
+                "local",
+                &failed_frame_cmd(
+                    None,
+                    None,
+                    "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
+                ),
+            );
+        });
+        assert_eq!(out.matches("still nope").count(), 2, "{out}");
+    }
+
+    /// Below `-v` no command prints, so the printed history keeps none.
+    #[test]
+    fn the_printed_history_keeps_no_command_below_v() {
+        for (verbosity, kept) in [(0, false), (1, true)] {
+            let mut r = Renderer::new(Vec::new(), &["local".into()], verbosity);
+            r.event("local", &step_started(1, "x"));
+            r.event("local", &failing_cmd(1, "x"));
+            r.event("local", &step_started(2, "next"));
+            assert_eq!(r.state("local").shown[0].cmd.is_some(), kept);
+        }
+    }
+
     /// Two `Ctx` values both number from 1, so `a` (this run's) and `b` (a
     /// second context's) share an id. `b`'s reason was held back when `a`'s
     /// frame arrived; it is a different step, and must still print.
@@ -1393,6 +1848,7 @@ web1    4        1             0        0       0          2         0
                 diff,
                 note,
                 elapsed_ms,
+                cmd,
                 ..
             } => Event::StepFinished {
                 id,
@@ -1403,6 +1859,7 @@ web1    4        1             0        0       0          2         0
                 diff,
                 note,
                 elapsed_ms,
+                cmd,
             },
             other => other,
         }
