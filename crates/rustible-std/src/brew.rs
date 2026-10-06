@@ -21,26 +21,30 @@
 //! without running `brew`.
 //!
 //! An alias or an old name (`python3`, `pkg-config`) has no rack of its own.
-//! When no rack has the name, both ops follow `<prefix>/opt/<name>`, which
-//! brew links to the keg for every alias it recorded at install time and the
-//! migrator for an old name; a link that resolves to `<Cellar>/<rack>/<version>`
-//! means the formula is installed as that rack, at that version. Still no
-//! `brew`. Without such a link the name is not installed: [`Present`] runs
-//! `brew install <name>` and the next run finds the link, and [`Absent`] has
-//! nothing to remove. [`Absent`] uninstalls by the rack's name, never the
-//! alias, and looks for the pin under it, which is the formula's current
-//! name.
+//! When no rack has the name, both ops follow `<prefix>/opt/<name>`. A link
+//! that resolves to `<Cellar>/<rack>/<version>` means the formula is
+//! installed as that rack, at that version, when brew made the link for that
+//! name: the keg's `INSTALL_RECEIPT.json` lists it among its `aliases`,
+//! exactly, or the migrator left `<Cellar>/<name>` a symlink to the rack. A
+//! link alone is not enough, because brew leaves stale `opt/` links pointing
+//! into a rack whose receipt no longer lists them. Still no `brew`. Otherwise
+//! the name is not installed: [`Present`] runs `brew install <name>` and the
+//! next run finds the link, and [`Absent`] has nothing to remove. [`Absent`]
+//! uninstalls by the rack's name, never the alias, and looks for the pin
+//! under the rack's name, which is where brew pins it.
 //!
 //! Two consequences of reading the link rather than the tap's alias table:
 //!
 //! - Once an alias moves to a newer formula (`python3` from `python@3.12` to
 //!   `python@3.13`), `Present(["python3"])` stays satisfied by the keg the
 //!   link points at, as any installed version satisfies [`Present`].
-//! - Known gap: a name brew did not link — an alias the tap added after the
-//!   formula was installed, or an old name of a formula installed after the
-//!   rename — reads as not installed, and `brew install` of an installed,
+//! - Known gap: a name brew did not link reads as not installed, though its
+//!   formula is. That is an alias the tap added after the formula was
+//!   installed, an old name of a formula installed after the rename, or the
+//!   new name of a rack not yet migrated. `brew install` of an installed,
 //!   up-to-date formula only warns and links nothing, so [`Present`] reports
-//!   `changed` on every run. Name the formula itself.
+//!   `changed` on every run, and [`Absent`] reports `ok` while the formula
+//!   is still installed. Name the formula itself.
 //!
 //! Two things are different from every other package op here, and both are
 //! Homebrew's doing:
@@ -109,8 +113,10 @@ pub struct InstallReport {
 /// Output of [`Absent`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoveReport {
-    /// Formulae this step uninstalled, one entry per version removed: a
-    /// formula that had two versions installed appears twice.
+    /// Formulae this step uninstalled, one entry per version removed and per
+    /// name the step gave the formula: a formula that had two versions
+    /// installed appears twice, and so does one named both by an alias and
+    /// by its own name.
     pub removed: Vec<Formula>,
     /// Names that were not installed to begin with.
     pub already_absent: Vec<String>,
@@ -155,14 +161,13 @@ impl Rack {
         }
     }
 
-    /// The name to show for this rack when the step was given `name`: the
-    /// rack's own name, or `name (rack)` when an alias or an old name led to
+    /// The name to show for this rack when the step named it `names`: the
+    /// rack's own name, or `names (rack)` when an alias or an old name led to
     /// it.
-    fn label(&self, name: &str) -> String {
-        if name == self.name {
-            name.to_string()
-        } else {
-            format!("{name} ({})", self.name)
+    fn label(&self, names: &[String]) -> String {
+        match names {
+            [name] if *name == self.name => name.clone(),
+            _ => format!("{} ({})", names.join(", "), self.name),
         }
     }
 }
@@ -397,6 +402,47 @@ fn read_rack(sys: &System, cellar: &Path, entries: &[String], name: &str) -> Res
     Ok(Rack::new(name, versions))
 }
 
+/// Whether the keg at `keg` lists `name` among its aliases, exactly, in its
+/// install receipt: brew records `formula.aliases` there at install time
+/// (`tab/tab.rb` L127) and links `opt/<alias>` for each (`keg.rb`
+/// `optlink`). A receipt that is missing, not JSON, or without `aliases`
+/// lists nothing, so the name is not shown to be this keg's.
+fn receipt_lists_alias(sys: &System, keg: &Path, name: &str) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Receipt {
+        #[serde(default)]
+        aliases: Option<Vec<String>>,
+    }
+    let path = keg.join("INSTALL_RECEIPT.json");
+    if !matches!(sys.stat_follow(&path)?, Some(s) if s.kind == FileKind::File) {
+        return Ok(false);
+    }
+    Ok(serde_json::from_slice::<Receipt>(&sys.read(&path)?)
+        .ok()
+        .and_then(|r| r.aliases)
+        .is_some_and(|aliases| aliases.iter().any(|a| a == name)))
+}
+
+/// Whether `name` is an old name of `rack` as the migrator leaves one:
+/// `<Cellar>/<name>`, by that exact name, a symlink to the rack
+/// (`migrator.rb` `link_oldname_cellar`).
+fn migrated_from(
+    sys: &System,
+    cellar: &Path,
+    entries: &[String],
+    name: &str,
+    rack: &str,
+) -> Result<bool> {
+    if !entries.iter().any(|e| e == name) {
+        return Ok(false);
+    }
+    let old = cellar.join(name);
+    if !is_symlink(sys, &old)? {
+        return Ok(false);
+    }
+    Ok(normalize(&cellar.join(sys.read_link(&old)?)) == cellar.join(rack))
+}
+
 /// Which of `names` brew has installed, in the order given, each with its
 /// rack, every version in it, and its current version. Read from the Cellar
 /// through `sys` as `brew list --formula --versions` reads it, and without
@@ -407,11 +453,16 @@ fn read_rack(sys: &System, cellar: &Path, entries: &[String], name: &str) -> Res
 /// A name is installed when its own rack is ([`read_rack`]); for a rack
 /// with several versions the opt link chooses between them
 /// ([`Rack::current`]). Otherwise, when `<prefix>/opt/<name>` resolves to
-/// `<Cellar>/<rack>/<version>`, a version that rack has, the name is an alias
-/// or an old name installed as that rack at that version: brew links
-/// `opt/<alias>` for every alias in the keg's receipt (`keg.rb` `optlink`)
-/// and `opt/<oldname>` when it migrates a rack (`migrator.rb`
-/// `link_oldname_opt`).
+/// `<Cellar>/<rack>/<version>`, a version that rack has, and brew made that
+/// link for this name, the name is an alias or an old name installed as that
+/// rack at that version. Brew made it for an alias the keg's receipt lists
+/// ([`receipt_lists_alias`]), and for an old name the migrator left
+/// `<Cellar>/<name>` pointing at the rack for ([`migrated_from`],
+/// `link_oldname_opt`). A link alone proves nothing: brew re-points every
+/// `opt/` link into a rack at each new keg (`keg.rb` `optlink`, L642-645)
+/// and never removes a stale versioned one (`remove_old_aliases`, L297-302),
+/// and on a case-insensitive volume `opt/NINVADERS` answers with the
+/// `ninvaders` link.
 fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Installed>> {
     let brew = Path::new(brew);
     let Some(cellar) = cellar(sys, brew)? else {
@@ -459,7 +510,15 @@ fn installed(sys: &System, brew: &str, names: &[String]) -> Result<Vec<Installed
         let Some(rack) = read_rack(sys, &cellar, &entries, &rack_name)? else {
             continue;
         };
-        if rack.versions.contains(&version) {
+        // The version as the Cellar spells it: on a case-insensitive volume
+        // a link may reach a version directory by another case.
+        if !rack.versions.contains(&version) {
+            continue;
+        }
+        let keg = cellar.join(&rack.name).join(&version);
+        if receipt_lists_alias(sys, &keg, name)?
+            || migrated_from(sys, &cellar, &entries, name, &rack.name)?
+        {
             found.push(Installed {
                 name: name.clone(),
                 rack,
@@ -612,8 +671,9 @@ pub struct Absent {
 
 impl Absent {
     /// Ensure none of `names` is installed. A name that is not there is `ok`.
-    /// A name given twice counts once, and so do two names for one formula
-    /// (an alias and the formula's own name): under the first.
+    /// A name given twice counts once. Two names for one formula (an alias
+    /// and the formula's own name) remove it once, and the report names
+    /// both.
     pub fn new<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -625,11 +685,12 @@ impl Absent {
     }
 }
 
-/// One formula [`Absent`] will remove: the name the step gave it and the
-/// rack that name resolved to, with every version the Cellar showed.
+/// One formula [`Absent`] will remove: every name the step gave it, in the
+/// order given, and the rack they resolved to, with every version the Cellar
+/// showed.
 #[derive(Debug)]
 struct Removal {
-    name: String,
+    names: Vec<String>,
     rack: Rack,
 }
 
@@ -651,7 +712,7 @@ impl Intent for Uninstall {
                 .iter()
                 .map(|r| {
                     AttrChange::new(
-                        r.rack.label(&r.name),
+                        r.rack.label(&r.names),
                         format!("installed {}", r.rack.versions.join(", ")),
                         "absent",
                     )
@@ -661,15 +722,17 @@ impl Intent for Uninstall {
     }
 }
 
-/// One [`Formula`] per version in each rack, named as the step named it, in
-/// the order `check` read them.
+/// One [`Formula`] per version in each rack and per name the step gave it,
+/// in the order `check` read them.
 fn each_version(removals: &[Removal]) -> Vec<Formula> {
     removals
         .iter()
         .flat_map(|r| {
-            r.rack.versions.iter().map(|v| Formula {
-                name: r.name.clone(),
-                version: v.clone(),
+            r.names.iter().flat_map(|name| {
+                r.rack.versions.iter().map(|v| Formula {
+                    name: name.clone(),
+                    version: v.clone(),
+                })
             })
         })
         .collect()
@@ -694,26 +757,34 @@ impl Op for Absent {
         let mut removals: Vec<Removal> = vec![];
         let mut already_absent = vec![];
         for name in &self.names {
-            match have.iter().find(|f| &f.name == name) {
-                // A second name for a rack already planned is the same
-                // formula; `brew uninstall` is given each rack once.
-                Some(f) if removals.iter().any(|r| r.rack.name == f.rack.name) => {}
-                Some(f) => removals.push(Removal {
-                    name: name.clone(),
+            let Some(f) = have.iter().find(|f| &f.name == name) else {
+                already_absent.push(name.clone());
+                continue;
+            };
+            // A second name for a rack already planned is the same formula:
+            // `brew uninstall` is given each rack once, and the report
+            // names both.
+            match removals.iter_mut().find(|r| r.rack.name == f.rack.name) {
+                Some(r) => r.names.push(name.clone()),
+                None => removals.push(Removal {
+                    names: vec![name.clone()],
                     rack: f.rack.clone(),
                 }),
-                None => already_absent.push(name.clone()),
             }
         }
         // `brew uninstall --force` removes a pinned formula and its pin
         // without a word (`uninstall.rb` L32-43 never asks `pinned?`), so the
         // refusal brew gives without `--force` is made here instead, in a
-        // dry run too: the pin is the operator's, set on purpose. Homebrew
-        // pins under the formula's current name (`formula_pin.rb` L15), which
-        // is the rack's: a pin is made only where `<Cellar>/<name>/<version>`
-        // exists (L22), and the migrator renames the pin with the rack
-        // (`migrator.rb` `repin`). So the pin is looked for under the rack an
-        // alias or an old name resolved to, never under the alias.
+        // dry run too: the pin is the operator's, set on purpose. It is
+        // looked for under the rack's name, which is where brew pins it:
+        // `pinned/<formula name>` (`formula_pin.rb` L15), made only where
+        // `<Cellar>/<formula name>/<version>` exists (L22) and renamed with
+        // the rack by the migrator (`migrator.rb` `repin`). So an alias or an
+        // old name is checked under the rack it resolved to, never under
+        // itself, where brew never pins. Known gap: a migration that failed
+        // half way, leaving a real `<Cellar>/<old>` beside `<Cellar>/<new>`
+        // with the pin at `pinned/<new>`, is not seen as pinned when the step
+        // names `<old>`, and `--force` removes that pin (`uninstall.rb` L43).
         let mut pinned = vec![];
         for r in &removals {
             if is_symlink(sys, &pin_link(Path::new(&brew), &r.rack.name))? {
@@ -725,14 +796,14 @@ impl Op for Absent {
             [r] => bail!(
                 "`{}` is pinned (`brew pin`); `brew::Absent` will not remove a pinned \
                  formula. Run `brew unpin {}` first, or drop it from the step.",
-                r.rack.label(&r.name),
+                r.rack.label(&r.names),
                 r.rack.name
             ),
             rs => bail!(
                 "{} are pinned (`brew pin`); `brew::Absent` will not remove a pinned formula. \
                  Run `brew unpin {}` first, or drop them from the step.",
                 rs.iter()
-                    .map(|r| format!("`{}`", r.rack.label(&r.name)))
+                    .map(|r| format!("`{}`", r.rack.label(&r.names)))
                     .collect::<Vec<_>>()
                     .join(", "),
                 rs.iter()
@@ -1529,6 +1600,20 @@ mod tests {
         .unwrap();
     }
 
+    /// Plant the keg's install receipt, with the aliases brew recorded in it
+    /// (`tab/tab.rb` L127: `formula.aliases`).
+    fn receipt(fake: &Fake, rack: &str, version: &str, aliases: &[&str]) {
+        let json = serde_json::json!({ "homebrew_version": "7.0.1", "aliases": aliases });
+        fake.write(
+            &Path::new(CELLAR)
+                .join(rack)
+                .join(version)
+                .join("INSTALL_RECEIPT.json"),
+            json.to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
     /// Plant a pin on `name`, the way `brew pin` writes it.
     fn pin(fake: &Fake, name: &str, version: &str) {
         fake.mkdir_all(Path::new("/opt/homebrew/var/homebrew/pinned"))
@@ -1548,6 +1633,7 @@ mod tests {
     fn an_installed_alias_is_satisfied_through_its_opt_link() {
         let fake = mac_fake(&[("python@3.12", &["3.12.10", "3.12.4"])]);
         opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        receipt(&fake, "python@3.12", "3.12.4", &["python3"]);
         let Plan::Satisfied(r) = Present::new(["python3"]).check(&mac_sys(&fake)).unwrap() else {
             panic!("expected satisfied")
         };
@@ -1603,6 +1689,7 @@ mod tests {
         // because the Fake's `brew` writes nothing.
         plant(&fake, CELLAR, &[("sixtunnel", &["0.14"])]);
         opt_link(&fake, "6tunnel", "../Cellar/sixtunnel/0.14");
+        receipt(&fake, "sixtunnel", "0.14", &["6tunnel"]);
         let r = op.apply(&s, c).unwrap();
         assert_eq!(fake.argvs(), vec![vec![BREW, "install", "6tunnel"]]);
         assert_eq!(
@@ -1616,17 +1703,28 @@ mod tests {
     }
 
     /// An opt link that does not resolve to a version directory of a rack in
-    /// this Cellar is no installation: a link left dangling, one to a
-    /// version the rack no longer has, one out of the Cellar altogether, and
-    /// one to a hidden rack.
+    /// this Cellar is no installation, even with the name in the receipt: a
+    /// link left dangling, one out of the Cellar altogether, and one to a
+    /// hidden rack.
     #[test]
     fn an_opt_link_that_does_not_reach_a_rack_is_not_installed() {
         let fake = mac_fake(&[("python@3.12", &["3.12.4"]), (".hidden", &["1.0"])]);
+        receipt(
+            &fake,
+            "python@3.12",
+            "3.12.4",
+            &["gone", "outside", "hidden"],
+        );
+        receipt(&fake, ".hidden", "1.0", &["gone", "outside", "hidden"]);
         fake.mkdir_all(Path::new("/elsewhere/python@3.12/3.12.4"))
             .unwrap();
+        fake.write(
+            Path::new("/elsewhere/python@3.12/3.12.4/INSTALL_RECEIPT.json"),
+            br#"{"aliases":["gone","outside","hidden"]}"#,
+        )
+        .unwrap();
         for (name, target) in [
             ("gone", "../Cellar/gone/1.0"),
-            ("old-version", "../Cellar/python@3.12/3.12.3"),
             ("outside", "/elsewhere/python@3.12/3.12.4"),
             ("hidden", "../Cellar/.hidden/1.0"),
         ] {
@@ -1650,6 +1748,7 @@ mod tests {
     fn a_rack_matching_the_name_wins_over_an_opt_link() {
         let fake = mac_fake(&[("python3", &["1.0"]), ("python@3.12", &["3.12.4"])]);
         opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        receipt(&fake, "python@3.12", "3.12.4", &["python3"]);
         let s = mac_sys(&fake);
         let Plan::Satisfied(r) = Present::new(["python3"]).check(&s).unwrap() else {
             panic!("expected satisfied")
@@ -1694,6 +1793,7 @@ mod tests {
     fn absent_of_an_installed_alias_removes_its_rack_by_the_racks_name() {
         let fake = mac_fake(&[("python@3.12", &["3.12.4", "3.12.3"])]);
         opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        receipt(&fake, "python@3.12", "3.12.4", &["python3"]);
         let s = mac_sys(&fake);
         let op = Absent::new(["python3"]);
         let Plan::Change(c) = op.check(&s).unwrap() else {
@@ -1747,12 +1847,13 @@ mod tests {
     }
 
     /// An alias and its formula's own name in one step are one formula: one
-    /// line in the diff, under the first name, and the rack once on `brew
-    /// uninstall`'s command line.
+    /// line in the diff naming both, the rack once on `brew uninstall`'s
+    /// command line, and each name accounted for in the report.
     #[test]
     fn absent_counts_an_alias_and_its_formula_once() {
         let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
         opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        receipt(&fake, "python@3.12", "3.12.4", &["python3"]);
         let s = mac_sys(&fake);
         let op = Absent::new(["python3", "python@3.12"]);
         let Plan::Change(c) = op.check(&s).unwrap() else {
@@ -1760,7 +1861,7 @@ mod tests {
         };
         assert_eq!(
             c.diff().render(),
-            "brew formulae:\n  python3 (python@3.12): installed 3.12.4 -> absent\n"
+            "brew formulae:\n  python3, python@3.12 (python@3.12): installed 3.12.4 -> absent\n"
         );
         let r = op.apply(&s, c).unwrap();
         assert_eq!(
@@ -1773,7 +1874,11 @@ mod tests {
                 "python@3.12"
             ]]
         );
-        assert_eq!(r.removed.len(), 1);
+        let formula = |name: &str| Formula {
+            name: name.into(),
+            version: "3.12.4".into(),
+        };
+        assert_eq!(r.removed, vec![formula("python3"), formula("python@3.12")]);
         assert!(r.already_absent.is_empty());
     }
 
@@ -1784,6 +1889,7 @@ mod tests {
     fn absent_refuses_an_alias_pinned_under_its_formula() {
         let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
         opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+        receipt(&fake, "python@3.12", "3.12.4", &["python3"]);
         pin(&fake, "python@3.12", "3.12.4");
         for check_mode in [false, true] {
             let s = mac_sys(&fake).with_check_mode(check_mode);
@@ -1828,5 +1934,123 @@ mod tests {
             "{err}"
         );
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// Review round 1 on #100: brew re-points every `opt/` link into a rack
+    /// at each new keg (`keg.rb` L642-645) and never removes a stale
+    /// versioned one (L297-298, L302), so an `opt/<name>` link into a rack
+    /// does not make `<name>` that formula. A link is the name's only when
+    /// the keg's receipt lists it as an alias, exactly. Here `openssl@3.5` is
+    /// a formula of its own, not installed, whose name was once an alias of
+    /// `openssl@3`.
+    #[test]
+    fn a_stale_opt_link_not_in_the_kegs_receipt_is_not_installed() {
+        let fake = mac_fake(&[("openssl@3", &["3.6.3"])]);
+        opt_link(&fake, "openssl@3.5", "../Cellar/openssl@3/3.6.3");
+        opt_link(&fake, "openssl@3.6", "../Cellar/openssl@3/3.6.3");
+        receipt(&fake, "openssl@3", "3.6.3", &["openssl", "openssl@3.6"]);
+        let s = mac_sys(&fake);
+        assert!(Present::new(["openssl@3.5"]).check(&s).unwrap().is_change());
+        assert!(matches!(
+            Absent::new(["openssl@3.5"]).check(&s).unwrap(),
+            Plan::Satisfied(_)
+        ));
+        // The alias the receipt does list still resolves.
+        assert!(matches!(
+            Present::new(["openssl@3.6"]).check(&s).unwrap(),
+            Plan::Satisfied(_)
+        ));
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// No receipt, one that is not JSON, or one with no `aliases`: the link
+    /// is not shown to be the name's, so the name is not installed.
+    #[test]
+    fn an_opt_link_without_a_readable_receipt_is_not_installed() {
+        for body in [
+            None,
+            Some("not json"),
+            Some(r#"{"homebrew_version":"1.0"}"#),
+            Some(r#"{"aliases":null}"#),
+        ] {
+            let fake = mac_fake(&[("python@3.12", &["3.12.4"])]);
+            opt_link(&fake, "python3", "../Cellar/python@3.12/3.12.4");
+            if let Some(body) = body {
+                fake.write(
+                    Path::new("/opt/homebrew/Cellar/python@3.12/3.12.4/INSTALL_RECEIPT.json"),
+                    body.as_bytes(),
+                )
+                .unwrap();
+            }
+            let s = mac_sys(&fake);
+            assert!(
+                Present::new(["python3"]).check(&s).unwrap().is_change(),
+                "{body:?}"
+            );
+            assert!(
+                matches!(
+                    Absent::new(["python3"]).check(&s).unwrap(),
+                    Plan::Satisfied(_)
+                ),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// On a case-insensitive volume `opt/NINVADERS` answers with the
+    /// `ninvaders` link, as `<Cellar>/Python` answers for `python`. The
+    /// `Fake` is case-sensitive, so the answer is planted under the asked
+    /// name. Only an exact entry in the receipt makes it the name's: neither
+    /// the rack's own name nor an alias in another case counts.
+    #[test]
+    fn an_opt_link_answering_for_another_case_is_not_installed() {
+        let fake = mac_fake(&[("ninvaders", &["0.1.1"])]);
+        receipt(&fake, "ninvaders", "0.1.1", &["space-invaders"]);
+        opt_link(&fake, "NINVADERS", "../Cellar/ninvaders/0.1.1");
+        opt_link(&fake, "Space-Invaders", "../Cellar/ninvaders/0.1.1");
+        let s = mac_sys(&fake);
+        for name in ["NINVADERS", "Space-Invaders"] {
+            assert!(
+                Present::new([name]).check(&s).unwrap().is_change(),
+                "{name}"
+            );
+            assert!(
+                matches!(Absent::new([name]).check(&s).unwrap(), Plan::Satisfied(_)),
+                "{name}"
+            );
+        }
+    }
+
+    /// An old name's `opt/` link counts only beside the migrator's other
+    /// mark, `<Cellar>/<old>` a symlink to the renamed rack: without it the
+    /// link is no more than a stale one.
+    #[test]
+    fn an_old_name_link_without_the_cellar_symlink_is_not_installed() {
+        let fake = mac_fake(&[("libmpdec-new", &["4.0.1"]), ("other", &["1.0"])]);
+        receipt(&fake, "libmpdec-new", "4.0.1", &[]);
+        opt_link(&fake, "libmpdec-old", "../Cellar/libmpdec-new/4.0.1");
+        let s = mac_sys(&fake);
+        assert!(
+            Present::new(["libmpdec-old"])
+                .check(&s)
+                .unwrap()
+                .is_change()
+        );
+        // A `<Cellar>/<old>` symlink to some other rack does not count either.
+        fake.symlink(
+            Path::new("other"),
+            Path::new("/opt/homebrew/Cellar/libmpdec-old"),
+        )
+        .unwrap();
+        assert!(
+            Present::new(["libmpdec-old"])
+                .check(&s)
+                .unwrap()
+                .is_change()
+        );
+        assert!(matches!(
+            Absent::new(["libmpdec-old"]).check(&s).unwrap(),
+            Plan::Satisfied(_)
+        ));
     }
 }
