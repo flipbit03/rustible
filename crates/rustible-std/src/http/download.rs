@@ -228,7 +228,11 @@ impl Digests {
 /// (`sys.write_from`), hashed as it arrives, and is renamed over `dest`
 /// only once it is whole: the old file stays untouched until then. A
 /// checksum mismatch at the end of the body, or a body over
-/// [`Download::max_bytes`], fails the step and writes nothing. A non-2xx
+/// [`Download::max_bytes`], fails the step and writes nothing, and so does
+/// a body that ends before the size its `Content-Length` declares, or
+/// before its chunked encoding's last chunk. A body framed only by the
+/// server closing the connection cannot be told from a whole one when the
+/// connection drops; `.checksum` is what catches that. A non-2xx
 /// status fails the step naming the status and the URL. Redirects are
 /// followed, up to ten, and a header given with [`Download::header_secret`]
 /// is dropped when one leaves the scheme, host and port it was meant for
@@ -756,7 +760,8 @@ impl Op for Download {
         };
         // The body streams into the file staged beside `dest`, with its
         // mode and owner, and is renamed over it only once it is whole and
-        // verified: a mismatch, a body over `.max_bytes()`, a failed read or
+        // verified: a mismatch, a body over `.max_bytes()`, a read that
+        // fails (one short of its `Content-Length` or chunked framing) or
         // a refused owner leaves `dest` as it was, and removes the backup
         // taken for it (decision 26).
         let mut body = Verified::new(self.fetch(&url)?, checksum, &url, &dest);
@@ -1062,8 +1067,8 @@ mod tests {
     #[test]
     fn a_body_over_max_bytes_is_refused_without_a_content_length() {
         // No `Content-Length`, so the size is unknown until it is read and
-        // only ureq's `limit` can stop it: the guard that actually bounds
-        // memory, rather than trusting the server's header.
+        // only the count `client::Body` keeps as it reads can stop it: the
+        // guard that holds whatever the server's header says.
         let big = vec![b'x'; 4096];
         let (base, _) = serve(vec![(
             "/big",
@@ -1770,34 +1775,46 @@ mod tests {
         assert_eq!(fake.reads(), vec![], "dest was not read back");
     }
 
+    /// A temporary directory for a test through the in-process helper,
+    /// removed when the guard drops.
+    struct Scratch<'a>(&'a System, PathBuf);
+
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.remove_all(&self.1);
+        }
+    }
+
+    fn scratch<'a>(sys: &'a System, name: &str) -> Scratch<'a> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustible-download-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        sys.mkdir_all(&dir).unwrap();
+        Scratch(sys, dir)
+    }
+
+    /// A body of several helper chunks.
+    fn multi_chunk() -> Vec<u8> {
+        use rustible_sdk::protocol::CHUNK_SIZE;
+        (0..3 * CHUNK_SIZE + 5).map(|i| (i % 253) as u8).collect()
+    }
+
     /// Through a real escalation helper (in process, as this user, over a
     /// temporary directory): a body of several helper chunks is downloaded
     /// with a checksum and a mode, and the next `check` hashes it back
     /// through the helper and is satisfied.
     #[test]
     fn a_download_through_the_helper_streams_a_multi_chunk_body() {
-        use rustible_sdk::protocol::CHUNK_SIZE;
-
-        let content: Vec<u8> = (0..3 * CHUNK_SIZE + 5).map(|i| (i % 253) as u8).collect();
+        let content = multi_chunk();
         let s = super::super::test_server::serve(vec![("/big", 200, vec![], content.clone())]);
         let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rustible-download-helper-{}-{nanos}",
-            std::process::id()
-        ));
-        struct Cleanup<'a>(&'a System, PathBuf);
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                let _ = self.0.remove_all(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(&sys, dir.clone());
-        sys.mkdir_all(&dir).unwrap();
-        let dest = dir.join("big");
+        let dir = scratch(&sys, "checksum");
+        let dest = dir.1.join("big");
         sys.write_atomic(&dest, b"old").unwrap();
 
         let sha256 = digest(Algorithm::Sha256, &content);
@@ -1822,10 +1839,71 @@ mod tests {
         assert_eq!(again.sha256, Some(sha256));
         assert_eq!(s.hits(), 1, "check never fetched");
         assert_eq!(
-            sys.read_dir(&dir).unwrap().len(),
+            sys.read_dir(&dir.1).unwrap().len(),
             2,
             "dest and its backup, nothing staged left beside them"
         );
+    }
+
+    /// The same without `.checksum` (#82 asks for both): the body streams
+    /// through the helper into a new file, the report's digest is the
+    /// stream's, and the next `check` is satisfied without reading it.
+    /// `.force(true)` then streams it over the existing file. And a body
+    /// over `.max_bytes()`, with no `Content-Length` to refuse it early,
+    /// fails part way through the helper's write, leaving the file as it
+    /// was and nothing staged beside it.
+    #[test]
+    fn a_download_without_a_checksum_through_the_helper() {
+        let content = multi_chunk();
+        let s = super::super::test_server::serve(vec![
+            ("/big", 200, vec![], content.clone()),
+            (
+                "/unsized",
+                200,
+                vec![("X-Omit-Length", String::new())],
+                content.clone(),
+            ),
+        ]);
+        let sys = System::in_process_helper(Arc::new(Collect::default())).unwrap();
+        let dir = scratch(&sys, "plain");
+        let dest = dir.1.join("big");
+
+        let op = Download::get(s.url("/big")).to(&dest).mode(0o640);
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        let sha256 = digest(Algorithm::Sha256, &content);
+        assert_eq!(
+            (r.bytes, r.sha256.as_deref()),
+            (content.len() as u64, Some(sha256.as_str()))
+        );
+        assert_eq!(sys.read(&dest).unwrap(), content);
+        assert_eq!(sys.stat(&dest).unwrap().unwrap().mode & 0o7777, 0o640);
+        let Plan::Satisfied(again) = op.check(&sys).unwrap() else {
+            panic!("expected satisfied");
+        };
+        assert_eq!((again.bytes, again.sha256), (content.len() as u64, None));
+
+        let forced = op.clone().force(true);
+        let c = expect_change(&forced, &sys);
+        assert_eq!(forced.apply(&sys, c).unwrap().bytes, content.len() as u64);
+        assert_eq!(s.hits(), 2);
+
+        let over = Download::get(s.url("/unsized"))
+            .to(&dest)
+            .force(true)
+            .max_bytes(content.len() as u64 - 1);
+        let c = expect_change(&over, &sys);
+        let err = over.apply(&sys, c).unwrap_err().chain();
+        assert_eq!(
+            err,
+            format!(
+                "GET {}: the body is larger than the {} byte limit; raise it with .max_bytes()",
+                s.url("/unsized"),
+                content.len() - 1
+            )
+        );
+        assert_eq!(sys.read(&dest).unwrap(), content);
+        assert_eq!(sys.read_dir(&dir.1).unwrap(), [dest]);
     }
 
     #[test]

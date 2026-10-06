@@ -21,17 +21,14 @@
 //! root under a scratch directory, copied there with `file::Copy` (the
 //! second run's `check` reads both sides back through the helper to report
 //! `ok`), and fetched to the workspace's ignored `out/macbrew/`, where CI
-//! compares it with what was generated and removes it (#86). It also
-//! downloads a 69 MB Go release there with `http::Download` as root, whose
-//! body streams through the helper into the file and whose second run's
-//! `check` hashes it back through the helper (#87). A removal run removes
-//! the scratch directory.
+//! compares it with what was generated and removes it (#86). A removal run
+//! removes the scratch directory.
 
 use std::path::{Component, Path, PathBuf};
 
 use rustible::prelude::*;
 use rustible::sdk::backend::FileKind;
-use rustible_std::{brew, file, http, shell};
+use rustible_std::{brew, file, shell};
 
 /// The version the copied keg is filed under. Any directory in a rack is a
 /// version to Homebrew; this one cannot be mistaken for a real release.
@@ -44,14 +41,6 @@ const SCRATCH: &str = "/private/tmp/rustible-macbrew";
 /// fetched copy with.
 const LARGE_BYTES: u64 = 50 * 1024 * 1024;
 const LARGE_LINE: &str = "rustible streams this line";
-
-/// A download larger than one helper frame: a Go release, 68,988,925 bytes,
-/// fixed once published, with the digest go.dev publishes for it
-/// (`https://go.dev/dl/?mode=json&include=all`). Any file would do; this is
-/// the one `vagrant.rs` downloads.
-const GO_TARBALL: &str = "https://go.dev/dl/go1.22.0.linux-amd64.tar.gz";
-const GO_SHA256: &str =
-    "sha256:f6c8a87aa03b92c4b0bf3d558e28ea03006eb29db78917daec5cfb6ec1046265";
 
 #[rustible::vars]
 struct Vars {
@@ -136,10 +125,9 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
 }
 
 /// 50 MiB through the sudo helper, both ways (decision 30 on #82): one
-/// frame of the helper carries less, so the copy, its comparison, the fetch
-/// and the download all cross it in chunks. Generated under a temporary
-/// name, so a generation cut short is not mistaken for a finished one by
-/// `creates`.
+/// frame of the helper carries less, so the copy, its comparison and the
+/// fetch all cross it in chunks. Generated under a temporary name, so a
+/// generation cut short is not mistaken for a finished one by `creates`.
 fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
     let large = format!("{SCRATCH}/large");
     let copy = format!("{SCRATCH}/large-copy");
@@ -163,16 +151,6 @@ fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
     if !root.check_mode() {
         root.fetch(&copy, "out/macbrew/")?;
     }
-    // A download over one helper frame (#87): the body streams into a file
-    // staged in the scratch directory, and the second run's `check` hashes
-    // it back through the helper.
-    root.step(
-        "69 MB download, as root",
-        http::Download::get(GO_TARBALL)
-            .to(format!("{SCRATCH}/go.tar.gz"))
-            .checksum(GO_SHA256)
-            .mode(0o600),
-    )?;
     Ok(())
 }
 

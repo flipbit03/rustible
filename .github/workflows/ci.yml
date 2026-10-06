@@ -180,8 +180,7 @@ jobs:
       # nothing installed and is `ok`. A removal that left a version behind
       # makes the second report `changed`. Each install run also generates a
       # 50 MiB file as root, copies it and fetches it back through the sudo
-      # helper (`ctx.as_root()`), in chunks, and downloads a 69 MB Go release
-      # through it with `http::Download`; each removal run removes them.
+      # helper (`ctx.as_root()`), in chunks; each removal run removes it.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
@@ -199,7 +198,7 @@ jobs:
           run mac -v
           run mac | tee /dev/stderr | grep -Eq '^runner +4 +1 +0 +0 +0 +0 +0$'
           run macbrew -v
-          run macbrew | tee /dev/stderr | grep -Eq '^runner +5 +0 +0 +0 +0 +0 +0$'
+          run macbrew | tee /dev/stderr | grep -Eq '^runner +4 +0 +0 +0 +0 +0 +0$'
           # What `ctx.fetch` brought back through the sudo helper is the
           # 50 MiB macbrew.rs generated, and nothing was left beside it.
           fetched=examples/workspace/out/macbrew/runner
