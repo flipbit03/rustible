@@ -310,7 +310,8 @@ fn failed_fetch(output: &str) -> Option<&str> {
 /// record that it succeeded in [`SUCCESS_STAMP`], whose mtime [`cache_age`]
 /// reads. Never under `--check` (vision 12). A failed update writes no
 /// stamp, and neither does one that exits 0 having failed to fetch an index
-/// ([`failed_fetch`]): that warns instead, and the next run refreshes again.
+/// ([`failed_fetch`]): that warns instead, and the next run may refresh
+/// again.
 ///
 /// The stamp is written with `mkdir -p` and `touch`, not through `sys`,
 /// because [`Latest`] refreshes in `check`, where the SDK refuses every
@@ -324,8 +325,9 @@ fn refresh_lists(sys: &System) -> Result<()> {
     if let Some(line) = failed_fetch(&output) {
         sys.warn(format!(
             "`apt-get update` exited 0 but did not fetch every package index (`{line}`), \
-             so {SUCCESS_STAMP} was not written and the next run will refresh again; \
-             check the host's network and the mirrors in /etc/apt/sources.list"
+             so {SUCCESS_STAMP} was not written and the next run may refresh again; \
+             check the host's network, and the repositories in /etc/apt/sources.list and \
+             /etc/apt/sources.list.d/ and their signing keys (a `NO_PUBKEY` above)"
         ));
         return Ok(());
     }
@@ -1501,7 +1503,10 @@ mod tests {
     }
 
     /// What `apt-get update` prints, under `LANG=C`, when it cannot reach a
-    /// mirror and still exits 0.
+    /// mirror and still exits 0. Real apt prints the `W:` lines on stderr,
+    /// and the `Fake` cannot plant stderr, so this exercises the stdout half
+    /// only; `it_apt_latest.rs`'s `an_update_that_fetched_nothing_writes_no_stamp`
+    /// (T2) is what pins the stderr path.
     const OFFLINE_UPDATE: &str = "\
 Ign:1 http://127.0.0.1:9/debian bookworm InRelease
 Err:1 http://127.0.0.1:9/debian bookworm InRelease
@@ -1556,7 +1561,9 @@ W: Some index files failed to download. They have been ignored, or old ones used
         assert!(
             warned[0].contains("W: Failed to fetch")
                 && warned[0].contains("was not written")
-                && warned[0].contains("will refresh again"),
+                && warned[0].contains("may refresh again")
+                && warned[0].contains("/etc/apt/sources.list.d/")
+                && warned[0].contains("NO_PUBKEY"),
             "{warned:?}"
         );
 
