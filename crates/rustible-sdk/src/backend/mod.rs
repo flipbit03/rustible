@@ -141,6 +141,62 @@ impl Output {
     }
 }
 
+/// The mode and owner a streamed write gives its file, applied to the staged
+/// temporary file **before** it is renamed over the target, so the new
+/// content is never readable at a wider mode than asked and never setuid
+/// with the wrong owner, even for a moment.
+///
+/// A field left `None` keeps what a write without attributes would give: a
+/// rewrite keeps the existing file's mode or owner, a new file gets the mode
+/// any newly created file gets (0666 minus the umask) and the writer's
+/// owner. A requested owner that cannot be given (`EPERM`, unprivileged)
+/// fails the write and leaves the target as it was; an owner kept from the
+/// existing file is best effort, as for [`Backend::write`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteAttrs {
+    /// Permission bits as `chmod` takes them, setuid, setgid and sticky
+    /// included: `0o600`, `0o4755`.
+    pub mode: Option<u32>,
+    /// Numeric `(uid, gid)`, both of them, as [`Backend::set_owner`] takes
+    /// them. Handing a file to another user needs root.
+    pub owner: Option<(u32, u32)>,
+}
+
+/// One attribute call, in the order [`attr_steps`] gives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttrStep {
+    /// `chmod` to these bits.
+    Mode(u32),
+    /// `chown` to these ids.
+    Owner(u32, u32),
+}
+
+/// The calls that give a regular file `mode` and, when there is one,
+/// `owner`, in the one order that is safe (`[ISSUE-51]`, `[ISSUE-79]`):
+///
+/// 1. the mode **without** setuid and setgid, while the writer still owns
+///    the file, so a root without `CAP_FOWNER` can still do it, and the
+///    content is never setuid to the writer when it is about to belong to
+///    someone else;
+/// 2. the owner;
+/// 3. the full mode again, only when it carries setuid or setgid: every
+///    successful `chown` of a non-directory clears setuid, and setgid with
+///    group execute, on Linux (`[FAKE-CHOWN]`).
+///
+/// Without an owner it is the one `chmod`. Directories have their own order
+/// (`file::set_mode_and_owner` in `rustible-std`); nothing that calls this
+/// writes one.
+pub(crate) fn attr_steps(mode: u32, owner: Option<(u32, u32)>) -> Vec<AttrStep> {
+    let Some((uid, gid)) = owner else {
+        return vec![AttrStep::Mode(mode)];
+    };
+    let mut steps = vec![AttrStep::Mode(mode & !0o6000), AttrStep::Owner(uid, gid)];
+    if mode & 0o6000 != 0 {
+        steps.push(AttrStep::Mode(mode));
+    }
+    steps
+}
+
 /// One method per primitive, nothing clever. `Local` is production, `Fake`
 /// is for tests, `Elevated` proxies every call to a `Local` inside a helper
 /// process running as another user (vision doc 7.2, 11.3).
@@ -201,4 +257,28 @@ pub trait Backend: Send + Sync {
     /// [`Output::status`], and only being unable to start the child at all
     /// is an `Err`.
     fn spawn(&self, spec: &CmdSpec) -> io::Result<Output>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without an owner, one `chmod`. With one, the mode without setuid and
+    /// setgid, the owner, and the full mode again only when it carries
+    /// either; sticky is not cleared by a `chown`, so it is no reason for a
+    /// third call.
+    #[test]
+    fn attr_steps_put_setuid_and_setgid_after_the_owner() {
+        use AttrStep::{Mode, Owner};
+        assert_eq!(attr_steps(0o4755, None), [Mode(0o4755)]);
+        for (mode, steps) in [
+            (0o600, vec![Mode(0o600), Owner(5, 6)]),
+            (0o1755, vec![Mode(0o1755), Owner(5, 6)]),
+            (0o4755, vec![Mode(0o755), Owner(5, 6), Mode(0o4755)]),
+            (0o2750, vec![Mode(0o750), Owner(5, 6), Mode(0o2750)]),
+            (0o6755, vec![Mode(0o755), Owner(5, 6), Mode(0o6755)]),
+        ] {
+            assert_eq!(attr_steps(mode, Some((5, 6))), steps, "{mode:o}");
+        }
+    }
 }
