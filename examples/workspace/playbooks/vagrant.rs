@@ -21,13 +21,17 @@
 //! and fetches it back, both larger than one frame of the escalation helper
 //! can carry, so they cross it in chunks (#86). The second run's `check`
 //! reads the 50 MiB copy back through the helper to report `ok`, and
-//! `vm-test.sh` compares what was fetched with what was generated.
+//! `vm-test.sh` compares what was fetched with what was generated. And it
+//! downloads a 69 MB Go release into that home with `http::Download`, which
+//! needs egress from the guest: the body streams through the helper into
+//! the file, and the second run's `check` hashes it back through the helper
+//! (#87).
 
 use std::time::Duration;
 
 use rustible::prelude::*;
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{apt, file, shell, sysctl, systemd, user};
+use rustible_std::{apt, file, http, shell, sysctl, systemd, user};
 
 /// What the marker file says, so a second run has something to compare.
 const MARKER: &str = "written by rustible from dev/vagrant\n";
@@ -56,6 +60,13 @@ const LARGE: &str = "/var/tmp/rustible-large";
 /// same bytes to compare the fetched copy with.
 const LARGE_BYTES: u64 = 50 * 1024 * 1024;
 const LARGE_LINE: &str = "rustible streams this line";
+
+/// A download larger than one helper frame: a Go release, 68,988,925 bytes,
+/// fixed once published, with the digest go.dev publishes for it
+/// (`https://go.dev/dl/?mode=json&include=all`). `go.dev` redirects it to
+/// `dl.google.com`.
+const GO_TARBALL: &str = "https://go.dev/dl/go1.22.0.linux-amd64.tar.gz";
+const GO_SHA256: &str = "sha256:f6c8a87aa03b92c4b0bf3d558e28ea03006eb29db78917daec5cfb6ec1046265";
 
 /// Where the fetched copy lands, in the workspace's ignored `out/`, as
 /// `<this>/<host>/large-copy`; `vm-test.sh` checks it and removes it.
@@ -121,6 +132,11 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
             login.fetch(&copy, FETCHED)?;
         }
     }
+
+    // A download over one helper frame, as that account too: the body
+    // streams into a file staged in its home, its mode set before the
+    // rename, and the second run's `check` hashes it through the helper.
+    ctx.as_user(LOGIN_ACCOUNT).step(format!("69 MB download as {LOGIN_ACCOUNT}"), http::Download::get(GO_TARBALL).to(format!("/home/{LOGIN_ACCOUNT}/go.tar.gz")).checksum(GO_SHA256).mode(0o600))?;
 
     // An account with no home at all: its helper runs from a private copy
     // in the temp directory, which removes itself.

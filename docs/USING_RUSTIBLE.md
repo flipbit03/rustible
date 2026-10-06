@@ -1131,6 +1131,10 @@ lists the codes. Read the response into a struct with `json_as`;
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 `.basic_auth(user, &s)` — and show as `<secret, N bytes>` in diffs and errors.
 
+Neither `http::Request` nor `http::Download` limits a response's size unless
+`.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`
+streams it to disk, so fetch large files with `Download`.
+
 ⚠️ A `.json(..)` body is not a secret: the diff shows it (`-v`, `--json`),
 and a server that echoes it into an error puts it in the step's error. To
 send a secret in a JSON body, build the JSON yourself and send it with
