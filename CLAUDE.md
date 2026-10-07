@@ -22,9 +22,22 @@ and why. The rest are read when you need them:
 
 ## The contract
 
-**`docs/01_VISION.md` is the source of truth.** It is long and it is vetted.
-When code and vision disagree, the vision wins and the code is wrong, unless
-the author decides otherwise in the session you are in.
+**`docs/01_VISION.md` is the source of truth on intent.** It is long and it
+is vetted. On intent, guarantees, and the shape a playbook author sees, when
+code and vision disagree the vision wins and the code is wrong, unless the
+author decides otherwise in the session you are in. On types, fields,
+signatures and mechanisms the source is the authority, and the vision does
+not carry them.
+
+**The vision never carries copies of internal types.** No struct or enum
+listings, field lists, trait or method signatures, wire layouts, byte sizes,
+library choices, one op's implementation details, or "what is in the tree"
+status. It states what must hold and names the source file that does it.
+Playbook and inventory examples stay, because they are the product's shape.
+A proposed amendment that would only update a struct, a field or a signature
+is not an amendment: drop it. Status belongs in `docs/plan/PROGRESS.md`;
+history, and the reasons behind implementation choices, in
+`docs/plan/DECISIONS.md`.
 
 **Do not edit it on your own initiative.** The rule exists so the contract is
 not rewritten by whoever happens to be passing. If your work requires an

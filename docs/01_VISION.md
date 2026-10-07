@@ -5,51 +5,40 @@ for vetting. **Vetted by Cadu: pending.**
 **Purpose:** this is the handoff. If every other context is lost, a reader of this
 document should be able to continue designing and building Rustible without
 re-deriving or re-arguing anything below. Every decision records the alternatives
-that were considered and why they lost. Sections marked **OPEN** are not yet
-decided; section 16 lists all of them with the milestone by which each must be
-settled.
+that were considered and why they lost. Section 16 lists what is still open.
 
 ---
 
 ## 0. Where the project is, and how to read this document
 
-**Phase.** Design and spiking are complete as of 2026-09-06. Every architectural
-question has a decision below together with the alternatives it beat. Three
-spikes validated the design in running code across two machines and two CPU
-architectures (section 17). The next phase is **building the real thing**
-against a milestone plan, `docs/06_BUILD_PLAN.md` (written 2026-09-08 after
-vetting), with one brief per milestone under `docs/plan/`.
+**Where the project is.** `docs/plan/PROGRESS.md` is the current state; this
+document is the design. Every architectural question has a decision below
+together with the alternatives it beat, three spikes validated the design in
+running code before building began (section 17), and `docs/06_BUILD_PLAN.md`
+is the milestone plan it was built against.
 
-**The two modes, and their rules.**
+**The two modes, and their rules.** `docs/06_BUILD_PLAN.md` section 1 spells
+out the rules of build mode.
 
-| | Spiking (done) | Building (next) |
+| | Spiking (done) | Building |
 |---|---|---|
 | Goal | Learn, then write it down | Ship code that stays |
 | Code quality | Throwaway and stand-ins allowed | Tests and docs in the same commit; no stand-ins |
-| Where decisions land | This doc and the spike docs | This doc first (as an amendment), then code |
+| Where decisions land | This doc and the spike docs | This doc first for design (as an amendment), then code |
 | Trying things | On `main` | On a branch |
 | Scope unit | One question | One milestone with a done condition |
 
-**What is in the tree today** (`crates/`), classified honestly:
-
-- **Keepers**, written to this design and tested: `Op`, `Plan`, `Intent`,
-  `Applied`, `System` over `Backend` with `Local` and `Fake`, `Facts` with real
-  probes, `Diff`, the event model, the protocol codec, and the ops `file::Line`,
-  `file::Directory`, `apt::Present`, `shell::Command`. 14 unit tests, clippy
-  clean, edition 2024.
-- **Stand-ins** the real thing replaces: `rustible_sdk::runtime::run` and its
-  flag parsing (the `#[playbook]` macro replaces it), the structured error enum
-  in `error.rs` (section 14 replaces it), `Ctx::local_file` (a local-path stub),
-  the `Pretty` renderer living in the SDK (moves to the CLI), and the whole
-  `crates/rustible` orchestrator (hardcoded package, hosts on the command line,
-  `$HOME` resolved through `sh`).
-- **Throwaway**: `crates/spike-playbook`. Deleted once a real workspace can run
-  playbooks.
+**What this document carries, and what it does not.** Intent, guarantees,
+decisions with their reasons and the alternatives they beat, and the shape a
+playbook author sees: playbooks, the inventory, the CLI. It does not carry
+copies of internal types, fields, signatures or wire layouts. Where a section
+needs one, it says what must hold and names the source file that is the
+authority on how it is done.
 
 **How to read.** Sections 1 to 4 are context. Sections 5 to 14 are the
 decisions, each with alternatives and reasons. Section 15 is the glossary,
-section 16 the open questions with decide-by milestones, section 17 the spike
-history. The spike documents `02` to `04` are frozen history: if one of them
+section 16 the questions still open, section 17 where the spike reports
+live. The spike documents `02` to `04` are frozen history: if one of them
 disagrees with this document, this document wins.
 
 ---
@@ -126,7 +115,10 @@ $ rustible playbook run ./playbooks/cadu/ssh_enable_root_user.rs [--check] [-v|-
 Reads the playbook's metadata (target hosts), validates the inventory vars
 against the playbook's typed struct, probes the hosts, compiles per
 architecture, uploads, runs, and renders progress. See section 5.2 for the
-pipeline. `--check` is dry-run; `-v` shows diffs, `-vv` shows every command.
+pipeline. `--check` is a dry run. Each step line carries a one-line summary
+of its change; `-v` adds the full diff, debug logs, and a failed command with
+its stderr, whether or not the playbook caught the failure; `-vv` adds every
+command run (section 5.5).
 
 ```
 $ rustible inventory show web2      # resolved parameters and vars, with their source
@@ -255,9 +247,10 @@ Consequences accepted with remote-brain:
    binary as a child process instead. A playbook that sets `ssh_user` logs in
    as that account on every host it targets, in place of the host's `ssh_user`
    (section 6.1).
-5. **Probe** each host with one shell command, `uname -sm`, mapped to a musl
-   triple. The real CLI also resolves `$HOME` here so later paths are absolute.
-   This bootstrap probe is the only shell-dependent step; everything after it
+5. **Probe** each host with one shell command, `uname -sm`, mapped to a
+   target triple (musl on Linux, Darwin on a mac, section 5.3). The real
+   CLI also resolves `$HOME` here so later paths are absolute. This
+   bootstrap probe is the only shell-dependent step; everything after it
    is the static binary.
 6. **Compile** once for all needed triples in **one cargo invocation**
    (`RUSTIBLE_PLAYBOOK=<name> cargo build --profile dist --features selected
@@ -268,35 +261,34 @@ Consequences accepted with remote-brain:
    invocation is both simplest and fastest. Per-triple target directories keep
    the caches independent. Use the `dist` profile (section 5.3).
 7. **Upload if missing.** SHA-256 the artifact; the target path is
-   `~/.cache/rustible/bin/<playbook>-<sha256>`. If `test -x` finds it, skip the
-   upload; otherwise stream the bytes through stdin of
-   `sh -c 'cat > tmp; chmod 755; mv'`.
-8. **Execute** `[sudo -n] <path> --remote` (the prefix when the playbook says
-   `escalate = true`, using the host's escalation method), write the `Start`
-   frame (section 5.5) to its stdin, read frames from its stdout until EOF,
-   capture stderr separately (panics land there), wait for the exit code.
+   `~/.cache/rustible/bin/<playbook>-<sha256>`. If it is already there, skip
+   the upload; otherwise stream the bytes over the session into a temporary
+   file and rename it into place.
+8. **Execute** the binary in `--remote` mode, under the host's escalation
+   method when the playbook says `escalate = true`; send it the run's start
+   (section 5.5) on its stdin, read frames from its stdout until EOF, capture
+   stderr separately (panics land there), wait for the exit code.
    When `escalate_user` is neither root nor the login user, the binary is not
    run from the login user's cache: it is copied to that account (or a private
    per-run directory) and launched from there, as an `as_user` helper is
    (11.3).
 9. **Render** the per-host, per-step view from the event stream as it arrives.
-   Facts gathering is the first thing the binary does and is reported as a
-   frame. Sub-events between `StepStarted` and `StepFinished` (`CmdRan`, debug
-   logs) belong to that step; the renderer buffers them under it.
+   Facts gathering is the first thing the binary does and is reported as an
+   event. What happens between a step's start and its finish (commands run,
+   debug logs) belongs to that step; the renderer buffers it under the step.
 
 Measured in spike 2 (x86 dev box, ARM VM over Tailscale, warm ControlMaster):
-exec to `Hello` 17 to 21 ms over SSH, 5 ms locally; a whole no-op run on the
-ARM VM 30 ms; two hosts on two architectures, warm, 345 ms total. Orchestrator
-overhead is negligible next to the ops themselves (apt installing one package
-took 4.5 s).
+exec to the binary's first frame 17 to 21 ms over SSH, 5 ms locally; a whole
+no-op run on the ARM VM 30 ms; two hosts on two architectures, warm, 345 ms
+total. Orchestrator overhead is negligible next to the ops themselves (apt
+installing one package took 4.5 s).
 
 ### 5.3 Cross-compilation constraints (DECIDED for MVP)
 
 - **Linux targets are `*-unknown-linux-musl` only.** Static musl binaries run
   on any Linux regardless of libc version.
 - **The controller needs rustup, a C compiler, and `curl`; zig is fetched by
-  `rustible` itself (DECIDED 2026-09-07, AMENDED 2026-09-08, AMENDED AGAIN
-  2026-09-13, M8).** The C compiler is cargo's, for a workspace under
+  `rustible` itself.** The C compiler is cargo's, for a workspace under
   `cargo check`, `cargo test` or rust-analyzer, not `rustible`'s.
   `rustup target add <triple>` is done for the operator, and so is zig: the
   CLI fetches the pinned release into `~/.cache/rustible/zig/<version>/` on
@@ -341,7 +333,7 @@ took 4.5 s).
 
 ### 5.4 Transport (DECIDED for MVP)
 
-Use the system `ssh` binary via the `openssh` crate (ControlMaster multiplexing).
+Use the system `ssh` binary, with ControlMaster multiplexing.
 This inherits `~/.ssh/config`, ssh-agent, jump hosts, ProxyCommand, and 2FA for
 free, and is what Ansible itself does. `russh` (pure Rust SSH) is the later option
 for zero external dependencies. "Local" is the other transport (run the binary on
@@ -351,68 +343,81 @@ The binary on the target never opens a socket. Everything rides the SSH session
 the orchestrator established, so firewalling and authentication are entirely
 SSH's concern.
 
-### 5.5 Protocol (DECIDED; in use since spike 2)
+### 5.5 Protocol (DECIDED)
 
-**Framing.** A u32 big-endian length followed by a JSON body, on the binary's
-stdin (down) and stdout (up). Stderr stays raw for panics and crash output.
-JSON was chosen over postcard or msgpack because the frames are small, it is
-debuggable with `--json` locally, and the codec is one function on each side
-if that ever changes. Nothing else may write to stdout in `--remote` mode.
+**Framing.** The orchestrator and the binary exchange typed frames, each a
+length prefix followed by a JSON body, on the binary's stdin (down) and stdout
+(up). Stderr stays raw for panics and crash output. JSON was chosen over
+postcard or msgpack because the frames are small, it is debuggable with
+`--json` locally, and the codec is one function on each side if that ever
+changes. Nothing else may write to stdout in `--remote` mode.
 
-**Frames in use:**
+**What crosses the channel.** Down, the orchestrator first sends the run's
+start: the vars, what the target needs to know about its host (11.1), whether
+this is a dry run, the verbosity, and the escalation password when the host's
+method needs one (11.3). After that it sends a cancel, and the chunks of
+files the binary asked for. Up, the binary first says hello, naming the
+protocol version and the playbook (the name comes from the macro, not
+`argv[0]`), and then streams events:
 
-```rust
-enum Down {
-    Start { run_id, host: HostInfo, vars: serde_json::Value, check_mode: bool, verbosity: u8 },
-    Cancel,                                    // ctrl-c on the orchestrator (handling: M5)
-}
+- the facts it gathered (13);
+- a block opening and closing (11.1);
+- a step starting, finishing, or deliberately skipped. A finished step
+  carries its status (`ok`, `changed`, `would change`, `failed`), its diff, a
+  short note (`action` for an always-changing op, for instance), how long it
+  took, and the identity it ran as, so the renderer can mark escalated steps
+  (`as root`);
+- logs, at debug, info and warning level;
+- every command run, with the identity it ran as and its exit status;
+- the host's failure (14), and the run's summary: ok, changed, would change,
+  skipped, failed, recovered, warnings.
 
-enum Up {
-    Hello { protocol: u32, playbook: String },  // first frame; playbook name comes from the macro, not argv[0]
-    Event(Event),
-}
+A failed step carries the command that failed, with its exit status and
+stderr, whenever its error holds one, so `-v` can show the command and its
+stderr whether the playbook caught the failure or not (14).
 
-enum Event {
-    Facts(Facts),
-    BlockStarted { blocks },  BlockFinished { blocks },   // blocks: the path, outermost first
-    StepStarted  { id, blocks, name, identity },
-    StepFinished { id, blocks, name, identity, status: Status, diff: Option<Diff>, note: Option<String>, elapsed_ms },
-    StepSkipped  { id, blocks, name, reason },
-    Log { level: Debug | Info | Warn, msg },
-    CmdRan { identity, argv: Vec<String>, status: i32, elapsed_ms },   // rendered at -vv
-    Failed { step: Option<String>, id: Option<u32>, blocks, error: String },   // the host failed (14)
-    Finished(Summary),   // ok, changed, would_change, skipped, failed, recovered, warnings
-}
-
-enum Status { Ok, Changed, WouldChange, Skipped, Failed }
-```
-
-`identity` is `"self"` or the user a step ran as (`as root`), so the renderer
-can mark escalated steps. `note` carries short hints such as `action` for
-always-changing ops.
-
-**Frames reserved, not yet implemented** (the signatures exist so adding them
-changes no playbook):
-
-```rust
-// Down
-FileChunk { req: u32, offset: u64, bytes: Vec<u8>, last: bool }   // answers FileRequest
-FileDenied { req: u32, reason: String }
-BarrierRelease { name }, PeerFacts { host, facts }                // section 11 tier 3
-// Up
-FileRequest { req: u32, path: String }                             // "send me files/x"
-FetchChunk  { req: u32, dest: String, offset: u64, bytes: Vec<u8>, last: bool }
-BarrierWait { name }
-```
-
+Files move both ways in chunks (5.6): the binary asks for a workspace file
+and receives it a chunk at a time, and sends a fetched file up the same way.
 Requests are correlated by id and may overlap: the binary can request a file
-while a step runs, and the orchestrator can serve several hosts from one local
-read.
+while a step runs, and the orchestrator can serve several hosts from one
+local read. A cancel (ctrl-c on the orchestrator) stops the run between
+steps: no step is interrupted half way through its `apply`, and no further
+step starts. A binary that has not stopped within a grace period is killed.
 
-**Protocol versioning.** `Hello.protocol` is a constant bumped on incompatible
-change. Beyond that, the binary is built from the same dependency graph the
-orchestrator knows, so a hash of the SDK and op-crate set can serve as the
-protocol identity; a mismatch means "rebuild", never silent breakage.
+**Reserved, not built.** Frames for multi-host coordination, a barrier the
+binary waits at until the orchestrator releases it and the facts of other
+hosts, belong to section 11's tier 3. The channel is bidirectional from day
+one so that adding them changes no playbook.
+
+The frames and everything they carry are defined in
+`crates/rustible-sdk/src/protocol.rs` and `crates/rustible-sdk/src/event.rs`,
+which are the authority on their fields.
+
+**What the operator sees.** The renderer turns the event stream into one
+line per step, prefixed with the host and the blocks open around it, ending
+in the step's status and a one-line summary of its change: how many lines
+changed, which attributes, or the first line of a longer summary. `-v` adds
+the full diff under every step that carries one, debug logs, and a failed
+step's command with its stderr, once per failure, whether or not the
+playbook caught it. `-vv` adds every command run, with the identity it ran
+as, its exit status and its time.
+
+**Protocol versioning.** The binary's hello names a protocol version, and
+the orchestrator compares it with its own before the first step, refusing a
+mismatch and saying how to bring the workspace to the CLI's release. An
+incompatible change to the frames, or to anything they carry, bumps it. A
+field added with a default leaves an older peer able to read the frames and
+needs no bump, but may take one on purpose when an older peer would read them
+and show less than it should. The escalation helper's wire (11.3) is outside
+the version: a helper is always the same build as its parent, so it never
+meets an older peer.
+
+The goal is that any skew between the CLI and a workspace's crates means
+"rebuild", never silent breakage. **That is not yet true.** Today only the
+protocol version is compared, so two releases that speak the same version
+but behave differently are not told apart, and the identity that would tell
+them apart, a hash of the SDK and op-crate set the binary was built from, is
+not built. `docs/plan/DECISIONS.md` records the gap.
 
 **The binary's modes.** One playbook binary answers to four flags: none
 (local pretty run, for development), `--remote` (driven by an orchestrator),
@@ -444,14 +449,28 @@ supports two mechanisms, each for a different need:
    ```
 
 2. **Stream over the channel at run time.** `ctx.local_file("files/big.tar.gz")`
-   sends a `FileRequest` up, receives `FileChunk`s down, and returns a temp path on
-   the target. `ctx.local_secret("vault/db_password")` returns bytes in memory
-   only. Use for large files, files generated right before the run, and secrets
-   that must not sit inside a binary in a build cache.
+   asks the orchestrator for a workspace file, receives it a chunk at a time,
+   writing each as it arrives, and returns a temp path on the target, removed
+   when the run ends; anything outside the workspace is denied.
+   `ctx.local_secret("vault/db_password")` returns bytes in memory only. Use
+   for large files, files generated right before the run, and secrets that
+   must not sit inside a binary in a build cache.
 
 Rule of thumb: embed by default, stream when large, dynamic, or secret.
 
-The reverse (Ansible's `fetch`) uses the same channel upward (`FetchChunk`).
+**Large stays large end to end.** Nothing on the way holds a file whole. The
+channel carries it in chunks, the escalation helper does the same (11.3), and
+the operations that move file contents (`file::Copy`, `http::Download`,
+`archive::Extracted`) read and write as they go. So a file's size is bounded
+by the target's disk, not by memory, as root or as any account, and no
+operation imposes a default size limit; a playbook that wants one asks for
+it. A streamed write lands whole or not at all: it is staged beside its
+destination with its mode and owner already set, and renamed into place only
+when complete, so a failure part way leaves the destination as it was.
+
+The reverse (Ansible's `fetch`) uses the same channel upward, in chunks, and
+whatever receives the file stages it beside the destination and renames it
+into place when the last chunk has arrived.
 Cross-host copy (Ansible's `synchronize` with `delegate_to`) is deferred; it is a
 coordination feature, not a backend concern.
 
@@ -545,112 +564,67 @@ closure is opaque and could only be run. Because ops are values, they can be
 built conditionally, stored in a `Vec`, or returned from helper functions in
 third-party crates.
 
-```rust
-/// What `check` decided, and what `apply` executes. The step's `Diff` is
-/// rendered from it by `Ctx::step`, so what is reported is what runs.
-///
-/// An intent holds typed fields: the state `check` observed and the change
-/// it decided on. It never holds what `apply` will produce (section 12), and
-/// it never holds a `Diff`: an `apply` that read its instruction out of the
-/// report would let rewording a report change what runs.
-pub trait Intent: std::fmt::Debug {
-    /// This intent as the report shows it. Called by `Ctx::step`, never by `apply`.
-    fn diff(&self) -> Diff;
-}
+**The contract.** An op has two halves and a value between them:
 
-pub trait Op {
-    type Output;
-    type Intent: Intent;
-    /// Inspect the system. Never mutates. Returns what would need to happen.
-    fn check(&self, sys: &System) -> Result<Plan<Self>>;
-    /// Execute the intent `check` produced. Only called when `check`
-    /// returned `Change` and we are not in check mode.
+```rust
+trait Op {
+    type Output; type Intent: Intent;  // an Intent renders the step's Diff
+    fn check(&self, sys: &System) -> Result<Plan<Self>>; // Satisfied(output) | Change(intent)
     fn apply(&self, sys: &System, intent: Self::Intent) -> Result<Self::Output>;
 }
-
-pub enum Plan<O: Op + ?Sized> {
-    /// Already in desired state. Carries the output so `step` can return it without applying.
-    Satisfied(O::Output),
-    /// Something must change: what `check` decided, and nothing else. A
-    /// would-change step has no output until `apply` has run (section 12).
-    Change(O::Intent),
-}
-
-/// For read-only ops, whose `check` never returns `Change`: their `apply` is
-/// `match intent {}`, and the compiler proves it unreachable.
-impl Intent for std::convert::Infallible {
-    fn diff(&self) -> Diff { match *self {} }
-}
-// (Spike 3 finding: `apply` takes the change rather than `Plan<T>`; see docs/02_SPIKE_SDK_CORE.md.
-//  `Change` lost its type parameter together with the prediction slot, 2026-09-24, and was
-//  replaced by the op's own intent on 2026-09-25.)
-
-pub struct Applied<T> {
-    value: Option<T>,        // None only in check mode, when the step would change (section 12)
-    pub changed: bool,
-    pub diff: Option<Diff>,  // for rendering: a `Diff` is opaque, with no field to read
-    pub elapsed: Duration,
-}
-// Applied<T> derefs to T, so `account.home` works and `account.changed` is there too.
-// `.output() -> Result<&T>` and `.is_available()` exist for the check-mode case.
-
-// Optional trait method with a default of `false`; a reporting hint only (section 6.4).
-fn always_changes(&self) -> bool { false }
 ```
 
-The step driver, in outline (this is what `crates/rustible-sdk/src/ctx.rs` does):
+- **`check` observes and decides, and does not mutate** (7.3 has the one
+  deliberate exception). It answers either that the system is already in
+  the desired state, with the op's output, or that something must change,
+  with the op's **intent**: a type of the op's own whose typed fields say
+  what `check` observed and what it decided to do. An intent never holds
+  what `apply` will produce (section 12).
+- **`apply` executes that intent.** It does not inspect the system again or
+  plan again; it may read for itself whatever its output needs beyond the
+  intent (a gid to report, a digest), because a read is not a decision.
+- **The report is rendered from the intent.** `ctx.step` asks the intent for
+  the step's `Diff`, so what is reported is what runs, and the diff shown in
+  check mode is exactly the change that would be applied. That is what makes
+  a dry run trustworthy.
+- **`Diff` is opaque.** It can be built and rendered, never matched or read
+  field by field, and an intent never contains one. An `apply` that read its
+  instruction out of the report would let rewording a report change what
+  runs.
+- A read-only op's intent is a type with no values, so its `apply` is proved
+  unreachable by the compiler.
 
-```rust
-pub fn step<O: Op>(&mut self, name, op: O) -> Result<Applied<O::Output>> {
-    emit(StepStarted { .. });
-    sys.set_phase(Checking);   let plan = op.check(&sys);   sys.set_phase(Idle);
-    match plan? {
-        Plan::Satisfied(out) => { emit(StepFinished { status: Ok }); Applied { value: Some(out), changed: false, .. } }
-        Plan::Change(intent) if sys.check_mode() => {
-            let diff = intent.diff();   // the intent is dropped unexecuted
-            emit(StepFinished { status: WouldChange, diff });
-            Applied { value: None, changed: true, .. }   // no apply, so no output (section 12)
-        }
-        Plan::Change(intent) => {
-            let diff = intent.diff();
-            sys.set_phase(Applying);   let out = op.apply(&sys, intent)?;   sys.set_phase(Idle);
-            emit(StepFinished { status: Changed, diff });
-            Applied { value: Some(out), changed: true, .. }
-        }
-    }
-}
-```
-
-`check` does all the thinking and produces the op's intent; `apply` executes
-that intent, and the `Diff` the report shows is rendered from it by
-`ctx.step`, so what is shown is what runs. This makes dry-run trustworthy: the
-diff shown in check mode is exactly the change that would be applied. The
-phase markers are what lets `System` refuse file mutations during `check`
-(section 7.3).
+**What `ctx.step` does.** It announces the step and runs `check` with the
+system marked as checking, so a file mutation there is refused (7.3). When
+`check` is satisfied, the step reports `ok` and returns the output. When it
+asks for a change under `--check`, the step renders the diff, reports `would
+change`, drops the intent unexecuted and returns without an output (12).
+Otherwise it renders the diff, runs `apply` with the intent, and reports
+`changed`, or `ok` for an action that ran and changed nothing (6.4). What it
+returns is the op's typed output together with whether the step changed and
+its diff; it derefs to the output, so `account.home` and `account.changed`
+both work. `crates/rustible-sdk/src/op.rs` and `ctx.rs` are the authority on
+the trait and the driver.
 
 **Policies learned in spike 3, now rules for the stdlib:**
-- **No predictions** (reversed 2026-09-24; the original rule is kept here for
-  the record). Spike 3 found that both of its ops computed their post-apply
-  output while planning, so handing it over as a prediction cost nothing, and
-  "every stdlib op predicts unless it genuinely cannot" became the rule. Two
-  waves of the stdlib showed where the cost lands: not in the code but in the
-  judgement. Every op that creates something had to rule on which fields it
-  may honestly claim before the tool has run (a uid it has not allocated, the
-  shell BusyBox picks from an environment the op cannot see, a version apt
-  has not resolved), each ruling needed its own decision-log entry, and the
-  report never distinguished a prediction from a fact. A would-change step
-  now has no output in check mode; section 12 has the rule. `apply` executes
-  the intent that `check` produced and reads for itself whatever its output
-  needs beyond it (a gid to report, a digest for the output): a read is not
-  a decision. The intent carries what `check` observed and decided, never
-  what `apply` will produce, so a would-change step still has no output.
+- **No predictions.** Spike 3 found that both of its ops computed their
+  post-apply output while planning, so handing it over as a prediction cost
+  nothing, and "every stdlib op predicts unless it genuinely cannot" became
+  the rule. Two waves of the stdlib showed where the cost lands: not in the
+  code but in the judgement. Every op that creates something had to rule on
+  which fields it may honestly claim before the tool has run (a uid it has
+  not allocated, the shell BusyBox picks from an environment the op cannot
+  see, a version apt has not resolved), each ruling needed its own
+  decision-log entry, and the report never distinguished a prediction from a
+  fact. The rule was reversed: a would-change step has no output in check
+  mode, and section 12 has the rule.
 - **Builders end in a finishing call for the one mandatory piece of desired
   state.** `Line::in_path(p).matching(re).backup(true).set(line)`: `set` returns
   the `Op`, so a `Line` without a line cannot be constructed.
-- **`apply` receives the intent, not `Plan`.** Only the change branch is
-  meaningful there; passing `Plan` forced a pointless match. The intent
-  replaced `Change { diff }` on 2026-09-25, when string-typed diffs had
-  become the instruction channel.
+- **`apply` receives the intent, not the plan.** Only the change branch is
+  meaningful there; passing the whole plan forced a pointless match. The
+  change was first carried as a diff, and the typed intent replaced it when
+  string-typed diffs had become the instruction channel.
 
 ### 6.3 Ops are named after desired state (DECIDED)
 
@@ -706,16 +680,28 @@ escape hatches as builder methods: `.creates(path)` makes `check` return
 `Satisfied` when the path exists; `.removes(path)` likewise. `changed_when` maps
 to a closure over the output.
 
-An op whose `check` always returns `Change` can flag itself as `always_changes`,
-so the orchestrator can mark those steps in the output. This preserves the
-"where does this playbook stop being idempotent" scan without a second verb.
+An op whose `check` always returns `Change` can mark itself as always
+changing, so the orchestrator can mark those steps in the output. This
+preserves the "where does this playbook stop being idempotent" scan without a
+second verb.
+
+An action that can only tell after running whether anything happened reports
+`ok` when nothing did, rather than `changed`: `shell::Command` with
+`.changed_when(..)`, `http::Request` for a `GET`, `HEAD` or `OPTIONS` unless
+the playbook says otherwise, and a lookup of remote state (6.5). Under
+`--check` it has not run, so it reports `would change`.
 
 ### 6.5 Lookups
 
 Read-only lookups are ops too (`user::Existing::named("rustible")`, see 13.1). They run
-through `ctx.step`, appear in the step list, are timed, and can never report
-`changed`. They fail the run if the thing is missing. In Ansible this is `getent`
-plus `register` plus `set_fact`; here it is one typed call.
+through `ctx.step`, appear in the step list, are timed, and never report
+`changed` in a real run. They fail the run if the thing is missing. In Ansible
+this is `getent` plus `register` plus `set_fact`; here it is one typed call.
+
+A lookup whose answer is remote state (`rustible_github::UserKeys`, say)
+cannot be read under `--check`, because a dry run contacts nothing beyond the
+target (12): it reports `would change` with no output there, and `ok` in a
+real run, where it makes the request (6.4).
 
 ### 6.6 No handlers; loops; conditionals
 
@@ -849,7 +835,7 @@ the same reload on its own, for a playbook that writes a unit file and wants
 systemd to notice it without bouncing anything: it names no unit and returns `()`
 (6.4).
 
-### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED 2026-09-07)
+### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED)
 
 The first ops are chosen from real usage, not from Ansible's module index.
 Cadu's personal infrastructure repository, `/home/cadu/w/cadu/my_infra`
@@ -889,9 +875,10 @@ generally important), `file::Replace`, `acl`, `mount`, `iptables`.
 looped into `authorized_key`) is not a `set_fact` problem and not a
 `rustible-std` problem. It is a small separate collection, `rustible-github`,
 with a read-only op `github::UserKeys::of("flipbit03")` returning the parsed
-keys, built on `ureq` with `rustls` (a synchronous pure-Rust HTTP client;
-`reqwest` was rejected because it brings tokio and, without careful feature
-selection, `native-tls` and therefore OpenSSL, which section 5.3 forbids).
+keys over `rustible-std`'s HTTP client: synchronous, with pure-Rust
+TLS and no OpenSSL (section 5.3). An async client was rejected because it
+brings a runtime and, without careful feature selection, native TLS and
+therefore OpenSSL.
 Published from this repository alongside the core crates, it is also the
 first collection written from the outside of the SDK, which tests the SDK
 itself. The `ssh_keys_from_github` role (two task files, a defaults file, and
@@ -961,57 +948,30 @@ What it does not replace: Docker integration tests remain the source of truth
 that the system agrees with our assumptions. The fake tests that the op does what
 we intended; the container tests that what we intended is correct.
 
-### 7.3 Sketch
+### 7.3 Shape and guarantees
 
-```rust
-pub struct System {
-    backend: Arc<dyn Backend>,   // Local, Fake, later Chroot/Container
-    facts: Arc<Facts>,
-    identity: Identity,          // who commands run as
-    check_mode: bool,
-    events: EventSink,           // so cmd invocations and warnings reach the orchestrator
-}
+`System` is concrete: ops write `fn check(&self, sys: &System)` and never see a
+generic or `dyn`. It knows the target's facts, the identity it acts as,
+whether the run is a dry run, and where to report what it does; behind it is
+a swappable backend: `Local` on a real machine, `Fake` in unit tests, and
+`Elevated` (section 11.3) for another identity, with a `Chroot` or
+`Container` backend possible later. What must hold:
 
-impl System {
-    // context
-    pub fn facts(&self) -> &Facts;          // typed: Os, Distro, Arch, Pm::{Apt,Dnf,Apk}, hostname, kernel, cpus
-    pub fn check_mode(&self) -> bool;
-    pub fn as_user(&self, name: &str) -> System;   // clone; commands run via sudo -u; not a mutation
-    pub fn is_root(&self) -> bool;
-    pub fn tempdir(&self) -> Result<TempDir>;       // location policy lives here
-
-    // processes: logged as CmdRan events, LANG=C, controlled umask, run as identity
-    pub fn cmd(&self, program: &str) -> Cmd;        // .arg() .args() .run() -> Output; .ok() -> Option<Output>
-
-    // files: reads are plain; mutations are logged and refuse to run inside check()
-    pub fn exists(&self, p: &Path) -> Result<bool>;
-    pub fn stat(&self, p: &Path) -> Result<Option<Stat>>;
-    pub fn read(&self, p: &Path) -> Result<Vec<u8>>;
-    pub fn read_to_string(&self, p: &Path) -> Result<String>;
-    pub fn write_atomic(&self, p: &Path, bytes: &[u8]) -> Result<()>;   // tmp + rename, keeps mode/owner/selinux
-    pub fn ensure_attrs(&self, p: &Path, attrs: &FileAttrs) -> Result<bool>; // Ansible's common file args
-    pub fn set_mode / set_owner / mkdir_all / remove / backup(&self, ..);
-
-    // reporting without failing
-    pub fn warn(&self, msg); pub fn debug(&self, msg);
-}
-
-pub trait Backend: Send + Sync {
-    fn read(&self, p: &Path) -> io::Result<Vec<u8>>;
-    fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()>;
-    fn stat(&self, p: &Path) -> io::Result<Option<Stat>>;
-    fn spawn(&self, cmd: &CmdSpec) -> io::Result<Output>;
-    // one method per primitive, nothing clever
-}
-pub struct Local;
-pub struct Fake { files: Mutex<BTreeMap<PathBuf, FakeFile>>, cmds: Mutex<Vec<CannedCmd>> }
-```
-
-Notes:
-- `System` is concrete; ops write `fn check(&self, sys: &System)` and never see a
-  generic or `dyn`.
-- `write_atomic` is the only write path (temp file in the same directory, then
-  rename).
+- **Every effect on the machine goes through `sys`, reads included**: files,
+  directories, attributes, commands. Otherwise the `Fake` is one nobody hits
+  (7.2).
+- **Commands** run as the `System`'s identity, with `LANG=C` and `LC_ALL=C`
+  forced, and each one is reported as an event the renderer shows at `-vv`.
+  A non-zero exit is an error carrying the command, its exit status and its
+  stderr (14), unless the op says that a failure is an answer, as a "does
+  this succeed" probe does.
+- **Writes are atomic.** A write is staged as a temporary file beside its
+  target and renamed over it, so the target is never seen half written.
+  Content of any size streams rather than being held whole (5.6), and a
+  requested mode and owner are applied to the staged file before the rename,
+  so the file never appears with the wrong ones.
+- `System` has no temp-directory or common-file-attributes helper; an op
+  that needs one builds it from the primitives.
 - Ops are synchronous. The event channel is the only concurrent thing in the
   binary and is owned by `Ctx`, not `System`.
 - **SSH is not a backend.** The binary runs on the target, so every file is local.
@@ -1019,25 +979,24 @@ Notes:
   `Local` (or `Elevated`, section 11.3, which proxies to a `Local` in a helper
   process). (In a local-brain design SSH would have been a backend; this is one
   of the payoffs of remote-brain.)
-- **The mutation guard covers files, not commands** (spike 3). `sys.cmd()` must
-  work inside `check` (`dpkg-query`, `systemctl is-enabled`), so nothing can stop
-  a `check` that runs `apt-get install`. File mutations error with
-  `MutationDuringCheck`; process honesty is the op author's. Verified by a test
-  in which a deliberately bad op writes in `check` and is refused.
-- **`cmd().run()` errors on non-zero exit** unless `.allow_failure()`; `.ok()`
-  returns `Option<Output>` for "does this succeed" probes. Every spawn is
-  reported as a `CmdRan` event with the identity it ran as.
-- **Test constructors**: `System::fake(Arc<Fake>, sink)` with plausible Debian
-  facts, `.with_facts(..)`, `.with_check_mode(..)`. `Fake::with_file`,
-  `with_cmd(program, Some(exact_args) | None, status, stdout)`, and `argvs()` to
-  assert what ran.
-- Not yet built from the sketch: `tempdir`, `ensure_attrs`, the `Elevated`
-  backend (M5).
+- **`check` cannot change the machine, with one deliberate exception.** The
+  mutation guard covers files, not commands (spike 3): `sys.cmd()` must work
+  inside `check` (`dpkg-query`, `systemctl is-enabled`), so nothing can stop
+  a `check` that runs `apt-get install`. A file mutation through `sys` during
+  `check` is refused, in the main process and again inside an escalation
+  helper; process honesty is the op author's. The exception is
+  `apt::Latest`: in a real run it refreshes the package lists from `check`
+  when asked to, by design, because its answer is read from those lists
+  (6.8). Under `--check` it does nothing of the kind (12). A test in which a
+  deliberately bad op writes in `check` verifies that it is refused.
+
+`crates/rustible-sdk/src/system.rs` and `crates/rustible-sdk/src/backend/`
+are the authority on the methods and the primitives.
 
 ### 7.4 What is deliberately not on `System`
 
 **Users and groups are not backend primitives.** `user::Present` reads
-`/etc/passwd` through `sys.read_to_string` and calls `sys.cmd("useradd")`. Putting
+`/etc/passwd` and runs `useradd`, both through `sys`. Putting
 `create_user` on `System` would force `System` to know that Alpine uses `adduser`
 with BusyBox flags, which is distro knowledge that belongs in the op, chosen via
 `facts.distro`. Layering:
@@ -1096,19 +1055,15 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    connects over SSH. And a target no container can be, macOS (there is no
    macOS container), which only the macOS runner covers: the Darwin probe,
    the Mach-O build through zig, launchd and brew. In CI the machine is a
-   Linux VM over SSH (Vagrant) or the macOS runner itself over a local
-   connection, which runs `hello` once, `mac` twice, and `macbrew` installing
-   twice and then removing twice; only the VM exercises the SSH transport.
-   `dev/vagrant/` holds a Debian 12 guest per architecture, x86_64 and
-   aarch64, driven by vagrant-libvirt on Linux and vagrant-qemu on macOS.
-   `make vm-test` converges the `vagrant`, `vagrant_login` and
-   `vagrant_escalate_user` playbooks in `examples/workspace/playbooks/`
-   against whichever are up, failing unless each second run reports nothing
-   changed, then requires `vagrant_login_escalate` to be refused at launch.
-   CI runs the VM on both architectures: GitHub's Linux runners expose
-   `/dev/kvm`, so the x86_64 guest is accelerated and the aarch64 one is
-   interpreted by qemu. The VM is distribution-specific in a way T2 is not —
-   one guest is one distro — so its CI job names the distribution it covers.
+   Linux VM over SSH, on both architectures, or the macOS runner itself over
+   a local connection; only the VM exercises the SSH transport. A
+   machine-tier run converges each playbook twice and fails unless the
+   second run reports nothing changed, because a first run reporting
+   `changed` proves only that the op did something. The VM is
+   distribution-specific in a way T2 is not — one guest is one distro — so
+   its CI job names the distribution it covers. `CLAUDE.md` ("The machine
+   tier") and `docs/DEVELOPING.md` name the playbooks, the guests and the
+   jobs.
 
 ## 9. Project layout and ecosystem
 
@@ -1265,9 +1220,9 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
     `Local`, `Fake`, `Facts`, `Diff`, `Ctx`, the event and protocol types, the
     runtime that the macro expands into, the test harness. Everything a
     collection author needs. Collections depend on this directly.
-  - `rustible-macros`: the `#[playbook]` and `#[vars]` proc macros. Proc macros
-    must live in their own crate; the facade re-exports them so users never
-    name it.
+  - `rustible-macros`: the `#[playbook]`, `#[vars]` and `#[integration_test]`
+    proc macros. Proc macros must live in their own crate; the facade
+    re-exports them so users never name it.
   - `rustible-build`: the playbook scanner called from the generated
     `build.rs` (a `[build-dependencies]` entry written by `rustible init`), so
     the build script itself stays a one-line shim.
@@ -1281,19 +1236,14 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 - **Publishing.** Seven crates ship from this repository: `rustible`,
   `rustible-cli`, `rustible-sdk`, `rustible-macros`, `rustible-build`,
   `rustible-std`, `rustible-github`. They are versioned in lockstep through
-  `workspace.package.version`, so one tag releases all of them. All six core
-  names were verified free on crates.io on 2026-09-07; reserving them with a
-  placeholder publish early is cheap insurance against squatting. The spike
-  playbook is never published and is deleted at M3.
-  - The spike orchestrator currently at `crates/rustible` is renamed to
-    `crates/rustible-cli` at M1, freeing the name for the facade.
+  `workspace.package.version`, so one tag releases all of them.
 - **A playbook binary has four modes** (section 5.5): plain local run,
   `--remote`, `--describe`, `--helper`. The macro generates all of them.
 - Every crate in the tree is pure Rust except `ring`, the TLS crypto provider,
   which compiles a little C on the operator's machine and nothing on the target
   (section 5.3).
 
-## 10. Inventory, typed vars, and the workspace (DECIDED 2026-09-05/06)
+## 10. Inventory, typed vars, and the workspace (DECIDED)
 
 ### 10.1 Structure
 
@@ -1307,7 +1257,7 @@ live directly on the host or group. Playbook vars live under a separate `vars` t
 Ansible mixes these (`ansible_host`, `ansible_user`) and that is a source of its
 precedence confusion.
 
-### 10.2 Format: KDL for the inventory, TOML for `rustible.toml` (DECIDED 2026-09-06)
+### 10.2 Format: KDL for the inventory, TOML for `rustible.toml` (DECIDED)
 
 Candidates were YAML, TOML, RON, KDL, JSON, and a Rust-file inventory.
 
@@ -1363,8 +1313,7 @@ Parameter resolution: host, then nearest group outward, then `defaults`, then
 the built-in default. For `ssh_user` only, a playbook's `ssh_user` attribute
 outranks all four (section 6.1); `inventory show` describes the inventory and
 does not apply it. Parameters never come from `vars` and vars never from
-properties. On the orchestrator side parameters deserialize into a `HostParams`
-struct via serde.
+properties.
 
 ### 10.2.2 Full example
 
@@ -1439,10 +1388,9 @@ source of each (all / group X / host / defaults), including what was overridden.
 
 ### 10.3 Typed vars: bridging the untyped bag and the typed playbook
 
-- The inventory holds a **bag of scalars** per host/group: `HashMap<String,
-  Scalar>` where `Scalar` is string, int, float, bool, or a list of one of those.
-  (Not `HashMap<String, String>`: the file format already has typed scalars;
-  flattening to strings and re-parsing is lossy.)
+- The inventory holds a **bag of typed scalars** per host/group: string, int,
+  float, bool, or a list of one of those. (Not strings alone: the file format
+  already has typed scalars; flattening to strings and re-parsing is lossy.)
 - A playbook declares a **flat (single-level) typed struct** of the vars it
   needs, in the same `.rs` file, with `Option<T>` for optional fields and
   defaults via attribute or `impl Default`. The `#[rustible::vars]` macro
@@ -1520,52 +1468,39 @@ everything else here failing loudly before a run.
   per-triple artifacts and describe output), so playbook runs never produce git
   noise.
 
-## 11. `Ctx` (DECIDED 2026-09-06)
+## 11. `Ctx` (DECIDED)
 
-`Ctx` is what `main` receives. Three tiers: MVP, cheap extras, and reserved
-shapes whose signatures and protocol frames exist now so adding them later
-changes no playbook.
+`Ctx` is what `main` receives: the playbook's handle on the run. Through it a
+playbook runs steps and learns about the host it is on, and everything it
+does is reported to the orchestrator. Behind it are the `System` the steps
+run against, what the target knows about its host (11.1), and the link to
+the orchestrator; every `Ctx` of a run shares one step sequence and one
+stack of open blocks. What it offers comes in three tiers:
 
-```rust
-pub struct Ctx {
-    sys: System,            // Local backend, facts, identity, check_mode
-    host: HostInfo,         // from the Start frame
-    channel: Channel,       // framed up/down link to the orchestrator
-    step_counter: u32,
-    blocks: Vec<BlockFrame>,   // the ctx.block stack open right now, shared by every Ctx of the run
-}
+- **Tier 1, the core.** `ctx.step(name, op)` (6.2); the host it runs on, its
+  facts (13) and whether this is a dry run; `log`, `warn` and `debug` lines
+  in the report; `ctx.local_file(..)` and `ctx.local_secret(..)` for a
+  workspace file or a secret streamed at run time (5.6), the file removed
+  when the run ends and the secret held in memory and zeroized; and
+  `ctx.sys()`, the machine directly (11.1).
+- **Tier 2.** `ctx.skip(name, reason)` for a step deliberately not run;
+  `ctx.block(name, |ctx| ..)` to group steps, returning what its closure
+  returns; `ctx.as_user(..)`, `ctx.as_root()` and `ctx.as_escalated()` for
+  another identity (11.3); and `ctx.fetch(..)`, a file from the target back
+  to the operator's machine (5.6).
+- **Tier 3, reserved, not built.** `ctx.barrier(name)`, where every host
+  waits until all have arrived; `ctx.run_once(name, |ctx| ..)`, run on one
+  host the orchestrator chooses; and `ctx.peer_facts(host)`, another host's
+  facts. They are blocking calls over the channel (5.5), and the channel is
+  bidirectional from day one so that adding them changes no playbook.
 
-impl Ctx {
-    // ---- tier 1: MVP ----
-    pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>>;
-    pub fn host(&self) -> &HostInfo;          // name, groups, target-relevant params
-    pub fn facts(&self) -> &Facts;
-    pub fn check_mode(&self) -> bool;
-    pub fn log(&self, msg);   pub fn warn(&self, msg);   pub fn debug(&self, msg);  // Log frames
-    pub fn local_file(&mut self, path) -> Result<PathBuf>;   // streamed; temp path; deleted at exit
-    pub fn local_secret(&mut self, name) -> Result<Secret>;  // bytes in memory; zeroized on drop
-    pub fn sys(&self) -> &System;             // reads fine; mutations should be steps
-
-    // ---- tier 2 ----
-    pub fn skip(&mut self, name, reason);     // record a deliberately-not-run step
-    pub fn block<T>(&mut self, name, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Block<T>>; // grouping; returns what the closure returns
-    pub fn as_user(&self, name: &str) -> Ctx; // same channel/host, different identity
-    pub fn as_root(&self) -> Ctx;             // literally as_user("root"), never follows the inventory
-    pub fn as_escalated(&self) -> Ctx;        // as_user(host.escalate_user): the inventory's privileged account
-    pub fn fetch(&mut self, remote, local_dest) -> Result<()>;  // reverse transfer
-
-    // ---- tier 3: reserved, not MVP ----
-    pub fn barrier(&mut self, name: &str) -> Result<()>;                       // blocks until all hosts arrive
-    pub fn run_once<T>(&mut self, name: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<Option<T>>;
-    pub fn peer_facts(&mut self, host: &str) -> Result<Facts>;
-}
-```
+`crates/rustible-sdk/src/ctx.rs` is the authority on the signatures.
 
 ### 11.1 Decisions embedded
 
 - **`vars` is a parameter of `main`** (`fn main(ctx: &mut Ctx, vars: Vars)`), not
-  a method on `Ctx`. The macro deserializes it from the `Start` frame before
-  `main` runs; failure is a clean per-host message. `Ctx` is untyped w.r.t. vars.
+  a method on `Ctx`. The macro deserializes it from the run's start (5.5)
+  before `main` runs; failure is a clean per-host message. `Ctx` is untyped w.r.t. vars.
 - **`sys()` is exposed.** Playbooks are programs; authors are responsible. Reads
   are unreported. Mutations outside a step still go through the backend (logged
   at `-v`) but do not appear as steps; if it should be in the report, make it a
@@ -1584,13 +1519,16 @@ impl Ctx {
   a read inside an op's `check` fails that step instead. Blocks nest.
 - **`bail!`** (re-exported) is Ansible's `fail` module.
 - **Tier 3 calls are blocking calls over the channel** (remote-brain): `barrier`
-  sends a frame up and waits for `BarrierRelease`; `run_once` is a barrier plus
-  an election by the orchestrator. Reserved, not implemented in the MVP.
-- **`HostInfo`** (from the `Start` frame) carries `name`, `groups`, and the
-  parameters that matter on the target: `escalate_user` (for `as_escalated`)
-  and `connection`. Never `addr` or `port`; those are the orchestrator's.
+  tells the orchestrator it has arrived and waits to be released; `run_once`
+  is a barrier plus an election by the orchestrator. Reserved, not built.
+- **What the target learns about its host** is what a playbook or an
+  escalation needs there: the host's inventory name and groups, how it is
+  connected, and the escalation parameters (`escalate_user` is what
+  `as_escalated` follows). Never its address or port; those are the
+  orchestrator's. `HostInfo` in `crates/rustible-sdk/src/ctx.rs` is the
+  authority on what it carries.
 - **`step` numbering and the summary are shared** across `as_user`
-  contexts (they clone a shared counter) and inside blocks (which pass the
+  contexts (they share one counter) and inside blocks (which pass the
   same `Ctx`), so a run has one step sequence regardless of how many `Ctx`
   values exist.
 - **In check mode `changed` means "would change".** A playbook that logs after
@@ -1630,7 +1568,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
 }
 ```
 
-### 11.3 Per-step privilege escalation (DECIDED 2026-09-06)
+### 11.3 Per-step privilege escalation (DECIDED)
 
 Escalation is a property of how a step runs, not of the op, so it lives on
 `Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
@@ -1640,7 +1578,7 @@ via the inventory's escalation method as `escalate_user` (default root), from
 whichever account logged in: the inventory's `ssh_user`, or the playbook's when
 it sets one.
 
-**Three identity methods (DECIDED 2026-09-06):**
+**Three identity methods (DECIDED):**
 - `as_user(name)`: explicit user.
 - `as_root()`: literally `as_user("root")`. It never follows the inventory; a
   method named `as_root` that might run as `admin` would be hidden indirection.
@@ -1650,34 +1588,33 @@ it sets one.
   uses at launch, exposed per step. Output marks steps whose identity differs
 from the binary's own (`as root`, `as postgres`).
 
-**Mechanism.** A running process cannot change identity per call, and
-`sys.write_atomic("/etc/...")` from an unprivileged process gets EACCES.
-Ansible's answer is shell tricks (`sudo tee`, chmod dances). Ours: `as_user`
-creates a `System` whose backend is `Elevated { user }`. On first use it spawns
-**the same binary** under sudo in helper mode. For root that is the binary
-already running
-(`sudo -n -u root <login home>/.cache/rustible/bin/<playbook>-<sha256> --helper`).
-Any other account usually cannot reach that file (homes are 0750 or 0700 by
-default on Ubuntu and Debian, and `~/.cache` is 0700 on macOS), so the binary
-copies itself to the account first: `/bin/sh`, run as the account, writes the
-bytes streamed on its stdin into the account's own
-`~/.cache/rustible/bin/<playbook>-<sha256>` (0700, temp name then rename, size
-checked), and the helper is exec'd from there; one byte on stdout before any
-frame says whether a copy was found. The copy is a cache, so a later run of the
-same build spawns once, as for root. An account with no usable home (none, not
-writable, or `noexec`) gets a private per-run directory instead,
-`${TMPDIR:-/tmp}/rustible-<random>` made with `mkdir -m 700`, which is not
-cached: the helper deletes its copy and the directory as it starts. A step is
-refused only when both are unusable, naming both causes. `escalate = true` with
-an `escalate_user` other than root or the login launches the binary the same
-way (5.2 step 8), except that its per-run temp copy is removed when the run
-ends rather than as it starts, because the run's own helpers are started from
-it.
+**Mechanism.** A running process cannot change identity per call, and a
+write to `/etc/...` from an unprivileged process gets EACCES. Ansible's answer
+is shell tricks (`sudo tee`, chmod dances). Ours: `as_user` creates a `System`
+whose backend is `Elevated`, for that user. On first use it spawns **the same
+binary**, through the host's escalation method, in helper mode. For root that
+is the binary already running, from the login user's cache. Any other account
+usually cannot reach that file (homes are 0750 or 0700 by default on Ubuntu
+and Debian, and `~/.cache` is 0700 on macOS), so the binary first copies
+itself, over a local pipe, into the account's own `~/.cache/rustible/bin`,
+named by its content hash, and the helper runs from there. The copy is a
+cache, so a later run of the same build spawns once, as for root. An account
+with no usable home (none, not writable, or `noexec`) gets a private per-run
+directory instead, which is not cached: the helper deletes its copy and the
+directory as it starts. A step is refused only when both are unusable, naming
+both causes. `escalate = true` with an `escalate_user` other than root or the
+login launches the binary the same way (5.2 step 8), except that its per-run
+temp copy is removed when the run ends rather than as it starts, because the
+run's own helpers are started from it.
 
-It speaks the `Backend` primitives (`read`, `write`, `stat`, `spawn`) to it
-over its stdin/stdout, framed like the main channel. The helper is `Local`
-wrapped in a request loop. One helper per identity, spawned lazily, kept alive
-for the run, killed at exit. Properties:
+The helper serves the same primitives `Local` does, to its parent over its
+stdin and stdout, framed like the main channel; it is `Local` wrapped in a
+request loop. Anything that can be large, a file read or written, a
+directory listing, a command's stdin and output, crosses in chunks, so the
+helper never holds a file whole either (5.6), and a write through it lands
+whole or not at all. A helper is always the same build as its parent, which
+is why its wire needs no version (5.5). One helper per identity, spawned
+lazily, kept alive for the run, killed at exit. Properties:
 
 - No extra upload from the controller: the helper is the binary already on the
   target, copied over a local pipe into an unprivileged account's own cache
@@ -1685,18 +1622,19 @@ for the run, killed at exit. Properties:
 - Ops know nothing: this is the payoff of routing all I/O through `sys`.
 - Stepping down (`as_user("postgres")`) is the same mechanism.
 - The check-mode mutation guard holds in the helper (same code).
-- Helper commands are reported back and forwarded up as `CmdRan` tagged with
-  the identity.
-- Cost: one spawn per identity, then a pipe round trip per file primitive.
+- Helper commands are reported back and forwarded up as commands run,
+  tagged with the identity.
+- Cost: one spawn per identity, then a pipe round trip per primitive, or per
+  chunk of a large one.
 
 Sudo passwords: `-n` fails rather than prompts. If the inventory's `escalate`
-needs a password, the orchestrator sends it in the `Start` frame as a secret
-and the helper spawn uses `sudo -S`. In memory only, zeroized after use.
-A rejected password is refused as soon as sudo says so, and a spawn that has
-not answered within 60 seconds is killed, so a wrong password cannot hang a
+needs a password, the orchestrator sends it with the run's start as a secret
+and the helper spawn hands it to sudo on stdin. In memory only, zeroized after
+use. A rejected password is refused as soon as sudo says so, and a spawn that
+does not answer in bounded time is killed, so a wrong password cannot hang a
 run.
 
-## 12. Check-mode semantics (DECIDED 2026-09-06, REVISED 2026-09-24, 2026-10-02)
+## 12. Check-mode semantics (DECIDED)
 
 Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change(intent)` does
 not, so in a dry run a step that *would* change has nothing to return, and a
@@ -1752,9 +1690,8 @@ where the dry run stopped seeing.
 - In check mode, a would-change step reports `WouldChange` with its diff and
   the run continues. Nothing is applied and nothing is predicted: the intent
   carries what `check` observed and decided, and no post-apply output.
-- A would-change step's output does not exist. `Applied<T>` holds `Option<T>`;
-  reading it, through `.output()` or through `Deref`, raises
-  `OutputUnavailable` naming the step. `.changed` and `.diff` remain readable.
+- A would-change step's output does not exist. Reading it, through
+  `.output()` or through `Deref`, raises an error naming the step. `.changed` and `.diff` remain readable.
   Under `--check` that read ends the innermost enclosing `ctx.block` — or,
   outside any block, the playbook body for that host — with a warning naming
   the block and the step whose output was read. (Read inside an operation's
@@ -1777,7 +1714,7 @@ where the dry run stopped seeing.
   the op knows it by name (a group, an account, a unit). The tolerance is
   gated on check mode, so a
   real run's `check` takes the refusal, and a dry run's plan never reaches
-  `apply` (`Ctx::step` returns at its check-mode arm): the refusal is never
+  `apply` (the step ends after `check`): the refusal is never
   skipped on a run that can act. What a dry run therefore does not catch is
   a forgotten prerequisite step: the real run refuses at that step, before
   that step touches anything, with the steps before it already applied.
@@ -1798,9 +1735,13 @@ where the dry run stopped seeing.
   send and that the remote state was not read; its output is unavailable, as
   for any would-change step. What this costs is a dry run that cannot report
   such a step `ok`, and that cost is accepted.
-- `check` still cannot mutate (7.3).
+- **`check` still cannot mutate a file through `sys`** (7.3), in a dry run
+  or a real one. The one op that changes the machine from `check` by design,
+  `apt::Latest` refreshing its package lists in a real run because its
+  answer is read from them, does it through commands and runs none of them
+  under `--check` (6.8).
 
-## 13. Facts (DECIDED 2026-09-06)
+## 13. Facts (DECIDED)
 
 **How Ansible does it.** The `setup` module eagerly returns a dict of well over
 a hundred keys, taking one to five seconds per host (hence `gather_facts: no`
@@ -1815,33 +1756,23 @@ registry, no merge, no extension mechanism. `rustible-docker` needs no facts:
 `docker::Container::Running` fails with "docker not found" at the step where it
 is used.
 
-**Decision: `Facts` is a fixed core struct.** Rule for membership: data that
+**Decision: `Facts` is a fixed, typed core.** Rule for membership: data that
 many *ops* need for their internal decisions, cheap to gather, stable for the
-run. Gathered eagerly at startup (about ten reads: `/etc/os-release`, `uname`,
-`/proc/cpuinfo`, `/proc/meminfo`, `/proc/1/comm`, PATH checks), milliseconds,
-sent up once in the `Facts` frame. No lazy facts, no dynamic facts.
+run. Gathered once, eagerly, at startup, from a handful of cheap reads taking
+milliseconds, and sent up once as an event. No lazy facts, no dynamic facts.
 
-```rust
-pub struct Facts {
-    pub os: Os,                  // Linux, Macos, Other(String)
-    pub distro: Distro,          // Debian, Ubuntu, Alpine, Fedora, Rhel, Arch, Macos, Other(String)
-    pub distro_version: String,  // "12", "24.04", "3.20"
-    pub arch: Arch,              // X86_64, Aarch64, Other(String)
-    pub kernel: String,
-    pub hostname: String,
-    pub package_managers: BTreeSet<Pm>, // every one found; ask with has_pm(). Apt, Dnf, Apk, Pacman, Zypper, Brew
-    pub init: Init,              // Systemd, OpenRc, Launchd, Other(String)
-    pub cpus: u32,
-    pub memory_mb: u64,
-    pub user: String,            // who the binary runs as
-    pub is_root: bool,
-}
-```
-
-Enums carry an `Other(String)` variant so unknown values degrade to strings.
-Deliberately excluded from the core: mounts, network interfaces, users and
-groups, installed packages, environment. Each is an op when a playbook needs
-it. No versioning needed: binary and orchestrator share one dependency set.
+What the core covers: the operating system, the distribution and its
+version, the CPU architecture, the kernel, the hostname, every package
+manager present (a playbook asks whether one is there, rather than being told
+the one), the init system, the CPU count and memory, and the account the
+binary runs as, with whether it is root. The operating system, distribution,
+architecture and init system are typed enums with an `Other(String)` variant,
+so an unknown value degrades to a string instead of failing; a package
+manager Rustible does not know is simply not listed. Deliberately excluded from the core: mounts, network
+interfaces, users and groups, installed packages, environment. Each is an op
+when a playbook needs it. Facts cross the wire, so changing their shape is a
+protocol change (5.5). `crates/rustible-sdk/src/facts.rs` is the authority on
+the fields and their variants.
 
 ### 13.1 Desired-state ops are the lookups
 
@@ -1856,7 +1787,7 @@ and "this user must already exist, fail otherwise" (`user::Existing`, where
 `user::Present` would create it). They appear as named steps with typed
 output, never report `changed`, and most resources do not need one.
 
-## 14. Error model (DECIDED 2026-09-06)
+## 14. Error model (DECIDED)
 
 **Semantics** are Ansible's: a failed step whose error leaves the playbook
 fails that host, and the run continues on the other hosts. In code that is
@@ -1893,15 +1824,17 @@ code, and stderr; file primitives with the path). `.context("installing
 error would not say which.
 
 **Typed values inside the chain.** The SDK's own signals remain concrete
-types that the orchestrator can `downcast_ref` for rendering:
-`MutationDuringCheck { path }`, `OutputUnavailable { step }`,
-`CmdFailed { argv, status, stderr }`. Playbooks never need them.
+types that the orchestrator can downcast for rendering: a file mutation
+during `check` (`MutationDuringCheck`), a read of a would-change step's
+output (`OutputUnavailable`), and a failed command (`CmdFailed`, with its
+argv, exit status and stderr). Playbooks never need them.
 
-**On the wire.** `Failed { step, id, blocks, error }` carries the rendered
-chain as text, the failed step's id and block path, plus the structured
-fields of a `CmdFailed` when present, so `-v` can show the command and its
-stderr separately. Step names repeat, so the id is what ties the frame to the
-step line it closes.
+**On the wire.** A host's failure carries the rendered chain as text, the
+failed step's id and block path, and the failed command when the chain holds
+one; a failed step's own report carries the same command, so `-v` can show
+the command and its stderr separately whether the playbook caught the
+failure or not, once per failure (5.5). Step names repeat, so the id is what
+ties the failure to the step line it closes.
 
 Rendered example:
 
@@ -1951,7 +1884,7 @@ Inside a block, the closing line names the block path as the step line does:
 - **Workspace**: a Cargo package whose root also holds `rustible.toml` and
   `hosts.kdl`.
 - **Transport**: how the orchestrator reaches a host: `local` (child process)
-  or `ssh` (system `ssh` via the `openssh` crate).
+  or `ssh` (the system `ssh`).
 - **Frame**: one length-prefixed JSON message on the channel.
 - **Remote mode / describe mode / helper mode**: the playbook binary's
   `--remote`, `--describe`, `--helper` flags (section 5.5).
@@ -1964,25 +1897,19 @@ Inside a block, the closing line names the block path as the step line does:
 
 ## 16. Open questions, with the milestone by which each is decided
 
-Everything architectural is decided. What remains is local to one crate each.
-The verdict column says whether deciding late has a cost.
+Everything architectural is decided. One question is still open, and it is
+local to one crate:
 
 | # | Question | Decide by | Why it can wait (or cannot) |
 |---|---|---|---|
-| 1 | ~~Crate naming~~ | decided 2026-09-07 | `rustible` is the facade lib, `rustible-cli` the CLI with binary `rustible` (section 9). |
-| 2 | ~~CLI verb order~~ | decided 2026-09-07 | `rustible playbook run`, noun then verb (section 3). |
-| 3 | ~~Playbook-to-bin mapping~~ | decided 2026-09-07 | Build-script discovery of files marked `#[rustible::playbook]`, one playbook per shipped binary via `RUSTIBLE_PLAYBOOK` (section 9). |
-| 4 | **`rustible init` file layout**: exact files, `rustible.toml` contents, `.gitignore` handling | M4 | It is a generator; nothing depends on it. |
-| 5 | **Diff representation**: today `Text`, `Attrs`, `Summary`, `Many`; more variants for package sets, permissions, services | M6 | Additive; ops build a `Diff` through its constructors, and nothing outside the SDK can match one (it is opaque since #43). |
-| 6 | **Output rendering**: per-host buffering vs live interleaving, verbosity levels, machine-readable mode | M3, then iterate | Orchestrator UX, not API. |
 | 7 | **Target-side cache cleanup** for `~/.cache/rustible/bin/` | whenever | Trivial. |
-| 8 | **`doas` specifics** for `escalate="doas"` | M5 | Same shape as sudo. |
-| 9 | **Docker integration-test harness** shape (section 8) | M6 | Needed once the stdlib grows. |
-| 10 | **`Cancel` handling** in the binary (a stdin reader that interrupts between steps) | M5 | Reserved frame exists. |
 
-Decided items that used to live here have moved into their sections: inventory
-and vars (10), `Ctx` (11), check mode (12), facts (13), error model (14),
-privilege escalation (11.3), protocol format (5.5), the `escalate` name (below).
+Rows keep the numbers they were opened under, because code and documents cite
+them. The others are answered in the sections they concern: 1, crate naming
+(9); 2, verb order (3); 3, playbook-to-binary mapping (9); 4, the `rustible
+init` layout (3, 10.4); 5, the diff representation (6.2); 6, output rendering
+(5.5); 8, `doas` (10.2.1, 11.3); 9, the container-tier harness (8); 10,
+`Cancel`, which stops the run between steps (5.5).
 
 **The `escalate` name (decided 2026-09-06, revised the same day).** The word
 `become` is not used anywhere in Rustible; it is `escalate` everywhere: the
@@ -1998,26 +1925,10 @@ everywhere won. Where `escalate` is defined, a comment says it is Ansible's
 
 ## 17. Spikes (all done)
 
-1. ~~**Cross-compile**~~: **done 2026-09-06**, see `docs/03_SPIKE_CROSS_COMPILE.md`.
-   The spike-3 playbook cross-linked to aarch64 musl with stock rustup plus
-   `rust-lld`, ran on the ARM VM with identical behaviour. Cold SSH connection
-   (20 s) dominates upload cost, not binary size (0.4 s warm).
-2. ~~**Protocol over SSH**~~: **done 2026-09-06**, see `docs/04_SPIKE_PROTOCOL_SSH.md`.
-   Orchestrator crate with local and SSH transports, hash-cached upload,
-   `Start`/`Hello`/event frames as length-prefixed JSON, `apt::Present` op,
-   two hosts on two architectures in one command, 345 ms warm. JSON framing
-   is kept for now (finding 7).
-3. ~~**SDK core**~~: **done 2026-09-06**, see `docs/02_SPIKE_SDK_CORE.md`. The
-   sketches hold; `apply` takes `Change<T>`; prediction is nearly free.
-
-**Spike learnings promoted to policy in this document:**
-`apply` takes the intent, not the plan (6.2; the predict-by-default rule that
-came with it was reversed 2026-09-24, section 12); builders end in a finishing call
-(6.2); the mutation guard covers files not commands (7.3); one cargo
-invocation builds all triples, `dist` profile, `rust-lld` per-target linker
-config (5.2, 5.3); content-hash cache path and early ControlMaster (5.2); JSON
-framing and the four binary modes (5.5); the playbook name comes from the
-macro not `argv[0]` (5.5); `changed` means "would change" in check mode (11);
-`become` is a reserved keyword (16). The spike docs remain as the record of
-how each was found.
-
+Three spikes validated the design in running code before building began:
+cross-compilation, the protocol over SSH, and the SDK core. Their reports are
+`docs/03_SPIKE_CROSS_COMPILE.md`, `docs/04_SPIKE_PROTOCOL_SSH.md` and
+`docs/02_SPIKE_SDK_CORE.md`, with the playbook-discovery spike in
+`docs/05_SPIKE_PLAYBOOK_DISCOVERY.md`; later measurements are under
+`docs/plan/reports/`. What they found that became policy is stated in the
+section it governs, and the reports remain the record of how each was found.
