@@ -41,9 +41,11 @@ pub enum Format {
     /// frame with `ruzstd` so several frames, such as `pzstd` writes (each
     /// after a skippable frame) or `cat` of several `.zst` files make, are
     /// all decoded, skippable frames are skipped, and each frame's content
-    /// checksum is verified when it has been read to its end. Decoded as it is read, like the others: memory is the
-    /// frame's window, which the compressor chose (8 MiB at `zstd -19`;
-    /// `ruzstd` refuses a window over 100 MiB), plus 1 MiB decoded ahead.
+    /// checksum is verified when it has been read to its end. Decoded as
+    /// it is read, like the others: memory is the frame's window, which the
+    /// compressor chose (8 MiB at `zstd -19`, up to 128 MiB with `--long`;
+    /// a frame asking for more is refused), about 1.5 times that while
+    /// decoding, plus 1 MiB decoded ahead.
     TarZst,
 }
 
@@ -243,6 +245,7 @@ pub struct ExtractReport {
 /// let op = archive::Extracted::from_path("/tmp/tool-1.2.tar.gz")
 ///     .to("/opt/tool")
 ///     .strip_components(1)
+///     // The member `tar -tf tool-1.2.tar.gz | tail -1` lists, stripped.
 ///     .creates("bin/tool");
 /// ```
 ///
@@ -297,19 +300,36 @@ pub struct ExtractReport {
 /// **Atomicity: each member, not the archive.** A file member is written
 /// whole or not at all: one whose data ends before the length the archive
 /// declares for it (the archive was truncated or replaced since `check`),
-/// or whose compressed stream is corrupt, fails the step with nothing
-/// written at its path, no parent directory left that was made for it, and
-/// a file already there as it was. Members extracted before it in the same
-/// run stay; the step is not rolled back, as with GNU tar and Ansible's
-/// `unarchive`. The next run extracts the whole archive again, unless the
-/// `.creates` marker is among the members already written, so make the
-/// marker a member the archive lists last, or a path outside it.
+/// or whose compressed stream breaks off or fails to decode while it is
+/// read, fails the step with nothing written at its path, no parent
+/// directory left that was made for it, and a file already there as it
+/// was. Members extracted before it in the same run stay; the step is not
+/// rolled back, as with GNU tar and Ansible's `unarchive`.
 ///
-/// **Memory.** Constant, about one chunk plus the decoder's state, for a
-/// plain tar and for gzip, xz and zstd alike, escalated or not: the archive
-/// is read a chunk at a time and each member is streamed to disk, never
-/// held whole. zstd's state is the frame's window (8 MiB at `zstd -19`;
-/// frames asking for over 100 MiB are refused), xz's its dictionary.
+/// Corruption that only a stream's own check catches is different: a zstd
+/// frame's checksum, gzip's CRC32 and length, xz's block check are read
+/// where the frame or stream ends, after the members it holds were
+/// written. Such an archive fails the step there, saying its checksum did
+/// not match and that members already extracted may hold corrupt data.
+/// `check` reads the whole stream first, in a real run as in a dry one, so
+/// an archive corrupt from the start is refused before anything is
+/// written; `apply` meets it only when the archive changed after `check`.
+///
+/// The next run extracts the whole archive again, unless the `.creates`
+/// marker is among the members already written. So make the marker the
+/// member the archive lists last (`tar -tf archive | tail -1`), or a path
+/// a later step creates once the extraction succeeded.
+///
+/// **Memory.** Member data takes constant memory, about one chunk plus the
+/// decoder's state, for a plain tar and for gzip, xz and zstd alike,
+/// escalated or not: the archive is read a chunk at a time and each member
+/// is streamed to disk, never held whole. zstd's state is the frame's
+/// window (8 MiB at `zstd -19`, up to 128 MiB with `--long`; a frame asking
+/// for more is refused), about 1.5 times that while decoding; xz's is its
+/// dictionary (8 MiB at the default `-6`, 64 MiB at `-9`). Headers are
+/// read whole by the `tar` crate: a long name, a link target, a member's
+/// pax records. A pax global header is read whole to scan it, and refused
+/// over 1 MiB.
 ///
 /// **Escalation.** Under `ctx.as_root()` or `ctx.as_user(..)` the archive is
 /// read, and its members are written, through that identity's one helper,
@@ -405,18 +425,33 @@ impl Extracted {
         Ok((format, tar::Archive::new(reader)))
     }
 
-    /// Read a zstd stream on to its end once `tar` has stopped at the
-    /// archive's end marker, so the last frame's checksum is verified and
-    /// anything after the last frame is refused, as they were when the
-    /// stream was decoded whole. What is left is the tar's padding to its
-    /// record size, a few KiB at most. gzip and xz streams are left where
-    /// `tar` stopped, as before.
-    fn finish<R: Read>(&self, format: Format, archive: tar::Archive<R>) -> Result<()> {
-        if format == Format::TarZst {
-            std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
-                .with_context(|| format!("{}: decompressing", self.src.display()))?;
+    /// Read a compressed stream on to its end once `tar` has stopped at
+    /// the archive's end marker, so the stream's own checks run: the last
+    /// zstd frame's checksum, gzip's CRC32 and length, xz's block check,
+    /// index and footer. Whatever follows the end marker is decoded to its
+    /// end too, so anything after the stream is refused. A plain tar has
+    /// no check, and is left where `tar` stopped. After `apply` (`written`)
+    /// a checksum that fails here covers members already in place, and the
+    /// error says so.
+    fn finish<R: Read>(
+        &self,
+        format: Format,
+        archive: tar::Archive<R>,
+        written: bool,
+    ) -> Result<()> {
+        if format == Format::Tar {
+            return Ok(());
         }
-        Ok(())
+        match std::io::copy(&mut archive.into_inner(), &mut std::io::sink()) {
+            Ok(_) => Ok(()),
+            Err(e) if written && checksum_failed(&e) => Err(Error::from(e).context(format!(
+                "{}: the archive's checksum did not match at its end, after every member was \
+                 written; the members this run extracted may hold corrupt data; replace the \
+                 archive and run the step again",
+                self.src.display()
+            ))),
+            Err(e) => Err(Error::from(e).context(format!("{}: decompressing", self.src.display()))),
+        }
     }
 
     /// Everything the archive would create, entry by entry in archive order,
@@ -425,7 +460,7 @@ impl Extracted {
         let (format, mut archive) = self.open(sys)?;
         let entries = walk(&mut archive, self.strip)
             .with_context(|| format!("{}: refusing to extract", self.src.display()))?;
-        self.finish(format, archive)?;
+        self.finish(format, archive, false)?;
         let members: Vec<Member> = entries.iter().filter_map(|e| e.member.clone()).collect();
         self.check_destination(sys, &members)?;
         Ok((format, entries))
@@ -534,6 +569,7 @@ impl Extracted {
                     read: 0,
                     short: false,
                     failed: false,
+                    checksum: false,
                 };
                 let written = sys.write_from(&full, &mut member, Some(attrs));
                 if let Err(e) = written {
@@ -555,6 +591,15 @@ impl Extracted {
                         member.read,
                         full.display()
                     );
+                    if member.checksum {
+                        return Err(e.context(format!(
+                            "the archive's checksum did not match while member `{}` was read, so \
+                             nothing was written at {}; members extracted before it in this run \
+                             may hold corrupt data; replace the archive and run the step again",
+                            m.path.display(),
+                            full.display()
+                        )));
+                    }
                     if member.failed {
                         return Err(e.context(format!(
                             "reading member `{}` from the archive failed part way (truncated or \
@@ -672,14 +717,19 @@ fn decompress<'a>(format: Format, raw: Box<dyn Read + 'a>) -> Box<dyn Read + 'a>
 /// the window the frame keeps.
 const ZSTD_AHEAD: usize = 1 << 20;
 
+/// The largest window a zstd frame may ask for: 128 MiB, the most the
+/// `zstd` tool itself decodes without `--memory`, which `zstd --long`
+/// (window log 27) reaches. `ruzstd`'s own default is 100 MiB.
+const ZSTD_MAX_WINDOW: u64 = 128 << 20;
+
 /// Every frame of a zstd stream, decoded as it is read: skippable frames
 /// skipped, each frame's content checksum verified once it is read to its
 /// end. `ruzstd`'s own `StreamingDecoder` stops at the end of the first
 /// frame, and a stream may hold several, as `pzstd` and `cat` of several
-/// `.zst` files write. Holds the
-/// frame's window (what the compressor chose, 8 MiB at `zstd -19`; `ruzstd`
-/// refuses a frame asking for more than 100 MiB) plus up to
-/// [`ZSTD_AHEAD`] decoded ahead of the reader.
+/// `.zst` files write. Holds the frame's window (what the compressor
+/// chose, 8 MiB at `zstd -19`; a frame asking for more than
+/// [`ZSTD_MAX_WINDOW`] is refused), about 1.5 times that while decoding,
+/// plus up to [`ZSTD_AHEAD`] decoded ahead of the reader.
 struct Zstd<R: Read> {
     src: std::io::BufReader<R>,
     dec: ruzstd::decoding::FrameDecoder,
@@ -689,12 +739,49 @@ struct Zstd<R: Read> {
 
 impl<R: Read> Zstd<R> {
     fn new(src: R) -> Self {
+        let mut dec = ruzstd::decoding::FrameDecoder::new();
+        dec.set_max_window_size(ZSTD_MAX_WINDOW);
         Zstd {
             src: std::io::BufReader::new(src),
-            dec: ruzstd::decoding::FrameDecoder::new(),
+            dec,
             in_frame: false,
         }
     }
+}
+
+/// A zstd frame whose content does not match its checksum.
+#[derive(Debug)]
+struct ZstdChecksum {
+    got: u32,
+    want: u32,
+}
+
+impl std::fmt::Display for ZstdChecksum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "zstd: frame checksum mismatch (got {:08x}, want {:08x})",
+            self.got, self.want
+        )
+    }
+}
+
+impl std::error::Error for ZstdChecksum {}
+
+/// Whether `e` is a decoder finding that data it already handed out does
+/// not match the stream's own check: a zstd frame's checksum, gzip's CRC32
+/// and length, or an xz block's check or its index. Those cover data read
+/// before them, so members written from it are already in place. gzip's
+/// and xz's are told by their decoders' own words, which
+/// `a_corrupt_archive_that_only_a_checksum_catches_is_reported` pins.
+fn checksum_failed(e: &std::io::Error) -> bool {
+    if e.get_ref().is_some_and(|inner| inner.is::<ZstdChecksum>()) {
+        return true;
+    }
+    let msg = e.to_string();
+    msg == "corrupt gzip stream does not have a matching checksum"
+        || msg.contains("block checksum")
+        || msg.contains("index CRC32 mismatch")
 }
 
 /// A zstd failure as the reader reports it, prefixed so the step's error
@@ -734,9 +821,10 @@ impl<R: Read> Read for Zstd<R> {
                     self.dec.get_calculated_checksum(),
                 ) && want != got
                 {
-                    return Err(zstd_error(format!(
-                        "frame checksum mismatch (got {got:08x}, want {want:08x})"
-                    )));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        ZstdChecksum { got, want },
+                    ));
                 }
                 self.in_frame = false;
             }
@@ -778,6 +866,9 @@ struct Declared<'a> {
     short: bool,
     /// Reading the archive failed (a corrupt or cut compressed stream).
     failed: bool,
+    /// That failure was a stream's checksum, which covers data read before
+    /// this member too ([`checksum_failed`]).
+    checksum: bool,
 }
 
 impl Read for Declared<'_> {
@@ -786,6 +877,7 @@ impl Read for Declared<'_> {
             Ok(n) => n,
             Err(e) => {
                 self.failed |= e.kind() != std::io::ErrorKind::Interrupted;
+                self.checksum |= checksum_failed(&e);
                 return Err(e);
             }
         };
@@ -821,6 +913,11 @@ fn kind_label(kind: &Kind) -> &'static str {
     }
 }
 
+/// The most of a pax global header (`g`) that is read to scan it for sparse
+/// records: 1 MiB, far above the few dozen bytes `git archive` and GNU tar
+/// write there.
+const PAX_GLOBAL_LIMIT: u64 = 1 << 20;
+
 /// What the refusal names when `entry` carries pax sparse records, `None`
 /// when it carries none. GNU tar's `--format=posix -S` writes a sparse
 /// member in three formats (0.0, 0.1, 1.0), each marked by `GNU.sparse.*`
@@ -845,6 +942,15 @@ fn kind_label(kind: &Kind) -> &'static str {
 /// archive over it would refuse legal archives.
 fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Option<String>> {
     if entry.header().entry_type().is_pax_global_extensions() {
+        // Read whole to scan it, so bounded first: a size field is the
+        // archive's word, and a few KiB of archive can claim gigabytes.
+        let size = entry.size();
+        ensure!(
+            size <= PAX_GLOBAL_LIMIT,
+            "the archive's pax global header is {size} bytes, more than the {PAX_GLOBAL_LIMIT} \
+             `archive::Extracted` reads of one; `git archive` and GNU tar write a few dozen \
+             bytes there, so the archive is corrupt or was made to exhaust memory"
+        );
         let mut records = vec![];
         entry
             .read_to_end(&mut records)
@@ -1169,9 +1275,26 @@ impl Op for Extracted {
             .entries()
             .with_context(|| format!("extracting {}: reading tar members", intent.src.display()))?;
         for entry in entries {
-            let mut entry = entry.with_context(|| {
-                format!("extracting {}: reading tar member", intent.src.display())
-            })?;
+            let mut entry = match entry {
+                Ok(entry) => entry,
+                // Between two members, as `tar` reads the next header: the
+                // check covers members already written.
+                Err(e) if checksum_failed(&e) => {
+                    return Err(Error::from(e).context(format!(
+                        "extracting {}: the archive's checksum did not match between two \
+                         members, after earlier members were written; the members this run \
+                         extracted may hold corrupt data; replace the archive and run the step \
+                         again",
+                        intent.src.display()
+                    )));
+                }
+                Err(e) => {
+                    return Err(Error::from(e).context(format!(
+                        "extracting {}: reading tar member",
+                        intent.src.display()
+                    )));
+                }
+            };
             let raw = entry
                 .path()
                 .with_context(|| format!("extracting {}", intent.src.display()))?
@@ -1197,7 +1320,7 @@ impl Op for Extracted {
              between check and apply",
             intent.src.display()
         );
-        self.finish(format, archive)?;
+        self.finish(format, archive, true)?;
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
@@ -3064,6 +3187,163 @@ mod tests {
                 "{format:?}: nothing at the cut member's path, nothing staged, nothing after it"
             );
         }
+    }
+
+    /// `archive`, with the first occurrence of `needle` changed in its
+    /// first byte: a data byte of the big member, in an encoding that
+    /// stores it as is, so only the stream's own check can tell.
+    fn flipped(archive: &[u8], needle: &[u8]) -> Vec<u8> {
+        let at = archive
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the needle is stored as is");
+        let mut out = archive.to_vec();
+        out[at] ^= 0x08;
+        out
+    }
+
+    /// A data byte of the big member, as `numbered` writes it.
+    const NEEDLE: &[u8] = b"000000000000100\n";
+
+    /// One zstd frame storing `bytes` as is, with its checksum.
+    fn zst_stored(bytes: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(bytes, ruzstd::encoding::CompressionLevel::Uncompressed)
+    }
+
+    /// One gzip member storing `bytes` as is.
+    fn gz_stored(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Corruption only a stream's own check catches: a data byte of a stored
+    /// gzip member or zstd frame, where the check is the gzip trailer or the
+    /// frame's checksum, and a byte of an xz index's CRC32. `check` reads
+    /// each stream to its end and refuses it, writing nothing. Swapped in
+    /// after `check`, `apply` writes the members and then fails at the
+    /// stream's end, saying the checksum failed after they were written.
+    #[test]
+    fn a_corrupt_archive_that_only_a_checksum_catches_is_reported() {
+        let tar = tree_tar(BIG);
+        let mut xz_bad = xz(&tar);
+        // The stream footer is the last 12 bytes; the index's CRC32 the 4
+        // before it.
+        let at = xz_bad.len() - 13;
+        xz_bad[at] ^= 0x08;
+        for (whole, bad, says) in [
+            (
+                gz_stored(&tar),
+                flipped(&gz_stored(&tar), NEEDLE),
+                "corrupt gzip stream does not have a matching checksum",
+            ),
+            (
+                zst_stored(&tar),
+                flipped(&zst_stored(&tar), NEEDLE),
+                "zstd: frame checksum mismatch",
+            ),
+            (xz(&tar), xz_bad, "index CRC32 mismatch"),
+        ] {
+            let err = check_err(&bad);
+            assert!(err.contains("/tmp/a.tar: decompressing: "), "{err}");
+            assert!(err.contains(says), "{err}");
+
+            let (fake, sys) = sys_with(&whole);
+            let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+            let c = expect_change(&op, &sys);
+            sys.write_atomic("/tmp/a.tar", &bad).unwrap();
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(
+                err.contains(
+                    "/tmp/a.tar: the archive's checksum did not match at its end, after every \
+                     member was written; the members this run extracted may hold corrupt data"
+                ),
+                "{err}"
+            );
+            assert!(err.contains(says), "{err}");
+            assert_eq!(fake.content("/opt/m/after").unwrap(), "after\n");
+        }
+    }
+
+    /// A zstd frame whose checksum fails while a member is read, the frame
+    /// ending inside it: that member is not written, and the error says the
+    /// archive's checksum failed, not that the member is the corrupt one,
+    /// and that members before it may hold corrupt data.
+    #[test]
+    fn a_checksum_failing_inside_a_member_blames_the_archive() {
+        let tar = tree_tar(BIG);
+        let whole = [zst_stored(&tar[..CUT]), zst_stored(&tar[CUT..])].concat();
+        let bad = flipped(&whole, NEEDLE);
+        let err = check_err(&bad);
+        assert!(err.contains("zstd: frame checksum mismatch"), "{err}");
+
+        let (fake, sys) = sys_with(&whole);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &bad).unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.contains(
+                "the archive's checksum did not match while member `m/big` was read, so nothing \
+                 was written at /opt/m/big; members extracted before it in this run may hold \
+                 corrupt data"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("failed part way"), "{err}");
+        assert_eq!(fake.content("/opt/m/small").unwrap(), "small\n");
+        assert_eq!(
+            sys.read_dir("/opt/m").unwrap(),
+            [PathBuf::from("/opt/m/small")]
+        );
+    }
+
+    /// A pax global header is read whole to scan it, so one over 1 MiB is
+    /// refused from its size, before anything is read: a few KiB of archive
+    /// can claim gigabytes there.
+    #[test]
+    fn a_pax_global_header_over_one_mib_is_refused_unread() {
+        let mut h = tar::Header::new_ustar();
+        h.set_path("pax_global_header").unwrap();
+        h.set_entry_type(tar::EntryType::XGlobalHeader);
+        h.set_size((1 << 20) + 1);
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend(std::iter::repeat_n(0u8, 1024));
+        let err = check_err(&archive);
+        assert!(
+            err.contains(
+                "the archive's pax global header is 1048577 bytes, more than the 1048576 \
+                 `archive::Extracted` reads of one"
+            ),
+            "{err}"
+        );
+        // At the limit it is read, and here found short of its size.
+        h.set_size(1 << 20);
+        h.set_cksum();
+        let mut archive = h.as_bytes().to_vec();
+        archive.extend(std::iter::repeat_n(0u8, 1024));
+        let err = check_err(&archive);
+        assert!(!err.contains("reads of one"), "{err}");
+    }
+
+    /// A zstd frame may ask for a window of up to 128 MiB, which
+    /// `zstd --long` writes, and not more. Only the frame header is given,
+    /// so the decoder allocates nothing: past the window check, the stream
+    /// simply ends.
+    #[test]
+    fn a_zstd_window_up_to_128_mib_is_accepted_and_one_over_refused() {
+        // No single-segment flag, so a window descriptor follows: exponent
+        // 17 is 2^27 bytes, 18 is 2^28.
+        let frame = |descriptor: u8| vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, descriptor];
+        let err = check_err(&frame(17 << 3));
+        assert!(!err.contains("window_size is too big"), "{err}");
+        let err = check_err(&frame(18 << 3));
+        assert!(
+            err.contains("Specified window_size is too big; Requested: 268435456, Max: 134217728"),
+            "{err}"
+        );
     }
 
     // ---- through a helper ----
