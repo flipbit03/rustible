@@ -1,16 +1,17 @@
 //! Docker integration test for `archive::Extracted` (vision 8, T2).
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_archive_extracted`.
 //!
-//! The four `hello.tar*` fixtures under `fixtures/archive/` are the same
-//! tree encoded as tar, tar.gz, tar.xz and tar.zst; each is written into
-//! the container and extracted with the pure-Rust decoders, no `tar`
-//! binary involved.
+//! The `hello*.tar*` fixtures under `fixtures/archive/` are the same tree
+//! encoded as tar, tar.gz, tar.xz and tar.zst, and once more as a tar.zst
+//! of two frames with a skippable frame between them, all made by the real
+//! tools; each is written into the container and extracted with the
+//! pure-Rust decoders, a chunk at a time, no `tar` binary involved.
 
 use rustible::prelude::*;
 use rustible::sdk::testing::changed_then_ok;
 use rustible_std::archive::{Extracted, Format};
 
-const FIXTURES: [(&str, Format, &[u8]); 4] = [
+const FIXTURES: [(&str, Format, &[u8]); 5] = [
     (
         "hello.tar",
         Format::Tar,
@@ -30,6 +31,11 @@ const FIXTURES: [(&str, Format, &[u8]); 4] = [
         "hello.tar.zst",
         Format::TarZst,
         include_bytes!("../fixtures/archive/hello.tar.zst"),
+    ),
+    (
+        "hello-frames.tar.zst",
+        Format::TarZst,
+        include_bytes!("../fixtures/archive/hello-frames.tar.zst"),
     ),
 ];
 
@@ -71,11 +77,10 @@ fn extracted_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         ctx.sys().write_atomic(&src, bytes)?;
         ctx.sys().mkdir_all(&dest)?;
 
-        // With the `creates` marker: extracted once, then `ok`.
+        // With the `creates` marker, the member the archive lists last:
+        // extracted once, then `ok`.
         let (first, second) = changed_then_ok(ctx, &format!("extract {name}"), || {
-            Extracted::from_path(&src)
-                .to(&dest)
-                .creates("hello/README.txt")
+            Extracted::from_path(&src).to(&dest).creates("hello/link")
         })?;
         assert_eq!(first.format, Some(format));
         assert_eq!(

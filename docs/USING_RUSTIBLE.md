@@ -1013,13 +1013,16 @@ directory first.
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
 unpacked, so without a marker it reports `changed` every time — which is
-otherwise the signature of a bug. Give it a path that exists only after a
-successful extraction, relative to the destination:
+otherwise the signature of a bug. Give it, relative to the destination, the
+member the archive lists last (`tar -tf x | tail -1`), or a path a later step
+creates once the extraction succeeded. An extraction that fails partway leaves
+the members before the failure in place, so a marker the archive lists early
+makes the next run `ok` over a partial tree.
 
 ```rust
 ctx.step("app extracted", archive::Extracted::from_path(TARBALL)
     .to("/opt/app")                // .to() first: it produces the operation
-    .creates("bin/app")            // then report ok when /opt/app/bin/app exists
+    .creates("bin/app")            // the member `tar -tf` lists last
     .owner(svc.uid, svc.gid))?;
 ```
 
