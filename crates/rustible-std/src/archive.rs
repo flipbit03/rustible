@@ -925,16 +925,17 @@ const PAX_GLOBAL_LIMIT: u64 = 1 << 20;
 /// unless given `--no-read-sparse`. The `tar` crate expands none of them:
 /// 0.0 lands at the right path with its holes squeezed out, 0.1 and 1.0
 /// under `GNUSparseFile.<pid>/`, and 1.0 with the sparse map as text ahead
-/// of the data. 0.1 and 1.0 put a placeholder in the header and the real name in a
-/// `GNU.sparse.name` record, so that record is the name when there is one,
-/// and `raw`, the member's path, otherwise. A global header (`g`) is no
-/// member, and is named as what it is.
+/// of the data. 0.1 and 1.0 put a placeholder in the header and the real
+/// name in a `GNU.sparse.name` record, so that record is the name when
+/// there is one, and `raw`, the member's path, otherwise. A global header
+/// (`g`) is no member, and is named as what it is.
 ///
 /// The `tar` crate returns a global header as an entry of its own, so its
-/// records are read as bytes and scanned for `GNU.sparse.`, without
-/// parsing; an `x` header ahead of it, which the crate attaches to it, is
-/// checked parsed, as a member's. A member's own records the crate has already read and offers
-/// only parsed, so a record it cannot parse is skipped, as the crate's own
+/// records are read as bytes, at most [`PAX_GLOBAL_LIMIT`] of them, and
+/// scanned for `GNU.sparse.`, without parsing; an `x` header ahead of it,
+/// which the crate attaches to it, is checked parsed, as a member's. A
+/// member's own records the crate has already read and offers only
+/// parsed, so a record it cannot parse is skipped, as the crate's own
 /// xattr extraction skips it, unlike GNU tar, which reads some of those
 /// (a sparse record there can go unseen; `[ISSUE-80]` has the shapes).
 /// The crate splits records on newlines, so a value holding one (a binary
