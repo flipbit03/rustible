@@ -261,6 +261,9 @@ pub struct ExtractReport {
 /// without writing, and refuses the whole archive when any member:
 ///
 /// - has an absolute path or a `..` component (tar-slip), naming it;
+/// - has a path, or a symlink target, no filesystem takes: a component
+///   over 255 bytes, or over 4096 bytes in all (GNU tar's "File name too
+///   long");
 /// - is a symlink to an absolute target or one climbing outside `dest`;
 /// - sits under an earlier symlink member (a write through it would land
 ///   elsewhere);
@@ -432,29 +435,37 @@ impl Extracted {
     /// zstd frame's checksum, gzip's CRC32 and length, xz's block check,
     /// index and footer. Whatever follows the end marker is decoded to its
     /// end too, so anything after the stream is refused, but for zero
-    /// padding after gzip ([`Gz`]) and xz's own stream padding. A plain tar has
-    /// no check, and is left where `tar` stopped. After `apply` (`written`)
-    /// a checksum that fails here covers members already in place, and the
-    /// error says so.
+    /// padding after gzip ([`Gz`]) and xz's own stream padding (zero bytes,
+    /// in any number). A plain tar has no check, and is left where `tar`
+    /// stopped. In `apply`, `written` says whether a member was written yet,
+    /// which a checksum failing here covers, and the error says which; in
+    /// `check` it is `None`.
     fn finish<R: Read>(
         &self,
         format: Format,
         archive: tar::Archive<R>,
-        written: bool,
+        written: Option<bool>,
     ) -> Result<()> {
         if format == Format::Tar {
             return Ok(());
         }
-        match std::io::copy(&mut archive.into_inner(), &mut std::io::sink()) {
-            Ok(_) => Ok(()),
-            Err(e) if written && checksum_failed(&e) => Err(Error::from(e).context(format!(
-                "{}: the archive's checksum did not match at its end, after every member was \
+        let Err(e) = std::io::copy(&mut archive.into_inner(), &mut std::io::sink()) else {
+            return Ok(());
+        };
+        let src = self.src.display();
+        let context = match written {
+            Some(true) if checksum_failed(&e) => format!(
+                "{src}: the archive's checksum did not match at its end, after every member was \
                  written; the members this run extracted may hold corrupt data; {}",
-                self.src.display(),
                 self.after_checksum()
-            ))),
-            Err(e) => Err(Error::from(e).context(format!("{}: decompressing", self.src.display()))),
-        }
+            ),
+            Some(false) if checksum_failed(&e) => format!(
+                "{src}: the archive's checksum did not match at its end, before any member was \
+                 written, so nothing was extracted; replace the archive and run the step again"
+            ),
+            _ => format!("{src}: decompressing"),
+        };
+        Err(Error::from(e).context(context))
     }
 
     /// What to do once a checksum failed after members were written: the
@@ -476,7 +487,7 @@ impl Extracted {
         let (format, mut archive) = self.open(sys)?;
         let entries = walk(&mut archive, self.strip)
             .with_context(|| format!("{}: refusing to extract", self.src.display()))?;
-        self.finish(format, archive, false)?;
+        self.finish(format, archive, None)?;
         let members: Vec<Member> = entries.iter().filter_map(|e| e.member.clone()).collect();
         self.check_destination(sys, &members)?;
         Ok((format, entries))
@@ -495,15 +506,17 @@ impl Extracted {
                 self.dest.display()
             ),
         }
+        // Borrowed from the members' paths, which `walk` held to
+        // `PATH_MAX`, so a deep one costs a pointer per level, not a path.
         let mut ancestors = BTreeSet::new();
         for m in members {
             let mut p = m.path.parent();
             while let Some(a) = p.filter(|a| !a.as_os_str().is_empty()) {
-                ancestors.insert(a.to_path_buf());
+                ancestors.insert(a);
                 p = a.parent();
             }
         }
-        for a in &ancestors {
+        for a in ancestors {
             let full = self.dest.join(a);
             match sys.stat(&full)? {
                 None => {}
@@ -742,6 +755,15 @@ enum GzState<R: Read> {
     Member(flate2::bufread::GzDecoder<std::io::BufReader<R>>),
     /// After a member: another, padding, or the end.
     Between(std::io::BufReader<R>),
+    /// After the last member, counting what follows to its end: `after`
+    /// bytes so far, every one zero while `zero`. Kept here, not in a local,
+    /// so a read that fails part way (`Interrupted`, which callers retry)
+    /// resumes the count rather than taking the stream for ended.
+    Trailing {
+        src: std::io::BufReader<R>,
+        after: u64,
+        zero: bool,
+    },
     /// Read to the end.
     Done,
 }
@@ -775,7 +797,13 @@ impl<R: Read> Read for Gz<R> {
                     return n;
                 }
                 GzState::Between(mut src) => {
-                    let head = src.fill_buf()?;
+                    let head = match src.fill_buf() {
+                        Ok(head) => head,
+                        Err(e) => {
+                            self.state = GzState::Between(src);
+                            return Err(e);
+                        }
+                    };
                     if head.is_empty() {
                         return Ok(0);
                     }
@@ -784,9 +812,25 @@ impl<R: Read> Read for Gz<R> {
                         continue;
                     }
                     // Padding to the end, or bytes that are not gzip.
-                    let (mut after, mut zero) = (0u64, true);
+                    self.state = GzState::Trailing {
+                        src,
+                        after: 0,
+                        zero: true,
+                    };
+                }
+                GzState::Trailing {
+                    mut src,
+                    mut after,
+                    mut zero,
+                } => {
                     loop {
-                        let head = src.fill_buf()?;
+                        let head = match src.fill_buf() {
+                            Ok(head) => head,
+                            Err(e) => {
+                                self.state = GzState::Trailing { src, after, zero };
+                                return Err(e);
+                            }
+                        };
                         if head.is_empty() {
                             break;
                         }
@@ -937,7 +981,13 @@ impl<R: Read> Read for Zstd<R> {
             if self.src.fill_buf()?.is_empty() {
                 return Ok(0);
             }
-            match self.dec.init(&mut self.src) {
+            let mut header = Counted {
+                inner: &mut self.src,
+                read: 0,
+            };
+            let begun = self.dec.init(&mut header);
+            let read = header.read;
+            match begun {
                 Ok(()) => self.in_frame = true,
                 Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
                     length,
@@ -951,9 +1001,50 @@ impl<R: Read> Read for Zstd<R> {
                         return Err(zstd_error("truncated skippable frame"));
                     }
                 }
+                // No frame's magic, or the stream ends inside one: what
+                // follows the stream is not zstd. Refused, counted, as gzip
+                // refuses it; the `zstd` tool has no padding either.
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    ReadFrameHeaderError::BadMagicNumber(_),
+                )) => return Err(not_zstd(&mut self.src, read)),
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    ReadFrameHeaderError::MagicNumberReadError(e),
+                )) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(not_zstd(&mut self.src, read));
+                }
                 Err(e) => return Err(zstd_error(e)),
             }
         }
+    }
+}
+
+/// A reader counting the bytes read through it: how much of what follows
+/// a zstd stream `FrameDecoder::init` took before it found no frame there.
+struct Counted<'a, R: Read> {
+    inner: &'a mut R,
+    read: u64,
+}
+
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
+/// The refusal of bytes after a zstd stream that are not another frame:
+/// `read` of them already taken, and the rest counted to the end.
+fn not_zstd(rest: &mut impl Read, read: u64) -> std::io::Error {
+    match std::io::copy(rest, &mut std::io::sink()) {
+        Ok(more) => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} bytes after the zstd stream are not another zstd frame",
+                read + more
+            ),
+        ),
+        Err(e) => e,
     }
 }
 
@@ -1123,6 +1214,32 @@ fn named(p: &Path) -> String {
     quoted_to(&p.to_string_lossy(), NAME_CAP)
 }
 
+/// The longest file name, and the longest path, a member may have: Linux's
+/// `NAME_MAX` and `PATH_MAX`. A member over either is refused by [`walk`],
+/// as GNU tar fails it with "File name too long", before any `sys` call
+/// on it fails with an error naming the path whole. That also bounds how
+/// deep a member nests, and so the ancestors `check_destination` lists.
+const NAME_MAX: usize = 255;
+const PATH_MAX: usize = 4096;
+
+/// Why `p` is longer than a filesystem takes, or `None`. `what` is how the
+/// message calls it ("a target"). Pure.
+fn too_long(p: &Path, what: &str) -> Option<String> {
+    let len = p.as_os_str().len();
+    if len > PATH_MAX {
+        return Some(format!(
+            "{what} of {len} bytes, more than the {PATH_MAX} a path may have"
+        ));
+    }
+    let longest = p.components().map(|c| c.as_os_str().len()).max()?;
+    (longest > NAME_MAX).then(|| {
+        format!(
+            "{what} with a component of {longest} bytes, more than the {NAME_MAX} a file name \
+             may have"
+        )
+    })
+}
+
 /// [`quoted`], cut at `cap` bytes.
 fn quoted_to(name: &str, cap: usize) -> String {
     let mut out = String::new();
@@ -1170,6 +1287,9 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
             out.push(PlannedEntry { raw, member: None });
             continue;
         };
+        if let Some(why) = too_long(&path, "a path") {
+            bail!("member `{}` has {why}", named(&raw));
+        }
         if let Some(link) = symlinks.iter().find(|l| path.starts_with(l)) {
             bail!(
                 "member `{}` is under the symlink member `{}`",
@@ -1198,6 +1318,15 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
                     Error::msg(format!("member `{}` has no link target", named(&raw)))
                 })?;
             if ty.is_symlink() {
+                // A hard link's target is held to the limits as a member
+                // extracted before it, which it must be.
+                if let Some(why) = too_long(&target, "a target") {
+                    bail!(
+                        "symlink `{}` -> `{}` has {why}",
+                        named(&raw),
+                        named(&target)
+                    );
+                }
                 validate_link_target(&path, &target).map_err(Error::msg)?;
                 Kind::Symlink(target)
             } else {
@@ -1453,7 +1582,7 @@ impl Op for Extracted {
              between check and apply",
             intent.src.display()
         );
-        self.finish(format, archive, true)?;
+        self.finish(format, archive, Some(wrote))?;
         if let Some(marker) = self.marker()
             && !sys.exists(&marker)?
         {
@@ -3257,7 +3386,13 @@ mod tests {
         );
         let trailing = [zst(&tar), b"junk".to_vec()].concat();
         let err = check_err(&trailing);
-        assert!(err.contains("/tmp/a.tar: decompressing: zstd: "), "{err}");
+        assert!(
+            err.contains(
+                "/tmp/a.tar: decompressing: 4 bytes after the zstd stream are not another zstd \
+                 frame"
+            ),
+            "{err}"
+        );
     }
 
     /// An archive with no members, only the end marker, is refused in every
@@ -3501,8 +3636,10 @@ mod tests {
     /// Zero bytes after a gzip stream are padding, as a tape or
     /// `dd conv=sync` leaves it, and GNU tar and gzip take them: the archive
     /// extracts. Anything else after it is refused, saying how many bytes
-    /// follow the stream and that they are not another gzip member. xz's
-    /// stream padding, a multiple of four zero bytes, is its own format's.
+    /// follow the stream and that they are not another gzip member. xz has
+    /// stream padding of its own, which the format makes a multiple of four
+    /// zero bytes; `lzma-rust2` takes any number of them, where the `xz`
+    /// tool refuses one or three.
     #[test]
     fn zero_padding_after_a_gzip_stream_is_accepted_and_other_bytes_refused() {
         let tar = tree_tar(BIG);
@@ -3512,6 +3649,8 @@ mod tests {
             [gz(&tar), vec![0; 1]].concat(),
             [gz(&tar[..CUT]), gz(&tar[CUT..]), vec![0; 4093]].concat(),
             [xz(&tar), vec![0; 1024]].concat(),
+            [xz(&tar), vec![0; 3]].concat(),
+            [xz(&tar), vec![0; 1]].concat(),
         ] {
             let (fake, _, _) = extract(&archive);
             assert_eq!(tree(&fake), want);
@@ -3534,7 +3673,7 @@ mod tests {
     /// A member's name is the archive's, and GNU tar's long-name header
     /// lets it be as long as the archive likes: a refusal names it cut to
     /// 4 KiB, so one name cannot flood the step's error and every event
-    /// that carries it.
+    /// that carries it. A name that long is refused for its length first.
     #[test]
     fn a_huge_member_name_is_cut_in_a_refusal() {
         let name = "x".repeat(70_000);
@@ -3546,7 +3685,10 @@ mod tests {
         b.append_data(&mut h, &name, &[][..]).unwrap();
         let err = check_err(&b.into_inner().unwrap());
         assert!(
-            err.contains(&format!("member `{}…` is a special file", "x".repeat(4096))),
+            err.contains(&format!(
+                "member `{}…` has a path of 70000 bytes, more than the 4096 a path may have",
+                "x".repeat(4096)
+            )),
             "{}",
             &err[..err.len().min(300)]
         );
@@ -3626,6 +3768,210 @@ mod tests {
         assert!(!err.contains("after earlier members"), "{err}");
         assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
         let _ = fake;
+    }
+
+    /// `.strip_components` dropping every member, so `apply` writes
+    /// nothing: a checksum failing at the stream's end says nothing was
+    /// extracted, not that it failed after every member was written.
+    #[test]
+    fn a_checksum_failing_at_the_end_with_every_member_stripped_says_nothing_was_written() {
+        let tar = tree_tar(BIG);
+        let whole = zst_stored(&tar);
+        let (_, sys) = sys_with(&whole);
+        let op = Extracted::from_path("/tmp/a.tar")
+            .to("/opt")
+            .strip_components(2);
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &flipped(&whole, NEEDLE))
+            .unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.contains(
+                "/tmp/a.tar: the archive's checksum did not match at its end, before any member \
+                 was written, so nothing was extracted; replace the archive and run the step again"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("zstd: frame checksum mismatch"), "{err}");
+        assert!(!err.contains("after every member"), "{err}");
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
+    }
+
+    /// Bytes after a zstd stream, zero or not, are not another frame, and
+    /// are refused counted, as gzip's are: the `zstd` tool refuses them too
+    /// ("unsupported format"), and has no padding.
+    #[test]
+    fn bytes_after_a_zstd_stream_are_refused_counted() {
+        let tar = tree_tar(BIG);
+        for (tail, n) in [
+            (b"junk".to_vec(), 4),
+            (vec![0; 1], 1),
+            (vec![0; 3], 3),
+            (vec![0; 100], 100),
+            (
+                [vec![0; 4], zst(b"another")].concat(),
+                4 + zst(b"another").len(),
+            ),
+        ] {
+            let err = check_err(&[zst(&tar), tail].concat());
+            assert!(
+                err.contains(&format!(
+                    "/tmp/a.tar: decompressing: {n} bytes after the zstd stream are not another \
+                     zstd frame"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// A reader of `data` that stops once at `at` bytes, returning
+    /// `Interrupted` there once, and hands out nothing past `at` before it.
+    struct Hiccup {
+        data: Vec<u8>,
+        pos: usize,
+        at: usize,
+        done: bool,
+    }
+
+    impl Read for Hiccup {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.at && !self.done {
+                self.done = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let end = if self.pos < self.at {
+                self.at
+            } else {
+                self.data.len()
+            };
+            let n = buf.len().min(end - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// A read interrupted after a gzip stream, where `Gz` looks for another
+    /// member or padding, is retried where it stopped, as `read_to_end`
+    /// does: the bytes after the stream are still counted and refused, not
+    /// taken for its end.
+    #[test]
+    fn an_interrupted_read_after_a_gzip_stream_still_refuses_what_follows() {
+        let tar = tree_tar(BIG);
+        let stream = gz(&tar);
+        let data = [stream.clone(), vec![0; 100], b"junk".to_vec()].concat();
+        // Where `Gz` first looks past the stream, and inside the padding.
+        for at in [stream.len(), stream.len() + 10] {
+            let mut out = vec![];
+            let err = Gz::new(Hiccup {
+                data: data.clone(),
+                pos: 0,
+                at,
+                done: false,
+            })
+            .read_to_end(&mut out)
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "104 bytes after the gzip stream are not another gzip member",
+                "interrupted at {at}"
+            );
+            assert_eq!(out, tar, "interrupted at {at}");
+        }
+    }
+
+    /// One regular file member called `name`, through `tar::Builder`, which
+    /// writes a GNU `L` header for a long one.
+    fn file_named(name: &str) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(3);
+        h.set_mode(0o644);
+        b.append_data(&mut h, name, &b"hi\n"[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// A symlink member `l` pointing at `target` (a GNU `K` header for a
+    /// long one).
+    fn symlink_to(target: &str) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        b.append_link(&mut h, "l", target).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    /// A member path no filesystem takes, a component over 255 bytes or a
+    /// path over 4096, is refused by the walk, before any `sys` call on
+    /// it, as GNU tar fails it with "File name too long": a symlink's
+    /// target too. At the limits, it extracts.
+    #[test]
+    fn a_member_path_too_long_for_a_filesystem_is_refused_at_check() {
+        let deepest = format!("{}f", "a/".repeat(2047));
+        assert_eq!(deepest.len(), 4095);
+        for archive in [
+            file_named(&"y".repeat(255)),
+            file_named(&deepest),
+            symlink_to(&"z".repeat(255)),
+        ] {
+            extract(&archive);
+        }
+        let long = format!("d/{}/f", "y".repeat(256));
+        let over = format!("{}f", "a/".repeat(2048));
+        for (archive, says) in [
+            (
+                file_named(&long),
+                format!(
+                    "member `{long}` has a path with a component of 256 bytes, more than the 255 a \
+                     file name may have"
+                ),
+            ),
+            (
+                file_named(&over),
+                format!(
+                    "member `{}…` has a path of 4097 bytes, more than the 4096 a path may have",
+                    &over[..4096]
+                ),
+            ),
+            (
+                symlink_to(&"z".repeat(256)),
+                format!(
+                    "symlink `l` -> `{}` has a target with a component of 256 bytes, more than \
+                     the 255 a file name may have",
+                    "z".repeat(256)
+                ),
+            ),
+            (
+                symlink_to(&over),
+                format!(
+                    "symlink `l` -> `{}…` has a target of 4097 bytes, more than the 4096 a path \
+                     may have",
+                    &over[..4096]
+                ),
+            ),
+        ] {
+            let err = check_err(&archive);
+            assert!(err.contains("/tmp/a.tar: refusing to extract"), "{err}");
+            assert!(err.contains(&says), "{err}");
+        }
+    }
+
+    /// A path nested deeper than any filesystem takes is refused from its
+    /// length, quickly, before `check_destination` lists its ancestors:
+    /// each is a path of its own, so their total grows with the square of
+    /// the depth (a name of `a/` 32,000 times took 1 GB there).
+    #[test]
+    fn a_path_nested_past_the_limit_is_refused_quickly() {
+        let name = format!("{}f", "a/".repeat(8000));
+        let err = bounded(30, move || check_err(&file_named(&name)));
+        assert!(
+            err.contains("has a path of 16001 bytes, more than the 4096 a path may have"),
+            "{}",
+            &err[..err.len().min(300)]
+        );
+        assert!(err.len() < 5000, "{} bytes", err.len());
     }
 
     // ---- through a helper ----
@@ -3711,6 +4057,48 @@ mod tests {
                 assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
             });
         }
+    }
+
+    /// On a real filesystem, through `System::local`: a regular file member
+    /// with a 1 MiB GNU long name, or one component over `NAME_MAX`, is
+    /// refused at `check` in a message of a few KiB, where `stat` of the
+    /// first failed with `ENAMETOOLONG` in an error carrying the whole name
+    /// (the `Fake` takes any name). Nothing is written.
+    #[test]
+    fn a_huge_member_name_is_refused_in_a_small_message_on_a_real_filesystem() {
+        let sys = System::local(false, Arc::new(Collect::default()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rustible-archive-long-{}-{nanos}",
+            std::process::id()
+        ));
+        sys.mkdir_all(dir.join("dest")).unwrap();
+        let src = dir.join("a.tar");
+        let mut errs = vec![];
+        for name in ["x".repeat(1 << 20), format!("d/{}", "x".repeat(300))] {
+            sys.write_atomic(&src, &file_named(&name)).unwrap();
+            errs.push(
+                Extracted::from_path(&src)
+                    .to(dir.join("dest"))
+                    .check(&sys)
+                    .map(|_| ())
+                    .unwrap_err()
+                    .chain(),
+            );
+        }
+        let listed = sys.read_dir(dir.join("dest")).unwrap();
+        let _ = sys.remove_all(&dir);
+        for (err, says) in errs.iter().zip([
+            "has a path of 1048576 bytes, more than the 4096 a path may have",
+            "has a path with a component of 300 bytes, more than the 255 a file name may have",
+        ]) {
+            assert!(err.contains(says), "{}", &err[..err.len().min(300)]);
+            assert!(err.len() < 5000, "{} bytes", err.len());
+        }
+        assert_eq!(listed, Vec::<PathBuf>::new());
     }
 
     /// A dry run through the helper reads an archive of several chunks
