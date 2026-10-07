@@ -29,11 +29,14 @@ out the rules of build mode.
 | Scope unit | One question | One milestone with a done condition |
 
 **What this document carries, and what it does not.** Intent, guarantees,
-decisions with their reasons and the alternatives they beat, and the shape a
-playbook author sees: playbooks, the inventory, the CLI. It does not carry
-copies of internal types, fields, signatures or wire layouts. Where a section
-needs one, it says what must hold and names the source file that is the
-authority on how it is done.
+decisions with their reasons, the alternatives they beat and the measurements
+that settled them, the short sketch of the `Op` contract (6.2), and the shape
+a playbook author sees: playbooks, the inventory, the CLI. It does not copy
+the code: if a line would go stale when a field is added or an op's
+internals change, it is not here. Where a section needs such detail, it says
+what must hold and names the source file that is the authority on how it is
+done; a library or a mechanism appears only where choosing it is the
+decision.
 
 **How to read.** Sections 1 to 4 are context. Sections 5 to 14 are the
 decisions, each with alternatives and reasons. Section 15 is the glossary,
@@ -211,7 +214,7 @@ Consequences accepted with remote-brain:
   HTTP GET for a GitHub user's SSH keys, for instance) runs inside the binary
   on the target, so the *target* needs the network access, not the operator's
   laptop. This is a known semantic difference, first noticed while surveying
-  `my_infra` (section 6.9), where eleven `set_fact` tasks fetch
+  the dogfooding repository (section 6.9), where eleven `set_fact` tasks fetch
   `https://github.com/<user>.keys`. Controller-side data reaches the target
   only through the two file mechanisms in section 5.6.
 
@@ -355,10 +358,10 @@ changes. Nothing else may write to stdout in `--remote` mode.
 **What crosses the channel.** Down, the orchestrator first sends the run's
 start: the vars, what the target needs to know about its host (11.1), whether
 this is a dry run, the verbosity, and the escalation password when the host's
-method needs one (11.3). After that it sends a cancel, and the chunks of
-files the binary asked for. Up, the binary first says hello, naming the
-protocol version and the playbook (the name comes from the macro, not
-`argv[0]`), and then streams events:
+method needs one (11.3). After that it may send a cancel, and it answers
+the binary's file requests chunk by chunk, or with a refusal. Up, the
+binary first says hello, naming the protocol version and the playbook (the
+name comes from the macro, not `argv[0]`), and then streams events:
 
 - the facts it gathered (13);
 - a block opening and closing (11.1);
@@ -466,7 +469,8 @@ by the target's disk, not by memory, as root or as any account, and no
 operation imposes a default size limit; a playbook that wants one asks for
 it. A streamed write lands whole or not at all: it is staged beside its
 destination with its mode and owner already set, and renamed into place only
-when complete, so a failure part way leaves the destination as it was.
+when complete, so a failure part way leaves the destination as it was
+(though a process killed part way can leave its staged file beside it).
 
 The reverse (Ansible's `fetch`) uses the same channel upward, in chunks, and
 whatever receives the file stages it beside the destination and renames it
@@ -774,75 +778,70 @@ limits.
 
 ### 6.8 Translations of real Ansible modules
 
-**`ansible.builtin.apt`**
+Each translation is which op replaces the module, and where the meaning
+differs. How the op does it is in its source.
+
+**`ansible.builtin.apt`** becomes three ops, one per `state` (6.3):
+`apt::Present`, `apt::Absent` and `apt::Latest`.
 ```rust
 let pkgs = ctx.step("Install nginx and curl",
     apt::Present::new(["nginx", "curl"]).update_cache(Duration::from_secs(3600)))?;
-// pkgs.installed: Vec<Package{name,version}> (only ones this step installed), pkgs.already_present
+// `pkgs` says which packages this step installed and which were already there
 ctx.step("Remove apache2", apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
 ctx.step("Keep openssl current", apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
 ```
-All three refuse early on a non-Debian box using `facts.has_pm(&Pm::Apt)`, and
-all three need root.
-
-`Present` `check`: `dpkg-query -W` per name, build the missing set, `Satisfied`
-if empty. `apply`: `apt-get update` if the cache is older than the max age, then
-`apt-get install -y` the missing set.
+All three refuse on a host whose package manager is not apt, and when not
+running as root.
 
 `Latest` compares each installed version against the *candidate* apt would
-install, and candidates come from the package lists. With `.update_cache(max_age)`,
-a real run refreshes them in `check` — `apt-get update` when the lists are older
-than the max age — then reads `apt-cache policy` per name, then `apt-get install
--y --only-upgrade`. Under `--check` the refresh is not run: a dry run contacts no
-mirror and writes nothing (12). So when the lists are older than the max age the
-step cannot know the candidates, and says so: it reports `would change`, with a
-diff saying the lists were not refreshed, and has no output. Lists within the max
+install, and the candidates come from the package lists, so with
+`.update_cache(max_age)` a real run refreshes stale lists in `check`, before
+it decides: the one op that changes the machine from `check` (7.3). Under
+`--check` the refresh is not run: a dry run contacts no mirror and writes
+nothing (12). So when the lists are older than the max age the step cannot
+know the candidates, and says so: it reports `would change`, with a diff
+saying the lists were not refreshed, and has no output. Lists within the max
 age need no refresh, and the dry run plans from them exactly as the real run
 will. Without `.update_cache(...)` neither mode refreshes, and both compare
-against whatever the lists already say. Ansible's `apt` also skips the refresh
-under check mode (`apt.py`, `if not module.check_mode: cache.update()`), but then
-plans against the stale lists, so its dry run can call a package current that the
-real run upgrades; Rustible says it does not know instead.
+against whatever the lists already say. Ansible's `apt` also skips the
+refresh under check mode (`apt.py`, `if not module.check_mode:
+cache.update()`), but then plans against the stale lists, so its dry run can
+call a package current that the real run upgrades; Rustible says it does not
+know instead.
 
-**`ansible.builtin.lineinfile`**
+**`ansible.builtin.lineinfile`** becomes `file::Line`.
 ```rust
 let sshd = ctx.step("Disable password auth",
     file::Line::in_path("/etc/ssh/sshd_config")
         .matching(r"^#?PasswordAuthentication")
         .set("PasswordAuthentication no")
         .backup(true))?;
-// sshd.changed, sshd.backup_path: Option<PathBuf>, sshd.line_no
+// `sshd.changed`, and where the backup went when one was made
 ```
-`check` reads the file, finds the line by regex (or exact match), and returns
-`Satisfied` if it already equals the target, otherwise `Change` with the
-rewritten text (the line replaced in place, or inserted at the position
-`.insert(..)` picks: `Insert::Append` by default, `Prepend`, `After(re)`,
-`Before(re)`). `apply` optionally backs up and writes the planned text
-atomically. The pure "given text and regex, produce new text" logic is a free
-function so it can be unit-tested with strings.
+`check` plans the rewritten text and returns `Satisfied` when it is already
+there; `apply` backs up if asked and writes exactly that text, atomically
+(7.3).
 
-**`ansible.builtin.systemd`**
+**`ansible.builtin.systemd`** becomes one op per state and one per action.
 ```rust
 ctx.step("sshd enabled", systemd::Enabled::new("sshd"))?;
 if sshd.changed {
     ctx.step("sshd restarted", systemd::Restart::new("sshd").daemon_reload(true))?;
 }
 ```
-`Enabled`/`Running`/`Stopped` are states (`systemctl is-enabled` / `is-active` in
-`check`). `Restart` is an action: `check` always returns `Change`; `apply` does
-optional `daemon-reload`, `restart`, then verifies `is-active`. `DaemonReload` is
-the same reload on its own, for a playbook that writes a unit file and wants
-systemd to notice it without bouncing anything: it names no unit and returns `()`
-(6.4).
+`Enabled`, `Running` and `Stopped` are states. `Restart` is an action (6.4):
+its `check` always plans it, and the step fails unless the unit is active
+afterwards. `DaemonReload` is the reload on its own, for a playbook that
+writes a unit file and wants systemd to notice it without bouncing anything:
+it names no unit and returns `()` (6.4).
 
 ### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED)
 
 The first ops are chosen from real usage, not from Ansible's module index.
-Cadu's personal infrastructure repository, `/home/cadu/w/cadu/my_infra`
-(Ansible playbooks and roles for nine hosts: a home server, a storage server,
-a games box, a Home Assistant box, a Tailscale box, a Vultr VPS running
-Headscale, two family PCs, and a macOS laptop), was surveyed on 2026-09-07:
-39 playbook and role files, disabled ones excluded. Module usage:
+The standard library is shaped by dogfooding against a real infrastructure
+repository: Ansible playbooks and roles for a small fleet, surveyed on
+2026-09-07, 39 playbook and role files with disabled ones excluded. Module
+usage:
 
 | Ansible module | Uses | Rustible op |
 |---|---|---|
@@ -855,13 +854,13 @@ Headscale, two family PCs, and a macOS laptop), was surveyed on 2026-09-07:
 | `set_fact` | 12 | not an op: `let`. Eleven of these fetch GitHub SSH keys, see below |
 | `hostname` | 9 | `hostname::Is` |
 | `include_role` | 7 | not an op: a role is a function in `src/lib.rs` taking `&mut Ctx` |
-| `lineinfile`, `blockinfile` | 4 + 4 | `file::Line` (exists), `file::Block` |
+| `lineinfile`, `blockinfile` | 4 + 4 | `file::Line`, `file::Block` |
 | `get_url`, `unarchive` | 3 + 2 | `http::Download`, `archive::Extracted` |
 | `sysctl` | 3 | `sysctl::Present` |
 | `group` | 2 | `group::Present` |
 | `stat`, `acl`, `mount`, `iptables`, `replace`, `template`, `command`, `shell` | 1 or 2 each | tail |
 
-**Wave one of `rustible-std`** (M6), covering about 95 percent of that repo
+**Wave one of `rustible-std`**, covering about 95 percent of that repository
 with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,
 `file::{Copy, Directory, Symlink, Absent, Attrs, Line, Block}`,
 `apt::{Present, Absent, Latest}`, `systemd::{Enabled, Disabled, Running,
@@ -874,8 +873,8 @@ generally important), `file::Replace`, `acl`, `mount`, `iptables`.
 (`lookup('url', 'https://github.com/<user>.keys')` combined into a list and
 looped into `authorized_key`) is not a `set_fact` problem and not a
 `rustible-std` problem. It is a small separate collection, `rustible-github`,
-with a read-only op `github::UserKeys::of("flipbit03")` returning the parsed
-keys over `rustible-std`'s HTTP client: synchronous, with pure-Rust
+with a read-only op `rustible_github::UserKeys::of("flipbit03")` returning
+the parsed keys over `rustible-std`'s HTTP client: synchronous, with pure-Rust
 TLS and no OpenSSL (section 5.3). An async client was rejected because it
 brings a runtime and, without careful feature selection, native TLS and
 therefore OpenSSL.
@@ -885,17 +884,15 @@ itself. The `ssh_keys_from_github` role (two task files, a defaults file, and
 a `set_fact`/`combine`/`product` dance) becomes a fifteen-line function with
 typed arguments.
 
-**Dogfooding.** A Rustible workspace lives inside `my_infra` (a `rustible/`
-folder, created by `rustible init` once M4 exists, by hand before that), with
-path dependencies to the local Rustible checkout until the crates are
-published. The inventory maps directly: `ansible_host` becomes `addr`,
-`ansible_user` becomes `ssh_user`, `computer_hostname` becomes a var; the
-macOS laptop is out of MVP scope (section 5.3). Port order: `ourserver/00_basic`
-first (hostname, apt, sysctl; three ops, no roles), then the
-`ssh_keys_from_github` role as a lib function, then the user-setup subtask,
-then a whole host. Ansible and Rustible run side by side until parity, and
-every port is a test of an op against a real machine. Ansible's `notify:
-Restart avahi-daemon` becomes `if hostname.changed { .. }`.
+**Dogfooding.** That repository gains a Rustible workspace beside its
+playbooks, and its hosts are ported one at a time. The inventory maps
+directly: `ansible_host` becomes `addr`, `ansible_user` becomes `ssh_user`,
+and a per-host hostname variable becomes a var. Port order: a host's basic
+setup first (hostname, apt, sysctl; three ops, no roles), then the
+`ssh_keys_from_github` role as a lib function, then the user setup, then a
+whole host. Ansible and Rustible run side by side until parity, and every
+port is a test of an op against a real machine. Ansible's `notify: Restart
+avahi-daemon` becomes `if hostname.changed { .. }`.
 
 ## 7. The `System` handle
 
@@ -967,9 +964,13 @@ a swappable backend: `Local` on a real machine, `Fake` in unit tests, and
   this succeed" probe does.
 - **Writes are atomic.** A write is staged as a temporary file beside its
   target and renamed over it, so the target is never seen half written.
-  Content of any size streams rather than being held whole (5.6), and a
-  requested mode and owner are applied to the staged file before the rename,
-  so the file never appears with the wrong ones.
+  Content of any size streams rather than being held whole (5.6). A
+  requested mode and owner are applied to the staged file before the
+  rename, so the file never appears with the wrong ones; without one, a
+  rewrite keeps the existing file's mode and, where the identity may give
+  it, its owner, as Ansible's `atomic_move` does (7.1), so rewriting a
+  `0440` file leaves it `0440`. A new file with no requested mode gets the
+  mode any new file gets.
 - `System` has no temp-directory or common-file-attributes helper; an op
   that needs one builds it from the primitives.
 - Ops are synchronous. The event channel is the only concurrent thing in the
@@ -1001,7 +1002,8 @@ are the authority on the methods and the primitives.
 with BusyBox flags, which is distro knowledge that belongs in the op, chosen via
 `facts.distro`. Layering:
 
-- `System`: primitives identical on every Unix (read, write, stat, spawn, identity).
+- `System`: primitives identical on every Unix (files, directories,
+  attributes, processes, identity; `backend/` is the authority).
 - Ops: everything distro-specific.
 - `Facts`: the data that lets ops choose.
 
@@ -1075,31 +1077,26 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   manifest entry to add on create or remove on delete, while keeping full
   rust-analyzer, clippy, types, and completion in every playbook file.
 
-  **Mechanism.** The workspace package has one bin target, `src/main.rs`,
-  written once by `rustible init` and never edited, and a `build.rs`, also
-  generated once. Both are **shims that must stay shims (DECIDED
-  2026-09-07):** `src/main.rs` is a doc comment plus two lines (include the
-  registry, call `rustible::runtime::main(PLAYBOOKS)`), and `build.rs` is a doc
-  comment plus one call into a `rustible-build` helper crate that does the
-  scanning, so all logic lives in crates and a fix ships as a version bump,
-  never as "edit your main.rs". Each file opens with a header stating that it
-  was generated by `rustible init` at version X, that it is not to be edited,
-  that playbooks go in `playbooks/` and shared code in `src/lib.rs`, and that
-  `rustible init --refresh` regenerates it. The CLI does **not** hash-check or
-  police these files: a power user may edit them, at their own risk, and the
-  header comment is the whole safeguard. (A hash-and-warn scheme was proposed
-  during vetting and rejected 2026-09-07 as unnecessary nannying.) The build script walks `playbooks/**/*.rs`, parses each
-  file with `syn` (milliseconds per file; immune to the attribute appearing in
-  a comment or string), and for every file containing a function marked
-  `#[rustible::playbook(..)]` writes into `OUT_DIR` a
-  `#[path = "<abs path>"] mod <name>;` line plus a registry entry
-  `("cadu/x", entry)`. `src/main.rs` is essentially
-  `include!(concat!(env!("OUT_DIR"), "/playbooks.rs"))` plus the SDK's
-  dispatcher, which picks the entry by name and speaks the protocol. Files
-  without the marker are not playbooks: they are ignored unless a playbook
-  pulls them in with `mod helpers;` or `#[path]`, so helper code may live
-  next to playbooks. Two marked functions in one file is a build error naming
-  the file. The same scan backs `rustible playbook list`.
+  **How it works.** The workspace has one bin target, `src/main.rs`, and a
+  `build.rs`, both written once by `rustible init` and both **shims that
+  must stay shims**: each is a doc comment plus a call into a crate (the
+  `rustible` runtime, and the `rustible-build` scanner), so all logic lives
+  in crates and a fix ships as a version bump, never as "edit your
+  main.rs". Each file opens with a header saying that `rustible init`
+  generated it, that it is not to be edited, where playbooks and shared code
+  go, and that `rustible init --refresh` regenerates it. The CLI does **not**
+  hash-check or police these files: a power user may edit them, at their own
+  risk, and the header comment is the whole safeguard. (A hash-and-warn
+  scheme was proposed during vetting and rejected as unnecessary nannying.)
+  The build script parses every file under `playbooks/` (a real parse, so
+  the attribute in a comment or a string does not count) and compiles each
+  file with a function marked `#[rustible::playbook(..)]` into the bin crate
+  as a module, registered under its name; the runtime picks the entry by
+  name and speaks the protocol. Files without the marker are not playbooks:
+  they are ignored unless a playbook pulls them in with `mod helpers;` or
+  `#[path]`, so helper code may live next to playbooks. Two marked functions
+  in one file is a build error naming the file. The same scan backs
+  `rustible playbook list`.
 
   Two Cargo behaviours make this work, both verified in scratch projects on
   2026-09-07 (the second time as a 20-hypothesis spike with positive and
@@ -1202,8 +1199,8 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
     missing regeneration (fresh clone, manual delete) breaks the whole
     workspace until `rustible playbook sync` runs.
   - `cargo script` single-file packages: closest to "just a file", but still
-    nightly-only (`requires -Zscript` on cargo 1.97.1), one dependency cache
-    per playbook, partial rust-analyzer support.
+    nightly-only (`-Zscript`), one dependency cache per playbook, partial
+    rust-analyzer support.
 - **Inventory is data**, in `hosts.kdl` next to `rustible.toml`. See section 10.
   Dynamic inventories become a trait later.
 - **Crates (DECIDED 2026-09-07):**
@@ -1214,7 +1211,8 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   - `rustible-cli`: the CLI and orchestrator (init, playbook run/create,
     inventory show/check, SSH, compile, render), installed with
     `cargo install rustible-cli`, binary named `rustible`. Never a dependency of
-    a workspace: it would drag tokio and openssh into every cross-compiled
+    a workspace: it would drag the orchestrator's async runtime and SSH
+    client into every cross-compiled
     playbook. The `Pretty` renderer belongs here, not in the SDK.
   - `rustible-sdk`: `Op`, `Plan`, `Intent`, `Applied`, `System`, `Backend`,
     `Local`, `Fake`, `Facts`, `Diff`, `Ctx`, the event and protocol types, the
@@ -1407,7 +1405,8 @@ source of each (all / group X / host / defaults), including what was overridden.
   that the struct is flat (one level), which is an inventory design choice, not
   a parser limitation.
 - A field is *required* iff it is not `Option<T>` and has no default.
-- Last line of defense: the binary deserializes its vars again at `Start` on the
+- Last line of defense: the binary deserializes its vars again from the run's
+  start (5.5) on the
   target, so nothing runs with bad vars even if the pre-check were bypassed.
 - Options rejected: `syn` on the source (instant, but only sound for a closed
   canonically spelled type set, and needs a second parser kept in sync with the
@@ -1500,7 +1499,8 @@ stack of open blocks. What it offers comes in three tiers:
 
 - **`vars` is a parameter of `main`** (`fn main(ctx: &mut Ctx, vars: Vars)`), not
   a method on `Ctx`. The macro deserializes it from the run's start (5.5)
-  before `main` runs; failure is a clean per-host message. `Ctx` is untyped w.r.t. vars.
+  before `main` runs; failure is a clean per-host message. `Ctx` is untyped
+  w.r.t. vars.
 - **`sys()` is exposed.** Playbooks are programs; authors are responsible. Reads
   are unreported. Mutations outside a step still go through the backend (logged
   at `-v`) but do not appear as steps; if it should be in the report, make it a
@@ -1590,31 +1590,31 @@ from the binary's own (`as root`, `as postgres`).
 
 **Mechanism.** A running process cannot change identity per call, and a
 write to `/etc/...` from an unprivileged process gets EACCES. Ansible's answer
-is shell tricks (`sudo tee`, chmod dances). Ours: `as_user` creates a `System`
-whose backend is `Elevated`, for that user. On first use it spawns **the same
-binary**, through the host's escalation method, in helper mode. For root that
-is the binary already running, from the login user's cache. Any other account
-usually cannot reach that file (homes are 0750 or 0700 by default on Ubuntu
-and Debian, and `~/.cache` is 0700 on macOS), so the binary first copies
-itself, over a local pipe, into the account's own `~/.cache/rustible/bin`,
-named by its content hash, and the helper runs from there. The copy is a
-cache, so a later run of the same build spawns once, as for root. An account
-with no usable home (none, not writable, or `noexec`) gets a private per-run
-directory instead, which is not cached: the helper deletes its copy and the
-directory as it starts. A step is refused only when both are unusable, naming
-both causes. `escalate = true` with an `escalate_user` other than root or the
-login launches the binary the same way (5.2 step 8), except that its per-run
-temp copy is removed when the run ends rather than as it starts, because the
-run's own helpers are started from it.
+is shell tricks (`sudo tee`, chmod dances). Ours: a step under another
+identity does its I/O through a helper, which is **the same binary** started
+in helper mode as that identity, through the host's escalation method, on
+first use. So nothing extra is uploaded from the controller, and the helper
+is always the same build as its parent. The account has to be able to run
+that binary, and an account other than root usually cannot reach the login
+user's cache (homes are 0750 or 0700 by default on Ubuntu and Debian, and
+`~/.cache` is 0700 on macOS), so the binary is copied, on the target, to a
+place the account owns: its own cache, kept for later runs of the same
+build, or a private per-run directory when it has no usable home (none, not
+writable, or `noexec`). A step is refused only when neither is usable,
+naming both causes. `escalate = true` with an `escalate_user` other than
+root or the login launches the binary the same way (5.2 step 8).
+`crates/rustible-sdk/src/launch.rs` and `backend/elevated.rs` are the
+authority on how.
 
 The helper serves the same primitives `Local` does, to its parent over its
 stdin and stdout, framed like the main channel; it is `Local` wrapped in a
 request loop. Anything that can be large, a file read or written, a
 directory listing, a command's stdin and output, crosses in chunks, so the
 helper never holds a file whole either (5.6), and a write through it lands
-whole or not at all. A helper is always the same build as its parent, which
-is why its wire needs no version (5.5). One helper per identity, spawned
-lazily, kept alive for the run, killed at exit. Properties:
+whole or not at all, as any streamed write does. A helper is always the
+same build as its parent, which is why its wire needs no version (5.5). One
+helper per identity, spawned lazily, kept alive for the run, killed at exit.
+Properties:
 
 - No extra upload from the controller: the helper is the binary already on the
   target, copied over a local pipe into an unprivileged account's own cache
@@ -1687,11 +1687,12 @@ when a later step reads what a dry run could not produce: a warning saying
 where the dry run stopped seeing.
 
 **The rules:**
-- In check mode, a would-change step reports `WouldChange` with its diff and
+- In check mode, a would-change step reports `would change` with its diff and
   the run continues. Nothing is applied and nothing is predicted: the intent
   carries what `check` observed and decided, and no post-apply output.
 - A would-change step's output does not exist. Reading it, through
-  `.output()` or through `Deref`, raises an error naming the step. `.changed` and `.diff` remain readable.
+  `.output()` or through `Deref`, raises an error naming the step.
+  `.changed` and `.diff` remain readable.
   Under `--check` that read ends the innermost enclosing `ctx.block` — or,
   outside any block, the playbook body for that host — with a warning naming
   the block and the step whose output was read. (Read inside an operation's
@@ -1768,8 +1769,9 @@ the one), the init system, the CPU count and memory, and the account the
 binary runs as, with whether it is root. The operating system, distribution,
 architecture and init system are typed enums with an `Other(String)` variant,
 so an unknown value degrades to a string instead of failing; a package
-manager Rustible does not know is simply not listed. Deliberately excluded from the core: mounts, network
-interfaces, users and groups, installed packages, environment. Each is an op
+manager Rustible does not know is simply not listed. Deliberately excluded
+from the core: mounts, network interfaces, users and groups, installed
+packages, environment. Each is an op
 when a playbook needs it. Facts cross the wire, so changing their shape is a
 protocol change (5.5). `crates/rustible-sdk/src/facts.rs` is the authority on
 the fields and their variants.
@@ -1777,15 +1779,16 @@ the fields and their variants.
 ### 13.1 Desired-state ops are the lookups
 
 There is no generic `::lookup()`. The desired-state op's typed output already
-says what was found: `pkg::Present::new(["python3"])` returns
+says what was found: `apt::Present::new(["python3"])` returns
 `already_present` and `installed`, and `.changed` is false when nothing was
 done (reported as `ok`, never `skipped`; `skipped` means deliberately not run).
 
 A small minority of **read-only ops** exists for *observe without changing*:
-"if docker is installed, configure it" (where `pkg::Present` would install it)
+"if docker is installed, configure it" (where `apt::Present` would install it)
 and "this user must already exist, fail otherwise" (`user::Existing`, where
 `user::Present` would create it). They appear as named steps with typed
-output, never report `changed`, and most resources do not need one.
+output, never report `changed` in a real run (a lookup of remote state is
+`would change` under `--check`, 6.5), and most resources do not need one.
 
 ## 14. Error model (DECIDED)
 
@@ -1913,8 +1916,9 @@ init` layout (3, 10.4); 5, the diff representation (6.2); 6, output rendering
 
 **The `escalate` name (decided 2026-09-06, revised the same day).** The word
 `become` is not used anywhere in Rustible; it is `escalate` everywhere: the
-playbook attribute (`escalate = true`), the CLI flag (`--escalate`), the
-inventory parameters (`escalate="sudo"`, `escalate_user`), and all code.
+playbook attribute (`escalate = true`), the inventory parameters
+(`escalate="sudo"`, `escalate_user`), the CLI's `--escalate-password-env`,
+and all code.
 Reason: `become` is a reserved Rust keyword (for guaranteed tail calls).
 Options weighed: `r#become` internally (ugly all over the code), a
 `rustible_become` prefix in the attribute (redundant inside

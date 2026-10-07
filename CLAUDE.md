@@ -23,21 +23,29 @@ and why. The rest are read when you need them:
 ## The contract
 
 **`docs/01_VISION.md` is the source of truth on intent.** It is long and it
-is vetted. On intent, guarantees, and the shape a playbook author sees, when
-code and vision disagree the vision wins and the code is wrong, unless the
-author decides otherwise in the session you are in. On types, fields,
-signatures and mechanisms the source is the authority, and the vision does
-not carry them.
+is vetted. On intent, guarantees, decisions with their reasons, and the shape
+a playbook author sees, when code and vision disagree the vision wins and the
+code is wrong, unless the author decides otherwise in the session you are
+in. On types, fields, signatures and how a guarantee is implemented, the
+source is the authority. When you cannot tell which of the two a
+disagreement is, treat it as intent and raise it.
 
-**The vision never carries copies of internal types.** No struct or enum
-listings, field lists, trait or method signatures, wire layouts, byte sizes,
-library choices, one op's implementation details, or "what is in the tree"
-status. It states what must hold and names the source file that does it.
-Playbook and inventory examples stay, because they are the product's shape.
-A proposed amendment that would only update a struct, a field or a signature
-is not an amendment: drop it. Status belongs in `docs/plan/PROGRESS.md`;
-history, and the reasons behind implementation choices, in
-`docs/plan/DECISIONS.md`.
+**The vision does not copy the code.** The test: if a line would go stale
+when a field is added or an op's internals change, it does not belong there.
+So no struct or enum listings, field lists, wire layouts, full trait or
+method signatures, chunk or frame sizes, one op's internals (the flags it
+passes, the files it reads), or "what is in the tree" status; where a
+section needs one, it states what must hold and names the source file that
+is the authority. What it does carry: a design decision with its rationale
+and the alternatives it beat, including when the decision is a tool or a
+library (zig and `ring` in 5.3, KDL in 10.2, `anyhow` in 14) and the
+measurements that justified it (5.3's binary sizes); the minimal sketch of
+the `Op` contract in 6.2, because that is the core idea; and playbook,
+inventory and CLI examples with their rendered output, because they are the
+product's shape. A proposed amendment that would only update a struct, a
+field or a signature is not an amendment: drop it. Status belongs in
+`docs/plan/PROGRESS.md`; history, and the reasons behind implementation
+choices the vision does not make, in `docs/plan/DECISIONS.md`.
 
 **Do not edit it on your own initiative.** The rule exists so the contract is
 not rewritten by whoever happens to be passing. If your work requires an
@@ -270,8 +278,10 @@ Two obligations beyond the code. Add a `docs/plan/DECISIONS.md` entry with its
 `Reverse:` clause for any decision a reader would otherwise have to
 reconstruct — the shape you rejected, a refusal you chose, a tool you drive
 and why. Adding an op that follows the existing pattern needs no entry. And if
-the vision doc does not cover the op, say so in the pull request and propose
-the amendment; do not edit `docs/01_VISION.md` yourself.
+the vision doc does not cover the op's concept — the desired state it
+manages, the Ansible module it replaces, a guarantee or a refusal class it
+adds — say so in the pull request and propose the amendment in those terms,
+never the op's internals; do not edit `docs/01_VISION.md` yourself.
 
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are
