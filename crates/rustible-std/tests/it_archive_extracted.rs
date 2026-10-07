@@ -77,11 +77,10 @@ fn extracted_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         ctx.sys().write_atomic(&src, bytes)?;
         ctx.sys().mkdir_all(&dest)?;
 
-        // With the `creates` marker: extracted once, then `ok`.
+        // With the `creates` marker, the member the archive lists last:
+        // extracted once, then `ok`.
         let (first, second) = changed_then_ok(ctx, &format!("extract {name}"), || {
-            Extracted::from_path(&src)
-                .to(&dest)
-                .creates("hello/README.txt")
+            Extracted::from_path(&src).to(&dest).creates("hello/link")
         })?;
         assert_eq!(first.format, Some(format));
         assert_eq!(

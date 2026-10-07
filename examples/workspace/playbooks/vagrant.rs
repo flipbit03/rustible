@@ -27,6 +27,7 @@
 //! one is over 48 MiB too, so its reads cross the helper in chunks, and in
 //! both the member's writes do, alternating with them.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rustible::prelude::*;
@@ -153,6 +154,10 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         login.step(format!("50 MiB member of {tarball} as {LOGIN_ACCOUNT}"), archive::Extracted::from_path(tarball).to(&dest).creates("rustible-tree/large"))?;
         if !ctx.check_mode() {
             ctx.sys().cmd("cmp").args([LARGE.to_string(), format!("{dest}/rustible-tree/large")]).run().with_context(|| format!("the member extracted from {tarball} is not the 50 MiB file"))?;
+            // The tree and its one member, and nothing staged beside them.
+            let tree = PathBuf::from(format!("{dest}/rustible-tree"));
+            let left = (ctx.sys().read_dir(&dest)?, ctx.sys().read_dir(&tree)?);
+            ensure!(left == (vec![tree.clone()], vec![tree.join("large")]), "extracting {tarball} left more than its member in {dest}: {left:?}");
         }
     }
 

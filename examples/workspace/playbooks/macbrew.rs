@@ -186,6 +186,13 @@ fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
                 .args([large.clone(), format!("{dest}/tree/large")])
                 .run()
                 .with_context(|| format!("the member extracted from {tarball} is not the 50 MiB file"))?;
+            // The tree and its one member, and nothing staged beside them.
+            let tree = PathBuf::from(format!("{dest}/tree"));
+            let left = (root.sys().read_dir(&dest)?, root.sys().read_dir(&tree)?);
+            ensure!(
+                left == (vec![tree.clone()], vec![tree.join("large")]),
+                "extracting {tarball} left more than its member in {dest}: {left:?}"
+            );
         }
     }
     Ok(())
