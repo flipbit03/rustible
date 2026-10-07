@@ -42,10 +42,10 @@ pub enum Format {
     /// after a skippable frame) or `cat` of several `.zst` files make, are
     /// all decoded, skippable frames are skipped, and each frame's content
     /// checksum is verified when it has been read to its end. Decoded as
-    /// it is read, like the others: memory is the frame's window, which the
-    /// compressor chose (8 MiB at `zstd -19`, up to 128 MiB with `--long`;
-    /// a frame asking for more is refused), about 1.5 times that while
-    /// decoding, plus 1 MiB decoded ahead.
+    /// it is read, like the others, in memory that grows with the frame's
+    /// window, which the compressor chose: peak resident memory measured
+    /// about 11 MB at a 2 MiB window, 35 MB at 8 MiB (`zstd -19`) and
+    /// 292 MB at 128 MiB (`zstd --long=27`), the most a frame may ask for.
     TarZst,
 }
 
@@ -118,10 +118,10 @@ pub fn validate_entry_path(raw: &Path) -> std::result::Result<PathBuf, String> {
             Component::Normal(n) => out.push(n),
             Component::CurDir => {}
             Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("`{}` is an absolute path", raw.display()));
+                return Err(format!("`{}` is an absolute path", named(raw)));
             }
             Component::ParentDir => {
-                return Err(format!("`{}` contains `..`", raw.display()));
+                return Err(format!("`{}` contains `..`", named(raw)));
             }
         }
     }
@@ -142,8 +142,8 @@ pub fn validate_link_target(link: &Path, target: &Path) -> std::result::Result<(
     if target.is_absolute() {
         return Err(format!(
             "symlink `{}` -> `{}` has an absolute target",
-            link.display(),
-            target.display()
+            named(link),
+            named(target)
         ));
     }
     let mut depth = link.components().count().saturating_sub(1) as isize;
@@ -155,8 +155,8 @@ pub fn validate_link_target(link: &Path, target: &Path) -> std::result::Result<(
                 if depth < 0 {
                     return Err(format!(
                         "symlink `{}` -> `{}` points outside the destination",
-                        link.display(),
-                        target.display()
+                        named(link),
+                        named(target)
                     ));
                 }
             }
@@ -323,10 +323,12 @@ pub struct ExtractReport {
 /// **Memory.** Member data takes constant memory, about one chunk plus the
 /// decoder's state, for a plain tar and for gzip, xz and zstd alike,
 /// escalated or not: the archive is read a chunk at a time and each member
-/// is streamed to disk, never held whole. zstd's state is the frame's
-/// window (8 MiB at `zstd -19`, up to 128 MiB with `--long`; a frame asking
-/// for more is refused), about 1.5 times that while decoding; xz's is its
-/// dictionary (8 MiB at the default `-6`, 64 MiB at `-9`). Headers are
+/// is streamed to disk, never held whole. zstd's state grows with the
+/// frame's window, which the compressor chose: peak resident memory was
+/// measured at about 11 MB for a 2 MiB window, 35 MB for 8 MiB
+/// (`zstd -19`) and 292 MB for 128 MiB (`zstd --long=27`), the most a frame
+/// may ask for. xz's is its dictionary (8 MiB at the default `-6`, 64 MiB
+/// at `-9`). Headers are
 /// read whole by the `tar` crate: a long name, a link target, a member's
 /// pax records. A pax global header is read whole to scan it, and refused
 /// over 1 MiB.
@@ -429,7 +431,8 @@ impl Extracted {
     /// the archive's end marker, so the stream's own checks run: the last
     /// zstd frame's checksum, gzip's CRC32 and length, xz's block check,
     /// index and footer. Whatever follows the end marker is decoded to its
-    /// end too, so anything after the stream is refused. A plain tar has
+    /// end too, so anything after the stream is refused, but for zero
+    /// padding after gzip ([`Gz`]) and xz's own stream padding. A plain tar has
     /// no check, and is left where `tar` stopped. After `apply` (`written`)
     /// a checksum that fails here covers members already in place, and the
     /// error says so.
@@ -446,11 +449,24 @@ impl Extracted {
             Ok(_) => Ok(()),
             Err(e) if written && checksum_failed(&e) => Err(Error::from(e).context(format!(
                 "{}: the archive's checksum did not match at its end, after every member was \
-                 written; the members this run extracted may hold corrupt data; replace the \
-                 archive and run the step again",
-                self.src.display()
+                 written; the members this run extracted may hold corrupt data; {}",
+                self.src.display(),
+                self.after_checksum()
             ))),
             Err(e) => Err(Error::from(e).context(format!("{}: decompressing", self.src.display()))),
+        }
+    }
+
+    /// What to do once a checksum failed after members were written: the
+    /// archive is bad, and a `.creates` marker already among them would
+    /// make the next run `ok` over what this one extracted.
+    fn after_checksum(&self) -> String {
+        match self.marker() {
+            Some(marker) => format!(
+                "replace the archive, remove {} if this run extracted it, and run the step again",
+                marker.display()
+            ),
+            None => "replace the archive and run the step again".to_string(),
         }
     }
 
@@ -494,11 +510,11 @@ impl Extracted {
                 Some(s) if s.kind == FileKind::Dir => {}
                 Some(s) if s.kind == FileKind::Symlink => bail!(
                     "{} is a symlink; refusing to extract through it",
-                    full.display()
+                    named(&full)
                 ),
                 Some(_) => bail!(
                     "{} is not a directory but the archive puts entries under it",
-                    full.display()
+                    named(&full)
                 ),
             }
         }
@@ -511,18 +527,18 @@ impl Extracted {
                 (Kind::Dir, FileKind::Dir) => {}
                 (Kind::Dir, other) => bail!(
                     "{} exists and is not a directory ({other:?}); the archive has a directory there",
-                    full.display()
+                    named(&full)
                 ),
                 (_, FileKind::Dir) => bail!(
                     "{} is a directory; the archive has a {} there",
-                    full.display(),
+                    named(&full),
                     match m.kind {
                         Kind::Symlink(_) => "symlink",
                         _ => "file",
                     }
                 ),
                 (_, FileKind::Other) => {
-                    bail!("{} exists and is not a regular file", full.display())
+                    bail!("{} exists and is not a regular file", named(&full))
                 }
                 _ => {}
             }
@@ -587,25 +603,26 @@ impl Extracted {
                          for it; the archive is truncated, or changed between check and apply, \
                          and nothing was written at {}; run the step again once the archive is \
                          whole",
-                        m.path.display(),
+                        named(&m.path),
                         member.read,
-                        full.display()
+                        named(&full)
                     );
                     if member.checksum {
                         return Err(e.context(format!(
                             "the archive's checksum did not match while member `{}` was read, so \
                              nothing was written at {}; members extracted before it in this run \
-                             may hold corrupt data; replace the archive and run the step again",
-                            m.path.display(),
-                            full.display()
+                             may hold corrupt data; {}",
+                            named(&m.path),
+                            named(&full),
+                            self.after_checksum()
                         )));
                     }
                     if member.failed {
                         return Err(e.context(format!(
                             "reading member `{}` from the archive failed part way (truncated or \
                              corrupt), and nothing was written at {}",
-                            m.path.display(),
-                            full.display()
+                            named(&m.path),
+                            named(&full)
                         )));
                     }
                     return Err(e);
@@ -646,11 +663,7 @@ impl Extracted {
                     Ok(())
                 };
                 link().with_context(|| {
-                    format!(
-                        "linking member `{}` at {}",
-                        m.path.display(),
-                        full.display()
-                    )
+                    format!("linking member `{}` at {}", named(&m.path), named(&full))
                 })?;
                 // `set_mode` and `set_owner` follow links; neither is
                 // applied to a symlink member.
@@ -707,9 +720,94 @@ const BLOCK: usize = 512;
 fn decompress<'a>(format: Format, raw: Box<dyn Read + 'a>) -> Box<dyn Read + 'a> {
     match format {
         Format::Tar => raw,
-        Format::TarGz => Box::new(flate2::read::MultiGzDecoder::new(raw)),
+        Format::TarGz => Box::new(Gz::new(raw)),
         Format::TarXz => Box::new(lzma_rust2::XzReader::new(raw, true)),
         Format::TarZst => Box::new(Zstd::new(raw)),
+    }
+}
+
+/// Every member of a gzip stream, decoded as it is read, each checked
+/// against its CRC32 and length when it ends, as `flate2`'s
+/// `MultiGzDecoder` reads them, so a tarball concatenated by `pigz` or
+/// `cat` is read to its end. Unlike it, zero bytes after the last member
+/// are padding, as a tape or `dd conv=sync` leaves them and GNU tar and
+/// gzip take them; any other bytes there are refused, counted, as not
+/// another gzip member.
+struct Gz<R: Read> {
+    state: GzState<R>,
+}
+
+enum GzState<R: Read> {
+    /// Inside a member.
+    Member(flate2::bufread::GzDecoder<std::io::BufReader<R>>),
+    /// After a member: another, padding, or the end.
+    Between(std::io::BufReader<R>),
+    /// Read to the end.
+    Done,
+}
+
+impl<R: Read> Gz<R> {
+    fn new(src: R) -> Self {
+        Gz {
+            state: GzState::Member(flate2::bufread::GzDecoder::new(std::io::BufReader::new(
+                src,
+            ))),
+        }
+    }
+}
+
+impl<R: Read> Read for Gz<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::BufRead;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match std::mem::replace(&mut self.state, GzState::Done) {
+                GzState::Member(mut member) => {
+                    let n = member.read(buf);
+                    if matches!(n, Ok(0)) {
+                        self.state = GzState::Between(member.into_inner());
+                        continue;
+                    }
+                    self.state = GzState::Member(member);
+                    return n;
+                }
+                GzState::Between(mut src) => {
+                    let head = src.fill_buf()?;
+                    if head.is_empty() {
+                        return Ok(0);
+                    }
+                    if head[0] == 0x1f && head.get(1).is_none_or(|b| *b == 0x8b) {
+                        self.state = GzState::Member(flate2::bufread::GzDecoder::new(src));
+                        continue;
+                    }
+                    // Padding to the end, or bytes that are not gzip.
+                    let (mut after, mut zero) = (0u64, true);
+                    loop {
+                        let head = src.fill_buf()?;
+                        if head.is_empty() {
+                            break;
+                        }
+                        zero &= head.iter().all(|b| *b == 0);
+                        after += head.len() as u64;
+                        let n = head.len();
+                        src.consume(n);
+                    }
+                    if !zero {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "{after} bytes after the gzip stream are not another gzip member"
+                            ),
+                        ));
+                    }
+                    return Ok(0);
+                }
+                GzState::Done => return Ok(0),
+            }
+        }
     }
 }
 
@@ -726,10 +824,11 @@ const ZSTD_MAX_WINDOW: u64 = 128 << 20;
 /// skipped, each frame's content checksum verified once it is read to its
 /// end. `ruzstd`'s own `StreamingDecoder` stops at the end of the first
 /// frame, and a stream may hold several, as `pzstd` and `cat` of several
-/// `.zst` files write. Holds the frame's window (what the compressor
-/// chose, 8 MiB at `zstd -19`; a frame asking for more than
-/// [`ZSTD_MAX_WINDOW`] is refused), about 1.5 times that while decoding,
-/// plus up to [`ZSTD_AHEAD`] decoded ahead of the reader.
+/// `.zst` files write. Holds the frame's window and the decoder's
+/// buffers around it, and up to [`ZSTD_AHEAD`] decoded ahead of the
+/// reader; a frame asking for a window over [`ZSTD_MAX_WINDOW`] is
+/// refused. Peak resident memory, measured: about 11 MB at a 2 MiB window,
+/// 35 MB at 8 MiB (`zstd -19`), 292 MB at 128 MiB (`zstd --long=27`).
 struct Zstd<R: Read> {
     src: std::io::BufReader<R>,
     dec: ruzstd::decoding::FrameDecoder,
@@ -770,7 +869,10 @@ impl std::error::Error for ZstdChecksum {}
 
 /// Whether `e` is a decoder finding that data it already handed out does
 /// not match the stream's own check: a zstd frame's checksum, gzip's CRC32
-/// and length, or an xz block's check or its index. Those cover data read
+/// and length, or an xz block's check or its index (its CRC32, which covers
+/// the sizes it records; `lzma-rust2`'s sans-I/O decoder compares those
+/// sizes on their own and says so, and is classified alike should the
+/// reader ever do the same). Those cover data read
 /// before them, so members written from it are already in place. gzip's
 /// and xz's are told by their decoders' own words, which
 /// `a_corrupt_archive_that_only_a_checksum_catches_is_reported` pins.
@@ -782,6 +884,8 @@ fn checksum_failed(e: &std::io::Error) -> bool {
     msg == "corrupt gzip stream does not have a matching checksum"
         || msg.contains("block checksum")
         || msg.contains("index CRC32 mismatch")
+        || msg == "index unpadded size mismatch"
+        || msg == "index uncompressed size mismatch"
 }
 
 /// A zstd failure as the reader reports it, prefixed so the step's error
@@ -979,7 +1083,7 @@ fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Opti
     }
     let Some(records) = entry
         .pax_extensions()
-        .with_context(|| format!("member `{}`: reading its pax records", raw.display()))?
+        .with_context(|| format!("member `{}`: reading its pax records", named(raw)))?
     else {
         return Ok(None);
     };
@@ -1004,7 +1108,23 @@ fn pax_sparse<R: Read>(entry: &mut tar::Entry<'_, R>, raw: &Path) -> Result<Opti
 /// escaped, so it cannot drive the operator's terminal, and cut at 256
 /// bytes with `…` after it.
 fn quoted(name: &str) -> String {
-    const CAP: usize = 256;
+    quoted_to(name, 256)
+}
+
+/// The most of a member's path a message shows, cut with `…` after it.
+/// GNU tar's long-name header lets a name be as long as the archive likes,
+/// and a refusal naming it whole would carry all of it to the controller
+/// in every event that holds the error.
+const NAME_CAP: usize = 4096;
+
+/// A path from the archive, or one built from it, as a message names it:
+/// [`quoted`], cut at [`NAME_CAP`].
+fn named(p: &Path) -> String {
+    quoted_to(&p.to_string_lossy(), NAME_CAP)
+}
+
+/// [`quoted`], cut at `cap` bytes.
+fn quoted_to(name: &str, cap: usize) -> String {
     let mut out = String::new();
     for c in name.chars() {
         let piece: String = if c.is_control() {
@@ -1012,7 +1132,7 @@ fn quoted(name: &str) -> String {
         } else {
             c.to_string()
         };
-        if out.len() + piece.len() > CAP {
+        if out.len() + piece.len() > cap {
             out.push('…');
             break;
         }
@@ -1053,8 +1173,8 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         if let Some(link) = symlinks.iter().find(|l| path.starts_with(l)) {
             bail!(
                 "member `{}` is under the symlink member `{}`",
-                raw.display(),
-                link.display()
+                named(&raw),
+                named(link)
             );
         }
         let header = entry.header();
@@ -1072,23 +1192,23 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         } else if ty.is_symlink() || ty.is_hard_link() {
             let target = entry
                 .link_name()
-                .with_context(|| format!("member `{}`: link target", raw.display()))?
+                .with_context(|| format!("member `{}`: link target", named(&raw)))?
                 .map(|t| t.into_owned())
                 .ok_or_else(|| {
-                    Error::msg(format!("member `{}` has no link target", raw.display()))
+                    Error::msg(format!("member `{}` has no link target", named(&raw)))
                 })?;
             if ty.is_symlink() {
                 validate_link_target(&path, &target).map_err(Error::msg)?;
                 Kind::Symlink(target)
             } else {
                 let t = validate_entry_path(&target)
-                    .map_err(|e| format!("hard link `{}`: target {e}", raw.display()))
+                    .map_err(|e| format!("hard link `{}`: target {e}", named(&raw)))
                     .map_err(Error::msg)?;
                 let t = strip_components(&t, strip).filter(|t| files.contains(t)).ok_or_else(|| {
                     Error::msg(format!(
                         "hard link `{}` -> `{}` points at a file the archive did not extract before it",
-                        raw.display(),
-                        target.display()
+                        named(&raw),
+                        named(&target)
                     ))
                 })?;
                 Kind::Hardlink(t)
@@ -1096,7 +1216,7 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         } else {
             bail!(
                 "member `{}` is a special file (type {:?}); only files, directories and links are extracted",
-                raw.display(),
+                named(&raw),
                 ty
             );
         };
@@ -1109,7 +1229,7 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         {
             bail!(
                 "member `{}` is a {label} at a path the archive already used for a {earlier}",
-                raw.display()
+                named(&raw)
             );
         }
         // A non-directory member sitting on top of a path earlier members
@@ -1127,8 +1247,8 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         {
             bail!(
                 "member `{}` is a {label} at a path the archive already populated as a directory (`{}`)",
-                raw.display(),
-                under.display()
+                named(&raw),
+                named(under)
             );
         }
         claimed.insert(path.clone(), label);
@@ -1272,6 +1392,9 @@ impl Op for Extracted {
         // so data is never written under another member's name.
         let (format, mut archive) = self.open(sys)?;
         let mut planned = intent.entries.iter();
+        // Whether a member was written yet, for what a failed checksum
+        // says about the members already in place.
+        let mut wrote = false;
         let entries = archive
             .entries()
             .with_context(|| format!("extracting {}: reading tar members", intent.src.display()))?;
@@ -1280,12 +1403,20 @@ impl Op for Extracted {
                 Ok(entry) => entry,
                 // Between two members, as `tar` reads the next header: the
                 // check covers members already written.
-                Err(e) if checksum_failed(&e) => {
+                Err(e) if checksum_failed(&e) && wrote => {
                     return Err(Error::from(e).context(format!(
                         "extracting {}: the archive's checksum did not match between two \
                          members, after earlier members were written; the members this run \
-                         extracted may hold corrupt data; replace the archive and run the step \
-                         again",
+                         extracted may hold corrupt data; {}",
+                        intent.src.display(),
+                        self.after_checksum()
+                    )));
+                }
+                Err(e) if checksum_failed(&e) => {
+                    return Err(Error::from(e).context(format!(
+                        "{}: the archive's checksum did not match before any member was \
+                         written, so nothing was extracted; replace the archive and run the \
+                         step again",
                         intent.src.display()
                     )));
                 }
@@ -1306,10 +1437,11 @@ impl Op for Extracted {
                      the archive changed between check and apply, and nothing further was \
                      extracted",
                     intent.src.display(),
-                    raw.display()
+                    named(&raw)
                 );
             };
             if let Some(m) = &slot.member {
+                wrote = true;
                 let declared = entry.size();
                 self.write_member(sys, &intent.dest, m, declared, &mut entry)
                     .with_context(|| format!("extracting {}", intent.src.display()))?;
@@ -3233,6 +3365,18 @@ mod tests {
         // before it.
         let at = xz_bad.len() - 13;
         xz_bad[at] ^= 0x08;
+        // The uncompressed size the index records for the one block: the
+        // footer's backward size gives the index's start; after its
+        // indicator and record count comes the unpadded size, then this.
+        let mut xz_size_bad = xz(&tar);
+        let footer = xz_size_bad.len() - 12;
+        let backward = u32::from_le_bytes(xz_size_bad[footer + 4..footer + 8].try_into().unwrap());
+        let index = footer - (backward as usize + 1) * 4;
+        let mut at = index + 2;
+        while xz_size_bad[at] & 0x80 != 0 {
+            at += 1;
+        }
+        xz_size_bad[at + 1] ^= 0x01;
         for (whole, bad, says) in [
             (
                 gz_stored(&tar),
@@ -3245,20 +3389,27 @@ mod tests {
                 "zstd: frame checksum mismatch",
             ),
             (xz(&tar), xz_bad, "index CRC32 mismatch"),
+            // `XzReader` checks the index by its CRC32, which covers the
+            // sizes it records.
+            (xz(&tar), xz_size_bad, "index CRC32 mismatch"),
         ] {
             let err = check_err(&bad);
             assert!(err.contains("/tmp/a.tar: decompressing: "), "{err}");
             assert!(err.contains(says), "{err}");
 
             let (fake, sys) = sys_with(&whole);
-            let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+            let op = Extracted::from_path("/tmp/a.tar")
+                .to("/opt")
+                .creates("m/after");
             let c = expect_change(&op, &sys);
             sys.write_atomic("/tmp/a.tar", &bad).unwrap();
             let err = op.apply(&sys, c).unwrap_err().chain();
             assert!(
                 err.contains(
                     "/tmp/a.tar: the archive's checksum did not match at its end, after every \
-                     member was written; the members this run extracted may hold corrupt data"
+                     member was written; the members this run extracted may hold corrupt data; \
+                     replace the archive, remove /opt/m/after if this run extracted it, and run \
+                     the step again"
                 ),
                 "{err}"
             );
@@ -3345,6 +3496,136 @@ mod tests {
             err.contains("Specified window_size is too big; Requested: 268435456, Max: 134217728"),
             "{err}"
         );
+    }
+
+    /// Zero bytes after a gzip stream are padding, as a tape or
+    /// `dd conv=sync` leaves it, and GNU tar and gzip take them: the archive
+    /// extracts. Anything else after it is refused, saying how many bytes
+    /// follow the stream and that they are not another gzip member. xz's
+    /// stream padding, a multiple of four zero bytes, is its own format's.
+    #[test]
+    fn zero_padding_after_a_gzip_stream_is_accepted_and_other_bytes_refused() {
+        let tar = tree_tar(BIG);
+        let want = plain_tree(&tar);
+        for archive in [
+            [gz(&tar), vec![0; 1024]].concat(),
+            [gz(&tar), vec![0; 1]].concat(),
+            [gz(&tar[..CUT]), gz(&tar[CUT..]), vec![0; 4093]].concat(),
+            [xz(&tar), vec![0; 1024]].concat(),
+        ] {
+            let (fake, _, _) = extract(&archive);
+            assert_eq!(tree(&fake), want);
+        }
+        for (tail, n) in [
+            (b"junk junk".to_vec(), 9),
+            ([vec![0; 100], vec![1]].concat(), 101),
+        ] {
+            let err = check_err(&[gz(&tar), tail].concat());
+            assert!(
+                err.contains(&format!(
+                    "/tmp/a.tar: decompressing: {n} bytes after the gzip stream are not another \
+                     gzip member"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// A member's name is the archive's, and GNU tar's long-name header
+    /// lets it be as long as the archive likes: a refusal names it cut to
+    /// 4 KiB, so one name cannot flood the step's error and every event
+    /// that carries it.
+    #[test]
+    fn a_huge_member_name_is_cut_in_a_refusal() {
+        let name = "x".repeat(70_000);
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Char);
+        h.set_size(0);
+        h.set_mode(0o644);
+        b.append_data(&mut h, &name, &[][..]).unwrap();
+        let err = check_err(&b.into_inner().unwrap());
+        assert!(
+            err.contains(&format!("member `{}…` is a special file", "x".repeat(4096))),
+            "{}",
+            &err[..err.len().min(300)]
+        );
+        assert!(err.len() < 5000, "{} bytes", err.len());
+    }
+
+    /// `n` bytes no compressor can shrink, so xz stores them as they are.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect()
+    }
+
+    /// xz's block check (CRC64 here), over a stored LZMA2 chunk with a
+    /// flipped data byte: refused by `check`, and reported after the members
+    /// by `apply`, as a checksum failure.
+    #[test]
+    fn an_xz_block_check_that_fails_is_a_checksum_failure() {
+        let data = noise(64 * 1024);
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, "noise", &data[..]).unwrap();
+        let tar = b.into_inner().unwrap();
+        let whole = xz(&tar);
+        let bad = flipped(&whole, &data[30_000..30_016]);
+        let err = check_err(&bad);
+        assert!(err.contains("block checksum"), "{err}");
+
+        let (_, sys) = sys_with(&whole);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &bad).unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.contains("the archive's checksum did not match"),
+            "{err}"
+        );
+        assert!(err.contains("block checksum"), "{err}");
+    }
+
+    /// A checksum failing before `apply` wrote anything says so, and not
+    /// that earlier members were written. `.strip_components(1)` drops the
+    /// first member, `m/`, and the first frame ends inside the second
+    /// header, so its checksum is read before any member is written. (A
+    /// frame ending inside the first header fails in `open`, which says only
+    /// that decompressing failed.)
+    #[test]
+    fn a_checksum_failing_before_any_member_says_nothing_was_written() {
+        let tar = tree_tar(BIG);
+        let whole = [zst_stored(&tar[..600]), zst_stored(&tar[600..])].concat();
+        // A byte of the second header's name field, past `m/small`.
+        let mut bad = whole.clone();
+        let at = bad.windows(9).position(|w| w == b"m/small\0\0").unwrap() + 40;
+        bad[at] ^= 0x01;
+        let (fake, sys) = sys_with(&whole);
+        let op = Extracted::from_path("/tmp/a.tar")
+            .to("/opt")
+            .strip_components(1);
+        let c = expect_change(&op, &sys);
+        sys.write_atomic("/tmp/a.tar", &bad).unwrap();
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.contains(
+                "/tmp/a.tar: the archive's checksum did not match before any member was \
+                 written, so nothing was extracted"
+            ),
+            "{err}"
+        );
+        assert!(!err.contains("after earlier members"), "{err}");
+        assert_eq!(sys.read_dir("/opt").unwrap(), Vec::<PathBuf>::new());
+        let _ = fake;
     }
 
     // ---- through a helper ----
