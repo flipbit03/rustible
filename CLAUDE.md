@@ -22,9 +22,41 @@ and why. The rest are read when you need them:
 
 ## The contract
 
-**`docs/01_VISION.md` is the source of truth.** It is long and it is vetted.
-When code and vision disagree, the vision wins and the code is wrong, unless
-the author decides otherwise in the session you are in.
+**`docs/01_VISION.md` is the source of truth on intent.** It is long and it is
+vetted. On intent, guarantees, decisions with their reasons, and the concepts
+a playbook author works with (one type per desired state, one verb, typed
+outputs), when code and vision disagree the vision wins and the code is wrong,
+unless the author decides otherwise in the session you are in. On types,
+fields, signatures and how a guarantee is implemented, the source is the
+authority. When you cannot tell which of the two a disagreement is, treat it
+as intent and raise it.
+
+**The vision contains no code.** No code blocks of any kind: not a type, a
+trait or a signature, not an example playbook or inventory, not a CLI session
+or rendered output. Each goes stale on the next change, and something else is
+already the authority on it. Instead the vision says in prose what a thing is
+and what must hold, and points at where the real one lives: the source for a
+definition ("the `Op` trait in `crates/rustible-sdk/src/op.rs`"), and for a
+playbook, an inventory or a run, the compiled examples in
+`examples/workspace`, which CI builds and which therefore cannot drift. Names
+stay inline (a type, an op, a flag, a path), because a name is a pointer, not
+a snippet. Prose that restates code in words (field by field, step by step,
+variant by variant) is code by another name: state the idea and point at the
+source. Prose goes stale too, so the same test applies to it: if a line would
+go stale when a field is added or an op's internals change, it does not belong
+there, which rules out one op's internals (the flags it passes, the files it
+reads) and any "what is in the tree" status. What the vision does carry: a
+design decision with its rationale and the alternatives it beat, including
+when the decision is a tool, a library or a mechanism (zig and `ring` in 5.3,
+KDL in 10.2, `anyhow` in 14, the `selected` feature in 9), and the
+measurements that settled it (5.3's binary sizes); and a short marker that a
+stated goal is not yet true (pointing at its `KNOWN GAP` entry) or that a
+shape is reserved and not built, so that a promise is never read as a fact.
+That marker stays one sentence; it never grows into a status ledger. A
+proposed amendment that would only update a struct, a field or a signature is
+not an amendment: drop it. Status belongs in `docs/plan/PROGRESS.md`; history,
+and the reasons behind implementation choices the vision does not make, in
+`docs/plan/DECISIONS.md`.
 
 **Do not edit it on your own initiative.** The rule exists so the contract is
 not rewritten by whoever happens to be passing. If your work requires an
@@ -257,8 +289,10 @@ Two obligations beyond the code. Add a `docs/plan/DECISIONS.md` entry with its
 `Reverse:` clause for any decision a reader would otherwise have to
 reconstruct — the shape you rejected, a refusal you chose, a tool you drive
 and why. Adding an op that follows the existing pattern needs no entry. And if
-the vision doc does not cover the op, say so in the pull request and propose
-the amendment; do not edit `docs/01_VISION.md` yourself.
+the vision doc does not cover the op's concept — the desired state it
+manages, the Ansible module it replaces, a guarantee or a refusal class it
+adds — say so in the pull request and propose the amendment in those terms,
+never the op's internals; do not edit `docs/01_VISION.md` yourself.
 
 - **One type per desired state, named for it**: `apt::Present`, `apt::Absent`,
   `systemd::Enabled`. Never a `state:` enum parameter. Things that are

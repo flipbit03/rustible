@@ -28,7 +28,7 @@ const STRANGER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLD someone@else";
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn authorized_keys_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
-    // The vision 6.1 playbook exactly as it now reads: two steps, because
+    // A user and its keys, as a playbook writes them: two steps, because
     // `~/.ssh` is the keys step's own business (issue #40, vision 6.7's
     // home-directory exception).
     let account = ctx.step("user", user::Present::new("rustible-ak").shell("/bin/bash"))?;

@@ -1807,7 +1807,7 @@ mod tests {
         );
         let sys = fake_sys(&fake);
         let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
-        // Vision 6.1 order: `.keys(..).exclusive(true)`.
+        // The order a playbook writes: `.keys(..).exclusive(true)`.
         let op = Present::for_user_name("cadu")
             .keys([K1, K2])
             .exclusive(true);
