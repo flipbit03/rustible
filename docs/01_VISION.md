@@ -31,13 +31,15 @@ out the rules of build mode.
 **What this document carries, and what it does not.** Intent, guarantees,
 decisions with their reasons, the alternatives they beat and the measurements
 that settled them, the short sketch of the `Op` contract (6.2), and the shape
-a playbook author sees: playbooks, the inventory, the CLI. It does not copy
-the code: if a line would go stale when a field is added or an op's
-internals change, it is not here. Where a section needs such detail, it says
-what must hold and names the source file that is the authority on how it is
-done; a library or a mechanism appears only where choosing it is the
-decision. A goal the code does not meet yet is marked as such in one
-sentence, so that a promise is never read as a fact.
+a playbook author sees: playbooks, the inventory, the CLI. It contains no
+code definitions — no `struct`, `enum` or `trait` declarations, field lists,
+signatures, wire layouts or constants copied from the source — and nothing
+else that would go stale when a field is added or an op's internals change.
+Where a section needs such detail, it says what must hold and names the
+source file that is the authority on how it is done; a library or a mechanism
+appears only where choosing it is the decision. A goal the code does not meet
+yet is marked as such in one sentence, so that a promise is never read as a
+fact.
 
 **How to read.** Sections 1 to 4 are context. Sections 5 to 14 are the
 decisions, each with alternatives and reasons. Section 15 is the glossary,

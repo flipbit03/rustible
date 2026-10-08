@@ -30,25 +30,31 @@ in. On types, fields, signatures and how a guarantee is implemented, the
 source is the authority. When you cannot tell which of the two a
 disagreement is, treat it as intent and raise it.
 
-**The vision does not copy the code.** The test: if a line would go stale when
-a field is added or an op's internals change, it does not belong there. So no
-struct or enum listings, field lists, wire layouts, full trait or method
-signatures, chunk or frame sizes, one op's internals (the flags it passes, the
-files it reads), or "what is in the tree" status; where a section needs one,
-it states what must hold and names the source file that is the authority. What
-it does carry: a design decision with its rationale and the alternatives it
-beat, including when the decision is a tool, a library or a mechanism (zig and
-`ring` in 5.3, KDL in 10.2, `anyhow` in 14, the `selected` feature in 9), and
-the measurements that justified it (5.3's binary sizes); the minimal sketch of
-the `Op` contract in 6.2, because that is the core idea; playbook, inventory
-and CLI examples with their rendered output, because they are the product's
-shape; and a short marker that a stated goal is not yet true (pointing at its
-`KNOWN GAP` entry) or that a shape is reserved and not built, so that a
-promise is never read as a fact. That marker stays one sentence; it never
-grows into a status ledger. A proposed amendment that would only update a
-struct, a field or a signature is not an amendment: drop it. Status belongs in
-`docs/plan/PROGRESS.md`; history, and the reasons behind implementation
-choices the vision does not make, in `docs/plan/DECISIONS.md`.
+**The vision contains no code definitions.** No `struct`, `enum` or `trait`
+declarations, no field lists, no function or method signatures, no wire
+layouts, no constants or sizes copied from the source: each goes stale on the
+next change, and the source is already the authority on it. The test for
+anything else: if a line would go stale when a field is added or an op's
+internals change, it does not belong there. So also no one op's internals (the
+flags it passes, the files it reads) and no "what is in the tree" status;
+where a section needs such detail, it states what must hold and names the
+source file that is the authority. Code a playbook author writes is not a
+definition in this sense: a playbook, a `#[rustible::vars]` struct, a call to
+an op are the product's shape, and they stay. The one internal declaration
+allowed is the five-line sketch of the `Op` contract in 6.2, because that
+contract is the core idea. What it does carry: a design decision with its
+rationale and the alternatives it beat, including when the decision is a tool,
+a library or a mechanism (zig and `ring` in 5.3, KDL in 10.2, `anyhow` in 14,
+the `selected` feature in 9), and the measurements that justified it (5.3's
+binary sizes); playbook, inventory and CLI examples with their rendered
+output, because they are the product's shape; and a short marker that a stated
+goal is not yet true (pointing at its `KNOWN GAP` entry) or that a shape is
+reserved and not built, so that a promise is never read as a fact. That marker
+stays one sentence; it never grows into a status ledger. A proposed amendment
+that would only update a struct, a field or a signature is not an amendment:
+drop it. Status belongs in `docs/plan/PROGRESS.md`; history, and the reasons
+behind implementation choices the vision does not make, in
+`docs/plan/DECISIONS.md`.
 
 **Do not edit it on your own initiative.** The rule exists so the contract is
 not rewritten by whoever happens to be passing. If your work requires an
