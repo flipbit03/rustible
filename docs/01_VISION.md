@@ -30,16 +30,16 @@ out the rules of build mode.
 
 **What this document carries, and what it does not.** Intent, guarantees,
 decisions with their reasons, the alternatives they beat and the measurements
-that settled them, the short sketch of the `Op` contract (6.2), and the shape
-a playbook author sees: playbooks, the inventory, the CLI. It contains no
-code definitions — no `struct`, `enum` or `trait` declarations, field lists,
-signatures, wire layouts or constants copied from the source — and nothing
-else that would go stale when a field is added or an op's internals change.
-Where a section needs such detail, it says what must hold and names the
-source file that is the authority on how it is done; a library or a mechanism
-appears only where choosing it is the decision. A goal the code does not meet
-yet is marked as such in one sentence, so that a promise is never read as a
-fact.
+that settled them; a tool, a library or a mechanism appears where choosing it
+is the decision. It contains no code: no type, trait or signature, no example
+playbook or inventory, no rendered output. It says in prose what a thing is
+and what must hold, and points at where the real one lives: the source for a
+definition (the `Op` trait in `crates/rustible-sdk/src/op.rs`, say), and for
+what a playbook, an inventory or a run looks like, the workspace in
+`examples/workspace`, which CI builds and so cannot drift, and
+`docs/USING_RUSTIBLE.md`. Types, operations, flags and paths are named
+inline, as pointers. A goal the code does not meet yet is marked as such in
+one sentence, so that a promise is never read as a fact.
 
 **How to read.** Sections 1 to 4 are context. Sections 5 to 14 are the
 decisions, each with alternatives and reasons. Section 15 is the glossary,
@@ -92,55 +92,50 @@ Collections of new operations are plain crates built on a public SDK, added with
 
 ## 3. The intended user experience
 
-```
-$ rustible init
-```
-Creates a Cargo package in the current directory or a chosen folder. It refuses
-only when a file it would itself write is already there, and names the ones that
-clash; a directory holding anything else (a `README.md`, a `LICENSE`, a
-`.gitignore` from a fresh clone) is written into. Those files are left alone and
-never read, with one exception: an existing `.gitignore` gains the lines it
-lacks, because a workspace that does not ignore `target/` is a workspace that
-commits build output. Refusing on conflict rather than on non-emptiness is
-`cargo init`'s rule. `--force` adds the missing files anyway and keeps the
-existing ones, rewriting only the two generated shims.
-Adds `rustible` (runtime) and `rustible-std` (the base operations, mirroring
-Ansible's builtin modules: files, users, groups, packages, services, ssh keys, and
-so on) as dependencies. Creates an opinionated layout: `.gitignore`, an inventory
-file, a `playbooks/` folder (with `.gitkeep`), and any config files that turn out to
-be necessary.
+The operator meets Rustible through a handful of commands;
+`docs/USING_RUSTIBLE.md` (section 5, "The CLI") is how to use them.
 
-```
-$ rustible playbook create ./playbooks/ops/ssh_enable_root_user.rs
-```
-Scaffolds a playbook file with a `main` function and the metadata attribute.
+**`rustible init`** creates a Cargo package in the current directory or a
+chosen folder. It refuses only when a file it would itself write is already
+there, and names the ones that clash; a directory holding anything else (a
+`README.md`, a `LICENSE`, a `.gitignore` from a fresh clone) is written into.
+Those files are left alone and never read, with one exception: an existing
+`.gitignore` gains the lines it lacks, because a workspace that does not
+ignore `target/` is a workspace that commits build output. Refusing on
+conflict rather than on non-emptiness is `cargo init`'s rule. `--force` adds
+the missing files anyway and keeps the existing ones, rewriting only the two
+generated shims. It adds `rustible` (runtime) and `rustible-std` (the base
+operations, mirroring Ansible's builtin modules: files, users, groups,
+packages, services, ssh keys, and so on) as dependencies, and creates an
+opinionated layout: `.gitignore`, an inventory file, a `playbooks/` folder
+(with `.gitkeep`), and any config files that turn out to be necessary.
 
-```
-$ rustible playbook run ./playbooks/ops/ssh_enable_root_user.rs [--check] [-v|-vv] [--var key=value]
-```
-Reads the playbook's metadata (target hosts), validates the inventory vars
-against the playbook's typed struct, probes the hosts, compiles per
-architecture, uploads, runs, and renders progress. See section 5.2 for the
-pipeline. `--check` is a dry run. Each step line carries a one-line summary
-of its change; `-v` adds the facts, the full diff, debug logs, and a failed
-command with its stderr, whether or not the playbook caught the failure;
-`-vv` adds every command run (section 5.5).
+**`rustible playbook create`**, given a path under `playbooks/` such as
+`playbooks/ops/ssh_enable_root_user.rs`, scaffolds a playbook file with a
+`main` function and the metadata attribute.
 
-```
-$ rustible inventory show web2      # resolved parameters and vars, with their source
-$ rustible inventory check          # validate hosts.kdl, and vars against every playbook
-```
+**`rustible playbook run`**, given that playbook, with `--check`, `-v` or
+`-vv`, and `--var key=value` to set a var for the run, reads the playbook's
+metadata (target hosts), validates the inventory vars against the playbook's
+typed struct, probes the hosts, compiles per architecture, uploads, runs, and
+renders progress. See section 5.2 for the pipeline. `--check` is a dry run.
+Each step line carries a one-line summary of its change; `-v` adds the facts,
+the full diff, debug logs, and a failed command with its stderr, whether or
+not the playbook caught the failure; `-vv` adds every command run (section
+5.5).
+
+**`rustible inventory show`**, given a host, prints its resolved parameters
+and vars with the source of each; **`rustible inventory check`** validates
+`hosts.kdl`, and the inventory's vars against every playbook.
 
 **Verb order (decided 2026-09-07): noun first, then verb.** `rustible playbook
 run`, `rustible playbook create`, `rustible inventory show`, `rustible
 inventory check`. The subject comes first, like `gh pr create`; the earlier
 `rustible run playbook` form is not used.
 
-```
-$ cargo add rustible-docker
-```
-Adds a third-party collection. Its operations are immediately usable in every
-playbook of the project, fully typed.
+**`cargo add`** of a third-party collection, `rustible-docker` say, is all it
+takes to use one: its operations are immediately usable in every playbook of
+the project, fully typed.
 
 ## 4. Prior art
 
@@ -258,11 +253,11 @@ Consequences accepted with remote-brain:
    CLI also resolves `$HOME` here so later paths are absolute. This
    bootstrap probe is the only shell-dependent step; everything after it
    is the static binary.
-6. **Compile** once for all needed triples in **one cargo invocation**
-   (`RUSTIBLE_PLAYBOOK=<name> cargo build --profile dist --features selected
-   --target A --target B`; the build script includes only that playbook, and
-   the `selected` feature keeps the build's output directory apart from the
-   editor's, section 9).
+6. **Compile** once for all needed triples in **one cargo invocation**: a
+   `cargo build` with the `dist` profile, the `selected` feature and one
+   `--target` per triple, with `RUSTIBLE_PLAYBOOK` naming the playbook. The
+   build script includes only that playbook, and the `selected` feature
+   keeps the build's output directory apart from the editor's (section 9).
    Cargo accepts several `--target` flags and locks the target directory, so one
    invocation is both simplest and fastest. Per-triple target directories keep
    the caches independent. Use the `dist` profile (section 5.3).
@@ -441,30 +436,23 @@ supports two mechanisms, each for a different need:
 
 1. **Embed at compile time** via `include_bytes!` / `include_str!`, or a
    compile-time template engine (askama-style). Use for small, fixed files and
-   templates. The binary stays self-contained. Compile-time templates are checked
-   against a typed struct, so `{{ server_nmae }}` is a compile error.
+   templates. The binary stays self-contained. An embedded file is handed to
+   `file::Copy` as its content, with the destination and mode the step sets.
+   A compile-time template renders a struct whose fields the template names,
+   so a misspelt field in the template is a compile error, and
+   `file::Template` writes the result. That op is wave two (6.9) and not
+   built; today a playbook builds the text in Rust and copies it
+   (`docs/USING_RUSTIBLE.md`, "Putting a variable into a config file").
 
-   ```rust
-   ctx.step("Install nginx config",
-       file::Copy::from_bytes(include_bytes!("../files/nginx.conf"))
-           .to("/etc/nginx/nginx.conf").mode(0o644))?;
-
-   #[derive(Template)]
-   #[template(path = "nginx.conf.j2")]
-   struct NginxConf<'a> { server_name: &'a str, workers: u32 }
-
-   ctx.step("Render nginx config",
-       file::Template::render(NginxConf { server_name: &vars.domain, workers: facts.cpus })
-           .to("/etc/nginx/nginx.conf"))?;
-   ```
-
-2. **Stream over the channel at run time.** `ctx.local_file("files/big.tar.gz")`
-   asks the orchestrator for a workspace file, receives it a chunk at a time,
-   writing each as it arrives, and returns a temp path on the target, removed
-   when the run ends; anything outside the workspace is denied.
-   `ctx.local_secret("vault/db_password")` returns bytes in memory only. Use
+2. **Stream over the channel at run time.** `ctx.local_file`, given a
+   workspace path, asks the orchestrator for that file, receives it a chunk
+   at a time, writing each as it arrives, and returns a temp path on the
+   target, removed when the run ends; anything outside the workspace is
+   denied. `ctx.local_secret` returns a secret's bytes in memory only. Use
    for large files, files generated right before the run, and secrets that
    must not sit inside a binary in a build cache.
+   `examples/workspace/playbooks/demo/streaming.rs` streams a file, loads a
+   secret and fetches a file back.
 
 Rule of thumb: embed by default, stream when large, dynamic, or secret.
 
@@ -489,51 +477,34 @@ coordination feature, not a backend concern.
 
 ### 6.1 Playbook file shape
 
-```rust
-//! playbooks/ops/ensure_rustible_user.rs
-use rustible::prelude::*;
-use rustible_std::ssh::authorized_keys;
-use rustible_std::user;
+A playbook is a Rust file under `playbooks/`. It imports the prelude and the
+modules of the operations it uses, and marks one function, `main`, with
+`#[rustible::playbook(...)]`; `main` receives the run's `Ctx` and returns a
+`Result`. Its body is ordinary Rust, and each thing it does to the machine
+is a `ctx.step`. Two things it shows that YAML could not:
 
-#[rustible::playbook(hosts = "local", escalate = true)]
-fn main(ctx: &mut Ctx) -> Result<()> {
-    let keys = [
-        "ssh-ed25519 AAAAC3...XYZ alice@x86",
-        "ssh-ed25519 AAAAC3...ABC alice@arm",
-    ];
+- **Typed outputs flow into the next step.** A step returns its op's typed
+  output, and the next op is built from that value directly. The account
+  `user::Present` returns is what `ssh::authorized_keys::Present` is told to
+  manage, so the keys op receives the account's uid, gid and home, not a
+  name to look up again; it creates `~/.ssh` itself (6.7). A misspelt field,
+  or an output handed to an op it does not fit, is a compile error.
+- **Reacting to change is an `if`.** Every step's result says whether it
+  changed, and the playbook branches on that, with no handler mechanism
+  (6.6).
 
-    // Typed output: `account` is the account as it now is, typed.
-    let account = ctx.step(
-        "Ensure rustible user exists",
-        user::Present::new("rustible").shell("/bin/bash").create_home(true),
-    )?;
+`examples/workspace/playbooks/hello.rs` is the smallest playbook there is,
+and `examples/workspace/playbooks/vagrant.rs` hands the account from
+`user::Present` to `authorized_keys::Present`, among much else; CI compiles
+both.
 
-    // Chaining: the next op consumes the previous op's typed result.
-    // `~/.ssh` is not a step: `authorized_keys` creates it (6.7).
-    let authorized = ctx.step(
-        "Install authorized keys",
-        authorized_keys::Present::for_user(&account).keys(keys).exclusive(true),
-    )?;
-
-    // No Ansible "handlers": reacting to change is just an `if`.
-    if authorized.changed {
-        ctx.log(format!("installed {} key(s)", authorized.added.len()));
-    }
-    Ok(())
-}
-```
-
-Rendered by the orchestrator from the event stream:
-
-```
-PLAYBOOK ensure_rustible_user   hosts: local   (x86_64-unknown-linux-musl, cached)
-
-[local]  Ensure rustible user exists ............................. changed         uid=1002
-[local]  Install authorized keys ................................. changed         +2 keys
-
-host    ok  changed  would change  skipped  failed  recovered  warnings
-local    0        2             0        0       0          0         0
-```
+**What the operator sees.** The orchestrator renders the event stream as one
+line per step: the host in brackets, the step's name, its status (`ok`,
+`changed`, `would change`, `skipped` or `FAILED`), and a one-line summary of
+its change, such as the uid a new account received or how many keys were
+added. The run ends with a recap, one row per host counting ok, changed,
+would change, skipped, failed, recovered and warnings. Section 5.5 has what
+each verbosity adds; `crates/rustible-cli/src/render.rs` is the renderer.
 
 - The `#[rustible::playbook(...)]` attribute carries metadata: target hosts (a host
   or group from the inventory), `escalate`, `ssh_user`, and later things like
@@ -541,13 +512,14 @@ local    0        2             0        0       0          0         0
 - `escalate = true` (Ansible's `become`; see section 16 for the name) means
   the binary is launched under `sudo` on the target. Per-step escalation is
   `ctx.as_root()` (section 11.3).
-- `ssh_user = "<account>"` makes this playbook log in as that account instead
+- `ssh_user`, naming an account, makes this playbook log in as it instead
   of the inventory's `ssh_user`, overriding every inventory level (host,
   group, `defaults`): an explicit per-file choice wins, unlike Ansible, where
   an inventory `ansible_user` beats a play's `remote_user`. Escalation
   (`escalate = true`, `as_root`, `as_user`) runs from that account. A
   `connection="local"` host has no login to change, so a run that targets one
   with this attribute is refused.
+  `examples/workspace/playbooks/vagrant_login.rs` sets it.
 - `?` on a step means "this host's run fails here". Ansible's `ignore_errors` is
   `.ok()` or a `match`; `failed_when` is an `if` after the step.
 - Loops, conditionals, helper functions, and third-party crates are all just Rust.
@@ -567,23 +539,21 @@ distinction lives in the op type instead (see 6.4).
 rejected: "state" is what the system has after an op is applied, not the thing
 you hand to `step`.
 
-`Op` values are plain data structs built with builders. Constructing one
-(`group::Present::new("docker")`) touches nothing. Only `ctx.step` executes.
+`Op` values are plain data structs built with builders. Constructing one (a
+`group::Present` for `docker`, say) touches nothing. Only `ctx.step` executes.
 This is deliberate: a data struct can be inspected before it runs, which is what
 gives dry-run, diff rendering, and a future `rustible plan` mode for free. A
 closure is opaque and could only be run. Because ops are values, they can be
 built conditionally, stored in a `Vec`, or returned from helper functions in
 third-party crates.
 
-**The contract.** An op has two halves and a value between them:
-
-```rust
-trait Op {
-    type Output; type Intent: Intent;  // an Intent renders the step's Diff
-    fn check(&self, sys: &System) -> Result<Plan<Self>>; // Satisfied(output) | Change(intent)
-    fn apply(&self, sys: &System, intent: Self::Intent) -> Result<Self::Output>;
-}
-```
+**The contract.** An op has two halves and a value between them. It names
+two types of its own, its output and its intent; `check` looks at the
+machine and returns a plan, and `apply` takes the intent from that plan and
+returns the output. Both reach the machine only through the `System` they
+are handed (section 7). The definition is the `Op` trait in
+`crates/rustible-sdk/src/op.rs`, with `Plan` and the `Intent` trait beside
+it.
 
 - **`check` observes and decides, and does not mutate** (7.3 has the one
   deliberate exception). It answers either that the system is already in
@@ -630,8 +600,9 @@ the trait and the driver.
   fact. The rule was reversed: a would-change step has no output in check
   mode, and section 12 has the rule.
 - **Builders end in a finishing call for the one mandatory piece of desired
-  state.** `Line::in_path(p).matching(re).backup(true).set(line)`: `set` returns
-  the `Op`, so a `Line` without a line cannot be constructed.
+  state.** `file::Line` is built from its path, then the pattern and options,
+  and finished by `set`, which takes the line and returns the `Op`, so a
+  `Line` without a line cannot be constructed.
 - **`apply` receives the intent, not the plan.** Only the change branch is
   meaningful there; passing the whole plan forced a pointless match. The
   change was first carried as a diff, and the typed intent replaced it when
@@ -660,15 +631,16 @@ translation rule for the standard library.
 | `getent`/`register`        | `user::Existing` (read-only op, 13.1)      |
 
 **Alternative considered and rejected:** one struct per resource with a state
-parameter, e.g. `apt::Package::new(..).state(State::Present)`. Rejected because:
+parameter, e.g. an `apt::Package` with a `state` setting. Rejected because:
 - Valid options differ per state (`purge`, `autoremove` only make sense for
   `Absent`; `update_cache` only for `Present`/`Latest`). A shared struct cannot
-  stop `.purge(true).state(Present)` at compile time, which is YAML hell in Rust
-  clothing.
+  stop a purge being asked of a package meant to be present at compile time,
+  which is YAML hell in Rust clothing.
 - Outputs differ per state (`Present` returns installed versions to chain from;
   `Absent` returns what was removed). A shared struct means one output with a
   pile of `Option`s.
-- Reading the playbook, intent is on the left: `apt::Absent::new(["apache2"])`.
+- Reading the playbook, intent is on the left: the type is `apt::Absent`
+  before any package is named.
 
 Cost accepted: more types in the stdlib. Types are cheap; runtime "invalid
 parameter for this state" errors are what we are escaping.
@@ -704,7 +676,7 @@ the playbook says otherwise, and a lookup of remote state (6.5). Under
 
 ### 6.5 Lookups
 
-Read-only lookups are ops too (`user::Existing::named("rustible")`, see 13.1). They run
+Read-only lookups are ops too (`user::Existing`, see 13.1). They run
 through `ctx.step`, appear in the step list, are timed, and never report
 `changed` in a real run. They fail the run if the thing is missing. In Ansible
 this is `getent` plus `register` plus `set_fact`; here it is one typed call.
@@ -716,43 +688,32 @@ real run, where it makes the request (6.4).
 
 ### 6.6 No handlers; loops; conditionals
 
-- **Handlers are gone.** "Restart sshd only if the config changed" is
-  `if cfg.changed { ctx.step("sshd restarted", systemd::Restart::new("sshd"))?; }`.
-  Ansible needs `notify`, a handler section, and flush semantics.
+- **Handlers are gone.** "Restart sshd only if the config changed" is an `if`
+  on whether the config step changed, with the `systemd::Restart` step inside
+  it. Ansible needs `notify`, a handler section, and flush semantics.
 - **Loops are `for`.** Each iteration is its own enumerated step; the name is a
   `format!` string the author produces, which is both the price and the win
   ("Add rustible to docker" beats `item=docker`). Loop bodies chain naturally:
   the group op's output feeds the membership op in the same scope.
 - **Conditionals are `if`.** `when:` does not exist.
 
-Second example, showing removal and loops:
+A second shape, showing removal and loops: a playbook looks an account up
+with `user::Existing`, revokes compromised keys with
+`ssh::authorized_keys::Absent` for that account and logs how many it
+removed, then loops over a list of group names; each iteration ensures the
+group with `group::Present` and the account's membership in it with
+`user::Membership`, which is built from the account and the group step's
+output, and each step's name carries the group's name.
+`examples/workspace/playbooks/vagrant.rs` loops over its tarballs the same
+way, one named step per iteration.
 
-```rust
-#[rustible::playbook(hosts = "local", escalate = true)]
-fn main(ctx: &mut Ctx) -> Result<()> {
-    let revoked = ["ssh-ed25519 AAAAC3...OLD1 alice@laptop", "ssh-ed25519 AAAAC3...OLD2 ci@jenkins"];
-    let groups = ["docker", "systemd-journal", "adm"];
-
-    let account = ctx.step("Look up rustible user", user::Existing::named("rustible"))?;
-
-    let keys = ctx.step("Revoke compromised keys",
-        authorized_keys::Absent::for_user(&account).keys(revoked))?;
-    ctx.log(format!("removed {} key(s)", keys.removed.len()));
-
-    for name in groups {
-        let grp = ctx.step(format!("Ensure group {name} exists"), group::Present::new(name))?;
-        ctx.step(format!("Add rustible to {name}"), user::Membership::of(&account).in_group(&grp))?;
-    }
-    Ok(())
-}
-```
-
-Note the three shapes on one resource, following rule 6.3: `authorized_keys::Present`
-("ensure these"), `authorized_keys::Present ... .exclusive(true)` ("ensure exactly
-these": still the present state, with the option of removing strangers, and the
-output gains a `removed` list), and `authorized_keys::Absent` ("ensure not these").
-An earlier draft had `.remove(keys)` as a method on one type, which was the
-state-as-parameter shape 6.3 rejects; corrected 2026-09-07 during vetting.
+Note the three shapes on one resource, following rule 6.3:
+`authorized_keys::Present` ("ensure these"), `authorized_keys::Present` with
+its `exclusive` option ("ensure exactly these": still the present state, with
+the option of removing strangers, and the output gains a `removed` list), and
+`authorized_keys::Absent` ("ensure not these"). An earlier draft had a
+`remove` method on one type, which was the state-as-parameter shape 6.3
+rejects; corrected 2026-09-07 during vetting.
 
 ### 6.7 Granularity rule (DECIDED)
 
@@ -789,15 +750,12 @@ Each translation is which op replaces the module, and where the meaning
 differs. How the op does it is in its source.
 
 **`ansible.builtin.apt`** becomes three ops, one per `state` (6.3):
-`apt::Present`, `apt::Absent` and `apt::Latest`.
-```rust
-let pkgs = ctx.step("Install nginx and curl",
-    apt::Present::new(["nginx", "curl"]).update_cache(Duration::from_secs(3600)))?;
-// `pkgs` says which packages this step installed and which were already there
-ctx.step("Remove apache2", apt::Absent::new(["apache2", "sendmail"]).purge(true).autoremove(true))?;
-ctx.step("Keep openssl current", apt::Latest::new(["openssl"]).update_cache(Duration::ZERO))?;
-```
-All three refuse on a host whose package manager is not apt, and when not
+`apt::Present`, `apt::Absent` and `apt::Latest`. Each takes a list of
+packages. `Present` and `Latest` can refresh the package lists when they are
+older than a given age, and `Present`'s output says which packages the step
+installed and which were already there; `Absent` can purge and autoremove.
+`examples/workspace/playbooks/vagrant.rs` installs a package with a refresh
+age. All three refuse on a host whose package manager is not apt, and when not
 running as root. Two defaults differ from Ansible's: recommended packages
 are not installed unless the playbook asks for them, where Ansible follows
 the system's apt configuration; and `Present` refreshes the lists only when
@@ -820,26 +778,19 @@ cache.update()`), but then plans against the stale lists, so its dry run can
 call a package current that the real run upgrades; Rustible says it does not
 know instead.
 
-**`ansible.builtin.lineinfile`** becomes `file::Line`.
-```rust
-let sshd = ctx.step("Disable password auth",
-    file::Line::in_path("/etc/ssh/sshd_config")
-        .matching(r"^#?PasswordAuthentication")
-        .set("PasswordAuthentication no")
-        .backup(true))?;
-// `sshd.changed`, and where the backup went when one was made
-```
-`check` plans the rewritten text and returns `Satisfied` when it is already
-there; `apply` backs up if asked and writes exactly that text, atomically
-(7.3).
+**`ansible.builtin.lineinfile`** becomes `file::Line`. It is given a file, a
+regular expression for the line to replace, and the line to set, with an
+optional backup; disabling password authentication in `sshd_config` is one
+step, and its result says whether the file changed and where the backup
+went when one was made. `check` plans the rewritten text and returns
+`Satisfied` when it is already there; `apply` backs up if asked and writes
+exactly that text, atomically (7.3). `examples/workspace/playbooks/mac.rs`
+edits a line this way.
 
 **`ansible.builtin.systemd`** becomes one op per state and one per action.
-```rust
-ctx.step("sshd enabled", systemd::Enabled::new("sshd"))?;
-if sshd.changed {
-    ctx.step("sshd restarted", systemd::Restart::new("sshd").daemon_reload(true))?;
-}
-```
+Enabling `sshd` is a `systemd::Enabled` step, and restarting it after its
+config changed is a `systemd::Restart` step inside an `if` on the config
+step's result (6.6), optionally reloading the manager first.
 `Enabled`, `Running` and `Stopped` are states. `Restart` is an action (6.4):
 its `check` always plans it, and the step fails unless the unit is running,
 or on its way up, afterwards. `DaemonReload` is the reload on its own, for a
@@ -880,15 +831,15 @@ Stopped, Restart, Reload, DaemonReload}`, `ssh::authorized_keys::{Present, Absen
 `shell::Command`. **Wave two**, the tail: `file::Template` (used once, but
 generally important), `file::Replace`, `acl`, `mount`, `iptables`.
 
-**`rustible-github`, the first collection.** The GitHub-keys pattern
-(`lookup('url', 'https://github.com/<user>.keys')` combined into a list and
+**`rustible-github`, the first collection.** The GitHub-keys pattern (a
+`url` lookup of `https://github.com/<user>.keys`, combined into a list and
 looped into `authorized_key`) is not a `set_fact` problem and not a
 `rustible-std` problem. It is a small separate collection, `rustible-github`,
-with a read-only op `rustible_github::UserKeys::of("flipbit03")` returning
-the parsed keys over `rustible-std`'s HTTP client: synchronous, with
-`rustls` over `ring` and no OpenSSL; `ring`'s small C part is compiled by
-zig (section 5.3). An async client was rejected because it
-brings a runtime and, without careful feature selection, native TLS and
+with a read-only op, `rustible_github::UserKeys`, that takes a GitHub user
+and returns the parsed keys over `rustible-std`'s HTTP client: synchronous,
+with `rustls` over `ring` and no OpenSSL; `ring`'s small C part is compiled
+by zig (section 5.3). An async client was rejected because it brings a
+runtime and, without careful feature selection, native TLS and
 therefore OpenSSL.
 Published from this repository alongside the core crates, it is also the
 first collection written from the outside of the SDK, which tests the SDK
@@ -904,7 +855,7 @@ setup first (hostname, apt, sysctl; three ops, no roles), then the
 `ssh_keys_from_github` role as a lib function, then the user setup, then a
 whole host. Ansible and Rustible run side by side until parity, and every
 port is a test of an op against a real machine. Ansible's `notify: Restart
-avahi-daemon` becomes `if hostname.changed { .. }`.
+avahi-daemon` becomes an `if` on whether the hostname step changed.
 
 ## 7. The `System` handle
 
@@ -946,8 +897,8 @@ nobody hits. A clippy `disallowed-methods` config in op crates nudges away from
 What it buys beyond the middle column:
 - Fast unit tests for op logic with no container: "given this `/etc/passwd` and
   this canned `useradd` output, the op plans this diff and runs this command".
-- Testing the distro branch itself: set `facts.distro = Alpine` on the fake and
-  assert BusyBox `adduser` flags.
+- Testing the distro branch itself: give the fake Alpine's facts and assert
+  BusyBox `adduser` flags.
 - Testing failure paths (exit code 9, permission denied) that are awkward to
   provoke in a real container.
 - A future third backend (`Chroot`, `Container`) for applying ops to a mounted
@@ -959,8 +910,8 @@ we intended; the container tests that what we intended is correct.
 
 ### 7.3 Shape and guarantees
 
-`System` is concrete: ops write `fn check(&self, sys: &System)` and never see a
-generic or `dyn`. It knows the target's facts, the identity it acts as,
+`System` is concrete: an op's `check` and `apply` take it as it is and never
+see a generic or `dyn`. It knows the target's facts, the identity it acts as,
 whether the run is a dry run, and where to report what it does; behind it is
 a swappable backend: `Local` on a real machine, `Fake` in unit tests, and
 `Elevated` (section 11.3) for another identity, with a `Chroot` or
@@ -1054,12 +1005,12 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    does, and T1 has no real permissions, ownership, processes, users or
    distributions, and no kernel, init, `sudo` or SSH.
 2. **T2, Docker integration tests** per distro, the source of truth for how a
-   real tool behaves, which the `Fake` only models. The SDK ships a harness
-   (`#[rustible::integration_test(images = ["debian:12", "alpine:3.20",
-   "ubuntu:24.04"])]`) that builds the test as a static musl binary and runs
-   it in each container. A typical test applies an op twice: first run `changed`,
-   second run `ok`, and the system looks right. Static binaries drop into any
-   image with no setup.
+   real tool behaves, which the `Fake` only models. The SDK ships a harness,
+   the `#[rustible::integration_test]` attribute given a list of images
+   (`debian:12`, `alpine:3.20`, `ubuntu:24.04`), that builds the test as a
+   static musl binary and runs it in each container. A typical test applies
+   an op twice: first run `changed`, second run `ok`, and the system looks
+   right. Static binaries drop into any image with no setup.
 3. **T3, a real machine**: its own kernel, init and `sudo`, all real, with
    no harness. It gives what the container harness cannot. Structurally: its
    own kernel and `/proc/sys` (a container shares the host kernel, so a write
@@ -1108,10 +1059,10 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   file with a function marked `#[rustible::playbook(..)]` into the bin crate
   as a module, registered under its name; the runtime picks the entry by
   name and speaks the protocol. Files without the marker are not playbooks:
-  they are ignored unless a playbook pulls them in with `mod helpers;` or
-  `#[path]`, so helper code may live next to playbooks. Two marked functions
-  in one file is a build error naming the file. The same scan backs
-  `rustible playbook list`.
+  they are ignored unless a playbook pulls them in with a `mod` declaration
+  or `#[path]`, so helper code may live next to playbooks. Two marked
+  functions in one file is a build error naming the file. The same scan
+  backs `rustible playbook list`.
 
   Two Cargo behaviours make this work, both verified in scratch projects on
   2026-09-07 (the second time as a 20-hypothesis spike with positive and
@@ -1154,8 +1105,8 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   recompiling each other's view. Running a playbook from a terminal must not
   make the editor forget the rest of the tree.
 
-  The fix is a Cargo feature that carries no code: `rustible init` writes
-  `[features] selected = []` into the workspace manifest, and every CLI build
+  The fix is a Cargo feature that carries no code: `rustible init` declares
+  an empty `selected` feature in the workspace manifest, and every CLI build
   that sets `RUSTIBLE_PLAYBOOK` also passes `--features selected`. A different
   feature set changes the package's metadata hash, so the build script run,
   its `OUT_DIR`, and the bin artifact for the selected build live in their own
@@ -1175,20 +1126,23 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   is a cache-key, not a configuration knob, and the SDK does not expose it.
 
   **Consequences for playbook files.** A playbook file is a module, not a
-  crate root: `use rustible::prelude::*;` works, `#[rustible::vars] struct
-  Vars` is module-local so every playbook may have its own, and the
-  `#[rustible::playbook]` attribute on `fn main` registers an entry rather than
+  crate root: importing `rustible::prelude` works, a `#[rustible::vars]`
+  struct is module-local so every playbook may have its own, and the
+  `#[rustible::playbook]` attribute on `main` registers an entry rather than
   defining the process entry point. **Helper modules are siblings:** because
-  `#[path]`-loaded files get `mod.rs` semantics, `mod helpers;` inside
-  `playbooks/ops/x.rs` resolves to `playbooks/ops/helpers.rs` (verified; an
-  earlier draft of this paragraph said `ops/x/helpers.rs`, which is wrong).
-  A playbook that wants a subfolder layout writes
-  `#[path = "x/helpers.rs"] mod helpers;`. Two playbooks in one directory that
-  both say `mod helpers;` each compile the same file as a private module,
-  which works. Code shared across playbooks lives in the package's
-  `src/lib.rs` and is reached by the **package name**, `myinfra::helper()`,
-  not `crate::helper()`, because playbooks are modules of the bin crate
-  (verified both ways). A playbook's name is its path under `playbooks/`
+  `#[path]`-loaded files get `mod.rs` semantics, a `mod helpers` declaration
+  inside `playbooks/ops/x.rs` resolves to `playbooks/ops/helpers.rs`
+  (verified; an earlier draft of this paragraph said `ops/x/helpers.rs`,
+  which is wrong), as `examples/workspace/playbooks/demo/mc.rs` and its
+  `helpers.rs` show. A playbook that wants a subfolder layout puts a
+  `#[path]` attribute naming `x/helpers.rs` on the declaration. Two
+  playbooks in one directory that both declare `mod helpers` each compile
+  the same file as a private module, which works. Code shared across
+  playbooks lives in the package's `src/lib.rs` and is reached by the
+  **package name**, `myinfra::helper()`, not `crate::helper()`, because
+  playbooks are modules of the bin crate (verified both ways);
+  `examples/workspace/playbooks/hello.rs` calls its workspace's
+  `src/lib.rs` this way. A playbook's name is its path under `playbooks/`
   without the extension (`ops/x`); generated module identifiers carry the
   needed `#[allow]`s and leak only into test names and backtraces. The scanner
   matches the attribute path textually (`rustible::playbook` or bare
@@ -1220,9 +1174,10 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   Dynamic inventories become a trait later.
 - **Crates (DECIDED 2026-09-07):**
   - `rustible`: a **thin facade library** that playbook workspaces depend on.
-    Re-exports the SDK, the macros, and the std prelude, so a playbook is
-    `use rustible::prelude::*;` and `#[rustible::playbook(..)]`. No logic of
-    its own. `rustible init` adds this one dependency plus `rustible-std`.
+    Re-exports the SDK, the macros, and the std prelude, so a playbook
+    imports `rustible::prelude` and is marked `#[rustible::playbook(..)]`.
+    No logic of its own. `rustible init` adds this one dependency plus
+    `rustible-std`.
   - `rustible-cli`: the CLI and orchestrator (init, playbook run/create,
     inventory show/check, SSH, compile, render), installed with
     `cargo install rustible-cli`, binary named `rustible`. Never a dependency
@@ -1261,8 +1216,8 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
 ### 10.1 Structure
 
 The inventory stores single hosts and host groups. Groups can contain groups
-(`members = [..]`); a host's group set is the transitive closure, and vars merge
-from outermost group to innermost.
+(through `members`); a host's group set is the transitive closure, and vars
+merge from outermost group to innermost.
 
 **Connection settings are not vars.** `addr`, `port`, `ssh_user`, `connection`
 (`ssh` | `local`), and the escalation method are orchestrator configuration and
@@ -1330,61 +1285,18 @@ properties.
 
 ### 10.2.2 Full example
 
-```kdl
-// hosts.kdl  (KDL 2.0)
-// Nodes: vars, defaults, host, group.
+`examples/workspace/hosts.kdl` is a complete inventory that shows every kind
+of node above: workspace-wide `vars` (the "all" level), `defaults` for the
+workspace-wide parameters, a local host, groups carrying parameters and
+vars, a host that overrides its group's var, a list var given as positional
+arguments, a group of groups, a group that cherry-picks hosts by name, and
+a host disabled with slash-dash, children included. The CLI's tests load it
+(`example_workspace_inventory_loads`), so it cannot drift from the parser.
+`docs/HOSTS_KDL_REFERENCE.md` is the reference for the format.
 
-vars {                                  // workspace-wide vars: the "all" level
-    fruit "banana"
-    timezone "America/Sao_Paulo"
-}
-
-defaults ssh_user="admin" port=22 escalate="sudo"   // workspace-wide parameters
-
-host "laptop" connection="local"
-
-group "web" ssh_user="deploy" {         // group-level parameter
-    vars {
-        nginx_workers 4
-        allowed_ports 22 80 443         // list: positional arguments -> Vec<u16>
-        tls #true
-    }
-    host "web1" addr="10.0.1.11"
-    host "web2" addr="10.0.1.12" {
-        vars { nginx_workers 8 }        // host-level override
-    }
-}
-
-group "db" {
-    vars { pg_version 16 }
-    host "db1" addr="10.0.2.11" ssh_user="pgadmin" port=2222 {
-        vars { role "primary" }
-    }
-    host "db2" addr="10.0.2.12" {
-        vars {
-            role "replica"
-            replica_of "db1"
-        }
-    }
-}
-
-group "production" {                    // group of groups
-    members "web" "db"
-    vars { env "production" }
-}
-
-group "monitored" {
-    members "web1" "db1"                // cherry-pick hosts by name
-    vars { alerts #true }
-}
-
-/-host "web3" addr="10.0.1.13" {        // slash-dash: disabled, children included
-    vars { nginx_workers 2 }
-}
-```
-
-`rustible inventory show web2` prints the resolved parameters and vars with the
-source of each (all / group X / host / defaults), including what was overridden.
+`rustible inventory show`, given `web2` from that file, prints the resolved
+parameters and vars with the source of each (all / group X / host /
+defaults), including what was overridden.
 
 ### 10.2.3 Structural rules
 
@@ -1392,8 +1304,8 @@ source of each (all / group X / host / defaults), including what was overridden.
 - A host is defined exactly once (inside at most one group by nesting) and
   referenced from other groups by name. Defining it twice is an error.
 - Group membership is the transitive closure through `members`.
-- `vars { a 1 }` (children form) and `vars a=1` (property form) are equivalent;
-  use children form for lists and many vars.
+- A `vars` node may hold its vars as children or as properties, and the two
+  forms are equivalent; use children for lists and many vars.
 - Var names use underscores and match the Rust field names one to one. No case
   mapping.
 - Load-time errors name the file and line, e.g. missing `addr` on an ssh host,
@@ -1430,30 +1342,18 @@ source of each (all / group X / host / defaults), including what was overridden.
   struct generated from it (splits the playbook across two files); rustdoc JSON
   / rust-analyzer (heavyweight).
 
-```rust
-#[rustible::vars]
-struct Vars {
-    user: String,          // required
-    fruit: String,         // required
-    port: Option<u16>,     // optional
-    #[default = 3]
-    retries: u32,          // defaulted
-}
+In a playbook, the vars struct sits beside `main`: a plain field is
+required, an `Option` is optional, and a `#[default]` attribute gives a
+field its default. The playbook attribute names the struct, and `main`
+receives it as its second parameter. `examples/workspace/playbooks/vagrant.rs`
+and `examples/workspace/playbooks/demo/mc.rs` declare vars with defaults.
 
-#[rustible::playbook(hosts = "myservers", vars = Vars, escalate = true)]
-fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { .. }
-```
-
-```
-error: 2 of 3 hosts in group `myservers` do not satisfy the vars of playbooks/thing.rs
-
-  host `a`   ok
-  host `b`   missing required var `user`
-  host `c`   missing required var `user`
-
-  Vars are resolved from hosts.kdl as: vars -> group vars -> host vars.
-  Add `user` to hosts b and c, or to group "myservers" vars if it is shared.
-```
+When validation fails, the error says how many of the targeted hosts do not
+satisfy the playbook's vars and names the target and the playbook; it lists
+every host, `ok` or the var it lacks or mistypes; it recalls the order vars
+are resolved from `hosts.kdl` in; and it says where to add a missing var: on
+each host that lacks it, or on the group when it is shared.
+`crates/rustible-cli/src/inventory/validate.rs` writes it.
 
 **Precedence** (four levels, versus Ansible's twenty-two): top-level `vars` (all), then
 group vars outermost to innermost, then host vars, then `--var key=value` on the
@@ -1498,12 +1398,12 @@ stack of open blocks. What it offers comes in three tiers:
   when the run ends and the secret held in memory and zeroized; and
   `ctx.sys()`, the machine directly (11.1).
 - **Tier 2.** `ctx.skip(name, reason)` for a step deliberately not run;
-  `ctx.block(name, |ctx| ..)` to group steps, returning what its closure
-  returns; `ctx.as_user(..)`, `ctx.as_root()` and `ctx.as_escalated()` for
-  another identity (11.3); and `ctx.fetch(..)`, a file from the target back
-  to the operator's machine (5.6).
+  `ctx.block`, given a name and a closure, to group steps, returning what
+  its closure returns; `ctx.as_user(..)`, `ctx.as_root()` and
+  `ctx.as_escalated()` for another identity (11.3); and `ctx.fetch(..)`, a
+  file from the target back to the operator's machine (5.6).
 - **Tier 3, reserved, not built.** `ctx.barrier(name)`, where every host
-  waits until all have arrived; `ctx.run_once(name, |ctx| ..)`, run on one
+  waits until all have arrived; `ctx.run_once`, a named closure run on one
   host the orchestrator chooses; and `ctx.peer_facts(host)`, another host's
   facts. They are blocking calls over the channel (5.5), and the channel is
   bidirectional from day one so that adding them changes no playbook.
@@ -1512,7 +1412,7 @@ stack of open blocks. What it offers comes in three tiers:
 
 ### 11.1 Decisions embedded
 
-- **`vars` is a parameter of `main`** (`fn main(ctx: &mut Ctx, vars: Vars)`), not
+- **`vars` is a parameter of `main`**, its second after the `Ctx`, not
   a method on `Ctx`. The macro deserializes it from the run's start (5.5)
   before `main` runs; failure is a clean per-host message. `Ctx` is untyped
   w.r.t. vars.
@@ -1552,42 +1452,32 @@ stack of open blocks. What it offers comes in three tiers:
 
 ### 11.2 Example
 
-```rust
-#[rustible::vars]
-struct Vars { domain: String, #[default = 4] workers: u32 }
+A playbook for a `web` group shows most of `Ctx` at once. It declares a
+domain and a defaulted worker count as its vars. It reads the facts first
+and, with `bail!`, refuses a host that has no apt, naming the distribution
+it found. It ensures nginx with `apt::Present`. It then opens a
+`ctx.block` around two steps, writing the site's config from the vars and
+enabling the site with `file::Symlink`, and the block's closure returns
+whether either changed. When one did, it restarts nginx; otherwise it
+records the restart with `ctx.skip` and the reason "config unchanged", so
+the report says why the step did not run. It warns, with `ctx.warn`, when
+the host has a single CPU. Last, it takes a TLS certificate from the
+workspace with `ctx.local_secret`, so the key never sits in a binary, and
+installs it with `file::Copy` at mode 0600.
 
-#[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
-fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
-    if !ctx.facts().has_pm(&Pm::Apt) {
-        bail!("this playbook only knows Debian-likes, got {:?}", ctx.facts().distro);
-    }
-    ctx.step("nginx present", apt::Present::new(["nginx"]))?;
-
-    let reload = ctx.block("Configure nginx", |ctx| {
-        let conf = ctx.step("Render site config",
-            file::Template::render(Site { domain: &vars.domain, workers: vars.workers })
-                .to("/etc/nginx/sites-available/app"))?;
-        let link = ctx.step("Enable site",
-            file::Symlink::at("/etc/nginx/sites-enabled/app").pointing_to("/etc/nginx/sites-available/app"))?;
-        Ok(conf.changed || link.changed)
-    })?;
-
-    if *reload { ctx.step("nginx restarted", systemd::Restart::new("nginx"))?; }
-    else { ctx.skip("nginx restarted", "config unchanged"); }
-
-    if ctx.facts().cpus < 2 { ctx.warn("single-CPU host, workers setting will be ignored"); }
-
-    let cert = ctx.local_secret("tls/app.pem")?;
-    ctx.step("Install TLS cert", file::Copy::from_bytes(cert.as_bytes()).to("/etc/ssl/app.pem").mode(0o600))?;
-    Ok(())
-}
-```
+No compiled example shows all of this together.
+`examples/workspace/playbooks/vagrant.rs` gates on facts with `ensure!`, and
+`examples/workspace/playbooks/demo/streaming.rs` loads a secret.
 
 ### 11.3 Per-step privilege escalation (DECIDED)
 
 Escalation is a property of how a step runs, not of the op, so it lives on
-`Ctx`: `ctx.as_root().step(..)`, or bind `let root = ctx.as_root();` for several
-steps, or `ctx.as_user("postgres").step(..)` to step down. Playbook-level
+`Ctx`: a step is run through `ctx.as_root()`, or that context is bound once
+and used for several steps, or `ctx.as_user` steps down to an account such
+as `postgres`. `examples/workspace/playbooks/demo/escalation.rs` runs one
+step as root from an unescalated playbook, and
+`examples/workspace/playbooks/vagrant.rs` steps into two unprivileged
+accounts. Playbook-level
 `escalate = true` remains for the common case and means the binary is launched
 via the inventory's escalation method as `escalate_user` (default root), from
 whichever account logged in: the inventory's `ssh_user`, or the playbook's when
@@ -1597,11 +1487,11 @@ it sets one.
 - `as_user(name)`: explicit user.
 - `as_root()`: literally `as_user("root")`. It never follows the inventory; a
   method named `as_root` that might run as `admin` would be hidden indirection.
-- `as_escalated()`: `as_user(host.escalate_user)`, i.e. the privileged account
-  the inventory chose for this host (root by default, or a shared admin
-  account where direct root is not allowed). This is what `escalate = true`
-  uses at launch, exposed per step. Output marks steps whose identity differs
-from the binary's own (`as root`, `as postgres`).
+- `as_escalated()`: `as_user` with the host's `escalate_user`, i.e. the
+  privileged account the inventory chose for this host (root by default, or
+  a shared admin account where direct root is not allowed). This is what
+  `escalate = true` uses at launch, exposed per step. Output marks steps
+  whose identity differs from the binary's own (`as root`, `as postgres`).
 
 **How it works.** A running process cannot change identity per call, and a
 write to `/etc/...` from an unprivileged process gets EACCES. Ansible's answer
@@ -1678,7 +1568,7 @@ what they showed is recorded so the reversal is not relitigated:
 - The predictions rarely fired where a dry run matters most. On a fresh host
   nearly every step creates something, and the honest answer for a created
   thing was usually "cannot predict", so the playbook author was told to add
-  `.uid(3000).gid(3000)` for the dry run's sake.
+  an explicit uid and gid for the dry run's sake.
 - The report never showed which values were predictions. The distinction
   existed for the playbook and not for the person reading the run.
 - To let a dry run get past a step that *needs* what an earlier step would
@@ -1796,7 +1686,7 @@ variants.
 ### 13.1 Desired-state ops are the lookups
 
 There is no generic `::lookup()`. The desired-state op's typed output already
-says what was found: `apt::Present::new(["python3"])` says which packages were
+says what was found: `apt::Present` for `python3` says which packages were
 already present and which it installed, and `.changed` is false when nothing
 was done (reported as `ok`, never `skipped`; `skipped` means deliberately not
 run).
@@ -1815,34 +1705,38 @@ fails that host, and the run continues on the other hosts. In code that is
 `?` on `ctx.step`. A failure the playbook catches is still reported as a
 failed step but does not fail the host: the summary counts it as
 `recovered`, Ansible's `ignored` and `rescued` in one column. A cancelled run
-and a panic always fail the host. Ignoring is
-`let _ = ctx.step(..)` or `.ok()`; rescue is `if let Err(e) = ctx.step(..)`;
-retry is a loop. None of these need to know the error's kind, and no playbook
-or op is expected to match on errors.
+and a panic always fail the host. Ignoring is discarding the step's result,
+or `.ok()` on it; rescue is a `match` or an `if let` on its `Err`; retry is
+a loop. None of these need to know the error's kind, and no playbook or op
+is expected to match on errors.
+`examples/workspace/playbooks/vagrant_login.rs` catches a step that must
+fail and checks its message.
 
 **Type.** An opaque, `anyhow`-style error with a context chain, wrapping the
-`anyhow` crate. `rustible_sdk::Result<T>` is `Result<T, rustible_sdk::Error>`
-where `Error` converts from any `std::error::Error` via `?`.
+`anyhow` crate. `rustible_sdk::Result` carries `rustible_sdk::Error`, which
+converts from any `std::error::Error` through `?`;
+`crates/rustible-sdk/src/error.rs` is the definition.
 
 Why not the structured enum from spike 3:
 - The drawback is on the *producer* side, not the consumer side. `?` on a
   foreign error (`serde_yaml::Error`, `regex::Error`, anything from a crate
   we do not own) does not compile against an enum unless we wrote a `From`
   for it, so op and playbook authors end up writing `.map_err(..)` on every
-  line. A catch-all variant plus a blanket `From<E: std::error::Error>` is
-  rejected by coherence when the enum itself implements `std::error::Error`;
-  `anyhow`'s design (its `Error` deliberately does not implement that trait)
-  is the one shape that makes the blanket conversion legal.
+  line. A catch-all variant plus a blanket `From` for every
+  `std::error::Error` is rejected by coherence when the enum itself
+  implements `std::error::Error`; `anyhow`'s design (its `Error`
+  deliberately does not implement that trait) is the one shape that makes
+  the blanket conversion legal.
 - No context chain: a deep failure renders flat, like Ansible's `msg`.
 - The enum would need `#[non_exhaustive]`, which removes exhaustive matching,
   its only advantage, and nobody was going to match anyway.
 
 **Context is optional.** Bare `?` is the norm. The SDK adds the two most
 useful layers automatically: `ctx.step` wraps any failure with the step name,
-and primitives carry their own detail (`sys.cmd().run()` fails with argv, exit
-code, and stderr; file primitives with the path). `.context("installing
-{pkg}")` is for ops or playbooks that do several similar things where the raw
-error would not say which.
+and primitives carry their own detail (a command run through `sys` fails
+with its argv, exit code, and stderr; file primitives with the path).
+`.context(..)` is for ops or playbooks that do several similar things where
+the raw error would not say which.
 
 **Typed values inside the chain.** The SDK's own signals remain concrete
 types that the orchestrator can downcast for rendering: a file mutation
@@ -1857,19 +1751,14 @@ the command and its stderr separately whether the playbook caught the
 failure or not, once per failure (5.5). Step names repeat, so the id is what
 ties the failure to the step line it closes.
 
-Rendered example:
-
-```
-[web1]  FAILED at `nginx present`: installing nginx: `apt-get install -y nginx` exited 100
-        E: Unable to locate package nginx
-```
-
-Inside a block, the closing line names the block path as the step line does:
-
-```
-[web1]  [outer][inner] boom ..................................... FAILED
-[web1]  FAILED at [outer][inner] `boom`: `/bin/sh -c exit 3` exited 3
-```
+**What the operator sees.** A failure that ends a host closes it with one
+line: the host, `FAILED at` and the step's name, then the error's context
+chain, from the step down to the failed command and its exit status; `-v`
+adds the command and its stderr beneath it (5.5). Inside a block, the
+step's own line carries the block path and `FAILED`, and the closing line
+names the block path as the step line does.
+`crates/rustible-cli/src/render.rs` renders both, and its tests hold the
+exact text.
 
 ## 15. Glossary
 
@@ -1891,7 +1780,7 @@ Inside a block, the closing line names the block path as the step line does:
 - **Escalate**: Ansible's `become`. Running the binary or a step as another
   user, root by default. Named `escalate` because `become` is a reserved Rust
   keyword (section 16).
-- **Block**: `ctx.block(name, |ctx| ..)`, a named grouping of steps, not an
+- **Block**: `ctx.block`, a named grouping of steps, not an
   operation; it returns what its closure returns.
 - **Skip**: `ctx.skip(name, reason)`, a step deliberately not run, counted in
   the summary.

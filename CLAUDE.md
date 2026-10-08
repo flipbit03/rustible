@@ -30,30 +30,29 @@ in. On types, fields, signatures and how a guarantee is implemented, the
 source is the authority. When you cannot tell which of the two a
 disagreement is, treat it as intent and raise it.
 
-**The vision contains no code definitions.** No `struct`, `enum` or `trait`
-declarations, no field lists, no function or method signatures, no wire
-layouts, no constants or sizes copied from the source: each goes stale on the
-next change, and the source is already the authority on it. The test for
-anything else: if a line would go stale when a field is added or an op's
-internals change, it does not belong there. So also no one op's internals (the
-flags it passes, the files it reads) and no "what is in the tree" status;
-where a section needs such detail, it states what must hold and names the
-source file that is the authority. Code a playbook author writes is not a
-definition in this sense: a playbook, a `#[rustible::vars]` struct, a call to
-an op are the product's shape, and they stay. The one internal declaration
-allowed is the five-line sketch of the `Op` contract in 6.2, because that
-contract is the core idea. What it does carry: a design decision with its
-rationale and the alternatives it beat, including when the decision is a tool,
-a library or a mechanism (zig and `ring` in 5.3, KDL in 10.2, `anyhow` in 14,
-the `selected` feature in 9), and the measurements that justified it (5.3's
-binary sizes); playbook, inventory and CLI examples with their rendered
-output, because they are the product's shape; and a short marker that a stated
-goal is not yet true (pointing at its `KNOWN GAP` entry) or that a shape is
-reserved and not built, so that a promise is never read as a fact. That marker
-stays one sentence; it never grows into a status ledger. A proposed amendment
-that would only update a struct, a field or a signature is not an amendment:
-drop it. Status belongs in `docs/plan/PROGRESS.md`; history, and the reasons
-behind implementation choices the vision does not make, in
+**The vision contains no code.** No code blocks of any kind: not a type, a
+trait or a signature, not an example playbook or inventory, not a CLI session
+or rendered output. Each goes stale on the next change, and something else is
+already the authority on it. Instead the vision says in prose what a thing is
+and what must hold, and points at where the real one lives: the source for a
+definition ("the `Op` trait in `crates/rustible-sdk/src/op.rs`"), and for a
+playbook, an inventory or a run, the compiled examples in
+`examples/workspace`, which CI builds and which therefore cannot drift. Names
+stay inline (a type, an op, a flag, a path), because a name is a pointer, not
+a snippet. Prose goes stale too, so the same test applies to it: if a line
+would go stale when a field is added or an op's internals change, it does not
+belong there, which rules out one op's internals (the flags it passes, the
+files it reads) and any "what is in the tree" status. What the vision does
+carry: a design decision with its rationale and the alternatives it beat,
+including when the decision is a tool, a library or a mechanism (zig and
+`ring` in 5.3, KDL in 10.2, `anyhow` in 14, the `selected` feature in 9), and
+the measurements that settled it (5.3's binary sizes); and a short marker that
+a stated goal is not yet true (pointing at its `KNOWN GAP` entry) or that a
+shape is reserved and not built, so that a promise is never read as a fact.
+That marker stays one sentence; it never grows into a status ledger. A
+proposed amendment that would only update a struct, a field or a signature is
+not an amendment: drop it. Status belongs in `docs/plan/PROGRESS.md`; history,
+and the reasons behind implementation choices the vision does not make, in
 `docs/plan/DECISIONS.md`.
 
 **Do not edit it on your own initiative.** The rule exists so the contract is
