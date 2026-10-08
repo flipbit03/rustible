@@ -5,14 +5,18 @@
 //! Two enums cross the wire: [`Down`] from the orchestrator and [`Up`] from
 //! the binary, both in serde's default externally tagged form, so the variant
 //! name is the JSON key. Everything they carry is part of the format too,
-//! which means [`HostInfo`], [`Event`] and [`Secret`] here, and `CmdSpec`,
-//! `Output` and `Stat` in the helper protocol, which reuses these frames.
-//! Adding a field with `#[serde(default)]` leaves an older peer's frames
-//! readable; any other change to the shapes is incompatible and bumps
-//! [`PROTOCOL_VERSION`], which the two ends compare in [`Up::Hello`] before
-//! the first step runs. A compatible field may bump it too, on purpose, when
-//! an older peer would read the frames but show less than it should: version
-//! 8 did, so a mixed pair is refused at `Hello`.
+//! which means [`HostInfo`], [`Event`] and [`Secret`]. Adding a field with
+//! `#[serde(default)]` leaves an older peer's frames readable; any other
+//! change to the shapes is incompatible and bumps [`PROTOCOL_VERSION`],
+//! which the two ends compare in [`Up::Hello`] before the first step runs.
+//! A compatible field may bump it too, on purpose, when an older peer would
+//! read the frames but show less than it should: version 8 did, so a mixed
+//! pair is refused at `Hello`.
+//!
+//! The escalation helper reuses this frame codec for its own requests and
+//! answers (`CmdSpec`, `Output` and `Stat` among them), but that wire is
+//! outside [`PROTOCOL_VERSION`]: a helper is always the same build as its
+//! parent, so it never meets an older peer.
 //!
 //! Byte fields (file chunks, command stdin) travel as base64 strings: a JSON
 //! array of numbers would cost 3.5x the payload, base64 costs 1.33x, and the

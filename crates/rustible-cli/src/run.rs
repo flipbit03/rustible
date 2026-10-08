@@ -48,7 +48,8 @@ pub struct RunArgs {
     /// Dry run: report what would change, change nothing.
     #[arg(long)]
     pub check: bool,
-    /// -v shows diffs and facts, -vv every command.
+    /// -v shows full diffs, facts, a failed command and its stderr, debug
+    /// lines and timings; -vv adds every command.
     #[arg(short, action = clap::ArgAction::Count)]
     pub verbose: u8,
     /// Playbook vars, `key=value`; JSON-looking values are parsed as JSON.

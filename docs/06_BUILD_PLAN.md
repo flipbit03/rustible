@@ -112,7 +112,7 @@ conflict); then **M3** joining M1 and M2, followed by dogfooding and release.
 amendments if any, how it was verified>
 ```
 
-## 4. Wave one op brief template (M6)
+## 4. Op brief template
 
 Each op is one task. The brief is the template above with these fixed parts:
 
@@ -120,13 +120,38 @@ Each op is one task. The brief is the template above with these fixed parts:
   2026-09-24), 6.3 (one type per desired state), 6.4 (actions), 6.7 (one
   resource per op), 7.3 (all I/O through `sys`), 8 (test tiers), 12 (check
   mode: a would-change step has no output; a prerequisite another step could
-  create is tolerated under `--check`).
+  create is tolerated under `--check`; nothing beyond the target is
+  contacted, so an answer that depends on remote state is `would change`
+  with the diff saying it was not read, and `check` runs no tool that may
+  download).
 - Scope: the op struct(s) and builder, the `Op` impl, with `check` producing a
   typed intent and `apply` executing it; the intent never wraps a `Diff`; an
-  `Output` struct,
-  rustdoc with the Ansible equivalent named, pure-function tests for the
-  planning logic, `Fake`-backend tests for satisfied / change / apply /
-  failure / wrong-distro, and a Docker harness test doing changed-then-ok.
+  `Output` struct, rustdoc with the Ansible equivalent named, pure-function
+  tests for the planning logic, `Fake`-backend tests for satisfied / change /
+  apply / failure / wrong platform / check mode
+  (`System::fake(..).with_check_mode(true)`), and a Docker harness test doing
+  changed-then-ok.
+  The `Fake` asserts what a final state cannot show: attribute calls with
+  `attr_calls()`, a refused owner with `with_chown_refused()`, streamed reads
+  with `reads()`.
+- Writing a file: content that wants a mode or an owner is given them in the
+  write, `sys.write_from(path, src, Some(WriteAttrs { mode, owner }))` or
+  `file::write_from_with_backup(.., Some(attrs))`, which set them on the
+  staged file before the rename; new content is never visible at a wider
+  mode or under the wrong owner, and an owner that cannot be given fails the
+  write with the old file intact. A change to attributes alone goes through
+  `file::set_mode_and_owner`, which owns the setuid and setgid ordering.
+  `write_atomic` is for content with no mode or owner of its own: it keeps
+  an existing file's, and creates a new one at 0666 minus the umask.
+- Messages: one that quotes text the op did not write (a server's body, an
+  archive member's name, a line of a file) quotes it bounded and on one line
+  (`http::one_line`, `archive`'s `named`), so the error stays small however
+  large the input.
+- Docs beyond rustdoc: a row in the README's operations table, and the
+  module in `docs/USING_RUSTIBLE.md`'s list if it is new. The manual lists no
+  signatures, so it gains a line only for a new builder shape or a trap.
+- T3: a step in `vagrant.rs`, `mac.rs` or `macbrew.rs` if the op needs a real
+  machine, or a sentence in the pull request saying it does not.
 - Do not touch: the SDK, other ops, the CLI.
 - Done when: `cargo test -p rustible-std <module>` passes and the harness test
   passes on both images.

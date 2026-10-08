@@ -47,8 +47,9 @@ integration:
 
 # T3 is a real machine; here, a Linux VM over a real SSH transport, with a
 # real sudo setup, a live /proc/sys and a real boot, none of which the
-# container harness gives. Optional day to day, and expected of a new
-# operation before it merges. CI's other T3 machine is the macOS runner.
+# container harness gives. Optional day to day; a new operation gets a step
+# in vagrant.rs only if it needs a real machine. CI's other T3 machine is the
+# macOS runner.
 
 # `vagrant up` with no argument brings up only the machine whose architecture
 # matches this host -- x86 on an x86_64 host, arm on Apple silicon -- because
@@ -74,8 +75,10 @@ vm-up-arm:
 # then vagrant_login and vagrant_escalate_user, which log in as and escalate
 # to accounts the first creates): the first run must change something
 # (otherwise the test is vacuous) and the second must change nothing; each
-# run recovers exactly the failures its playbook catches on purpose. Then
-# vagrant_login_escalate, once, whose launch must be refused. Pass
+# run recovers exactly the failures its playbook catches on purpose; each run
+# of vagrant must fetch back, byte for byte, the 50 MiB file it copied through
+# the escalation helper. Then vagrant_login_escalate, once, whose launch must
+# be refused. Pass
 # HOSTS=vagrant-arm to limit it, QUICK=1 to skip the recreate while iterating.
 vm-test: example
 	$(CARGO) build --release -p rustible-cli

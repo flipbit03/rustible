@@ -4,12 +4,17 @@
 
 Rustible is an independent replacement for Ansible. A playbook is an ordinary
 Rust file: typed operations, typed outputs, checked by the compiler and
-completed by your editor. Running one compiles it into a static binary for
-each target's architecture, ships it over SSH, runs it *there*, and streams
-`changed / ok / failed` back, with dry run and diffs built in. The target
-needs nothing installed: no Python, no agent, no runtime.
+completed by your editor. Running one compiles it into a self-contained
+binary for each target's architecture, ships it over SSH, runs it *there*, and
+streams `changed / ok / failed` back, with dry run and diffs built in. The
+target needs nothing installed: no Python, no agent, no runtime.
 
 ```rust
+use rustible::prelude::*;
+use rustible_std::{apt, file, systemd};
+
+const NGINX_CONF: &str = include_str!("nginx.conf");
+
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
@@ -49,7 +54,7 @@ readable runs — and changes what does not.
 | handlers and `notify` | `if step.changed { ... }` |
 | loops with `item` | just use `for` :-) |
 | `register` + `set_fact` | just use the value the step returns |
-| Python on every target | one static binary, nothing preinstalled |
+| Python on every target | one self-contained binary, nothing preinstalled |
 
 ## Supported platforms
 
@@ -64,7 +69,7 @@ Rustible runs **from** a controller and manages **targets**.
 | **Target** — BSD | not yet (planned) | not yet (planned) |
 | **Target** — Windows | nope | no way |
 
-Targets need nothing installed. A playbook arrives on the target machine as one static binary, that's it.
+Targets need nothing installed. A playbook arrives on the target machine as one self-contained binary, that's it.
 
 ## Install
 
@@ -110,7 +115,7 @@ host "local" connection="local"
 and here's a more fleshed out example of a `hosts.kdl` file:
 
 ```kdl
-defaults ssh_user="cadu" escalate="sudo"
+defaults ssh_user="deploy" escalate="sudo"
 
 group "web" {
     vars { nginx_workers 4 }
@@ -166,7 +171,7 @@ struct Vars {
     update_cache: bool,
 }
 
-#[rustible::playbook(hosts = "vagrant", vars = Vars, escalate = true)]
+#[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
 fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> { /* ... */ }
 ```
 
@@ -185,12 +190,17 @@ overrides the inventory.
   rendered from it. Dry run and diff are not a per-module afterthought.
 - **Outputs chain.** A step returns a typed value describing what it found or
   made, and later steps use it. In check mode a step that would change has
-  no output yet, and reading it returns an error saying so rather than a
-  guess.
+  no output yet. Reading it ends the innermost `ctx.block` (or that host's
+  dry run) with a warning naming the step, rather than guessing. Nothing
+  fails.
+- **Blocks group steps.** `ctx.block(name, |ctx| ..)` names a section and
+  returns its closure's value.
 - **Prerequisites are refused.** An op that manages a user does not create
   the group it references; it fails and names the op you wanted. For an
   account the run is creating, a dry run defers that refusal to the real run,
   since an earlier step may create the group — the same line Ansible draws.
+- **A dry run touches nothing outside the target.** No request of any method
+  is sent under `--check`; such a step reports `would change`.
 
 ## Operations and collections
 
@@ -205,13 +215,16 @@ Two collections ship from this repository.
 | module | ops |
 |---|---|
 | `apt` | `Present`, `Absent`, `Latest` — Debian and Ubuntu |
-| `brew` | `Present`, `Absent` — Homebrew, on a mac or Linuxbrew, as the login user |
+| `brew` | `Present`, `Absent` — Homebrew, on a mac or Linuxbrew; never as root (the login user, or the owner via `ctx.as_user`) |
 | `file` | `Copy`, `Directory`, `Symlink`, `Absent`, `Attrs`, `Line`, `Block` |
-| `user`, `group` | `Present`, `Absent`, `Membership` |
+| `user` | `Present`, `Absent`, `Membership`, `Existing` |
+| `group` | `Present`, `Absent` |
 | `ssh::authorized_keys` | `Present` (with `exclusive`), `Absent` |
 | `systemd` | `Enabled`, `Disabled`, `Running`, `Stopped`, `Restart`, `Reload`, `DaemonReload` |
-| `hostname`, `sysctl` | `Is`, `Present` |
-| `http`, `archive` | `Download`, `Extracted` |
+| `hostname` | `Is` |
+| `sysctl` | `Present` |
+| `http` | `Download`, `Request` |
+| `archive` | `Extracted` |
 | `shell` | `Command` |
 
 Every operation declares where it runs and refuses other platforms by name.
@@ -222,10 +235,10 @@ up; the rest refuse.
 **`rustible-github`** — a small collection showing what a third-party one
 looks like. It adds `rustible_github::UserKeys`, which fetches a GitHub user's public
 keys, and `github_ssh_keys_to_user`, a helper that runs it and
-`ssh::authorized_keys::Present` as two visible steps:
+`ssh::authorized_keys::Present` as two visible steps in one block:
 
 ```rust
-let r = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
+let r = github_ssh_keys_to_user(ctx, "flipbit03", "admin")?;
 ```
 
 Both are built on `rustible-sdk`, which is what you use to write your own
@@ -235,18 +248,23 @@ operations and collections.
 
 1. Find the workspace (`rustible.toml`), read the inventory.
 2. Ask the playbook about itself with a host-native build (`--describe`):
-   which hosts, which vars, whether it escalates. Cached by source hash.
+   which hosts, which vars, whether it escalates, and any `ssh_user`. Cached
+   by source hash.
 3. Validate every target host's vars. Abort before touching anything if one
    fails.
 4. Connect to all hosts in parallel, learn each one's architecture.
 5. One cargo build for every architecture in play, `--profile dist`
-   (stripped, LTO, ~1.4 MB static musl binaries).
+   (stripped, LTO; static musl on Linux, Mach-O against `libSystem` only on
+   macOS).
 6. Upload to `~/.cache/rustible/bin/<name>-<sha256>` unless it is already
-   there.
+   there; a playbook escalating to an `escalate_user` other than root or the
+   login gets its own copy, streamed to that account.
 7. Run it, escalating if the playbook says so, and stream framed events back
    over the SSH channel: steps, diffs, commands, logs, the summary.
 
-The playbook binary never opens a socket. SSH is the orchestrator's business.
+The playbook binary never listens on a socket or connects back to the
+controller: everything it reports rides the SSH session. An operation such as
+`http::Download` connects out from the target, and only in a real run.
 
 ## Crates
 

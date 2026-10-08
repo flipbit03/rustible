@@ -46,9 +46,9 @@ that are compiled code rather than YAML.
 
 A playbook is an ordinary Rust file. Running one compiles it to a single
 self-contained binary for the target's architecture — static musl on Linux, a
-Mach-O linked only against `libSystem` on macOS — copies it over SSH, and runs it **on the
-target**. The binary streams results back. Targets need nothing installed: no
-Python, no agent, no runtime.
+Mach-O linked only against `libSystem` on macOS — copies it over SSH, and runs
+it **on the target**. The binary streams results back. Targets need nothing
+installed: no Python, no agent, no runtime.
 
 That last point drives most of the design. There is no module library on the
 target to call into, so everything a playbook does is compiled into it.
@@ -256,7 +256,7 @@ Useful flags on `playbook run`:
 | flag | effect |
 |---|---|
 | `--check` | change nothing; report what would change (§15) |
-| `-v` | show diffs and facts |
+| `-v` | show full diffs, facts, a failed command and its stderr, debug lines, and timings |
 | `-vv` | show every command the run executes |
 | `--limit <HOSTS>` | comma-separated hosts or groups, narrowing the playbook's own `hosts` |
 | `--var k=v` | override an inventory var; JSON-looking values parse as JSON |
@@ -317,8 +317,8 @@ Seven, and no others. Set any of them on a `host`, on a `group`, or on
 |---|---|---|
 | `addr` | hostname or address to connect to | none — **required** unless `connection="local"` |
 | `connection` | `"ssh"` or `"local"` | `ssh` |
-| `ssh_user` | account ssh logs in as | your username |
-| `port` | ssh port | `22` |
+| `ssh_user` | account ssh logs in as | `~/.ssh/config`'s, else your username |
+| `port` | ssh port | `~/.ssh/config`'s, else `22` |
 | `escalate` | `"sudo"`, `"doas"` or `"none"` | `sudo` |
 | `escalate_user` | account to escalate to | `root` |
 | `ssh_args` | extra arguments for `ssh` | none |
@@ -343,7 +343,7 @@ group "web" {
 Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
 `#false`.
 
-### Four things that catch people out
+### Things that catch people out
 
 - ⚠️ **There is no implicit `all` group.** `hosts = "all"` fails with
   ``no host or group named `all` `` unless you define one. Ansible's most common
@@ -354,6 +354,8 @@ Numbers are bare (`port=2222`), strings are quoted, booleans are `#true` /
 - ⚠️ **`addr` cannot be inherited.** It is host-only; setting it on a group or
   on `defaults` is a load error.
 - ⚠️ **`ssh_args` does not merge.** The nearest level that sets it wins whole.
+- ⚠️ **`ssh_args` cannot set the login, port or address.** Use `ssh_user`,
+  `port` and `addr`; `-l`, `-p`, `-o User=` and the like are a load error.
 
 ### SSH, and secrets
 
@@ -412,7 +414,7 @@ module by module. Forgetting the second line is the most common first error.
 | `hosts` | string, **required** | a host name or a group name from the inventory |
 | `vars` | a type | the `#[rustible::vars]` struct this playbook needs (§11) |
 | `escalate` | bool | run every step escalated (§12) |
-| `ssh_user` | string | log in as this account instead of the host's `ssh_user`; refused on a `connection="local"` host |
+| `ssh_user` | string | log in as this account instead of the host's `ssh_user`; refused on a `connection="local"` host; escalation runs from this account |
 
 The function signature is fixed:
 
@@ -528,7 +530,7 @@ ctx.check_mode() -> bool
 // Output.
 ctx.log(msg)     // a line in the run
 ctx.warn(msg)    // a warning, counted in the summary
-ctx.debug(msg)   // only with -vv
+ctx.debug(msg)   // only with -v
 
 // Escalation, per step (§12).
 ctx.as_root()          -> Ctx
@@ -538,7 +540,7 @@ ctx.as_escalated()     -> Ctx
 // Files, between controller and target.
 ctx.local_file(path) -> Result<PathBuf>   // upload a controller file, get its remote path
 ctx.local_secret(path) -> Result<Secret>  // read into memory, never to disk
-ctx.fetch(remote, local_dest) -> Result<()>  // download from the target
+ctx.fetch(remote, local_dest) -> Result<()>  // to the workspace; "out/" lands at out/<host>/<file>
 
 // The escape hatch: run something no op covers.
 ctx.sys() -> &System
@@ -550,6 +552,11 @@ uploads it and gives you a path on the target. `local_secret` streams the bytes
 into memory and gives you a `Secret`: nothing is written to the target's disk,
 it is zeroized on drop, and its `Debug` prints `Secret(<n> bytes)`.
 
+`ctx.fetch` goes the other way. `local_dest` is relative to the workspace
+root, and anything outside it is refused. With a trailing `/` the file lands
+at `<dest>/<host>/<file>`; without one, every host writes the same path. The
+destination is replaced only once the whole file has arrived.
+
 ## 9. Reading what a step returns
 
 `ctx.step(...)` returns `Applied<T>`, where `T` is that operation's output
@@ -558,7 +565,7 @@ type. It carries:
 | field / method | what |
 |---|---|
 | `.changed` | `bool` — did this step change anything |
-| `.diff` | `Option<Diff>` — what changed, for rendering (`.render()`, `.short()`); it cannot be read field by field |
+| `.diff` | `Option<Diff>` — what the step planned, `None` if it was already satisfied; for rendering (`.render()`, `.short()`), it cannot be read field by field |
 | `.elapsed` | `Duration` |
 | `.output() -> Result<&T>` | the output, or an error if unavailable |
 | `.into_output() -> Result<T>` | the same, by value |
@@ -714,9 +721,9 @@ Rules:
 - **Precedence, nearest wins:** `--var` on the command line, then the host,
   then the closest group, then outer groups, then the workspace-wide
   `vars { }` block. ⚠️ `defaults` is for **parameters only** — a `vars` block
-  inside it is a load error, not a silently ignored one. So a host setting `nginx_workers 8` beats
-  its group's `4`, which is the ordinary case. `rustible inventory show <host>`
-  prints the winner and where it came from.
+  inside it is a load error, not a silently ignored one. So a host setting
+  `nginx_workers 8` beats its group's `4`, which is the ordinary case.
+  `rustible inventory show <host>` prints the winner and where it came from.
 - `--var package=htop` overrides the inventory for one run. A value that looks
   like JSON is parsed as JSON.
 - `rustible inventory check` validates every playbook against every host it
@@ -812,9 +819,9 @@ cargo doc -p rustible-std --no-deps --open
 the same thing on the web.
 
 The modules carrying operations are `apt`, `archive`, `brew`, `file`, `group`,
-`hostname`, `http`, `shell`, `ssh`, `sysctl`, `systemd` and `user`. What is in each is a `grep` away; what
-you cannot get that way — which shape to reach for, and what bites — is the
-rest of this section.
+`hostname`, `http`, `shell`, `ssh`, `sysctl`, `systemd` and `user`. What is in
+each is a `grep` away; what you cannot get that way — which shape to reach
+for, and what bites — is the rest of this section.
 
 ### Operations from elsewhere
 
@@ -829,9 +836,9 @@ cargo add rustible-github
 ```rust
 use rustible_github::github_ssh_keys_to_user;
 
-// fetches flipbit03's public keys from GitHub and puts them in cadu's
+// fetches flipbit03's public keys from GitHub and puts them in admin's
 // authorized_keys, as two visible steps in one block
-let keys = github_ssh_keys_to_user(ctx, "flipbit03", "cadu")?;
+let keys = github_ssh_keys_to_user(ctx, "flipbit03", "admin")?;
 ctx.block("report", |ctx| {
     ctx.log(format!("{} key(s) added", keys.added.len()));
     Ok(())
@@ -843,9 +850,10 @@ Under `--check` nothing is fetched, so the helper has no value: reading
 Put the code that depends on it in a block, as above.
 
 `rustible-github` is the worked example of a collection, and small enough to
-read end to end if you are writing your own. It also exports `rustible_github::UserKeys` for the fetch on its own,
-`GithubSshKeysToUser` for the configurable form of the helper above, and a
-`Fetch` trait so the HTTP call can be faked in tests.
+read end to end if you are writing your own. It also exports
+`rustible_github::UserKeys` for the fetch on its own, `GithubSshKeysToUser`
+for the configurable form of the helper above, and a `Fetch` trait so the
+HTTP call can be faked in tests.
 
 There is no galaxy and no roles path: collections are crates, `cargo add`
 finds them, and `cargo` pins the version.
@@ -920,6 +928,9 @@ file::Copy::from_bytes(include_bytes!("../files/nginx.conf")).to("/etc/nginx/ngi
 let staged = ctx.local_file("files/nginx.conf")?;
 file::Copy::from_local_path(staged).to("/etc/nginx/nginx.conf")
 ```
+
+⚠️ `file::Copy` copies one regular file: a directory source is refused, and so
+is a `dest` that is a symlink (remove it with `file::Absent` first).
 
 ### A worked example
 
@@ -1004,11 +1015,10 @@ In a real run most of these refuse in `check`, before anything is touched,
 naming the operation you wanted — `user`, `group` and `authorized_keys` all
 do. Under `--check` most do not: a prerequisite an earlier step could create
 is reported as `would change`, not refused, except an existing account's
-missing group and keys for an account that does not exist, which Ansible
-refuses too (§15). ⚠️ `file::Copy` looks only
-at the destination, so a copy into a directory that does not exist fails at
-`apply`, after earlier steps have already changed the machine. Create the
-directory first.
+missing group and keys for an account that does not exist (§15).
+⚠️ `file::Copy` looks only at the destination, so a copy into a directory that
+does not exist fails at `apply`, after earlier steps have already changed the
+machine. Create the directory first.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1036,13 +1046,21 @@ on `Extracted` chowns **every extracted file and directory**. Creating
 leaves a correctly-owned directory full of root-owned files, and the run
 reports `ok` for the directory step while it happens.
 
-A tarball holding pax sparse members is refused at `check`. GNU tar writes them
-with `--format=posix -S`, and macOS's `tar` (bsdtar) for any sparse file unless
-given `--no-read-sparse`; recreate it without sparse handling.
+A tarball with pax sparse members (GNU tar `-S --format=posix`, macOS `tar` on
+a sparse file) is refused at `check`; the error says how to recreate it.
+
+⚠️ A `git archive` tarball, which is what GitHub serves as a release's source
+code, needs `.strip_components(1)` or more: at 0 its `pax_global_header` is
+refused as a special file.
 
 **A new unit file is invisible until systemd re-reads.** Writing
 `/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
 with `not found`. Put a `systemd::DaemonReload::new()` between them.
+
+**`.user(true)` on a `systemd` op manages the units of the account the step
+runs as**, so under `escalate = true` that is root's. Chain it on
+`ctx.as_user("svc")`. The account needs a login session or linger
+(`loginctl enable-linger svc`).
 
 **`owner` takes numeric ids**, never names: `.owner(uid: u32, gid: u32)`. Read
 them off a `user::Account` returned by an earlier step. Changing the owner
@@ -1068,11 +1086,9 @@ cannot use `brew::Present`/`Absent` directly: run it unescalated or use
 `ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
 It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
 `brew::Absent` refuses a pinned formula, under `--check` too: `brew unpin` it
-first. An alias or old name (`python3`) counts as installed only when brew
-linked `<prefix>/opt/<name>` for it. One it did not (an alias added after the
-install, an old name, a rack not yet migrated) makes `brew::Present` report
-`changed` every run and `brew::Absent` report `ok` with the formula still
-installed, so name the formula itself.
+first. Name the formula, not an alias or old name (`python3`): one brew did not
+link at `<prefix>/opt/<name>` makes `Present` report `changed` every run and
+`Absent` report `ok` with the formula still installed.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
 mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
@@ -1132,11 +1148,16 @@ rendering happens on the target inside your playbook binary.
 lists the codes. Read the response into a struct with `json_as`;
 `rustible_std::http` re-exports `json!` and `Value` for the untyped case.
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
-`.basic_auth(user, &s)` — and show as `<secret, N bytes>` in diffs and errors.
+`.basic_auth(user, &s)`. The diff never shows them, and an error or a shown
+body carries `<secret>` where one appeared.
 
 Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`
 streams it to disk, so fetch large files with `Download`.
+
+⚠️ `Download`'s `.timeout` bounds connecting and the response head, not the
+body; `Request`'s bounds the whole exchange. When the file's integrity
+matters, give `Download` a `.checksum(..)`.
 
 ⚠️ A `.json(..)` body is not a secret: the diff shows it (`-v`, `--json`),
 and a server that echoes it into an error puts it in the step's error. To
@@ -1265,8 +1286,9 @@ the command does not run there.
 Other useful builders: `.cwd(dir)` (Ansible's `chdir`), `.env(k, v)`,
 `.stdin(bytes)`.
 
-Prefer a real operation where one exists: `shell::Command` has no diff, and
-`.creates` is a marker rather than a description of the state you wanted.
+Prefer a real operation where one exists: `shell::Command`'s diff is only the
+command line, not a before and after, and `.creates` is a marker rather than
+a description of the state you wanted.
 
 ## 14. Running, and reading the output
 
@@ -1396,7 +1418,7 @@ rustible playbook run site --check
 Nothing is modified. Steps report `would change` instead of `changed`, with
 the diff they would have applied.
 
-Three things to know:
+What to know:
 
 - ⚠️ **A step that would change has no output.** Its value only exists once
   `apply` has run, and `apply` never runs here. Reading it ends the
@@ -1412,13 +1434,16 @@ Three things to know:
   missing from the playbook, the **real** run refuses at that step, before
   that step touches anything but after the steps before it have run — so a
   dry run does not catch a forgotten `group::Present`; the real run does, and
-  stops there. Two things are refused under `--check` anyway, because Ansible
-  refuses them: an **existing** account's missing group, and
-  `authorized_keys` for an account that does not exist yet (chain from the
-  `user::Present` step with `for_user(&account)`, or dry-run again once the
-  account exists). Refusals about the machine itself
-  (not root, wrong platform, a masked unit, no `usermod` on BusyBox, a sysctl
-  key this kernel lacks) hold in both modes.
+  stops there. Two things are refused under `--check` anyway: an
+  **existing** account's missing group, and `authorized_keys` for an account
+  that does not exist yet (chain from the `user::Present` step with
+  `for_user(&account)`, or dry-run again once the account exists). Refusals
+  about the machine itself (not root, wrong platform, a masked unit, no
+  `usermod` on BusyBox, a sysctl key this kernel lacks) hold in both modes.
+- ⚠️ **`ctx.as_user(name)` needs the account to exist, under `--check` too.**
+  A dry run of a playbook that creates `name` earlier fails at the first step
+  run as `name` with `sudo: unknown user`. Dry-run again once the account
+  exists.
 - **Nothing outside the target is contacted.** A step whose answer is remote,
   such as `http::Request` (any method) or `rustible_github::UserKeys`,
   reports `would change` with no output.

@@ -6,7 +6,7 @@ vars {                                  // workspace-wide vars: the "all" level
     timezone "America/Sao_Paulo"
 }
 
-defaults ssh_user="cadu" port=22 escalate="sudo"   // workspace-wide parameters
+defaults ssh_user="admin" port=22 escalate="sudo"  // workspace-wide parameters
 
 host "laptop" connection="local"
 
