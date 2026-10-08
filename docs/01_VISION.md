@@ -1,7 +1,6 @@
 # Rustible: Vision and Architecture Decisions
 
-**Status:** living document, first written 2026-09-05, restructured 2026-09-06
-for vetting. **Vetted by Cadu: pending.**
+**Status:** living document, first written 2026-09-05. **Vetted by Cadu.**
 **Purpose:** this is the handoff. If every other context is lost, a reader of this
 document should be able to continue designing and building Rustible without
 re-deriving or re-arguing anything below. Every decision records the alternatives
