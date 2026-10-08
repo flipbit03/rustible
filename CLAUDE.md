@@ -39,15 +39,17 @@ definition ("the `Op` trait in `crates/rustible-sdk/src/op.rs`"), and for a
 playbook, an inventory or a run, the compiled examples in
 `examples/workspace`, which CI builds and which therefore cannot drift. Names
 stay inline (a type, an op, a flag, a path), because a name is a pointer, not
-a snippet. Prose goes stale too, so the same test applies to it: if a line
-would go stale when a field is added or an op's internals change, it does not
-belong there, which rules out one op's internals (the flags it passes, the
-files it reads) and any "what is in the tree" status. What the vision does
-carry: a design decision with its rationale and the alternatives it beat,
-including when the decision is a tool, a library or a mechanism (zig and
-`ring` in 5.3, KDL in 10.2, `anyhow` in 14, the `selected` feature in 9), and
-the measurements that settled it (5.3's binary sizes); and a short marker that
-a stated goal is not yet true (pointing at its `KNOWN GAP` entry) or that a
+a snippet. Prose that restates code in words (field by field, step by step,
+variant by variant) is code by another name: state the idea and point at the
+source. Prose goes stale too, so the same test applies to it: if a line would
+go stale when a field is added or an op's internals change, it does not belong
+there, which rules out one op's internals (the flags it passes, the files it
+reads) and any "what is in the tree" status. What the vision does carry: a
+design decision with its rationale and the alternatives it beat, including
+when the decision is a tool, a library or a mechanism (zig and `ring` in 5.3,
+KDL in 10.2, `anyhow` in 14, the `selected` feature in 9), and the
+measurements that settled it (5.3's binary sizes); and a short marker that a
+stated goal is not yet true (pointing at its `KNOWN GAP` entry) or that a
 shape is reserved and not built, so that a promise is never read as a fact.
 That marker stays one sentence; it never grows into a status ledger. A
 proposed amendment that would only update a struct, a field or a signature is
