@@ -98,10 +98,15 @@
 //!   `307`/`308` that would resend a secret body to another origin. The
 //!   error names both URLs, masked.
 //!
-//! A value given as a [`Secret`](rustible_sdk::prelude::Secret) shows as `<secret, N bytes>` in `Debug`,
-//! diffs and messages, and so never reaches `--json` output; a URL's
-//! userinfo is masked as `user:********@` everywhere a URL is printed
-//! ([`mask_url`]).
+//! Values given as a [`Secret`](rustible_sdk::prelude::Secret): a diff
+//! names no secret header or credential, and shows a secret body
+//! ([`Request::body_secret`]) as `<secret, N bytes>`. A message carries
+//! `<secret>` where a secret appears in it as it is, and only then: a
+//! secret a server echoes back JSON- or form-encoded is not hidden in a
+//! message. A body the diff shows carries `<secret>` where a secret appears
+//! as it is, or as `.json` or `.form` encoded it. `Debug` shows each as
+//! `<secret, N bytes>`. A URL's userinfo is masked as `user:********@`
+//! everywhere a URL is printed ([`mask_url`]).
 
 mod client;
 mod download;

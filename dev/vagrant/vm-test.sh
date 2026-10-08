@@ -3,7 +3,9 @@
 # Run examples/workspace/playbooks/vagrant.rs, then vagrant_login.rs, then
 # vagrant_escalate_user.rs, against whichever Vagrant machines are up, and
 # prove each is idempotent. The last two log in as, or escalate to, accounts
-# vagrant.rs creates, so the order is fixed. Then run
+# vagrant.rs creates, so the order is fixed. After each run of vagrant.rs,
+# every host must have fetched back, byte for byte, the 50 MiB file it copied
+# through the escalation helper (assert_fetched). Then run
 # vagrant_login_escalate.rs once, whose launch must be refused.
 #
 # A playbook run that reports `changed` proves the operation did something. It

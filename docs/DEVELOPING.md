@@ -83,9 +83,14 @@ slow boot is something you were told about rather than a mysterious hang. It
 does not print a duration: the table above is two machines, and yours is not
 one of them.
 
+`make vm-test` itself takes a few minutes on an accelerated guest and over
+ten on an emulated one, much of it the 50 MiB file `vagrant.rs` moves through
+the escalation helper. It is slow, not stuck.
+
 Disk: the box is ~841 MB unpacked under `~/.vagrant.d/boxes`, plus ~415 MB of
 it uploaded into libvirt's storage pool. Each machine's own disk is a
-copy-on-write overlay that starts near zero and grows with what you install.
+copy-on-write overlay that starts near zero and grows with what you install;
+a `make vm-test` run adds about 250 MB of test files to each guest.
 `make vm-destroy` takes the machines away; `vagrant box prune` takes the boxes.
 
 ## Setup: Linux
@@ -215,6 +220,10 @@ To limit a run to one machine:
 make vm-test HOSTS=vagrant-arm
 ```
 
+For `vagrant_escalate_user`, a limit to `vagrant-<m>` becomes that machine's
+two hosts in the `vagrant-escalate-user` group, `vagrant-<m>-as-login` and
+`vagrant-<m>-as-nohome`.
+
 To drive the machines with `rustible` directly — a dry run, more verbosity, a
 playbook of your own — point it at that inventory rather than editing a
 tracked file:
@@ -229,11 +238,15 @@ rustible --workspace examples/workspace \
 `vagrant_login` and `vagrant_escalate_user` twice each, and fails unless each
 first run changed something, each second run changed nothing and failed
 nothing, and every run recovered exactly the failures its playbook catches on
-purpose (`recovered_per_run` in `dev/vagrant/vm-test.sh`). The second run is
-the test. A first run that reports `changed` proves only that the operation
-did something; an operation that rewrites a correct file every time also
-reports `changed`. Last, `vagrant_login_escalate` runs once and must be
-refused at launch with the line naming its `ssh_user`.
+purpose (`recovered_per_run` in `dev/vagrant/vm-test.sh`). After each run of
+`vagrant` it also requires that the 50 MiB file the playbook copied into
+`rustible-login`'s home, through the escalation helper, came back byte for
+byte to `examples/workspace/out/vm-test/<host>/`, with nothing staged beside
+it; the script removes that directory. The second run is the test. A first
+run that reports `changed` proves only that the operation did something; an
+operation that rewrites a correct file every time also reports `changed`.
+Last, `vagrant_login_escalate` runs once and must be refused at launch with
+the line naming its `ssh_user`.
 
 The recreate is there because the alternative is a false green. CI always
 starts from a freshly created machine; a checkout does not, and a local run

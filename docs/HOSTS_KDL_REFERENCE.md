@@ -24,7 +24,7 @@ group "name" { ... }  // a set of machines
 
 ## A minimal file
 
-What `rustible init` writes:
+What `rustible init` writes, under a comment block of examples:
 
 ```kdl
 host "local" connection="local"
@@ -65,14 +65,16 @@ Seven, and no others. Set them on a `host`, on a `group`, or on `defaults`;
 the nearest one wins, and `rustible inventory show` prints where each came
 from. One thing outranks them all: a playbook's `ssh_user` attribute replaces
 the host's `ssh_user` for that playbook, whichever level set it.
-`inventory show` describes this file and does not apply it.
+`inventory show` describes this file and does not apply it. A
+`connection="local"` host has no login to replace, so such a playbook is
+refused for it.
 
 | parameter | meaning | default |
 |---|---|---|
 | `addr` | hostname or address ssh connects to | none |
 | `connection` | `"ssh"` or `"local"` | `ssh` |
-| `ssh_user` | account ssh logs in as | your username |
-| `port` | ssh port | `22` |
+| `ssh_user` | account ssh logs in as | your username (unset: not passed, so `~/.ssh/config` applies) |
+| `port` | ssh port | `22` (likewise) |
 | `escalate` | `"sudo"`, `"doas"` or `"none"` | `sudo` |
 | `escalate_user` | account to escalate to | `root` |
 | `ssh_args` | extra arguments for `ssh` | none |
@@ -128,7 +130,8 @@ group "web" {
 }
 ```
 
-Values are typed: strings, integers, booleans, and lists.
+Values are typed: strings, integers, floats, booleans, and lists; `#null` is
+refused.
 
 ```kdl
 vars {
@@ -167,6 +170,9 @@ group "monitored" {
 ```
 
 A host in several groups inherits from the nearest; a cycle is a load error.
+Two groups at the same distance that both set a var or parameter, with nothing
+nearer setting it, are a load error; set it on the host, or move it from both
+groups to one that contains them.
 
 ## Commenting a host out
 
@@ -197,8 +203,8 @@ directory.
 Load errors are reported together, one per line, with a position:
 
 ```
-hosts.kdl:12:5: error: `addr` cannot be set on a group
-hosts.kdl:20:1: error: group "prod" has no member named "web9"
+hosts.kdl:12:5: error: `addr` is not allowed on group `web`; addr is a host-only parameter
+hosts.kdl:20:1: error: group `prod`: member `web9` is not a host or group
 ```
 
 Nothing is built or connected until the file is clean.

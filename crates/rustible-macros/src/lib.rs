@@ -1,5 +1,6 @@
 //! Proc macros for Rustible. Not used directly: the `rustible` facade
-//! re-exports them as `rustible::playbook` and `rustible::vars`.
+//! re-exports them as `rustible::playbook`, `rustible::vars` and
+//! `rustible::integration_test`.
 //!
 //! Everything the expansions reference lives under `::rustible::sdk`, so a
 //! workspace only needs the `rustible` crate as a dependency.
