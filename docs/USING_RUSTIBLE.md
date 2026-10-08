@@ -1335,8 +1335,9 @@ that the binary is cached by source hash: it is rebuilt only when the source
 changes, and re-uploaded only when the target does not already have that
 exact binary, so a run that changes nothing is dominated by the SSH round
 trip rather than by cargo. Adding a second architecture adds one more build,
-not one more per-run cost. `-v` prints the run's own timings — trust those over any number
-here, since the build is your controller's CPU and nobody else's.
+not one more per-run cost. `-v` prints the run's own timings — trust those
+over any number here, since the build is your controller's CPU and nobody
+else's.
 
 ### When a step fails
 
