@@ -13,7 +13,7 @@ target needs nothing installed: no Python, no agent, no runtime.
 use rustible::prelude::*;
 use rustible_std::{apt, file, systemd};
 
-const NGINX_CONF: &str = include_str!("nginx.conf");
+const NGINX_CONF: &str = include_str!("../files/nginx.conf");
 
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
@@ -199,8 +199,8 @@ overrides the inventory.
   the group it references; it fails and names the op you wanted. For an
   account the run is creating, a dry run defers that refusal to the real run,
   since an earlier step may create the group — the same line Ansible draws.
-- **A dry run touches nothing outside the target.** No request of any method
-  is sent under `--check`; such a step reports `would change`.
+- **A dry run contacts nothing outside the target.** No request of any
+  method is sent under `--check`; such a step reports `would change`.
 
 ## Operations and collections
 

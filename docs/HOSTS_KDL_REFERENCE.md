@@ -171,8 +171,8 @@ group "monitored" {
 
 A host in several groups inherits from the nearest; a cycle is a load error.
 Two groups at the same distance that both set a var or parameter, with nothing
-nearer setting it, are a load error; set it on the host or on a common parent
-group.
+nearer setting it, are a load error; set it on the host, or move it from both
+groups to one that contains them.
 
 ## Commenting a host out
 

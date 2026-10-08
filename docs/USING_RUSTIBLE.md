@@ -929,8 +929,9 @@ let staged = ctx.local_file("files/nginx.conf")?;
 file::Copy::from_local_path(staged).to("/etc/nginx/nginx.conf")
 ```
 
-⚠️ `file::Copy` copies one regular file: a directory source is refused, and so
-is a `dest` that is a symlink (remove it with `file::Absent` first).
+⚠️ `file::Copy` copies one regular file to one path: a source that is a
+directory is refused, and so is a `dest` that is a directory or a symlink
+(remove it with `file::Absent` first).
 
 ### A worked example
 
@@ -1016,9 +1017,9 @@ naming the operation you wanted — `user`, `group` and `authorized_keys` all
 do. Under `--check` most do not: a prerequisite an earlier step could create
 is reported as `would change`, not refused, except an existing account's
 missing group and keys for an account that does not exist (§15).
-⚠️ `file::Copy` looks only at the destination, so a copy into a directory that
-does not exist fails at `apply`, after earlier steps have already changed the
-machine. Create the directory first.
+⚠️ `file::Copy` does not check that the destination's directory exists, so a
+copy into a directory that does not exist fails at `apply`, after earlier
+steps have already changed the machine. Create the directory first.
 
 **`archive::Extracted` re-extracts every run unless you give it `.creates()`.**
 Nothing about a directory full of files tells it the archive was already
@@ -1148,8 +1149,10 @@ rendering happens on the target inside your playbook binary.
 lists the codes. Read the response into a struct with `json_as`;
 `rustible_std::http` re-exports `json!` and `Value` for the untyped case.
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
-`.basic_auth(user, &s)`. The diff never shows them, and an error or a shown
-body carries `<secret>` where one appeared.
+`.basic_auth(user, &s)`. The diff never shows them. An error carries
+`<secret>` where one appears as it is, and only then: ⚠️ a server that echoes
+a secret back JSON- or form-encoded puts it in the error in the clear. A body
+the diff shows hides it in those encodings too.
 
 Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`
@@ -1326,13 +1329,13 @@ caught; see "When a step fails" below.
 
 ### What a run costs
 
-The first run for a given architecture compiles the playbook into a static
-binary, which is the slow part and the only slow part. After that the binary
-is cached by source hash: it is rebuilt only when the source changes, and
-re-uploaded only when the target does not already have that exact binary, so
-a run that changes nothing is dominated by the SSH round trip rather than by
-cargo. Adding a second architecture adds one more build, not one more
-per-run cost. `-v` prints the run's own timings — trust those over any number
+The first run for a given architecture compiles the playbook into a
+self-contained binary, which is the slow part and the only slow part. After
+that the binary is cached by source hash: it is rebuilt only when the source
+changes, and re-uploaded only when the target does not already have that
+exact binary, so a run that changes nothing is dominated by the SSH round
+trip rather than by cargo. Adding a second architecture adds one more build,
+not one more per-run cost. `-v` prints the run's own timings — trust those over any number
 here, since the build is your controller's CPU and nobody else's.
 
 ### When a step fails
@@ -1418,7 +1421,7 @@ rustible playbook run site --check
 Nothing is modified. Steps report `would change` instead of `changed`, with
 the diff they would have applied.
 
-What to know:
+Under `--check`:
 
 - ⚠️ **A step that would change has no output.** Its value only exists once
   `apply` has run, and `apply` never runs here. Reading it ends the

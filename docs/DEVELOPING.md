@@ -83,9 +83,9 @@ slow boot is something you were told about rather than a mysterious hang. It
 does not print a duration: the table above is two machines, and yours is not
 one of them.
 
-`make vm-test` itself takes a few minutes on an accelerated guest and closer
-to a quarter of an hour on an emulated one, mostly the 50 MiB file
-`vagrant.rs` moves through the escalation helper. It is slow, not stuck.
+`make vm-test` itself takes a few minutes on an accelerated guest and over
+ten on an emulated one, much of it the 50 MiB file `vagrant.rs` moves through
+the escalation helper. It is slow, not stuck.
 
 Disk: the box is ~841 MB unpacked under `~/.vagrant.d/boxes`, plus ~415 MB of
 it uploaded into libvirt's storage pool. Each machine's own disk is a
@@ -244,8 +244,9 @@ purpose (`recovered_per_run` in `dev/vagrant/vm-test.sh`). After each run of
 byte to `examples/workspace/out/vm-test/<host>/`, with nothing staged beside
 it; the script removes that directory. The second run is the test. A first
 run that reports `changed` proves only that the operation did something; an
-operation that rewrites a correct file every time also reports `changed`. Last, `vagrant_login_escalate` runs once and must be
-refused at launch with the line naming its `ssh_user`.
+operation that rewrites a correct file every time also reports `changed`.
+Last, `vagrant_login_escalate` runs once and must be refused at launch with
+the line naming its `ssh_user`.
 
 The recreate is there because the alternative is a false green. CI always
 starts from a freshly created machine; a checkout does not, and a local run

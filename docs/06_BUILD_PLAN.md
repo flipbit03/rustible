@@ -122,8 +122,8 @@ Each op is one task. The brief is the template above with these fixed parts:
   mode: a would-change step has no output; a prerequisite another step could
   create is tolerated under `--check`; nothing beyond the target is
   contacted, so an answer that depends on remote state is `would change`
-  with the diff saying it was not read, and `check` runs no tool that may
-  download).
+  with the diff saying it was not read, and under `--check` no `check` runs
+  a tool that may download).
 - Scope: the op struct(s) and builder, the `Op` impl, with `check` producing a
   typed intent and `apply` executing it; the intent never wraps a `Diff`; an
   `Output` struct, rustdoc with the Ansible equivalent named, pure-function
@@ -139,10 +139,12 @@ Each op is one task. The brief is the template above with these fixed parts:
   `file::write_from_with_backup(.., Some(attrs))`, which set them on the
   staged file before the rename; new content is never visible at a wider
   mode or under the wrong owner, and an owner that cannot be given fails the
-  write with the old file intact. A change to attributes alone goes through
-  `file::set_mode_and_owner`, which owns the setuid and setgid ordering.
-  `write_atomic` is for content with no mode or owner of its own: it keeps
-  an existing file's, and creates a new one at 0666 minus the umask.
+  write with the old file intact. Pass only the attributes `check` found
+  differing, so an owner already right is never re-applied. A change to
+  attributes alone goes through `file::set_mode_and_owner`, which owns the
+  setuid and setgid ordering. `write_atomic` is for content with no mode or
+  owner of its own: it keeps an existing file's, and creates a new one at
+  0666 minus the umask.
 - Messages: one that quotes text the op did not write (a server's body, an
   archive member's name, a line of a file) quotes it bounded and on one line
   (`http::one_line`, `archive`'s `named`), so the error stays small however

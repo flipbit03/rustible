@@ -100,12 +100,13 @@
 //!
 //! Values given as a [`Secret`](rustible_sdk::prelude::Secret): a diff
 //! names no secret header or credential, and shows a secret body
-//! ([`Request::body_secret`]) as `<secret, N bytes>`. A message, or a body
-//! the diff shows, carries `<secret>` where a secret appeared in it as it
-//! is, or as `.json` or `.form` encoded it. `Debug` shows each as
-//! `<secret, N bytes>`. So none reaches `--json` output, unless you encoded
-//! one into a `.body(..)` some other way yourself. A URL's userinfo is
-//! masked as `user:********@` everywhere a URL is printed ([`mask_url`]).
+//! ([`Request::body_secret`]) as `<secret, N bytes>`. A message carries
+//! `<secret>` where a secret appears in it as it is, and only then: a
+//! secret a server echoes back JSON- or form-encoded is not hidden in a
+//! message. A body the diff shows carries `<secret>` where a secret appears
+//! as it is, or as `.json` or `.form` encoded it. `Debug` shows each as
+//! `<secret, N bytes>`. A URL's userinfo is masked as `user:********@`
+//! everywhere a URL is printed ([`mask_url`]).
 
 mod client;
 mod download;
