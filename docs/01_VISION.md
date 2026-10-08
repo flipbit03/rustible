@@ -312,9 +312,11 @@ free, and is what Ansible itself does. `russh` (pure Rust SSH) is the later opti
 for zero external dependencies. "Local" is the other transport (run the binary on
 the orchestrator machine itself).
 
-The binary on the target never opens a socket. Everything rides the SSH session
-the orchestrator established, so firewalling and authentication are entirely
-SSH's concern.
+The binary on the target never listens, and never connects back to the
+controller: everything between them rides the SSH session the orchestrator
+established, so firewalling and authentication of that link are entirely
+SSH's concern. An op that reaches the network, such as a download, connects
+out from the target as any program there would.
 
 ### 5.5 Protocol (DECIDED)
 
