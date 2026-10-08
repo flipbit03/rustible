@@ -97,33 +97,22 @@ The operator meets Rustible through a handful of commands;
 `docs/USING_RUSTIBLE.md` (section 5, "The CLI") is how to use them.
 
 **`rustible init`** creates a Cargo package in the current directory or a
-chosen folder. It refuses only when a file it would itself write is already
-there, and names the ones that clash; a directory holding anything else (a
-`README.md`, a `LICENSE`, a `.gitignore` from a fresh clone) is written into.
-Those files are left alone and never read, with one exception: an existing
+chosen folder, depending on `rustible` (the runtime) and `rustible-std` (the
+base operations, mirroring Ansible's builtin modules), with an opinionated
+layout: an inventory, a `playbooks/` folder and a `.gitignore`. Like `cargo
+init`, it refuses only when a file it would write is already there, naming the
+clash, and otherwise writes into the directory as it is; an existing
 `.gitignore` gains the lines it lacks, because a workspace that does not
-ignore `target/` is a workspace that commits build output. Refusing on
-conflict rather than on non-emptiness is `cargo init`'s rule. `--force` adds
-the missing files anyway and keeps the existing ones, rewriting only the two
-generated shims. It adds `rustible` (runtime) and `rustible-std` (the base
-operations, mirroring Ansible's builtin modules: files, users, groups,
-packages, services, ssh keys, and so on) as dependencies, and creates an
-opinionated layout: `.gitignore`, an inventory file, a `playbooks/` folder
-(with `.gitkeep`), and any config files that turn out to be necessary.
+ignore `target/` commits build output.
 
 **`rustible playbook create`**, given a path under `playbooks/` such as
 `playbooks/ops/ssh_enable_root_user.rs`, scaffolds a playbook file with a
 `main` function and the metadata attribute.
 
-**`rustible playbook run`**, given that playbook, with `--check`, `-v` or
-`-vv`, and `--var key=value` to set a var for the run, reads the playbook's
-metadata (target hosts), validates the inventory vars against the playbook's
-typed struct, probes the hosts, compiles per architecture, uploads, runs, and
-renders progress. See section 5.2 for the pipeline. `--check` is a dry run.
-Each step line carries a one-line summary of its change; `-v` adds the facts,
-the full diff, debug logs, and a failed command with its stderr, whether or
-not the playbook caught the failure; `-vv` adds every command run (section
-5.5).
+**`rustible playbook run`** reads the playbook's metadata, validates the
+inventory's vars against it, probes the hosts, compiles per architecture,
+uploads, runs, and renders progress (section 5.2). `--check` is a dry run,
+`--var` sets a var for the run, and `-v` and `-vv` add detail (section 5.5).
 
 **`rustible inventory show`**, given a host, prints its resolved parameters
 and vars with the source of each; **`rustible inventory check`** validates
@@ -221,59 +210,44 @@ Consequences accepted with remote-brain:
 
 `rustible playbook run <file>` does, in order:
 
-1. **Locate the workspace** by walking up from the current directory to the
-   nearest `rustible.toml` (section 10.4), load `hosts.kdl`.
-2. **Read playbook metadata** by doing a host-native debug build of the playbook
-   and running it with `--describe`, which the `#[playbook]` macro generates.
-   This yields the target hosts, `escalate`, an optional `ssh_user`, and a JSON
-   schema of the typed vars struct (section 10.3). **Accepted trade-off
-   (final, 2026-09-06):** the pre-check costs a cold build the first time
-   (about a minute) and seconds afterwards. In exchange the schema comes from
-   the real compiled types, so there is no source parser of our own to maintain
-   and no restriction on var field types. (Alternative considered twice: parse
-   the source with `syn`. It is instant but only sound for a closed set of
-   canonically spelled types, cannot see through aliases or imports, and needs a
-   second parser kept in sync with the proc macro. Rejected.) Mitigations: cache
-   describe output by hash of the playbook source plus `Cargo.lock`; dev profile
-   with a shared target dir; the describe build shares dependency compilation
-   with the target build for same-arch hosts; `rustible inventory check` runs
-   only this step.
-3. **Resolve hosts and validate vars.** For every resolved host, merge its vars
-   (section 10.3) and check them against the schema. Any failure aborts the
-   whole run before anything is compiled or uploaded, naming each host and each
-   missing or mistyped var.
-4. **Connect** to every host in parallel. SSH uses a ControlMaster session
-   opened here and reused for everything after (spike 1 measured 20 s for a
-   cold Tailscale connection versus 0.4 s for a warm upload, so the connection
-   is the expensive part, not the bytes). `connection="local"` hosts run the
-   binary as a child process instead. A playbook that sets `ssh_user` logs in
-   as that account on every host it targets, in place of the host's `ssh_user`
-   (section 6.1).
-5. **Probe** each host with one shell command, `uname -sm`, mapped to a
-   target triple (musl on Linux, Darwin on a mac, section 5.3). The real
-   CLI also resolves `$HOME` here so later paths are absolute. This
-   bootstrap probe is the only shell-dependent step; everything after it
-   is the static binary.
-6. **Compile** once for all needed triples in **one cargo invocation**: a
-   `cargo build` with the `dist` profile, the `selected` feature and one
-   `--target` per triple, with `RUSTIBLE_PLAYBOOK` naming the playbook. The
-   build script includes only that playbook, and the `selected` feature
-   keeps the build's output directory apart from the editor's (section 9).
-   Cargo accepts several `--target` flags and locks the target directory, so one
-   invocation is both simplest and fastest. Per-triple target directories keep
-   the caches independent. Use the `dist` profile (section 5.3).
-7. **Upload if missing.** SHA-256 the artifact; the target path is
-   `~/.cache/rustible/bin/<playbook>-<sha256>`. If it is already there, skip
-   the upload; otherwise stream the bytes over the session into a temporary
-   file and rename it into place.
+1. **Locate the workspace**: the nearest `rustible.toml` above the current
+   directory (section 10.4), and its inventory.
+2. **Read playbook metadata** from the playbook itself: a host-native build
+   run with `--describe` reports its hosts, its escalation and login, and
+   a schema of its vars (section 10.3). **Accepted trade-off (final,
+   2026-09-06):** this costs a cold build the first time (about a minute)
+   and seconds afterwards, and in exchange the schema comes from the real
+   compiled types, so there is no parser of our own to keep in sync and no
+   restriction on var types. (Parsing the source with `syn` was considered
+   twice: instant, but sound only for a closed set of canonically spelled
+   types, blind to aliases and imports, and a second parser to maintain.
+   Rejected.) The output is cached, and `rustible inventory check` runs only
+   this step.
+3. **Resolve hosts and validate vars** against that schema. Any failure
+   aborts the whole run before anything is compiled or uploaded, naming
+   each host and each missing or mistyped var.
+4. **Connect** to every host in parallel, over one SSH session per host,
+   opened here and reused for everything after: spike 1 measured 20 s for a
+   cold connection against 0.4 s for a warm upload, so the connection is the
+   expensive part, not the bytes. A `connection="local"` host runs the
+   binary as a child process instead.
+5. **Probe** each host with one shell command, mapped to a target triple
+   (section 5.3). This bootstrap probe is the only shell-dependent step;
+   everything after it is the static binary.
+6. **Compile** once for all needed triples in **one cargo invocation**,
+   building only that playbook without disturbing the editor's build
+   (section 9), with the `dist` profile (section 5.3). Cargo accepts several
+   targets and locks the target directory, so one invocation is both
+   simplest and fastest.
+7. **Upload if missing.** The binary is cached on the target under its
+   hash, in `~/.cache/rustible/bin/`, so an unchanged playbook is not sent
+   again, and an upload lands whole or not at all.
 8. **Execute** the binary in `--remote` mode, escalated when the playbook
    says `escalate = true`, and speak the protocol (5.5) over its stdin and
    stdout; stderr is kept apart for panics. An `escalate_user` that cannot
    run the login user's copy gets one streamed where it can (11.3).
-9. **Render** the per-host, per-step view from the event stream as it arrives.
-   Facts gathering is the first thing the binary does and is reported as an
-   event. What happens between a step's start and its finish (commands run,
-   debug logs) belongs to that step; the renderer buffers it under the step.
+9. **Render** the per-host, per-step view from the event stream as it
+   arrives, with what happens during a step shown under that step.
 
 Measured in spike 2 (x86 dev box, ARM VM over Tailscale, warm ControlMaster):
 exec to the binary's first frame 17 to 21 ms over SSH, 5 ms locally; a whole
@@ -503,21 +477,14 @@ output together with whether the step changed.
 `crates/rustible-sdk/src/ctx.rs` is the authority on the driver.
 
 **Policies learned in spike 3, now rules for the stdlib:**
-- **No predictions.** Spike 3 found that both of its ops computed their
-  post-apply output while planning, so handing it over as a prediction cost
-  nothing, and "every stdlib op predicts unless it genuinely cannot" became
-  the rule. Two waves of the stdlib showed where the cost lands: not in the
-  code but in the judgement. Every op that creates something had to rule on
-  which fields it may honestly claim before the tool has run (a uid it has
-  not allocated, the shell BusyBox picks from an environment the op cannot
-  see, a version apt has not resolved), each ruling needed its own
-  decision-log entry, and the report never distinguished a prediction from a
-  fact. The rule was reversed: a would-change step has no output in check
-  mode, and section 12 has the rule.
+- **No predictions.** Spike 3's ops could predict their post-apply output
+  for free, so predicting became the rule. Two waves of the stdlib showed
+  that the cost landed in judgement rather than code, and that the report
+  never told a prediction from a fact, so the rule was reversed (section
+  12).
 - **Builders end in a finishing call for the one mandatory piece of desired
-  state.** `file::Line` is built from its path, then the pattern and options,
-  and finished by `set`, which takes the line and returns the `Op`, so a
-  `Line` without a line cannot be constructed.
+  state**, so an op without it cannot be constructed: a `file::Line` without
+  its line does not exist.
 - **`apply` receives the intent, not the plan.** Only the change branch is
   meaningful there; passing the whole plan forced a pointless match. The
   change was first carried as a diff, and the typed intent replaced it when
@@ -567,27 +534,21 @@ Some things are actions, not states: `systemd::Restart`, `systemd::DaemonReload`
 returns `Plan::Change`, because "restarted" is not a state you can already be in.
 In check mode they report "would change", as Ansible does.
 
-An action need not name a subject, and its output type is whatever it can
-honestly report. `systemd::DaemonReload` makes the manager re-read its unit
-files: it names no unit, so it cannot return the `UnitState` the rest of that
-module returns, and there is nothing else to read back afterwards. Its output is
-`()`. An output that only echoes the op's own inputs is an input, not an output.
+An action need not name a subject, and its output is only what it can
+honestly report: `systemd::DaemonReload` names no unit and returns nothing.
+An output that only echoes the op's own inputs is an input, not an output.
 
-`shell::Command` can be promoted toward state-like behavior with Ansible's
-escape hatches as builder methods: `.creates(path)` makes `check` return
-`Satisfied` when the path exists; `.removes(path)` likewise. `changed_when` maps
-to a closure over the output.
+`shell::Command` takes Ansible's escape hatches (`creates`, `removes`,
+`changed_when`) to behave more like a state.
 
-An op whose `check` always returns `Change` can mark itself as always
-changing, so the orchestrator can mark those steps in the output. This
-preserves the "where does this playbook stop being idempotent" scan without a
-second verb.
+An op whose `check` always asks for a change can mark itself as always
+changing, so the output can mark those steps. This preserves the "where
+does this playbook stop being idempotent" scan without a second verb.
 
-An action that can only tell after running whether anything happened reports
-`ok` when nothing did, rather than `changed`: `shell::Command` with
-`.changed_when(..)`, `http::Request` for a `GET`, `HEAD` or `OPTIONS` unless
-the playbook says otherwise, and a lookup of remote state (6.5). Under
-`--check` it has not run, so it reports `would change`.
+An action that can only tell after running whether anything happened
+reports `ok` when nothing did, rather than `changed`: a command with
+`changed_when`, a read-only HTTP request, a lookup of remote state (6.5).
+Under `--check` it has not run, so it reports `would change`.
 
 ### 6.5 Lookups
 
@@ -660,44 +621,31 @@ Each translation is which op replaces the module, and where the meaning
 differs. How the op does it is in its source.
 
 **`ansible.builtin.apt`** becomes three ops, one per `state` (6.3):
-`apt::Present`, `apt::Absent` and `apt::Latest`; `Present`'s output says
-which packages it installed and which were already there. All three
-refuse on a host whose package manager is not apt, and when not
-running as root. Two defaults differ from Ansible's: recommended packages
-are not installed unless the playbook asks for them, where Ansible follows
-the system's apt configuration; and `Present` refreshes the lists only when
-it is about to install something, so it is not a way to refresh them for
-later steps, as Ansible's `update_cache` is.
+`apt::Present`, `apt::Absent` and `apt::Latest`. They refuse a host without
+apt, or a run without root. Two defaults differ from Ansible's: recommended
+packages are installed only when the playbook asks, and `Present` refreshes
+the package lists only when it is about to install, so it is not a way to
+refresh them for later steps.
 
-`Latest` compares each installed version against the *candidate* apt would
-install, and the candidates come from the package lists, so with
-`.update_cache(max_age)` a real run refreshes stale lists in `check`, before
-it decides: the one op that changes the machine from `check` (7.3). Under
-`--check` the refresh is not run: a dry run contacts no mirror and writes
-nothing (12). So when the lists are older than the max age the step cannot
-know the candidates, and says so: it reports `would change`, with a diff
-saying the lists were not refreshed, and has no output. Lists within the max
-age need no refresh, and the dry run plans from them exactly as the real run
-will. Without `.update_cache(...)` neither mode refreshes, and both compare
-against whatever the lists already say. Ansible's `apt` also skips the
-refresh under check mode (`apt.py`, `if not module.check_mode:
-cache.update()`), but then plans against the stale lists, so its dry run can
-call a package current that the real run upgrades; Rustible says it does not
-know instead.
+`Latest` decides from the candidate versions in the package lists, so a
+real run may refresh stale lists from `check`, before it decides: the one
+op that changes the machine from `check` (7.3). A dry run never refreshes
+(12), so with stale lists `Latest` says it cannot know, reporting `would
+change` with no output. Ansible also skips the refresh under check mode
+(`apt.py`) but then plans against the stale lists, so its dry run can call
+a package current that the real run upgrades.
 
 **`ansible.builtin.lineinfile`** becomes `file::Line`, which replaces the
 line a pattern matches. `check` plans the rewritten text and returns
 `Satisfied` when it is already there; `apply` writes exactly that text,
 atomically (7.3).
 
-**`ansible.builtin.systemd`** becomes one op per state and one per action;
-a restart after a config change is a `systemd::Restart` step inside an `if`
-(6.6).
-`Enabled`, `Running` and `Stopped` are states. `Restart` is an action (6.4):
-its `check` always plans it, and the step fails unless the unit is running,
-or on its way up, afterwards. `DaemonReload` is the reload on its own, for a
-playbook that writes a unit file and wants systemd to notice it without
-bouncing anything: it names no unit and returns `()` (6.4).
+**`ansible.builtin.systemd`** becomes one op per state and one per action.
+`Enabled`, `Running` and `Stopped` are states. `Restart` is an action (6.4),
+and its step fails unless the unit is up afterwards. `DaemonReload` reloads
+the manager alone, for a playbook that writes a unit file without bouncing
+anything (6.4). A restart after a config change is a `Restart` step inside
+an `if` (6.6).
 
 ### 6.9 Initial standard library scope, and the dogfooding repository (DECIDED)
 
@@ -894,26 +842,13 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    an op twice: first run `changed`, second run `ok`, and the system looks
    right. Static binaries drop into any image with no setup.
 3. **T3, a real machine**: its own kernel, init and `sudo`, all real, with
-   no harness. It gives what the container harness cannot. Structurally: its
-   own kernel and `/proc/sys` (a container shares the host kernel, so a write
-   is refused or reaches the host), and a real boot (a harness container runs
-   systemd as pid 1 only in `systemd_images` mode, privileged, on the host's
-   kernel and cgroups). By the harness's choice: every body runs as root, so
-   no non-root login escalates through the host's sudoers, and nothing
-   connects over SSH. And a target no container can be, macOS (there is no
-   macOS container), which only the macOS runner covers: the Darwin probe,
-   the Mach-O build through zig, launchd and brew. In CI the machine is a
-   Linux VM over SSH, on both architectures, or the macOS runner itself over
-   a local connection; only the VM exercises the SSH transport. Each
+   no harness. It sees what a container cannot: its own kernel and
+   `/proc/sys`, a real boot, a non-root login escalating through the host's
+   sudoers, the SSH transport, and macOS, which no container can be. Each
    playbook that converges a machine is run twice, and the second run is
-   the test: on the VM it must report nothing changed, and on the macOS
-   runner its recap must match the counts expected of it (an always-changing
-   action still reports `changed`), because a first run reporting `changed`
-   proves only that the op did something. The VM is
-   distribution-specific in a way T2 is not — one guest is one distro — so
-   its CI job names the distribution it covers. `CLAUDE.md` ("The machine
-   tier") and `docs/DEVELOPING.md` name the playbooks, the guests and the
-   jobs.
+   the test, because a first run reporting `changed` proves only that the op
+   did something. `CLAUDE.md` ("The machine tier") and `docs/DEVELOPING.md`
+   name the machines, the playbooks and the jobs.
 
 ## 9. Project layout and ecosystem
 
@@ -926,25 +861,22 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   rust-analyzer, clippy, types, and completion in every playbook file.
 
   **How it works.** The workspace has one bin target, `src/main.rs`, and a
-  `build.rs`, both written once by `rustible init` and both **shims that
-  must stay shims**: each is a doc comment plus a call into a crate (the
-  `rustible` runtime, and the `rustible-build` scanner), so all logic lives
-  in crates and a fix ships as a version bump, never as "edit your
-  main.rs". Each file opens with a header saying that `rustible init`
-  generated it, that it is not to be edited, where playbooks and shared code
-  go, and that `rustible init --refresh` regenerates it. The CLI does **not**
-  hash-check or police these files: a power user may edit them, at their own
-  risk, and the header comment is the whole safeguard. (A hash-and-warn
-  scheme was proposed during vetting and rejected as unnecessary nannying.)
-  The build script parses every file under `playbooks/` (a real parse, so
-  the attribute in a comment or a string does not count) and compiles each
-  file with a function marked `#[rustible::playbook(..)]` into the bin crate
-  as a module, registered under its name; the runtime picks the entry by
-  name and speaks the protocol. Files without the marker are not playbooks:
-  they are ignored unless a playbook pulls them in with a `mod` declaration
-  or `#[path]`, so helper code may live next to playbooks. Two marked
-  functions in one file is a build error naming the file. The same scan
-  backs `rustible playbook list`.
+  `build.rs`, both written once by `rustible init` and both **shims that must
+  stay shims**: each is a doc comment plus a call into a crate (the `rustible`
+  runtime, and the `rustible-build` scanner), so all logic lives in crates and
+  a fix ships as a version bump, never as "edit your main.rs". Each opens with
+  a header saying it is generated, not to be edited, and regenerated by
+  `rustible init --refresh`. The CLI does **not** hash-check or police these
+  files: a power user may edit them, at their own risk, and the header comment
+  is the whole safeguard. (A hash-and-warn scheme was proposed during vetting
+  and rejected as unnecessary nannying.) The build script parses every file
+  under `playbooks/` (a real parse, so the attribute in a comment or a string
+  does not count) and compiles each marked one into the bin crate as a module,
+  registered under its name. Files without the marker are not playbooks: they
+  are ignored unless a playbook pulls them in with a `mod` declaration or
+  `#[path]`, so helper code may live next to playbooks. Two marked functions
+  in one file is a build error naming the file. The same scan backs `rustible
+  playbook list`.
 
   Two Cargo behaviours make this work, both verified in scratch projects on
   2026-09-07 (the second time as a 20-hypothesis spike with positive and
@@ -1149,15 +1081,10 @@ Two kinds of data with two syntactic homes so they cannot be confused:
   the `port` parameter: the block boundary is the namespace. (Ansible needs the
   reserved `ansible_*` prefix for the same separation.)
 
-| Parameter | Type | Required | Default | Settable on |
-|---|---|---|---|---|
-| `addr` | string (IP or hostname) | yes unless `connection="local"` | none | host only |
-| `connection` | `"ssh"` \| `"local"` | no | `"ssh"` | host, group, defaults |
-| `ssh_user` | string | no | local username | host, group, defaults |
-| `port` | u16 | no | 22 | host, group, defaults |
-| `escalate` | `"sudo"` \| `"doas"` \| `"none"` | no | `"sudo"` | host, group, defaults |
-| `escalate_user` | string | no | `"root"` | host, group, defaults |
-| `ssh_args` | list of strings | no | empty | host, group, defaults |
+Parameters say how to reach a host and how to escalate on it (`sudo`,
+`doas` or none, and to which account), and each has a built-in default: the
+login, for instance, defaults to the local username.
+`docs/HOSTS_KDL_REFERENCE.md` lists them with their meanings and defaults.
 
 Parameter resolution: host, then nearest group outward, then `defaults`, then
 the built-in default. For `ssh_user` only, a playbook's `ssh_user` attribute
@@ -1352,9 +1279,8 @@ one fails fast instead of hanging the run.
 
 ## 12. Check-mode semantics (DECIDED)
 
-Problem: `Plan::Satisfied(T)` carries an output, `Plan::Change(intent)` does
-not, so in a dry run a step that *would* change has nothing to return, and a
-later step that chains from it has no value.
+Problem: in a dry run a step that *would* change has not run, so it has no
+output, and a later step that chains from it has no value.
 
 Options considered:
 1. Stop the host at the first would-change step. Honest but shows only the
@@ -1369,11 +1295,9 @@ alone.** Two waves of the stdlib were built under the first decision, and
 what they showed is recorded so the reversal is not relitigated:
 
 - Prediction moved the work from code into judgement. Every op that creates
-  something had to rule on which fields it may claim before the tool has run,
-  and the rulings piled up: a new account predicts only with an explicit uid,
-  gid *and* shell; apt only when `apt-cache policy` names a candidate; a
-  download never, except when only its permissions change. Each ruling was a
-  decision-log entry, a guide paragraph and a test.
+  something had to rule on which fields it may claim before the tool has
+  run, and each ruling was a decision-log entry, a guide paragraph and a
+  test.
 - The predictions rarely fired where a dry run matters most. On a fresh host
   nearly every step creates something, and the honest answer for a created
   thing was usually "cannot predict", so the playbook author was told to add
@@ -1381,12 +1305,10 @@ what they showed is recorded so the reversal is not relitigated:
 - The report never showed which values were predictions. The distinction
   existed for the playbook and not for the person reading the run.
 - To let a dry run get past a step that *needs* what an earlier step would
-  create, `System` grew a registry of planned resources
-  (`note_would_create`, 2026-09-08). One op ever wrote to it. Every later gap
-  of the same shape — the unit a package ships, the directory a step would
-  make, the home an account would get — was answered by declining to extend
-  it and adding a check-mode branch in the op instead, so three different
-  answers to one question were in the tree at once.
+  create, `System` grew a registry of planned resources (2026-09-08). One op
+  ever wrote to it; every later gap of the same shape was answered with a
+  check-mode branch in the op instead, so three different answers to one
+  question were in the tree at once.
 
 Ansible's check mode has neither mechanism and one rule for a step that
 would create something: report `changed` and ask no further questions
@@ -1406,57 +1328,41 @@ where the dry run stopped seeing.
 - In check mode, a would-change step reports `would change` with its diff and
   the run continues. Nothing is applied and nothing is predicted: the intent
   carries what `check` observed and decided, and no post-apply output.
-- A would-change step's output does not exist. Reading it, through
-  `.output()` or through `Deref`, raises an error naming the step.
-  `.changed` and `.diff` remain readable.
-  Under `--check` that read ends the innermost enclosing `ctx.block` — or,
-  outside any block, the playbook body for that host — with a warning naming
-  the block and the step whose output was read. (Read inside an operation's
-  own `check`, the missing output is that step's failure instead: the step
-  fails like any other, `failed` when its error leaves the playbook and
-  `recovered` when the playbook catches it (14), and nothing is absorbed.)
-  The block yields no value and the run continues after it. This is not a
-  failure: nothing failed, the dry run could not see further, and it is
-  counted neither `failed` nor `recovered`. Playbooks are written as if
-  every output exists, without guards; `.is_available()` remains for a
-  playbook that wants to branch inside a block rather than end it. In a real
-  run every step has applied and the read cannot fail. Ansible carries on
-  with silent garbage; Rustible says where the dry run stopped seeing.
-- **Prerequisites are verified when the run is about to act.** An op whose
-  `check` would refuse for want of a resource another op in the same run
-  could create — a group for an account not there yet, that account, its
-  home, a parent directory, a unit; within the two limits Ansible draws above
-  — reports `would change` under check mode instead; its diff shows the state
-  it would set, or says what it waits for, and names the prerequisite when
-  the op knows it by name (a group, an account, a unit). The tolerance is
-  gated on check mode, so a real run's `check` takes the refusal, and a dry
-  run's plan never reaches `apply` (the step ends after `check`): the
-  refusal is never skipped on a run that can act. What a dry run therefore
-  does not catch is
-  a forgotten prerequisite step: the real run refuses at that step, before
-  that step touches anything, with the steps before it already applied.
-  That is the trade this rule accepts, and 6.7 still holds at the step.
+- A would-change step's output does not exist; whether it changed, and its
+  diff, remain readable. Under `--check`, reading the output in playbook
+  code ends the innermost enclosing `ctx.block` (outside any block, that
+  host's playbook body) with a warning naming the block and the step, and
+  the run continues after it. That is not a failure, and is counted neither
+  `failed` nor `recovered`: nothing failed, the dry run could not see
+  further. Read inside an op's own `check`, the missing output is that
+  step's failure instead (14). Playbooks are written as if every output
+  exists, without guards; in a real run the read cannot fail. Ansible
+  carries on with silent garbage; Rustible says where the dry run stopped
+  seeing.
+- **Prerequisites are verified when the run is about to act.** An op that
+  would refuse for want of something another step in the run could create
+  (a group, an account, a directory, a unit), within the two limits Ansible
+  draws above, reports `would change` under `--check`, its diff saying what
+  it waits for. A real run's `check` still refuses, so the refusal is never
+  skipped on a run that can act. The trade accepted: a dry run does not
+  catch a forgotten prerequisite step, and the real run refuses at that
+  step, before it touches anything, with the steps before it applied. 6.7
+  still holds at the step.
 - That deferral covers only what another step could supply. A refusal about
-  the machine or the request itself — wrong platform, not root, the tool the
-  op drives is absent, a malformed key, a sysctl key this kernel does not
-  have — stands in check mode as in a real run, because no earlier step
-  changes it.
+  the machine or the request itself (wrong platform, not root, a missing
+  tool, a malformed input) stands in check mode as in a real run, because
+  no earlier step changes it.
 - **A dry run touches nothing outside the target.** Under `--check` no
-  operation opens a connection to anything beyond the machine it runs on — no
-  request of any method, to any service, however read-only its author
-  believes it to be. A request can be logged, counted against a quota,
-  billed, or have effects its method does not advertise, and none of that is
-  visible from the client; a dry run is only worth running if nobody has to
-  wonder what it did. An operation whose answer depends on remote state
-  reports `would change` under check mode, with a diff saying what it would
-  send and that the remote state was not read; its output is unavailable, as
-  for any would-change step. What this costs is a dry run that cannot report
-  such a step `ok`, and that cost is accepted.
+  operation contacts anything beyond the machine it runs on, however
+  read-only the request: a request can be logged, counted against a quota,
+  billed, or have effects its method does not advertise, and a dry run is
+  only worth running if nobody has to wonder what it did. An operation whose
+  answer depends on remote state reports `would change`, saying the remote
+  state was not read. The cost, a dry run that cannot call such a step
+  `ok`, is accepted.
 - **`check` still cannot mutate a file through `sys`** (7.3), in a dry run
-  or a real one. The one op that changes the machine from `check` by design,
-  `apt::Latest` refreshing its package lists in a real run because its
-  answer is read from them, does it through commands and runs none of them
-  under `--check` (6.8).
+  or a real one; `apt::Latest`'s refresh, the one deliberate change from
+  `check`, does not run under `--check` (6.8).
 
 ## 13. Facts (DECIDED)
 
