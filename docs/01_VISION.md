@@ -1291,8 +1291,11 @@ workspace-wide parameters, a local host, groups carrying parameters and
 vars, a host that overrides its group's var, a list var given as positional
 arguments, a group of groups, a group that cherry-picks hosts by name, and
 a host disabled with slash-dash, children included. The CLI's tests load it
-(`example_workspace_inventory_loads`), so it cannot drift from the parser.
-`docs/HOSTS_KDL_REFERENCE.md` is the reference for the format.
+(`example_workspace_inventory_loads`), so it cannot drift from the parser,
+and resolve the same inventory, kept as
+`crates/rustible-cli/testdata/vision/hosts.kdl`, end to end, sources and
+overrides included. `docs/HOSTS_KDL_REFERENCE.md` is the reference for the
+format.
 
 `rustible inventory show`, given `web2` from that file, prints the resolved
 parameters and vars with the source of each (all / group X / host /
