@@ -195,7 +195,7 @@ Consequences accepted with remote-brain:
   `ctx.run_once(..)`, and "facts of other hosts" can be added later as calls
   over the channel without redesign. None of these are in the MVP.
 - Host-specific inputs (vars, secrets) must be sent over the channel after the
-  binary starts, never baked into the binary (see 5.4).
+  binary starts, never baked into the binary (see 5.5).
 - **Lookups run on the target, not on the controller.** Ansible's
   `lookup('url', ..)`, `lookup('file', ..)`, and friends execute on the machine
   running `ansible-playbook`. In Rustible any op that fetches something (an
@@ -221,8 +221,8 @@ Consequences accepted with remote-brain:
    restriction on var types. (Parsing the source with `syn` was considered
    twice: instant, but sound only for a closed set of canonically spelled
    types, blind to aliases and imports, and a second parser to maintain.
-   Rejected.) The output is cached, and `rustible inventory check` runs only
-   this step.
+   Rejected.) The output is cached, keyed on the playbook source and
+   `Cargo.lock`, and `rustible inventory check` runs only this step.
 3. **Resolve hosts and validate vars** against that schema. Any failure
    aborts the whole run before anything is compiled or uploaded, naming
    each host and each missing or mistyped var.
@@ -231,9 +231,10 @@ Consequences accepted with remote-brain:
    cold connection against 0.4 s for a warm upload, so the connection is the
    expensive part, not the bytes. A `connection="local"` host runs the
    binary as a child process instead.
-5. **Probe** each host with one shell command, mapped to a target triple
-   (section 5.3). This bootstrap probe is the only shell-dependent step;
-   everything after it is the static binary.
+5. **Probe** each host with one shell command, which yields its target
+   triple (section 5.3) and who the login is and where its home is, so
+   later paths are absolute. This bootstrap probe is the only
+   shell-dependent step; everything after it is the static binary.
 6. **Compile** once for all needed triples in **one cargo invocation**,
    building only that playbook without disturbing the editor's build
    (section 9), with the `dist` profile (section 5.3). Cargo accepts several
@@ -298,10 +299,11 @@ installing one package took 4.5 s).
 - **Shipped binaries use the `dist` profile** (strip, fat LTO, `opt-level = "z"`):
   1.4 MB for the spike playbook on aarch64 versus 3.1 MB for plain release.
 - **macOS is a target** (Apple silicon and Intel) from any controller, for the
-  operations that make sense there; `docs/plan/reports/MACOS-TARGET-SPIKE.md`
-  is the measurement and section 6 is why the ops that read `/etc/passwd`
-  refuse it by name. Windows targets are deferred. FreeBSD and NetBSD binaries
-  build (zig carries their libc; measured 2026-09-13) and wait for operations.
+  operations that make sense there, and each operation declares the platforms
+  it runs on and refuses the rest by name
+  (`docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement). Windows
+  targets are deferred. FreeBSD and NetBSD binaries build (zig carries their
+  libc; measured 2026-09-13) and wait for operations.
 
 ### 5.4 Transport (DECIDED for MVP)
 
@@ -327,12 +329,13 @@ changes. Nothing else may write to stdout in `--remote` mode.
 **What crosses the channel.** Down: what the binary needs to start that must
 not be baked into it (vars, whether this is a dry run, secrets), then file
 contents on request and a cancel. Up: a hello naming the protocol version and
-the playbook, then the events the orchestrator renders: facts, steps and their
-outcomes, logs, commands run, failures and a summary. Files move both ways in
-chunks (5.6), alongside a running step. A cancel stops the run between steps,
-never half way through an `apply`; a binary that does not stop within a grace
-period is killed. `crates/rustible-sdk/src/protocol.rs` and `event.rs` define
-the frames.
+the playbook (from the playbook's own registration, never `argv[0]`, since the
+cached binary is named by its hash), then the events the orchestrator renders:
+facts, steps and their outcomes, logs, commands run, failures and a summary.
+Files move both ways in chunks (5.6), alongside a running step. A cancel stops
+the run between steps, never half way through an `apply`; a binary that does
+not stop within a grace period is killed.
+`crates/rustible-sdk/src/protocol.rs` and `event.rs` define the frames.
 
 **Reserved, not built.** Frames for multi-host coordination (section 11's
 tier 3). The channel is bidirectional from day one so that adding them
@@ -355,9 +358,10 @@ The goal is that any skew between the CLI and a workspace's crates means
 protocol version is compared, so two releases that speak the same version
 are not told apart (`docs/plan/DECISIONS.md` records the gap).
 
-**The binary's modes.** One playbook binary runs locally for development,
-under an orchestrator (`--remote`), describes itself (`--describe`, 5.2), or
-serves as an escalation helper (`--helper`, 11.3).
+**The binary's modes.** One playbook binary serves every role: a local run
+for development, a run under the orchestrator, self-description and the
+vars pre-check of 5.2, and the escalation helper of 11.3.
+`crates/rustible-sdk/src/runtime.rs` dispatches them.
 
 ### 5.6 Getting local files to the target (DECIDED: both ways)
 
@@ -516,8 +520,8 @@ translation rule for the standard library.
 parameter, e.g. an `apt::Package` with a `state` setting. Rejected because:
 - Valid options differ per state (`purge`, `autoremove` only make sense for
   `Absent`; `update_cache` only for `Present`/`Latest`). A shared struct cannot
-  stop a purge being asked of a package meant to be present at compile time,
-  which is YAML hell in Rust clothing.
+  stop, at compile time, a purge being asked of a package meant to be
+  present, which is YAML hell in Rust clothing.
 - Outputs differ per state (`Present` returns installed versions to chain from;
   `Absent` returns what was removed). A shared struct means one output with a
   pile of `Option`s.
@@ -535,7 +539,8 @@ returns `Plan::Change`, because "restarted" is not a state you can already be in
 In check mode they report "would change", as Ansible does.
 
 An action need not name a subject, and its output is only what it can
-honestly report: `systemd::DaemonReload` names no unit and returns nothing.
+honestly report: `systemd::DaemonReload` names no unit, so it has no unit
+state to return, and returns nothing.
 An output that only echoes the op's own inputs is an input, not an output.
 
 `shell::Command` takes Ansible's escape hatches (`creates`, `removes`,
@@ -576,12 +581,13 @@ real run, where it makes the request (6.4).
 Removal and loops read the same way: revoking keys is an
 `authorized_keys::Absent` step for an account a lookup returned, and a
 `for` over group names gives each group and the account's membership in it
-a step of its own. `examples/workspace/playbooks/vagrant.rs` loops this way.
+a step of its own. `examples/workspace/playbooks/vagrant.rs` loops with
+`for`; no compiled example yet revokes keys or adds memberships.
 
 Note the three shapes on one resource, following rule 6.3:
 `authorized_keys::Present` ("ensure these"), `authorized_keys::Present` with
 its `exclusive` option ("ensure exactly these": still the present state, with
-the option of removing strangers, and the output gains a `removed` list), and
+the option of removing strangers, and the output says which it removed), and
 `authorized_keys::Absent` ("ensure not these"). An earlier draft had a
 `remove` method on one type, which was the state-as-parameter shape 6.3
 rejects; corrected 2026-09-07 during vetting.
@@ -623,7 +629,8 @@ differs. How the op does it is in its source.
 **`ansible.builtin.apt`** becomes three ops, one per `state` (6.3):
 `apt::Present`, `apt::Absent` and `apt::Latest`. They refuse a host without
 apt, or a run without root. Two defaults differ from Ansible's: recommended
-packages are installed only when the playbook asks, and `Present` refreshes
+packages are installed only when the playbook asks, where Ansible follows
+the system's apt configuration, and `Present` refreshes
 the package lists only when it is about to install, so it is not a way to
 refresh them for later steps.
 
@@ -631,12 +638,15 @@ refresh them for later steps.
 real run may refresh stale lists from `check`, before it decides: the one
 op that changes the machine from `check` (7.3). A dry run never refreshes
 (12), so with stale lists `Latest` says it cannot know, reporting `would
-change` with no output. Ansible also skips the refresh under check mode
-(`apt.py`) but then plans against the stale lists, so its dry run can call
-a package current that the real run upgrades.
+change` with no output; with fresh ones the dry run plans exactly as the
+real run will. Ansible also skips the refresh under check mode (`apt.py`
+guards its cache update with `check_mode`) but then plans against the stale
+lists, so its dry run can call a package current that the real run
+upgrades.
 
 **`ansible.builtin.lineinfile`** becomes `file::Line`, which replaces the
-line a pattern matches. `check` plans the rewritten text and returns
+line a pattern matches, or adds it when nothing matches, as Ansible does.
+`check` plans the rewritten text and returns
 `Satisfied` when it is already there; `apply` writes exactly that text,
 atomically (7.3).
 
@@ -782,8 +792,10 @@ is a swappable backend: `Local` on a real machine, `Fake` in unit tests,
   `apt::Latest`, which in a real run refreshes the package lists from
   `check` because its answer is read from them, and does nothing of the
   kind under `--check` (6.8, 12).
-- **Ops are synchronous, and `System` stays small**: no temp-directory or
-  common-attributes helper; an op builds what it needs from the primitives.
+- **Ops are synchronous, and `System` holds primitives only.** A
+  temp-directory or common-attributes helper was weighed and left unbuilt
+  (decided 2026-09-14, `docs/plan/M9.md` §4.3); an op builds what it needs
+  from the primitives.
 
 `crates/rustible-sdk/src/system.rs` and `crates/rustible-sdk/src/backend/`
 are the authority.
@@ -842,13 +854,15 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
    an op twice: first run `changed`, second run `ok`, and the system looks
    right. Static binaries drop into any image with no setup.
 3. **T3, a real machine**: its own kernel, init and `sudo`, all real, with
-   no harness. It sees what a container cannot: its own kernel and
-   `/proc/sys`, a real boot, a non-root login escalating through the host's
-   sudoers, the SSH transport, and macOS, which no container can be. Each
-   playbook that converges a machine is run twice, and the second run is
-   the test, because a first run reporting `changed` proves only that the op
-   did something. `CLAUDE.md` ("The machine tier") and `docs/DEVELOPING.md`
-   name the machines, the playbooks and the jobs.
+   no harness. It sees what the container harness cannot: its own kernel
+   and `/proc/sys` and a real boot; a non-root login escalating through the
+   host's sudoers and the SSH transport, which the harness, by its own
+   choice, does not exercise; and macOS, which no container can be, with
+   its launchd and Homebrew. Each playbook that converges a machine is run
+   twice, and the second run is the test, because a first run reporting
+   `changed` proves only that the op did something. `CLAUDE.md` ("The
+   machine tier") and `docs/DEVELOPING.md` name the machines, the playbooks
+   and the jobs.
 
 ## 9. Project layout and ecosystem
 
@@ -895,23 +909,23 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   invocation. `rustible playbook create` prints this hint. Scan cost is about
   10 ms for 50 playbooks; a no-op build does not re-run the script.
 
-  **Isolation.** The CLI sets `RUSTIBLE_PLAYBOOK=ops/x` when building for a
-  run, and the build script (with `rerun-if-env-changed`) includes only that
-  playbook. Verified: a playbook with a type error elsewhere in the tree does
-  not affect `rustible playbook run` of another one. The shipped binary
-  contains exactly one playbook, stays small, and is hashed per playbook for
-  the target-side cache. With the variable unset, as in the IDE, `cargo
-  check`, and CI, every playbook is included, so every broken playbook is
-  visible while editing and fails CI, which is the desired behaviour, not a
-  wart.
+  **Isolation.** The CLI names the playbook in `RUSTIBLE_PLAYBOOK` when
+  building for a run, and the build script (with `rerun-if-env-changed`)
+  includes only that playbook. Verified: a playbook with a type error
+  elsewhere in the tree does not affect `rustible playbook run` of another
+  one. The shipped binary contains exactly one playbook, stays small, and is
+  hashed per playbook for the target-side cache. With the variable unset, as
+  in the IDE, `cargo check`, and CI, every playbook is included, so every
+  broken playbook is visible while editing and fails CI, which is the desired
+  behaviour, not a wart.
 
   **The `selected` feature, and why it must exist (DECIDED 2026-09-07).** The
   selected build and the editor's own `cargo check` are the same package with
   the same feature set and profile, so Cargo gives them the **same build-script
   output directory**. The discovery spike showed what that does in practice:
-  with `playbooks/top.rs` open and healthy in the editor, a terminal
-  `RUSTIBLE_PLAYBOOK=ops/a cargo build` rewrote the registry file
-  rust-analyzer was reading down to `['ops/a']`, and `top.rs` immediately
+  with `playbooks/top.rs` open and healthy in the editor, a terminal build
+  that selected `ops/a` rewrote the registry file rust-analyzer was reading
+  down to that one playbook, and `top.rs` immediately
   showed as `unlinked-file` in the editor, with every other playbook likewise
   gone, until the next plain check-on-save wrote the full registry back. Every
   switch of the selected playbook also marked the whole package dirty on both
@@ -946,23 +960,21 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   defining the process entry point. **Helper modules are siblings:** because
   `#[path]`-loaded files get `mod.rs` semantics, a `mod helpers` declaration
   inside `playbooks/ops/x.rs` resolves to `playbooks/ops/helpers.rs`
-  (verified; an earlier draft of this paragraph said `ops/x/helpers.rs`,
-  which is wrong), as `examples/workspace/playbooks/demo/mc.rs` and its
-  `helpers.rs` show. A playbook that wants a subfolder layout puts a
-  `#[path]` attribute naming `x/helpers.rs` on the declaration. Two
-  playbooks in one directory that both declare `mod helpers` each compile
-  the same file as a private module, which works. Code shared across
-  playbooks lives in the package's `src/lib.rs` and is reached by the
-  **package name**, `myinfra::helper()`, not `crate::helper()`, because
+  (verified; an earlier draft of this paragraph said `ops/x/helpers.rs`, which
+  is wrong), as `examples/workspace/playbooks/demo/mc.rs` and its `helpers.rs`
+  show. A playbook that wants a subfolder layout puts a `#[path]` attribute
+  naming `x/helpers.rs` on the declaration. Two playbooks in one directory
+  that both declare `mod helpers` each compile the same file as a private
+  module, which works. Code shared across playbooks lives in the package's
+  `src/lib.rs` and is reached by the **package name**, not `crate`, because
   playbooks are modules of the bin crate (verified both ways);
-  `examples/workspace/playbooks/hello.rs` calls its workspace's
-  `src/lib.rs` this way. A playbook's name is its path under `playbooks/`
-  without the extension (`ops/x`); generated module identifiers carry the
-  needed `#[allow]`s and leak only into test names and backtraces. The scanner
-  matches the attribute path textually (`rustible::playbook` or bare
-  `playbook`), which is acceptable for a marker. An unmarked file nobody
-  references is silently ignored (rust-analyzer greys it out); `rustible
-  playbook list` may warn about such orphans.
+  `examples/workspace/playbooks/hello.rs` calls its workspace's `src/lib.rs`
+  this way. A playbook's name is its path under `playbooks/` without the
+  extension (`ops/x`); generated module identifiers carry the needed
+  `#[allow]`s and leak only into test names and backtraces. The scanner
+  recognises the marker by name, which is enough for a marker. An unmarked
+  file nobody references is silently ignored (rust-analyzer greys it out);
+  `rustible playbook list` may warn about such orphans.
 
   **Alternatives considered and rejected:**
   - Syncing `[[bin]]` entries (the previous plan): a maintenance chore on every
@@ -988,8 +1000,9 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   Dynamic inventories become a trait later.
 - **Crates (DECIDED 2026-09-07):**
   - `rustible`: a **thin facade library** that playbook workspaces depend on.
-    Re-exports the SDK, the macros, and the std prelude, so a playbook
-    imports `rustible::prelude` and is marked `#[rustible::playbook(..)]`.
+    Re-exports the SDK and the macros (and `rustible-std` as a module), so
+    a playbook imports `rustible::prelude` and is marked
+    `#[rustible::playbook(..)]`.
     No logic of its own. `rustible init` adds this one dependency plus
     `rustible-std`.
   - `rustible-cli`: the CLI and orchestrator (init, playbook run/create,
@@ -1015,12 +1028,10 @@ mechanism and what it ran against (`Test (T2): Docker (Debian/Ubuntu/Alpine)`).
   - Third-party collections (`rustible-docker`, ...): plain crates on
     `rustible-sdk`, published to crates.io, added with `cargo add`. Because
     playbooks link them directly, no registration mechanism is needed.
-- **Publishing.** Seven crates ship from this repository: `rustible`,
+- **Publishing.** The crates ship from this repository: `rustible`,
   `rustible-cli`, `rustible-sdk`, `rustible-macros`, `rustible-build`,
   `rustible-std`, `rustible-github`. They are versioned in lockstep through
   `workspace.package.version`, so one tag releases all of them.
-- **A playbook binary has four modes** (section 5.5): plain local run,
-  `--remote`, `--describe`, `--helper`. The macro generates all of them.
 - Every crate in the tree is pure Rust except `ring`, the TLS crypto provider,
   which compiles a little C on the operator's machine and nothing on the target
   (section 5.3).
@@ -1235,7 +1246,9 @@ returns whether anything changed, restarts a service only when it did and
 records the skip with a reason otherwise, and installs a certificate it
 took from the workspace as a secret. No compiled example shows all of it;
 `examples/workspace/playbooks/vagrant.rs` gates on facts, and
-`examples/workspace/playbooks/demo/streaming.rs` loads a secret.
+`examples/workspace/playbooks/demo/streaming.rs` loads a secret. Each piece
+is set out in its own section: facts and `bail!` (11.1, 13), blocks and
+skips (11.1, 12), secrets (5.6).
 
 ### 11.3 Per-step privilege escalation (DECIDED)
 
@@ -1268,7 +1281,9 @@ stepping down is the same mechanism. It streams large content like the main
 channel (5.6), and its commands are reported with the identity. An account
 that cannot reach the login user's copy of the binary runs one placed where
 it can, in its own cache or in a private directory removed by the end of the
-run, and nothing extra is uploaded from the controller for it. The cost
+run, because homes are commonly closed to other accounts; a step is refused
+only when neither place is usable, naming both causes. Nothing extra is
+uploaded from the controller for it. The cost
 is one spawn per identity and a pipe round trip per primitive.
 `crates/rustible-sdk/src/launch.rs` and `backend/elevated.rs` are the
 authority on how.
@@ -1336,14 +1351,17 @@ where the dry run stopped seeing.
   `failed` nor `recovered`: nothing failed, the dry run could not see
   further. Read inside an op's own `check`, the missing output is that
   step's failure instead (14). Playbooks are written as if every output
-  exists, without guards; in a real run the read cannot fail. Ansible
+  exists, without guards; one that wants to branch inside a block instead
+  can ask whether the output is available (`is_available`). In a real run
+  the read cannot fail. Ansible
   carries on with silent garbage; Rustible says where the dry run stopped
   seeing.
 - **Prerequisites are verified when the run is about to act.** An op that
   would refuse for want of something another step in the run could create
   (a group, an account, a directory, a unit), within the two limits Ansible
   draws above, reports `would change` under `--check`, its diff saying what
-  it waits for. A real run's `check` still refuses, so the refusal is never
+  it would set or what it waits for, naming the prerequisite when the op
+  knows it. A real run's `check` still refuses, so the refusal is never
   skipped on a run that can act. The trade accepted: a dry run does not
   catch a forgotten prerequisite step, and the real run refuses at that
   step, before it touches anything, with the steps before it applied. 6.7
@@ -1448,18 +1466,15 @@ with its argv, exit code, and stderr; file primitives with the path).
 `.context(..)` is for ops or playbooks that do several similar things where
 the raw error would not say which.
 
-**Typed values inside the chain.** The SDK's own signals remain concrete
-types that the orchestrator can downcast for rendering: a file mutation
-during `check` (`MutationDuringCheck`), a read of a would-change step's
-output (`OutputUnavailable`), and a failed command (`CmdFailed`, with its
-argv, exit status and stderr). Playbooks never need them.
+**Typed values inside the chain.** The SDK's own signals (a mutation during
+`check`, a read of a missing output, a failed command) remain concrete types
+the orchestrator downcasts for rendering; `crates/rustible-sdk/src/error.rs`
+has them. Playbooks never need them.
 
-**On the wire.** A host's failure carries the rendered chain as text, the
-failed step's id and block path, and the failed command when the chain holds
-one; a failed step's own report carries the same command, so `-v` can show
-the command and its stderr separately whether the playbook caught the
-failure or not, once per failure (5.5). Step names repeat, so the id is what
-ties the failure to the step line it closes.
+**On the wire.** A failure crosses as rendered text, tied to the step line it
+closes by the step's id, since names repeat, and with the failed command
+kept apart so `-v` can show it once, caught or not (5.5).
+`crates/rustible-sdk/src/event.rs` defines it.
 
 **What the operator sees.** A failure ends the host with a line naming
 the step, its block path, and the error's context chain; `-v` adds the
@@ -1502,8 +1517,7 @@ renders it.
 - **Transport**: how the orchestrator reaches a host: `local` (child process)
   or `ssh` (the system `ssh`).
 - **Frame**: one length-prefixed JSON message on the channel.
-- **Remote mode / describe mode / helper mode**: the playbook binary's
-  `--remote`, `--describe`, `--helper` flags (section 5.5).
+- **Binary modes**: the roles one playbook binary plays (section 5.5).
 - **Would change**: a step's status in check mode when `check` found a
   difference. `apply` does not run and the step has no output (section 12).
 - **`selected` feature**: an empty Cargo feature in every workspace manifest,

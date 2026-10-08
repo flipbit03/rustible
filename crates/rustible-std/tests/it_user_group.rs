@@ -115,7 +115,7 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(!looked_up.changed);
     assert_eq!(looked_up.groups, vec![GRP, GRP2]);
 
-    // The vision 6.1 shape with a group of the same name first: useradd
+    // A common shape, a group of the same name first: useradd
     // refuses to create the private group, so the op uses the existing one.
     let (same_grp, _) = changed_then_ok(ctx, "same-named group", || {
         group::Present::new("rustible-same")

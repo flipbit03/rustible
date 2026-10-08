@@ -127,7 +127,7 @@ fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
             .ends_with(":/bin/sh")
     );
 
-    // The vision 6.1 shape: a group of the account's name created first.
+    // A common shape: a group of the account's name created first.
     // Without the fix, `adduser` dies with "group name 'x' is in use".
     let (grp, _) = changed_then_ok(ctx, "same-named group", || {
         group::Present::new("rustible-same")

@@ -22,13 +22,14 @@ and why. The rest are read when you need them:
 
 ## The contract
 
-**`docs/01_VISION.md` is the source of truth on intent.** It is long and it
-is vetted. On intent, guarantees, decisions with their reasons, and the shape
-a playbook author sees, when code and vision disagree the vision wins and the
-code is wrong, unless the author decides otherwise in the session you are
-in. On types, fields, signatures and how a guarantee is implemented, the
-source is the authority. When you cannot tell which of the two a
-disagreement is, treat it as intent and raise it.
+**`docs/01_VISION.md` is the source of truth on intent.** It is long and it is
+vetted. On intent, guarantees, decisions with their reasons, and the concepts
+a playbook author works with (one type per desired state, one verb, typed
+outputs), when code and vision disagree the vision wins and the code is wrong,
+unless the author decides otherwise in the session you are in. On types,
+fields, signatures and how a guarantee is implemented, the source is the
+authority. When you cannot tell which of the two a disagreement is, treat it
+as intent and raise it.
 
 **The vision contains no code.** No code blocks of any kind: not a type, a
 trait or a signature, not an example playbook or inventory, not a CLI session
