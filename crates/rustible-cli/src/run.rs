@@ -2008,6 +2008,29 @@ host "laptop" connection="local"
         }
     }
 
+    /// Write a stand-in program that a child of this test binary will
+    /// `exec`, from a child of its own. Written here with `std::fs::write`,
+    /// a fork on another test thread inherits the open descriptor and holds
+    /// it until that child execs, and Linux refuses to `exec` a file still
+    /// open for writing: "Text file busy" (rust-lang/rust#114554). This
+    /// process never holds the descriptor, so nothing it forks can.
+    /// `rustible-sdk`'s `executable::write` is the same, for its own tests.
+    fn write_executable(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"exec cat > "$1""#, "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "writing {}: {status}", path.display());
+        // `chmod` takes a path, not a descriptor, so it opens no writer.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// Both places `drive` blames a refused launch on the playbook's login:
     /// `sudo -n` refusing before it read `Start` (the write fails), and after
     /// (the binary's stdout just ends). The prefix is the literal `sudo`, so
@@ -2016,7 +2039,6 @@ host "laptop" connection="local"
     /// that spawns a program.
     #[test]
     fn drive_blames_a_refused_launch_on_the_playbooks_login() {
-        use std::os::unix::fs::PermissionsExt;
         let line = "escalating to `root` with `sudo -n` failed before the playbook started; \
                     the login user `minecraft` comes from the playbook's `ssh_user` attribute";
         for mode in ["before-start", "after-start"] {
@@ -2033,8 +2055,7 @@ host "laptop" connection="local"
                     "sudo: a password is required",
                 ),
             };
-            std::fs::write(&sudo, script).unwrap();
-            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&sudo, script.as_bytes());
             let path = format!(
                 "{}:{}",
                 dir.path().display(),
@@ -2134,12 +2155,10 @@ exec "$@"
 "#;
 
     fn streamed_behind_stand_in_sudo(case: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("sudo"), STAND_IN_SUDO).unwrap();
-        std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&bin.join("sudo"), STAND_IN_SUDO.as_bytes());
         for d in ["home", "tmp"] {
             std::fs::create_dir(dir.path().join(d)).unwrap();
         }

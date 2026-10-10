@@ -4381,12 +4381,12 @@ exec "$@"
     /// Run the inner test for `case` behind the stand-in, in a fresh
     /// directory holding `home/`, `tmp/` and the binary to stream.
     fn behind_stand_in_sudo(case: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("sudo"), STAND_IN_SUDO).unwrap();
-        std::fs::set_permissions(bin.join("sudo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Written by a child, or a fork on another test thread can hold it
+        // open for writing and the `exec` of it fails with "Text file busy".
+        crate::executable::write(&bin.join("sudo"), STAND_IN_SUDO.as_bytes(), 0o755);
         for d in ["home", "tmp"] {
             std::fs::create_dir(dir.path().join(d)).unwrap();
         }
