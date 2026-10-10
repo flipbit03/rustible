@@ -21,11 +21,11 @@ check: fmt clippy test doc example
 fmt:
 	$(CARGO) fmt --all --check
 
-# The second line is the libraries as a playbook links them: the `testing`
-# feature off, and the test API compiled out.
+# The second line is every member as a playbook links it: no dev-dependency,
+# so the `testing` feature off and the test API compiled out.
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
-	$(CARGO) clippy -p rustible-sdk -p rustible -p rustible-std -p rustible-github -- -D warnings
+	$(CARGO) clippy --workspace -- -D warnings
 
 # T1, in-process: everything a plain `cargo test` runs with nothing installed,
 # chiefly pure functions and ops against the `Fake`. The T2 tests skip

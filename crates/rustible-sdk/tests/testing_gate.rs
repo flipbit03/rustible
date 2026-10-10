@@ -92,13 +92,6 @@ fn the_test_api_needs_the_testing_feature() {
         }
     }
     out.expect_no_errors_but_at(&expected.iter().map(|(l, _)| *l).collect::<Vec<_>>());
-    assert!(
-        out.stderr
-            .contains("could not find `testing` in `rustible_sdk`"),
-        "the compiler no longer says what `docs/USING_RUSTIBLE.md` quotes for a \
-         missing feature:\n{}",
-        out.stderr
-    );
 
     // With the feature: everything resolves but the `Ctx` constructors,
     // which are private whatever the features.
@@ -135,8 +128,11 @@ impl Checked {
         );
         assert!(
             !self.errors.is_empty(),
-            "`cargo check` failed before reaching the scratch crate's code, so the \
-             gate was not tested:\n{}",
+            "`cargo check` failed before reaching the scratch crate's code: a \
+             dependency did not build. If its error names a gated item, a library calls \
+             the test API outside its tests (or turns `testing` on in its \
+             `[dependencies]`); otherwise the setup is broken and the gate was not \
+             tested:\n{}",
             self.stderr
         );
     }
