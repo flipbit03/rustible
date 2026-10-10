@@ -10,6 +10,15 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
 
+# The test API: the container harness (`testing`), the `Fake` backend, and the
+# constructors that build a `System` or a `Ctx` from parts. A test crate turns
+# it on in `[dev-dependencies]` only, so no playbook binary contains it.
+[features]
+testing = []
+
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

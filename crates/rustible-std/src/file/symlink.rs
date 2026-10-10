@@ -307,7 +307,7 @@ mod tests {
     fn symlink_in_check_mode_reports_would_change_and_creates_nothing() {
         let fake = Arc::new(Fake::new());
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step("link", Symlink::at("/l").pointing_to("/t"))
             .unwrap();

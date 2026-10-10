@@ -143,7 +143,9 @@ pub(crate) struct Shared {
     failures: RefCell<Vec<FailedStep>>,
     /// Unique in this process, and put on every `StepFailed` layer this
     /// family of `Ctx` values attaches: step ids restart at 1 in every
-    /// `Ctx::new`, so only the pair says which run's step an error is from.
+    /// family, so only the pair says which run's step an error is from. A
+    /// run has one family; a test can make another with `testing::ctx`,
+    /// never with `testing::dry`, which shares this one.
     token: u64,
     /// The [`Ctx::block`]s running right now, outermost first. A step
     /// belongs to the blocks open while it runs, whichever `Ctx` value it
@@ -241,21 +243,25 @@ pub(crate) struct FailedStep {
 
 impl Ctx {
     /// A context with no orchestrator behind it: steps work, `local_file`
-    /// and friends fail. Tests and ad-hoc use.
-    pub fn new(sys: System, host: HostInfo) -> Self {
+    /// and friends fail. A new family, numbering its steps from 1. Outside
+    /// this crate, tests reach it as [`testing::ctx`](crate::testing::ctx);
+    /// a playbook is handed its `Ctx` and never builds one.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn new(sys: System, host: HostInfo) -> Self {
         Self::with_channel(sys, host, Channel::detached())
     }
 
     /// A run with no id from an orchestrator: the temp directory is named
     /// from the process id, which is unique among live runs on this host.
-    pub fn with_channel(sys: System, host: HostInfo, channel: Arc<Channel>) -> Self {
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn with_channel(sys: System, host: HostInfo, channel: Arc<Channel>) -> Self {
         Self::for_run(sys, host, channel, format!("pid{}", std::process::id()))
     }
 
     /// The orchestrator-driven form. `run_id` comes from `Start` and names
     /// the run's temp directory, so the orchestrator can remove it after
     /// killing a binary that ignored `Cancel`.
-    pub fn for_run(
+    pub(crate) fn for_run(
         sys: System,
         host: HostInfo,
         channel: Arc<Channel>,
@@ -714,11 +720,7 @@ impl Ctx {
 
     /// A `Ctx` whose ops run as another user. Same host, same counters.
     pub fn as_user(&self, name: &str) -> Ctx {
-        Ctx {
-            sys: self.sys.as_user(name),
-            host: self.host.clone(),
-            shared: self.shared.clone(),
-        }
+        self.sharing(self.sys.as_user(name))
     }
 
     /// Literally root. Never follows the inventory (vision 11.3).
@@ -778,6 +780,17 @@ impl Ctx {
     }
 
     // ---- internals ----
+
+    /// Another `Ctx` of this family over `sys`: same host, and the same
+    /// [`Shared`], so its steps continue this one's numbering, summary,
+    /// failures and open blocks. What `as_user` and `testing::dry` hand out.
+    pub(crate) fn sharing(&self, sys: System) -> Ctx {
+        Ctx {
+            sys,
+            host: self.host.clone(),
+            shared: self.shared.clone(),
+        }
+    }
 
     fn next_id(&self) -> u32 {
         let id = self.shared.step_counter.get() + 1;

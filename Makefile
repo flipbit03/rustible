@@ -21,8 +21,11 @@ check: fmt clippy test doc example
 fmt:
 	$(CARGO) fmt --all --check
 
+# The second line is every member as a playbook links it: no dev-dependency,
+# so the `testing` feature off and the test API compiled out.
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace -- -D warnings
 
 # T1, in-process: everything a plain `cargo test` runs with nothing installed,
 # chiefly pure functions and ops against the `Fake`. The T2 tests skip
@@ -30,8 +33,9 @@ clippy:
 test:
 	$(CARGO) test --workspace
 
+# `--all-features` documents the test API behind `testing`, as docs.rs does.
 doc:
-	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --lib
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --lib --all-features
 
 # examples/workspace is outside the cargo workspace on purpose, so
 # `cargo test --workspace` never compiles it. This is what catches a public

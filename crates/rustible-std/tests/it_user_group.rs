@@ -8,12 +8,9 @@
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group`.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use rustible::prelude::*;
-use rustible::sdk::event::Collect;
-use rustible::sdk::testing::changed_then_ok;
-use rustible::sdk::{HostInfo, System};
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::ssh::authorized_keys;
 use rustible_std::{group, user};
 
@@ -154,10 +151,7 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     // another step could create is verified only when the run is about to
     // act (vision 12) — except the two refusals Ansible keeps under check
     // mode, asserted below. Nothing here exists on the machine.
-    let mut dry = Ctx::new(
-        System::local(true, Arc::new(Collect::default())),
-        HostInfo::local(),
-    );
+    let mut dry = testing::dry(ctx);
     let planned = dry.step("dry group", group::Present::new("rustible-dry"))?;
     assert!(planned.changed && !planned.is_available());
     let dry_user = dry.step(

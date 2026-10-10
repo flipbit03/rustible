@@ -733,7 +733,7 @@ mod tests {
     fn check_mode_reports_would_change_writes_nothing_and_runs_nothing() {
         let fake = Arc::new(box_with(None, Some("0")));
         let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         let r = ctx.step("fwd", Present::new(KEY, "1")).unwrap();
         // A would-change step has no output in check mode (vision 12).
         assert!(r.changed && !r.is_available());
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn step_changed_then_ok_when_live_follows() {
         let fake = Arc::new(box_with(None, Some("0")));
-        let mut ctx = Ctx::new(sys(&fake), rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys(&fake));
         let r = ctx.step("fwd", Present::new(KEY, "1")).unwrap();
         assert!(r.changed);
         // The fake kernel does not react to sysctl -w; simulate it.

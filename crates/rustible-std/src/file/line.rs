@@ -528,7 +528,7 @@ mod tests {
         let sys = fake_sys(&fake);
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_facts(sys.facts().clone());
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let err = ctx.step("bad", Bad).unwrap_err().chain();
         assert!(err.contains("during check()"), "{err}");
         assert!(fake.content("/x").is_none());
@@ -542,7 +542,7 @@ mod tests {
         let fake = Arc::new(Fake::new().with_file("/f", "a\n"));
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
 
         let r = ctx.step("line", Line::in_path("/f").set("b")).unwrap();
         assert!(r.changed && !r.is_available());

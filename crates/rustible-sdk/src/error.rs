@@ -251,9 +251,9 @@ pub struct StepFailed {
     /// The failed step's id, set by `Ctx::step` only, and private so a
     /// layer built by hand cannot claim a step it did not come from.
     id: Option<u32>,
-    /// Which `Ctx` family drew `id`: ids restart at 1 in every context
-    /// `Ctx::new` makes, so the id alone does not say which run's step this
-    /// is. Private to the SDK, like `id`.
+    /// Which `Ctx` family drew `id`: ids restart at 1 in every family (a
+    /// run's, or one a test builds with `testing::ctx`), so the id alone
+    /// does not say which run's step this is. Private to the SDK, like `id`.
     run: u64,
 }
 

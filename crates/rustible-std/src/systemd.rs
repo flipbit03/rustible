@@ -1573,7 +1573,6 @@ mod tests {
 
     use rustible_sdk::backend::{Backend, CmdSpec, Fake, Output, Stat, WriteAttrs};
     use rustible_sdk::event::Collect;
-    use rustible_sdk::{Ctx, HostInfo};
 
     use super::*;
 
@@ -2605,7 +2604,7 @@ mod tests {
     fn daemon_reload_through_ctx_in_check_mode_runs_nothing() {
         let fake = Arc::new(Fake::new());
         let s = sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(s, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         let r = ctx
             .step("systemd re-reads its units", DaemonReload::new())
             .unwrap();
@@ -3583,7 +3582,7 @@ mod tests {
     fn check_mode_through_ctx_runs_only_probes_and_yields_no_output() {
         let fake = Arc::new(probes("disabled", "inactive"));
         let s = sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(s, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
 
         let en = ctx
             .step("nginx enabled", Enabled::new("nginx").now(true))
@@ -3621,7 +3620,7 @@ mod tests {
         // mutations (vision 7.3); an op that touched a file in check would
         // fail here. The action's full apply path also runs end to end.
         let fake = Arc::new(with_ok(probes("enabled", "active"), &["restart", "nginx"]));
-        let mut ctx = Ctx::new(sys(&fake), HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys(&fake));
         let r = ctx.step("nginx restarted", Restart::new("nginx")).unwrap();
         assert!(r.changed);
         assert_eq!(*r, state(true, true));

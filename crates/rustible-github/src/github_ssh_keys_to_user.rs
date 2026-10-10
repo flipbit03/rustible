@@ -192,9 +192,9 @@ impl GithubSshKeysToUser {
 mod tests {
     use std::sync::Arc;
 
+    use rustible_sdk::Ctx;
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::{Collect, Event, Level, Status};
-    use rustible_sdk::{Ctx, HostInfo};
 
     use super::*;
     use crate::fetch::Response;
@@ -230,7 +230,7 @@ mod tests {
     }
 
     fn mk_ctx(fake: &Arc<Fake>, sink: &Arc<Collect>) -> Ctx {
-        Ctx::new(System::fake(fake.clone(), sink.clone()), HostInfo::local())
+        rustible_sdk::testing::ctx(System::fake(fake.clone(), sink.clone()))
     }
 
     fn finished(sink: &Collect) -> Vec<(String, Status)> {
@@ -548,9 +548,8 @@ mod tests {
         let canned = Canned::answering(URL, Ok(Response::ok(body())));
         let fake = Arc::new(fake_fs());
         let sink = Arc::new(Collect::default());
-        let mut ctx = Ctx::new(
+        let mut ctx = rustible_sdk::testing::ctx(
             System::fake(fake.clone(), sink.clone()).with_check_mode(true),
-            HostInfo::local(),
         );
 
         let r = keys_to_user_via(&mut ctx, canned.clone()).unwrap();

@@ -251,6 +251,7 @@ impl Launch {
     }
 
     /// The same launch with a chosen temp-directory suffix (tests).
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_suffix(mut self, suffix: impl Into<String>) -> Launch {
         self.suffix = suffix.into();
         self

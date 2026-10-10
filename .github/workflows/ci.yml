@@ -41,10 +41,21 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Every member's library and binaries as a playbook links them: without
+      # `--all-targets` no dev-dependency is built, so the `testing` feature is
+      # off and the test API is compiled out. The line above builds them with
+      # it on, through the dev-dependencies, and this is the only build that
+      # would catch a library (a collection above all) or the CLI calling the
+      # test API outside its tests.
+      - name: Clippy, default features (the test API compiled out)
+        run: cargo clippy --workspace -- -D warnings
+
       # `--lib` keeps the `rustible` facade crate's docs from colliding with
       # the `rustible` binary of rustible-cli in the output directory.
+      # `--all-features` documents the test API behind `testing`, as docs.rs
+      # does, so it is held to the same missing-docs and link checks.
       - name: Rustdoc must be warning-free
-        run: cargo doc --workspace --no-deps --lib
+        run: cargo doc --workspace --no-deps --lib --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 

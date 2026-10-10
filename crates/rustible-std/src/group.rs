@@ -863,7 +863,7 @@ mod tests {
     fn check_mode_through_ctx_runs_nothing_and_has_no_output() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         // A would-change step has no output in check mode, gid given or not
         // (vision 12): the group only exists once `apply` has run.
         let r = ctx

@@ -419,15 +419,18 @@ impl<W: Write + Send> EventSink for JsonLines<W> {
 }
 
 /// Collects events in memory. For tests.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Default)]
 pub struct Collect(pub Mutex<Vec<Event>>);
 
+#[cfg(any(test, feature = "testing"))]
 impl EventSink for Collect {
     fn emit(&self, event: Event) {
         self.0.lock().unwrap().push(event);
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Collect {
     /// A snapshot of everything emitted so far, in order. Cloned out, so the
     /// sink keeps collecting and a test can assert mid-run. An op's unit

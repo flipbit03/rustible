@@ -2386,7 +2386,7 @@ mod tests {
     fn check_mode_through_ctx_walks_a_first_provision_with_no_outputs() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
 
         let g = ctx
             .step("group", crate::group::Present::new("app"))
@@ -2664,7 +2664,7 @@ mod tests {
         assert!(err.contains("user `ghost` does not exist"), "{err}");
         assert!(fake.commands().is_empty());
 
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx.step("lookup", Existing::named("cadu")).unwrap();
         assert!(!r.changed);
         assert_eq!(r.uid, 1000);
@@ -2741,7 +2741,7 @@ mod tests {
     fn check_mode_through_ctx_runs_nothing_and_no_would_change_step_has_an_output() {
         let fake = Arc::new(base());
         let sys = fake_sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
 
         // Every id given or none: a would-change step has no output either
         // way (vision 12), the diff is what the dry run shows.
@@ -2790,7 +2790,7 @@ mod tests {
     fn membership_through_ctx_is_changed_then_ok() {
         let fake = Arc::new(base().with_cmd("usermod", None, 0, ""));
         let sys = fake_sys(&fake);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let op = Membership::of_name("cadu").in_group_named("docker");
         let r = ctx.step("member", op.clone()).unwrap();
         assert!(r.changed && r.is_available());

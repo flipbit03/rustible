@@ -342,7 +342,7 @@ mod tests {
     fn ctx_with(fake: &Arc<Fake>, check_mode: bool) -> (Ctx, Arc<Collect>) {
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(check_mode);
-        (Ctx::new(sys, rustible_sdk::HostInfo::local()), sink)
+        (rustible_sdk::testing::ctx(sys), sink)
     }
 
     fn finished_statuses(sink: &Collect) -> Vec<Status> {

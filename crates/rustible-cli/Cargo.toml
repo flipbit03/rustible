@@ -40,6 +40,8 @@ tar.workspace = true
 lzma-rust2.workspace = true
 
 [dev-dependencies]
+# The SDK's test API (`Collect`, `testing::ctx`), for the renderer's tests.
+rustible-sdk = { workspace = true, features = ["testing"] }
 # The xz *encoder*, only so a test can build a release-shaped tarball in
 # memory instead of downloading one. Dev-only: the CLI itself never writes xz.
 lzma-rust2 = { workspace = true, features = ["encoder"] }

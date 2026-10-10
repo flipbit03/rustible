@@ -1509,7 +1509,7 @@ mod tests {
                 .with_dir("/home/cadu/.ssh"),
         );
         let sys = fake_sys(&fake);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let account = ctx
             .step("lookup", crate::user::Existing::named("cadu"))
             .unwrap();
@@ -1806,7 +1806,7 @@ mod tests {
                 .with_file("/home/cadu/.ssh/authorized_keys", format!("{K3}\n{K1}\n")),
         );
         let sys = fake_sys(&fake);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         // The order a playbook writes: `.keys(..).exclusive(true)`.
         let op = Present::for_user_name("cadu")
             .keys([K1, K2])
@@ -1832,7 +1832,7 @@ mod tests {
         let fake = fake_with_user_and_ssh_dir();
         let sink = Arc::new(Collect::default());
         let sys = System::fake(fake.clone(), sink).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step("keys", Present::for_user_name("cadu").keys([K1]))
             .unwrap();
@@ -2308,7 +2308,7 @@ mod tests {
         // filesystem would fail the step here.
         let fake = fake_with_user_and_ssh_dir();
         let sys = fake_sys(&fake);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step("keys", Present::for_user_name("cadu").keys([K1]))
             .unwrap();

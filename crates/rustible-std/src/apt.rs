@@ -982,7 +982,7 @@ mod tests {
 
     fn check_mode_ctx(fake: &Arc<Fake>) -> Ctx {
         let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        Ctx::new(s, rustible_sdk::HostInfo::local())
+        rustible_sdk::testing::ctx(s)
     }
 
     /// Can `dpkg-query` for one package.
@@ -1448,7 +1448,7 @@ mod tests {
     #[test]
     fn latest_stamps_a_check_time_refresh_in_a_real_step() {
         let fake = Arc::new(openssl_outdated_curl_missing());
-        let mut ctx = Ctx::new(sys(&fake), rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys(&fake));
         let r = ctx
             .step("up", Latest::new(["openssl"]).update_cache(Duration::ZERO))
             .unwrap();
@@ -1574,10 +1574,7 @@ W: Some index files failed to download. They have been ignored, or old ones used
             policy_of(fake, "openssl", "3.0.15-1", "3.0.16-1").with_cmd("apt-get", None, 0, ""),
         );
         let sink = Arc::new(Collect::default());
-        let mut ctx = Ctx::new(
-            System::fake(fake.clone(), sink.clone()),
-            rustible_sdk::HostInfo::local(),
-        );
+        let mut ctx = rustible_sdk::testing::ctx(System::fake(fake.clone(), sink.clone()));
         let r = ctx
             .step("up", Latest::new(["openssl"]).update_cache(Duration::ZERO))
             .unwrap();
@@ -2047,7 +2044,7 @@ W: Some index files failed to download. They have been ignored, or old ones used
         let fake = Arc::new(openssl_outdated_curl_missing());
         let sink = Arc::new(Collect::default());
         let s = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
-        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         let r = ctx
             .step(
                 "up",

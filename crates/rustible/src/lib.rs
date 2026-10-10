@@ -7,6 +7,7 @@
 //! Design: <https://github.com/flipbit03/rustible/blob/main/docs/01_VISION.md>.
 
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The SDK: `Op`, `System`, `Ctx`, facts, protocol, registry, runtime.
 pub use rustible_sdk as sdk;
@@ -14,7 +15,13 @@ pub use rustible_sdk as sdk;
 /// The standard operations, also available as the `rustible_std` crate.
 pub use rustible_std as std_ops;
 
-pub use rustible_macros::{integration_test, playbook, vars};
+pub use rustible_macros::{playbook, vars};
+
+// Test API: gated on the attribute itself, so a test crate without the
+// `testing` feature fails at the line that names it rather than inside the
+// expansion.
+#[cfg(feature = "testing")]
+pub use rustible_macros::integration_test;
 pub use rustible_sdk::{registry, runtime};
 
 /// What every playbook file starts with: `use rustible::prelude::*;`.

@@ -3069,7 +3069,7 @@ mod tests {
                 .with_file("/tmp/hello.tar.zst", TZST),
         );
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step(
                 "extract",
@@ -4116,10 +4116,7 @@ mod tests {
             let (sys, dir, _guard) = helper_scratch("dry");
             let (src, dest) = (dir.join("a.tar"), dir.join("dest"));
             sys.write_atomic(&src, &tar).unwrap();
-            let mut ctx = Ctx::new(
-                sys.clone().with_check_mode(true),
-                rustible_sdk::HostInfo::local(),
-            );
+            let mut ctx = rustible_sdk::testing::ctx(sys.clone().with_check_mode(true));
             let step = ctx
                 .step("extract", Extracted::from_path(&src).to(&dest))
                 .unwrap();

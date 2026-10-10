@@ -19,8 +19,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustible::prelude::*;
-use rustible::sdk::HostInfo;
-use rustible::sdk::testing::changed_then_ok;
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::apt;
 
 const STAMP: &str = "/var/lib/apt/periodic/update-success-stamp";
@@ -80,12 +79,6 @@ fn make_lists_stale(ctx: &mut Ctx) -> Result<u64> {
 fn apt_get_update(ctx: &mut Ctx) -> Result<()> {
     ctx.sys().cmd("apt-get").arg("update").run()?;
     Ok(())
-}
-
-/// A `Ctx` for a dry run over the same machine: harness bodies run with
-/// check mode off.
-fn dry(ctx: &mut Ctx) -> Ctx {
-    Ctx::new(ctx.sys().clone().with_check_mode(true), HostInfo::local())
 }
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
@@ -163,7 +156,7 @@ fn latest_refresh_that_changes_no_index_counts_as_fresh(ctx: &mut Ctx) -> Result
     let op = || apt::Latest::new(["sl"]).update_cache(HOUR);
 
     // The setup took: a dry run sees stale lists and cannot decide.
-    let Plan::Change(c) = op().check(dry(ctx).sys())? else {
+    let Plan::Change(c) = op().check(testing::dry(ctx).sys())? else {
         panic!("expected a change: the lists were made two days old");
     };
     let rendered = c.diff().render();
@@ -196,7 +189,7 @@ fn latest_refresh_that_changes_no_index_counts_as_fresh(ctx: &mut Ctx) -> Result
     );
 
     // The dry run now plans from the lists, as the real run did: `ok`.
-    let report = match op().check(dry(ctx).sys())? {
+    let report = match op().check(testing::dry(ctx).sys())? {
         Plan::Satisfied(report) => report,
         Plan::Change(c) => panic!(
             "expected satisfied: a real run refreshed the lists just now, but the dry run \
@@ -265,7 +258,7 @@ fn a_stale_stamp_does_not_outweigh_fresh_lists(ctx: &mut Ctx) -> Result<()> {
     let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
 
     let op = || apt::Latest::new(["sl"]).update_cache(HOUR);
-    let Plan::Change(c) = op().check(dry(ctx).sys())? else {
+    let Plan::Change(c) = op().check(testing::dry(ctx).sys())? else {
         panic!("expected a change: sl is not installed");
     };
     assert!(
@@ -341,7 +334,7 @@ fn a_dry_run_against_stale_lists_neither_refreshes_nor_stamps(ctx: &mut Ctx) -> 
     let lists = mtime(ctx, LISTS)?;
     let partial = back_date(ctx, PARTIAL, TWO_DAYS)?;
 
-    let mut dry = dry(ctx);
+    let mut dry = testing::dry(ctx);
     let latest = dry.step("sl latest", apt::Latest::new(["sl"]).update_cache(HOUR))?;
     assert!(latest.changed && !latest.is_available());
     let present = dry.step("sl present", apt::Present::new(["sl"]).update_cache(HOUR))?;
@@ -394,7 +387,7 @@ fn an_install_that_rewrites_pkgcache_does_not_freshen_the_lists(ctx: &mut Ctx) -
     // The lists are as stale as they were: the dry run cannot decide.
     let Plan::Change(c) = apt::Latest::new(["sl"])
         .update_cache(HOUR)
-        .check(dry(ctx).sys())?
+        .check(testing::dry(ctx).sys())?
     else {
         panic!("expected a change: the lists are two days old");
     };
@@ -447,7 +440,7 @@ fn an_update_that_fetched_nothing_writes_no_stamp(ctx: &mut Ctx) -> Result<()> {
     );
 
     // The next dry run still sees the lists two days old.
-    let Plan::Change(c) = op().check(dry(ctx).sys())? else {
+    let Plan::Change(c) = op().check(testing::dry(ctx).sys())? else {
         panic!("expected a change: no refresh happened, so the lists are stale");
     };
     let rendered = c.diff().render();

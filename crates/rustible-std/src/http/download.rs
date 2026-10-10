@@ -1928,7 +1928,7 @@ mod tests {
         let (base, hits) = hello_server();
         let fake = Arc::new(Fake::new().with_dir("/opt"));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step(
                 "download",

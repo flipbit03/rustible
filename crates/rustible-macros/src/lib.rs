@@ -386,6 +386,9 @@ fn reject_non_flat(ty: &Type, field: &syn::Ident) -> syn::Result<()> {
 /// booted with systemd as PID 1 first, see `testing::Image::Systemd` for the
 /// images that work. At least one of the two lists is required. The function
 /// takes exactly `ctx: &mut Ctx` and returns `Result<()>`.
+///
+/// The `rustible` facade re-exports this attribute only with its `testing`
+/// feature, which a test crate enables in `[dev-dependencies]`.
 #[proc_macro_attribute]
 pub fn integration_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     match integration_test_impl(attr.into(), item.into()) {

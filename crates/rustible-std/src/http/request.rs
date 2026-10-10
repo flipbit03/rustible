@@ -1265,7 +1265,6 @@ mod tests {
 
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::{Collect, Event, Status};
-    use rustible_sdk::{Ctx, HostInfo};
     use serde::Deserialize;
     use serde_json::json;
 
@@ -1299,7 +1298,7 @@ mod tests {
     /// One step in a fresh context: the result and what the sink saw.
     fn step(check: bool, op: Request) -> (Result<Applied<Response>>, Arc<Collect>) {
         let (sys, sink) = sys(check);
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         (ctx.step("request", op), sink)
     }
 
@@ -1865,7 +1864,7 @@ mod tests {
         assert_no_secret(&format!("{i:?}"));
 
         // And what `--json` prints: every event of both steps.
-        let mut ctx = Ctx::new(s, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         ctx.step("bearer", bearer).unwrap();
         ctx.step("basic", basic).unwrap();
         for ev in sink.events() {
@@ -2060,7 +2059,7 @@ mod tests {
         let server = folder_server();
         let url = server.url("/rest/config/folders/dcim");
         let (sys, sink) = sys(true);
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let got = ctx.step("read", with_secrets(Request::get(&url))).unwrap();
         let set = ctx
             .step(
@@ -2097,7 +2096,7 @@ mod tests {
         let server = folder_server();
         let url = server.url("/rest/config/folders/dcim");
         let (sys, sink) = sys(false);
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let got = ctx.step("read", with_secrets(Request::get(&url))).unwrap();
         assert!(!got.changed);
         assert_eq!(got.status, 200);

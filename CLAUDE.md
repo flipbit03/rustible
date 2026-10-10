@@ -249,8 +249,9 @@ which is these, in the order that fails soonest:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace -- -D warnings                      # the test API compiled out
 cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib --all-features
 cargo build --manifest-path examples/workspace/Cargo.toml
 RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
 ```
@@ -514,7 +515,20 @@ assert!(err.contains("no such group `wheel`"), "{err}");
 `System::fake(fake.clone(), Arc::new(Collect::default()))` is the whole
 wiring. `with_check_mode(true)` is a consuming builder on it —
 `System::fake(..).with_check_mode(true)` — and gives you the dry `System` a
-check-mode test needs.
+check-mode test needs. A test that runs steps rather than `check` and
+`apply` builds its `Ctx` with `rustible_sdk::testing::ctx(sys)`; a playbook
+is handed its `Ctx` and cannot build one.
+
+All of this is the test API, behind the `testing` feature of `rustible-sdk`
+(and of `rustible`, which re-exports `#[integration_test]` only with it).
+`rustible-std` enables it in `[dev-dependencies]`, and a crate whose tests
+start using it needs the same line there, never in `[dependencies]`:
+
+```toml
+[dev-dependencies]
+rustible-sdk = { workspace = true, features = ["testing"] }
+rustible = { path = "../rustible", features = ["testing"] }  # only for #[rustible::integration_test]
+```
 
 **T2 lives in `crates/rustible-std/tests/it_<op>.rs`** — usually one file
 per op, sometimes one per state or per toolset where the behaviour genuinely
@@ -589,8 +603,9 @@ Each of these has already produced a test that could not fail.
   step's output is unavailable, or that a missing prerequisite is tolerated,
   inside a T2 body is vacuous, because harness bodies run with check mode
   off. A review found exactly this in a merged Alpine test (it asserted on a
-  prediction, back when there were predictions). To test a dry run, build a
-  second dry `Ctx` over the same machine — see
+  prediction, back when there were predictions). To test a dry run, take a
+  dry twin of the body's `Ctx` with `testing::dry(ctx)`: the same machine,
+  check mode on, its steps numbered in the same run — see
   `crates/rustible-std/tests/it_user_group.rs`.
 - **The `Fake` models files well and commands badly.** `spawn` returns the
   *first* canned entry matching the program, and `with_cmd` consumes `self`,
