@@ -1852,8 +1852,8 @@ impl Elevated {
     /// [`Local`], as this process's own user, without `sudo`. `wrap_tx` and
     /// `wrap_rx` may put something between this side and the pipes, which
     /// is how a test watches the frames. The thread ends when this is
-    /// dropped and the helper sees EOF; [`Elevated::quiesce`] waits for
-    /// that.
+    /// dropped and the helper sees EOF; `Elevated::quiesce` (tests) waits
+    /// for that.
     pub(crate) fn in_process_with(
         user: &str,
         phase: Arc<AtomicU8>,
@@ -1885,11 +1885,22 @@ impl Elevated {
     /// this inside its watched window: what the helper drops once it sees
     /// EOF is then counted against the test that started it, rather than
     /// landing in whichever test watches next.
+    ///
+    /// The wait is bounded, so a helper that does not end at EOF fails the
+    /// test instead of hanging it.
     #[cfg(test)]
     pub(crate) fn quiesce(mut self) {
         let helper = self.helper.take();
         drop(self);
         if let Some(helper) = helper {
+            let t0 = Instant::now();
+            while !helper.is_finished() {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(30),
+                    "the in-process helper did not end within 30s of EOF"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             helper.join().expect("the in-process helper panicked");
         }
     }
