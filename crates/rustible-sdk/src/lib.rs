@@ -13,6 +13,8 @@ pub mod ctx;
 pub mod diff;
 pub mod error;
 pub mod event;
+#[cfg(test)]
+mod executable;
 pub mod facts;
 #[cfg(test)]
 mod freed;

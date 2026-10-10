@@ -920,8 +920,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("-p/rustible-feed");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join(NAME), BIN).unwrap();
-        std::fs::set_permissions(d.join(NAME), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Written by a child, or a fork on another test thread can hold it
+        // open for writing and our `exec` fails with "Text file busy".
+        crate::executable::write(&d.join(NAME), BIN, 0o700);
         let (_, out, err) = sh_in(
             dir.path(),
             TRY,
