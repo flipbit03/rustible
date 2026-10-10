@@ -40,48 +40,117 @@ const CTX_NEW: &str = "let _ = rustible_sdk::Ctx::new;";
 const ATTRIBUTE: &str = "#[rustible::integration_test(images = [\"debian:12\"])]\n\
                          fn t(_: &mut rustible::sdk::Ctx) -> rustible::sdk::Result<()> { Ok(()) }";
 
+/// What rustc reports when a path or an associated function is not there:
+/// the only reasons a gated line may fail without the feature. Anything
+/// else means the scratch crate is broken, not that the gate held.
+const NOT_FOUND: [&str; 4] = ["E0425", "E0432", "E0433", "E0599"];
+
 #[test]
 fn the_test_api_needs_the_testing_feature() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("testing-gate");
     let mut lines = GATED.to_vec();
     lines.push(CTX_NEW);
-    let at = |line: usize| format!("src/main.rs:{line}:");
-    // `main`, its lines, its brace and a blank line come first.
+    // `fn main() {` is line 1, so `lines[i]` is line `i + 2`; then the
+    // closing brace and a blank line, then the attribute.
+    let ctx_new_line = lines.len() + 1;
     let attribute_line = lines.len() + 4;
 
-    // Default features: every line fails, each at its own line.
+    // Default features: every line fails, each at its own line, and only
+    // because the name is not there.
     let out = check(&tmp, "default", "", &lines);
-    let errors: Vec<&str> = out.lines().filter(|l| l.contains(": error")).collect();
-    for (i, line) in lines.iter().enumerate() {
-        assert!(
-            errors.iter().any(|l| l.starts_with(&at(i + 2))),
-            "`{line}` compiled without the `testing` feature:\n{out}"
-        );
+    out.expect_compile_errors();
+    let mut expected: Vec<(usize, &str)> = (0..lines.len()).map(|i| (i + 2, lines[i])).collect();
+    expected.push((attribute_line, "#[rustible::integration_test]"));
+    for (line, what) in &expected {
+        match out.errors_at(*line).as_slice() {
+            [] => panic!(
+                "`{what}` compiled without the `testing` feature (no error at \
+                 src/main.rs:{line}); the gate is gone:\n{}",
+                out.stderr
+            ),
+            errs if !errs.iter().all(|e| NOT_FOUND.iter().any(|c| e.contains(c))) => panic!(
+                "`{what}` failed without the `testing` feature, but not because it was \
+                 not found, so this says nothing about the gate:\n{}",
+                out.stderr
+            ),
+            _ => {}
+        }
     }
+    out.expect_no_errors_but_at(&expected.iter().map(|(l, _)| *l).collect::<Vec<_>>());
     assert!(
-        errors.iter().any(|l| l.starts_with(&at(attribute_line))),
-        "`#[rustible::integration_test]` resolved without the `testing` feature:\n{out}"
-    );
-    assert!(
-        out.contains("could not find `testing` in `rustible_sdk`"),
-        "{out}"
+        out.stderr
+            .contains("could not find `testing` in `rustible_sdk`"),
+        "the compiler no longer says what `docs/USING_RUSTIBLE.md` quotes for a \
+         missing feature:\n{}",
+        out.stderr
     );
 
-    // With the feature: everything resolves but `Ctx::new`.
+    // With the feature: everything resolves but `Ctx::new`, which is
+    // private whatever the features.
     let out = check(&tmp, "testing", r#", features = ["testing"]"#, &lines);
-    let errors: Vec<&str> = out.lines().filter(|l| l.contains(": error")).collect();
+    out.expect_compile_errors();
+    out.expect_no_errors_but_at(&[ctx_new_line]);
+    let errs = out.errors_at(ctx_new_line);
     assert!(
-        errors.len() == 1 && errors[0].starts_with(&at(lines.len() + 1)),
-        "with `testing`, only `Ctx::new` should fail:\n{out}"
+        !errs.is_empty() && errs.iter().all(|e| e.contains("E0624")),
+        "with `testing`, `Ctx::new` must still fail as private (E0624):\n{}",
+        out.stderr
     );
-    assert!(errors[0].contains("private"), "{out}");
+}
+
+/// The outcome of one `cargo check` of the scratch crate.
+struct Checked {
+    passed: bool,
+    stderr: String,
+    /// `(line, message)` for every error rustc placed in `src/main.rs`.
+    errors: Vec<(usize, String)>,
+}
+
+impl Checked {
+    /// The check failed, and rustc reported errors in the scratch crate.
+    /// A failure with none (a dependency that did not build, a lock cargo
+    /// refused) is a broken setup, not a result.
+    fn expect_compile_errors(&self) {
+        assert!(
+            !self.passed,
+            "the scratch crate compiled, so nothing it names is gated:\n{}",
+            self.stderr
+        );
+        assert!(
+            !self.errors.is_empty(),
+            "`cargo check` failed before reaching the scratch crate's code, so the \
+             gate was not tested:\n{}",
+            self.stderr
+        );
+    }
+
+    fn errors_at(&self, line: usize) -> Vec<&str> {
+        self.errors
+            .iter()
+            .filter(|(l, _)| *l == line)
+            .map(|(_, e)| e.as_str())
+            .collect()
+    }
+
+    fn expect_no_errors_but_at(&self, lines: &[usize]) {
+        let stray: Vec<&(usize, String)> = self
+            .errors
+            .iter()
+            .filter(|(l, _)| !lines.contains(l))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "unexpected errors in the scratch crate {stray:?}:\n{}",
+            self.stderr
+        );
+    }
 }
 
 /// `cargo check` a binary crate in `<tmp>/<name>` whose `main` holds
 /// `lines`, followed by [`ATTRIBUTE`], depending on this checkout's
 /// `rustible-sdk` and `rustible` by path, with `features` appended to both
-/// dependencies. Returns cargo's stderr; the check is expected to fail.
-fn check(tmp: &Path, name: &str, features: &str, lines: &[&str]) -> String {
+/// dependencies.
+fn check(tmp: &Path, name: &str, features: &str, lines: &[&str]) -> Checked {
     let sdk = Path::new(env!("CARGO_MANIFEST_DIR"));
     let facade = sdk.join("../rustible");
     let dir = tmp.join(name);
@@ -107,19 +176,49 @@ fn check(tmp: &Path, name: &str, features: &str, lines: &[&str]) -> String {
     std::fs::copy(sdk.join("../../Cargo.lock"), dir.join("Cargo.lock")).unwrap();
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let out = Command::new(cargo)
-        .args([
-            "check",
-            "--quiet",
-            "--message-format=short",
-            "--manifest-path",
-        ])
-        .arg(dir.join("Cargo.toml"))
-        // One target directory for both, so the dependencies build once.
-        .env("CARGO_TARGET_DIR", tmp.join("target"))
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(cargo);
+    cmd.args([
+        "check",
+        "--quiet",
+        "--color",
+        "never",
+        "--message-format=short",
+        "--manifest-path",
+    ])
+    .arg(dir.join("Cargo.toml"))
+    // One target directory for both, so the dependencies build once.
+    .env("CARGO_TARGET_DIR", tmp.join("target"));
+    // Hermetic: nothing from the outer build or CI's environment reaches
+    // the scratch build (CI sets `CARGO_TERM_COLOR=always`, which put
+    // escape codes in every message this parses).
+    for var in [
+        "CARGO_TERM_COLOR",
+        "CARGO_BUILD_TARGET",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(!out.status.success(), "the check passed:\n{stderr}");
-    stderr
+    let errors = stderr
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("src/main.rs:")?;
+            let (line, msg) = rest.split_once(':')?;
+            if !msg.contains(": error") {
+                return None;
+            }
+            Some((line.parse().ok()?, l.to_string()))
+        })
+        .collect();
+    Checked {
+        passed: out.status.success(),
+        stderr,
+        errors,
+    }
 }
