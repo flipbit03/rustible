@@ -750,6 +750,14 @@ impl Ctx {
     /// call and the destination keeps what it held; the partial file is
     /// removed when the run ends. Whatever `remote` is gets read, as `cat`
     /// does, so a FIFO waits for a writer.
+    ///
+    /// Under `--check` it does nothing: it reads nothing on the target,
+    /// writes nothing to the workspace, logs `would fetch <remote> to
+    /// <dest> (not under --check)` and returns `Ok(())`. A `remote` with no
+    /// file name under a `/` destination is still refused. Code that reads
+    /// the fetched copy afterwards finds it missing, or as an earlier real
+    /// run left it; that is the playbook's to handle, with
+    /// [`Ctx::check_mode`].
     pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
         let remote = remote.as_ref();
         let dest = path_str(local_dest.as_ref());
@@ -761,6 +769,13 @@ impl Ctx {
         } else {
             dest
         };
+        if self.sys.check_mode() {
+            self.log(format!(
+                "would fetch {} to {dest} (not under --check)",
+                remote.display()
+            ));
+            return Ok(());
+        }
         let file = self
             .sys
             .open_read(remote)
@@ -1586,6 +1601,80 @@ mod tests {
 
         assert!(ctx.fetch("/missing", "out/").is_err());
         assert_eq!(up.0.lock().unwrap().len(), frames.len(), "nothing sent");
+    }
+
+    /// Every `Log` line at `Info`, as emitted.
+    fn infos(sink: &Collect) -> Vec<String> {
+        sink.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Log {
+                    level: Level::Info,
+                    msg,
+                } => Some(msg),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Under `--check`, `ctx.fetch` through the local channel reads nothing,
+    /// writes nothing into the workspace and says what it would have
+    /// fetched, and where (#117). A `remote` with no file name is still
+    /// refused.
+    #[test]
+    fn fetch_under_check_writes_nothing_locally_and_names_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(Collect::default());
+        let fake = Arc::new(Fake::new().with_file("/etc/hostname", "box1\n"));
+        let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
+        let (channel, _feeder) =
+            Channel::local(crate::stream::WorkspaceFiles::new(dir.path()).unwrap());
+        let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+
+        ctx.fetch("/etc/hostname", "out/").unwrap();
+        ctx.fetch("/etc/hostname", "exact.txt").unwrap();
+        assert_eq!(walkdir(dir.path()), Vec::<PathBuf>::new());
+        assert!(fake.reads().is_empty(), "{:?}", fake.reads());
+        assert_eq!(
+            infos(&sink),
+            [
+                "would fetch /etc/hostname to out/local/hostname (not under --check)",
+                "would fetch /etc/hostname to exact.txt (not under --check)",
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(ctx.summary()).unwrap(),
+            serde_json::to_value(Summary::default()).unwrap(),
+            "no counter moves"
+        );
+
+        let err = ctx.fetch("/", "out/").unwrap_err().chain();
+        assert!(err.contains("`/` has no file name"), "{err}");
+    }
+
+    /// Under `--check`, `ctx.fetch` through the orchestrated channel sends
+    /// no `FetchChunk` and reads nothing (#117). A `remote` with no file
+    /// name is still refused.
+    #[test]
+    fn fetch_under_check_sends_no_chunk_and_names_the_destination() {
+        let sink = Arc::new(Collect::default());
+        let fake = Arc::new(Fake::new().with_file("/var/log/big", "x\n"));
+        let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
+        let up = Arc::new(CaptureUp(std::sync::Mutex::new(vec![])));
+        let (channel, _feeder) = Channel::remote(up.clone());
+        let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+
+        ctx.fetch("/var/log/big", "out/").unwrap();
+        assert!(up.0.lock().unwrap().is_empty(), "nothing sent");
+        assert!(fake.reads().is_empty(), "{:?}", fake.reads());
+        assert_eq!(
+            infos(&sink),
+            ["would fetch /var/log/big to out/local/big (not under --check)"]
+        );
+
+        let err = ctx.fetch("/", "out/").unwrap_err().chain();
+        assert!(err.contains("`/` has no file name"), "{err}");
+        assert!(up.0.lock().unwrap().is_empty(), "nothing sent");
     }
 
     // ---- ctx.block ----

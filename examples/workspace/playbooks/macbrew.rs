@@ -152,9 +152,7 @@ fn large_file_as_root(ctx: &mut Ctx) -> Result<()> {
         "50 MiB copy, as root",
         file::Copy::from_local_path(&large).to(&copy),
     )?;
-    if !root.check_mode() {
-        root.fetch(&copy, "out/macbrew/")?;
-    }
+    root.fetch(&copy, "out/macbrew/")?;
     // The file as a tarball member, made by the mac's own `tar` (bsdtar;
     // `COPYFILE_DISABLE` keeps AppleDouble `._` members out): plain, over
     // 48 MiB, and gzipped. `creates` makes the second run `ok`.
