@@ -272,7 +272,7 @@ mod tests {
     fn attrs_in_check_mode_reports_would_change_and_changes_nothing() {
         let fake = Arc::new(Fake::new().with_file_mode("/f", "", 0o644));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx.step("attrs", Attrs::at("/f").mode(0o600)).unwrap();
         assert!(r.changed && !r.is_available(), "no apply, so no output");
         assert_eq!(r.diff.as_ref().unwrap().short(), "mode=0600");

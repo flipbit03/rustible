@@ -20,4 +20,6 @@ proc-macro2 = "1"
 
 [dev-dependencies]
 trybuild = "1"
-rustible = { path = "../rustible" }
+# `testing` for the `#[integration_test]` cases, which the facade re-exports
+# only with it.
+rustible = { path = "../rustible", features = ["testing"] }

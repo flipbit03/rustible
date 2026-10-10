@@ -641,6 +641,8 @@ mod one_line_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use rustible_sdk::CmdFailed;
     use rustible_sdk::event::Collect;
@@ -1296,47 +1298,120 @@ web1    4        1             0        0       0          2         0
         );
     }
 
-    /// A twin of the failed step, same id, name and blocks from a second
-    /// `Ctx`, was caught and printed its command. The run's own step then
-    /// escapes: its `Failed` frame takes the held reason, and prints its own
-    /// command with it, once, beside the twin's. (The reason is word for
-    /// word the twin's, so the line points above, as it did before.)
-    #[test]
-    fn an_escaped_failure_beside_a_caught_twin_shows_its_command_once() {
-        let with_stderr = |mut ev: Event, stderr: &str| {
-            if let Event::StepFinished { cmd: Some(c), .. } | Event::Failed { cmd: Some(c), .. } =
-                &mut ev
-            {
-                c.stderr = stderr.into();
+    /// Fails its step, in either mode, with `sh` exiting 3 and writing
+    /// `stderr`: what a probe in `check` does when its command fails.
+    struct FailsWith(&'static str);
+
+    impl rustible_sdk::Op for FailsWith {
+        type Output = ();
+        type Intent = std::convert::Infallible;
+        fn check(
+            &self,
+            _: &rustible_sdk::System,
+        ) -> rustible_sdk::Result<rustible_sdk::Plan<Self>> {
+            Err(CmdFailed {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo nope >&2; exit 3".into(),
+                ],
+                status: 3,
+                signal: None,
+                stderr: self.0.into(),
             }
-            ev
+            .into())
+        }
+        fn apply(
+            &self,
+            _: &rustible_sdk::System,
+            intent: Self::Intent,
+        ) -> rustible_sdk::Result<()> {
+            match intent {}
+        }
+    }
+
+    /// What a run and its dry twin emit when each fails a step named `x`,
+    /// one with stderr `AAA` and one with `BBB`, in the order `twin_first`
+    /// says, and the run's own `x` is the error that leaves the playbook:
+    /// every event both emitted, then the `Failed` frame the runtime builds
+    /// from that error.
+    fn run_and_dry_twin_both_fail_x(twin_first: bool) -> Vec<Event> {
+        use rustible_sdk::backend::Fake;
+        use rustible_sdk::testing;
+
+        let sink = Arc::new(Collect::default());
+        let mut ctx = testing::ctx(rustible_sdk::System::fake(
+            Arc::new(Fake::new()),
+            sink.clone(),
+        ));
+        let mut twin = testing::dry(&ctx);
+        let escaped = if twin_first {
+            let _ = twin.step("x", FailsWith("BBB\n")).unwrap_err();
+            ctx.step("x", FailsWith("AAA\n")).unwrap_err()
+        } else {
+            let kept = ctx.step("x", FailsWith("AAA\n")).unwrap_err();
+            let _ = twin.step("x", FailsWith("BBB\n")).unwrap_err();
+            kept
         };
-        let out = render(1, |r| {
-            r.event("local", &step_started(1, "x"));
-            r.event("local", &with_stderr(failing_cmd(1, "x"), "BBB\n"));
-            r.event("local", &step_started(1, "x"));
-            r.event("local", &with_stderr(failing_cmd(1, "x"), "AAA\n"));
-            r.event(
-                "local",
-                &with_stderr(
-                    failed_frame_cmd(
-                        Some("x"),
-                        Some(1),
-                        "step `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3",
-                    ),
-                    "AAA\n",
-                ),
-            );
+        // The runtime's frame for the error that left the playbook, matched
+        // to its step by the id the run drew for it.
+        let layer = escaped.step_failed().expect("a step's error names it");
+        let mut events = sink.events();
+        events.push(Event::Failed {
+            step: Some(layer.step.clone()),
+            id: layer.id(),
+            blocks: layer.blocks.clone(),
+            error: escaped.chain(),
+            cmd: escaped.cmd_failed().cloned(),
         });
-        assert_eq!(out.matches("BBB").count(), 1, "{out}");
-        assert_eq!(out.matches("AAA").count(), 1, "{out}");
-        assert!(
-            out.ends_with(
-                "[local]  FAILED: `x` (reason above)\n\
-                 [local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)\n\
-                 [local]      AAA\n"
-            ),
-            "{out}"
+        events
+    }
+
+    /// A failed `x` from [`run_and_dry_twin_both_fail_x`]: its step line,
+    /// its reason, and its command with `stderr`.
+    fn failed_x(stderr: &str) -> String {
+        format!(
+            "[local]  x ....................................................... FAILED\n\
+             [local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n\
+             [local]    $ /bin/sh -c \"echo nope >&2; exit 3\" (exit 3)\n\
+             [local]      {stderr}\n"
+        )
+    }
+
+    /// #96, the first order: a dry twin's `x` fails and is caught, then the
+    /// run's own `x` fails and escapes. The twin draws its id from the run's
+    /// sequence, so the two never share a key: each step prints its own
+    /// reason and command, once, and the frame adds nothing, since the
+    /// reason it closes is the escaped step's, printed with it.
+    #[test]
+    fn a_caught_dry_twin_then_an_escaped_step_each_print_their_own_command_once() {
+        let out = render(1, |r| {
+            for ev in run_and_dry_twin_both_fail_x(true) {
+                r.event("local", &ev);
+            }
+        });
+        assert_eq!(out, format!("{}{}", failed_x("BBB"), failed_x("AAA")));
+    }
+
+    /// #96, the reverse order: the run's own `x` fails and is kept, a dry
+    /// twin's `x` fails and is caught, and the playbook returns the first.
+    /// The frame closes `AAA`'s step and never takes `BBB`'s chain: each
+    /// stderr prints once. The frame repeats the reason, without the
+    /// command, because another `x` printed after it.
+    #[test]
+    fn a_kept_step_then_a_caught_dry_twin_each_print_their_own_command_once() {
+        let out = render(1, |r| {
+            for ev in run_and_dry_twin_both_fail_x(false) {
+                r.event("local", &ev);
+            }
+        });
+        assert_eq!(
+            out,
+            format!(
+                "{}{}[local]  FAILED at `x`: `/bin/sh -c echo nope >&2; exit 3` exited 3\n",
+                failed_x("AAA"),
+                failed_x("BBB")
+            )
         );
     }
 

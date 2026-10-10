@@ -131,6 +131,9 @@ Each op is one task. The brief is the template above with these fixed parts:
   apply / failure / wrong platform / check mode
   (`System::fake(..).with_check_mode(true)`), and a Docker harness test doing
   changed-then-ok.
+  All of that test API sits behind the `testing` feature of `rustible-sdk`
+  (and of `rustible`, for `#[integration_test]`), which a crate enables in
+  `[dev-dependencies]` only.
   The `Fake` asserts what a final state cannot show: attribute calls with
   `attr_calls()`, a refused owner with `with_chown_refused()`, streamed reads
   with `reads()`.

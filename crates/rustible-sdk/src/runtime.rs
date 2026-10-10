@@ -1836,21 +1836,41 @@ mod tests {
 
     static A_SECOND_CTX_CLAIMS_NOTHING: Playbook = playbook!(|ctx, _| {
         let _ = ctx.step("main1", Attempt(false)).ok();
-        // Ids restart at 1 in a new context: its step 1 is not this run's.
+        // Ids restart at 1 in a new family: its step 1 is not this run's.
+        // Only this crate and `testing::ctx` can make one.
         let mut other = Ctx::new(ctx.sys().clone(), HostInfo::local());
         other.step("other", Attempt(false))?;
         Ok(())
     });
 
-    /// An error from a second `Ctx` carries an id this run also drew, and
-    /// must not claim it: `main1` stays recovered, and the host fails by the
-    /// floor of one, with a frame that names `other` and no id.
+    /// An error from a second `Ctx` family carries an id this run also
+    /// drew, and must not claim it: `main1` stays recovered, and the host
+    /// fails by the floor of one, with a frame that names `other` and no id.
     #[test]
     fn an_error_from_a_second_ctx_does_not_claim_this_runs_step() {
         let (code, events) = run(&A_SECOND_CTX_CLAIMS_NOTHING, false);
         assert_eq!(verdict(&events), (1, 1));
         assert_eq!(failed_frames(&events), [(Some("other".into()), vec![])]);
         assert_eq!(failed_ids(&events), [None]);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+    }
+
+    static A_DRY_TWINS_ERROR_ESCAPES: Playbook = playbook!(|ctx, _| {
+        let _ = ctx.step("main1", Attempt(false)).ok();
+        let mut dry = crate::testing::dry(ctx);
+        dry.step("dry", Attempt(false))?;
+        Ok(())
+    });
+
+    /// A dry twin is the run's own family, so its error is claimed like
+    /// any step's: it draws id 2 after `main1`, it is the failed step, and
+    /// `main1` is recovered.
+    #[test]
+    fn an_error_from_a_dry_twin_claims_its_own_step() {
+        let (code, events) = run(&A_DRY_TWINS_ERROR_ESCAPES, false);
+        assert_eq!(verdict(&events), (1, 1));
+        assert_eq!(failed_frames(&events), [(Some("dry".into()), vec![])]);
+        assert_eq!(failed_ids(&events), [Some(2)]);
         assert_eq!(code, ExitCode::from(EXIT_FAILED));
     }
 

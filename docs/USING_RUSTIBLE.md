@@ -1515,6 +1515,27 @@ above. `rustible-github` is the worked example to copy the shape from; its
 lookup's intent is `Infallible`, so for an op with a real intent see
 `rustible_std::sysctl`.
 
+Its tests reach the test API, which is the `Fake` backend, `System::fake`,
+`event::Collect`, `testing::ctx` and `testing::dry`, and
+`#[rustible::integration_test]`, through the `testing` feature. Enable it in
+`[dev-dependencies]` only, at the same version as the normal dependency, so
+nothing a playbook builds contains it:
+
+```toml
+[dependencies]
+rustible-sdk = "0.5.0"
+
+[dev-dependencies]
+rustible-sdk = { version = "0.5.0", features = ["testing"] }
+rustible = { version = "0.5.0", features = ["testing"] }  # only for #[rustible::integration_test]
+```
+
+Without it the compiler says ``could not find `testing` in `rustible_sdk` ``
+(or `Fake` in `backend`, or `integration_test` in `rustible`) and notes that
+the item was configured out. A test builds its `Ctx` with
+`testing::ctx(sys)`, and sees what `--check` reports through
+`testing::dry(&ctx)`, a twin whose steps count in the same run.
+
 To contribute an operation to `rustible-std` itself, read
 [`CLAUDE.md`](../CLAUDE.md) — it covers the shape, where the tests go, and the
 traps that make a test pass while proving nothing.

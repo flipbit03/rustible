@@ -930,7 +930,7 @@ mod tests {
     fn copy_in_check_mode_reports_would_change_and_writes_nothing() {
         let fake = Arc::new(Fake::new().with_file("/f", "a\n"));
         let sys = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(sys, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let r = ctx
             .step("copy", Copy::from_str("bb\n").to("/f").mode(0o600))
             .unwrap();

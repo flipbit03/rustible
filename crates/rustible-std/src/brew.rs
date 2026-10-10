@@ -1316,7 +1316,7 @@ mod tests {
     fn check_mode_would_change_and_runs_nothing() {
         let fake = mac_fake(&[]);
         let s = mac_sys(&fake).with_check_mode(true);
-        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         let r = ctx.step("nethack", Present::new(["nethack"])).unwrap();
         assert!(r.changed && !r.is_available());
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());

@@ -20,6 +20,9 @@ rustible-sdk.workspace = true
 rustible-std.workspace = true
 
 [dev-dependencies]
+# The test API (`Fake`, `testing::ctx`), for tests only: a dev-dependency's
+# features never reach the library's own build.
+rustible-sdk = { workspace = true, features = ["testing"] }
 # Only so the module-header doctest can show a real `#[rustible::playbook]`.
 # Path-only on purpose: cargo strips a path-only dev-dependency at publish, the
 # same reason rustible-std and rustible-macros carry it this way.

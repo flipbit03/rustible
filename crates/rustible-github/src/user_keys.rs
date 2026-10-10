@@ -273,7 +273,6 @@ pub(crate) mod tests {
 
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::{Collect, Event, Status};
-    use rustible_sdk::{Ctx, HostInfo};
 
     use super::*;
     use crate::fetch::Response;
@@ -515,7 +514,7 @@ pub(crate) mod tests {
             Ok(Response::ok(body())),
         );
         let (sys, sink) = sys();
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let keys = ctx
             .step(
                 "Fetch keys",
@@ -569,7 +568,7 @@ pub(crate) mod tests {
         assert_eq!(canned.asked().len(), 1);
 
         // And through a step, which fails rather than reporting anything.
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let e = ctx
             .step("Fetch keys", UserKeys::of("nobody-here").fetch_with(canned))
             .unwrap_err()
@@ -679,7 +678,7 @@ pub(crate) mod tests {
             Ok(Response::ok(body())),
         );
         let (sys, sink) = sys();
-        let mut ctx = Ctx::new(sys.with_check_mode(true), HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys.with_check_mode(true));
         let keys = ctx
             .step(
                 "Fetch keys",
@@ -725,7 +724,7 @@ pub(crate) mod tests {
     #[ignore = "needs network: cargo test -p rustible-github network_ -- --ignored"]
     fn network_fetches_flipbit03_keys_over_https() {
         let (sys, _) = sys();
-        let mut ctx = Ctx::new(sys, HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(sys);
         let keys = ctx.step("Fetch keys", UserKeys::of("flipbit03")).unwrap();
         assert!(!keys.changed);
         assert!(!keys.is_empty(), "flipbit03 has published keys");

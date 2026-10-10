@@ -10,6 +10,14 @@ authors.workspace = true
 rust-version.workspace = true
 readme = "../../README.md"
 
+# Forwards the SDK's test API and re-exports `#[integration_test]`. A test
+# crate turns it on in `[dev-dependencies]` only.
+[features]
+testing = ["rustible-sdk/testing"]
+
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 rustible-sdk.workspace = true
 rustible-macros.workspace = true

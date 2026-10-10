@@ -18,12 +18,8 @@
 
 use std::path::Path;
 
-use std::sync::Arc;
-
 use rustible::prelude::*;
-use rustible::sdk::event::Collect;
-use rustible::sdk::testing::changed_then_ok;
-use rustible::sdk::{HostInfo, System};
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::shell::Command;
 use rustible_std::{group, user};
 
@@ -44,10 +40,7 @@ fn busybox_user_and_group(ctx: &mut Ctx) -> Result<()> {
     // BusyBox it cannot know which shell it will get. The diff is what a dry
     // run shows, so this claim is made against a dry `Ctx` over the same
     // real machine. A would-change step has no output there (vision 12).
-    let mut dry = Ctx::new(
-        System::local(true, Arc::new(Collect::default())),
-        HostInfo::local(),
-    );
+    let mut dry = testing::dry(ctx);
     let planned = dry.step(
         "dry user without a shell",
         user::Present::new("rustible-ash").uid(4100).gid("users"),

@@ -494,7 +494,7 @@ mod tests {
     fn check_mode_reports_would_change_and_runs_nothing() {
         let fake = Arc::new(box_named("old", "old").with_cmd("hostnamectl", None, 0, ""));
         let s = System::fake(fake.clone(), Arc::new(Collect::default())).with_check_mode(true);
-        let mut ctx = Ctx::new(s, rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(s);
         let r = ctx.step("name", Is::new("HOME-GAMES")).unwrap();
         // A would-change step has no output in check mode (vision 12).
         assert!(r.changed && !r.is_available());
@@ -509,7 +509,7 @@ mod tests {
         // Without systemd the fake box really changes: the op rewrites the
         // file, and we simulate the kernel side, so a second step is `ok`.
         let fake = Arc::new(box_named("old", "old").with_cmd("hostname", None, 0, ""));
-        let mut ctx = Ctx::new(openrc(&fake), rustible_sdk::HostInfo::local());
+        let mut ctx = rustible_sdk::testing::ctx(openrc(&fake));
         let r = ctx.step("name", Is::new("new")).unwrap();
         assert!(r.changed);
         rustible_sdk::backend::Backend::write(

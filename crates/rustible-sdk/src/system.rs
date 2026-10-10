@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::backend::{
-    Backend, CmdSpec, Elevated, Fake, HelperGone, Limits, Local, Output, Spawner, Stat, WriteAttrs,
+    Backend, CmdSpec, Elevated, HelperGone, Local, Output, Spawner, Stat, WriteAttrs,
 };
+#[cfg(any(test, feature = "testing"))]
+use crate::backend::{Fake, Limits};
 use crate::error::{CmdFailed, Error, IoAt, MutationDuringCheck, Result, SpawnFailed};
 use crate::event::{Event, Level, SharedSink};
 use crate::facts::Facts;
@@ -114,7 +116,9 @@ fn spawn_failed(program: &str, source: std::io::Error) -> Error {
 /// clone can differ in is its identity, its backend, and its check-mode
 /// flag.
 ///
-/// Use [`System::local`] for a real machine and [`System::fake`] for tests.
+/// The runtime builds one over the real machine with [`System::local`]; a
+/// test builds one over a `Fake` with `System::fake`, which the `testing`
+/// feature provides.
 #[derive(Clone)]
 pub struct System {
     backend: Arc<dyn Backend>,
@@ -128,8 +132,9 @@ pub struct System {
 
 impl System {
     /// A system over a backend of your own: a test double, a recording
-    /// proxy, anything implementing `Backend`. [`System::local`] and
-    /// [`System::fake`] cover the two cases that exist in practice.
+    /// proxy, anything implementing `Backend`. [`System::local`] and, with
+    /// the `testing` feature, `System::fake` cover the two cases that exist
+    /// in practice.
     ///
     /// The identity is [`Identity::Own`] and the phase starts at
     /// [`Phase::Idle`]. There is no escalation, so [`System::as_user`] on
@@ -227,7 +232,7 @@ impl System {
     /// helper shares this system's phase cell, so the check-mode guard holds
     /// on both sides as in a real run. The facts are this machine's, and the
     /// identity is the process's own.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn in_process_helper(sink: SharedSink) -> Result<System> {
         Self::over_helper(sink, |phase| {
             Elevated::in_process_with(
@@ -242,6 +247,7 @@ impl System {
 
     /// A system over the helper `make` builds around this system's phase
     /// cell.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn over_helper(
         sink: SharedSink,
         make: impl FnOnce(Arc<AtomicU8>) -> std::io::Result<Elevated>,
@@ -255,6 +261,7 @@ impl System {
 
     /// Fake backend for tests. Facts default to a plausible Debian box; use
     /// `with_facts` to change them.
+    #[cfg(any(test, feature = "testing"))]
     pub fn fake(fake: Arc<Fake>, sink: SharedSink) -> Self {
         let facts = Facts {
             os: crate::facts::Os::Linux,
@@ -276,6 +283,7 @@ impl System {
     /// Replace the facts, for a test that needs a different distro, init or
     /// unprivileged user than [`System::fake`]'s Debian default. Handles
     /// cloned before this call keep the facts they were built with.
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_facts(mut self, facts: Facts) -> Self {
         self.facts = Arc::new(facts);
         self
@@ -288,7 +296,11 @@ impl System {
     /// [`Ctx::step`](crate::ctx::Ctx::step) never calls `apply` at all, and
     /// that an op defers a refusal about a prerequisite another step could
     /// create (vision doc 12). As with [`System::with_facts`], only handles
-    /// cloned after the call see the new value.
+    /// cloned after the call see the new value. A test that wants a dry
+    /// `Ctx` beside a real one uses
+    /// [`testing::dry`](crate::testing::dry) instead, which keeps the run's
+    /// step numbering.
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_check_mode(mut self, on: bool) -> Self {
         self.check_mode = on;
         self

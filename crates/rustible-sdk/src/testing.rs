@@ -1,4 +1,8 @@
-//! Docker integration harness: T2 of the testing strategy (vision 8).
+//! The test API: [`ctx`] and [`dry`], which build the `Ctx` a test runs
+//! steps through, and the Docker integration harness, T2 of the testing
+//! strategy (vision 8). Behind the `testing` feature, with the rest of the
+//! test API: a crate whose tests use it enables the feature in
+//! `[dev-dependencies]` only.
 //!
 //! An op author writes one integration test per op and marks it with
 //! `#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]`.
@@ -132,8 +136,9 @@ pub struct StepReport {
     /// The name the test body passed to `ctx.step`, which is how an
     /// assertion in the outer test finds the step it cares about.
     pub name: String,
-    /// `Ok`, `Changed`, `Failed`; `WouldChange` never appears, since the
-    /// harness runs the body with check mode off.
+    /// `Ok`, `Changed`, `Failed`; `WouldChange` only from a step run
+    /// through a [`dry`] twin, since the harness runs the body with check
+    /// mode off.
     pub status: Status,
     /// `Diff::short`, not the full rendering: enough to see what moved, and
     /// small enough to keep the report on one line.
@@ -301,6 +306,53 @@ pub fn changed_then_ok<O: Op>(
         second.diff.as_ref().map(|d| d.short()).unwrap_or_default()
     );
     Ok((first, second))
+}
+
+/// A `Ctx` over `sys` for a test: the host is [`HostInfo::local`], and no
+/// orchestrator is behind it, so steps, blocks and logging work while
+/// `local_file`, `local_secret` and `fetch` fail. It starts a run of its
+/// own, numbering its steps from 1.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use rustible_sdk::backend::Fake;
+/// use rustible_sdk::event::Collect;
+/// use rustible_sdk::testing;
+/// use rustible_sdk::System;
+///
+/// let sys = System::fake(Arc::new(Fake::new()), Arc::new(Collect::default()));
+/// let ctx = testing::ctx(sys);
+/// assert!(!ctx.check_mode());
+/// ```
+pub fn ctx(sys: System) -> Ctx {
+    Ctx::new(sys, HostInfo::local())
+}
+
+/// A check-mode twin of `ctx`: the same machine, host and identity, with
+/// check mode on. A container body runs with check mode off, so this is how
+/// a T2 test sees what `--check` would report.
+///
+/// The twin belongs to `ctx`'s run, as a `ctx.as_user(..)` does: its steps
+/// continue `ctx`'s numbering, inside whatever blocks are open, and they
+/// are counted in the same summary, so a twin's steps show up in the
+/// parent's recap, and in a container body's report, beside the parent's.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use rustible_sdk::backend::Fake;
+/// use rustible_sdk::event::Collect;
+/// use rustible_sdk::testing;
+/// use rustible_sdk::System;
+///
+/// let sys = System::fake(Arc::new(Fake::new()), Arc::new(Collect::default()));
+/// let ctx = testing::ctx(sys);
+/// let dry = testing::dry(&ctx);
+/// assert!(dry.check_mode() && !ctx.check_mode());
+/// ```
+pub fn dry(ctx: &Ctx) -> Ctx {
+    ctx.sharing(ctx.sys().clone().with_check_mode(true))
 }
 
 /// Build the current test binary for musl (once per process) and run `spec`
@@ -845,7 +897,104 @@ fn status_word(s: Status) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
+    use crate::backend::Fake;
+    use crate::op::{Intent, Plan};
+
+    /// Always a change; counts how often it was applied.
+    struct Change(Arc<AtomicU32>);
+
+    #[derive(Debug)]
+    struct Apply;
+
+    impl Intent for Apply {
+        fn diff(&self) -> crate::Diff {
+            crate::Diff::summary("apply")
+        }
+    }
+
+    impl Op for Change {
+        type Output = ();
+        type Intent = Apply;
+        fn check(&self, _: &System) -> Result<Plan<Self>> {
+            Ok(Plan::Change(Apply))
+        }
+        fn apply(&self, _: &System, Apply: Apply) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A dry twin belongs to its parent's run: its step draws the next id
+    /// in the parent's sequence, the parent's next step the one after, and
+    /// only the twin is in check mode, so its change is planned and never
+    /// applied. Both are counted in the one summary.
+    #[test]
+    fn a_dry_twin_continues_its_parents_step_ids_in_check_mode() {
+        let sink = Arc::new(Collect::default());
+        let mut parent = ctx(System::fake(Arc::new(Fake::new()), sink.clone()));
+        let applied = Arc::new(AtomicU32::new(0));
+
+        parent.step("first", Change(applied.clone())).unwrap();
+        let mut twin = dry(&parent);
+        assert!(twin.check_mode() && twin.sys().check_mode());
+        assert!(!parent.check_mode());
+        let planned = twin.step("second", Change(applied.clone())).unwrap();
+        assert!(planned.changed && !planned.is_available());
+        parent.step("third", Change(applied.clone())).unwrap();
+
+        assert_eq!(
+            applied.load(Ordering::SeqCst),
+            2,
+            "the twin applied nothing"
+        );
+        let finished: Vec<(u32, String, Status)> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepFinished {
+                    id, name, status, ..
+                } => Some((id, name, status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            [
+                (1, "first".to_string(), Status::Changed),
+                (2, "second".to_string(), Status::WouldChange),
+                (3, "third".to_string(), Status::Changed),
+            ]
+        );
+        let summary = parent.summary();
+        assert_eq!((summary.changed, summary.would_change), (2, 1));
+    }
+
+    /// A dry twin made inside a block reports its steps inside it, as every
+    /// `Ctx` of the run does.
+    #[test]
+    fn a_dry_twin_reports_inside_the_parents_open_blocks() {
+        let sink = Arc::new(Collect::default());
+        let mut parent = ctx(System::fake(Arc::new(Fake::new()), sink.clone()));
+        let applied = Arc::new(AtomicU32::new(0));
+        parent
+            .block("outer", |ctx| {
+                dry(ctx).step("inside", Change(applied.clone()))?;
+                Ok(())
+            })
+            .unwrap();
+        let blocks: Vec<Vec<String>> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepFinished { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks, [vec!["outer".to_string()]]);
+    }
 
     /// The typed payload `Deref` unwinds with reports its own message, not
     /// "non-string panic payload".

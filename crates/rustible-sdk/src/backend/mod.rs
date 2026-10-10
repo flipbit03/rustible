@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 
 mod elevated;
 pub(crate) use elevated::HelperGone;
+#[cfg(any(test, feature = "testing"))]
 mod fake;
 mod local;
 
+#[cfg(any(test, feature = "testing"))]
 pub(crate) use elevated::Limits;
 pub use elevated::{Elevated, Spawner, helper_argv, serve_helper};
+#[cfg(any(test, feature = "testing"))]
 pub use fake::{AttrCall, Fake, FakeFile, ReadCall};
 pub use local::Local;
 pub(crate) use local::Staged;

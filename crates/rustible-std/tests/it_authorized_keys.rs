@@ -13,12 +13,8 @@
 //! can establish — and symlink resolution through a directory component,
 //! which `Fake::resolve` does not model.
 
-use std::sync::Arc;
-
 use rustible::prelude::*;
-use rustible::sdk::event::Collect;
-use rustible::sdk::testing::changed_then_ok;
-use rustible::sdk::{HostInfo, System};
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::ssh::authorized_keys;
 use rustible_std::user;
 
@@ -304,10 +300,7 @@ fn a_dry_run_of_a_first_provision_does_not_fail(ctx: &mut Ctx) -> Result<()> {
     )?;
     ensure!(!ctx.sys().exists(&account.home)?, "the home must be absent");
 
-    let mut dry = Ctx::new(
-        System::local(true, Arc::new(Collect::default())),
-        HostInfo::local(),
-    );
+    let mut dry = testing::dry(ctx);
     let planned = dry.step(
         "dry keys",
         authorized_keys::Present::for_user(&account).keys([K1]),

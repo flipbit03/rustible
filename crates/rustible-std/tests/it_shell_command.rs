@@ -3,12 +3,8 @@
 //! `changed_when` against a real `/bin/sh`. Runs with
 //! `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_shell_command`.
 
-use std::sync::Arc;
-
 use rustible::prelude::*;
-use rustible::sdk::event::Collect;
-use rustible::sdk::testing::changed_then_ok;
-use rustible::sdk::{HostInfo, System};
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::shell::Command;
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
@@ -83,10 +79,7 @@ fn command_options_against_a_real_shell(ctx: &mut Ctx) -> Result<()> {
 
     // Check mode over the real machine: nothing runs, nothing is created.
     let never = "/etc/rustible-test/never";
-    let mut dry = Ctx::new(
-        System::local(true, Arc::new(Collect::default())),
-        HostInfo::local(),
-    );
+    let mut dry = testing::dry(ctx);
     let r = dry.step("would touch", Command::new("touch").arg(never))?;
     assert!(r.changed && !r.is_available());
     let r = dry.step(

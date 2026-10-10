@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustible::prelude::*;
+use rustible::sdk::System;
 use rustible::sdk::backend::Local;
 use rustible::sdk::event::Collect;
-use rustible::sdk::testing::changed_then_ok;
-use rustible::sdk::{HostInfo, System};
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::{apt, shell, systemd, user};
 
 const UNIT: &str = "rustible-test";
@@ -127,7 +127,7 @@ fn user_units_of_another_account_through_as_user(ctx: &mut Ctx) -> Result<()> {
             check_mode,
             Arc::new(Collect::default()),
         );
-        Ctx::new(sys, HostInfo::local()).as_user(SVC)
+        testing::ctx(sys).as_user(SVC)
     };
     let enabled = || systemd::Enabled::new(USER_UNIT).user(true).now(true);
     let runtime_dir = format!("/run/user/{}", svc.uid);

@@ -1854,6 +1854,7 @@ impl Elevated {
     /// is how a test watches the frames. The thread ends when this is
     /// dropped and the helper sees EOF; `Elevated::quiesce` (tests) waits
     /// for that.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn in_process_with(
         user: &str,
         phase: Arc<AtomicU8>,

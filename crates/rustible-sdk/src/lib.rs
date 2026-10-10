@@ -1,6 +1,17 @@
 //! Rustible SDK: everything a playbook or an operation crate needs.
+//!
+//! The test API sits behind the `testing` feature: the container harness
+//! ([`testing`]), the `Fake` backend, and the constructors that build a
+//! `System` or a `Ctx` from parts. A crate whose tests use it enables the
+//! feature in `[dev-dependencies]` only, so no playbook binary can reach it:
+//!
+//! ```toml
+//! [dev-dependencies]
+//! rustible-sdk = { version = "X.Y", features = ["testing"] }
+//! ```
 
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // This crate implements the `Local` backend that vision 7.2's rule routes
 // everything else through, so it is the one place real filesystem and
 // process calls belong. The lint stays on for the op crates, which is where
@@ -26,6 +37,7 @@ pub mod runtime;
 pub mod secret;
 pub mod stream;
 pub mod system;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod vars;
 
