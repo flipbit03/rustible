@@ -1231,6 +1231,34 @@ impl Spawner {
             self.spawn_root(user)
         } else {
             self.spawn_streamed(user)
+                .map_err(|e| self.when_missing(user, e))
+        }
+    }
+
+    /// A helper for `user` that could not be started, explained when the
+    /// account does not exist: `id -u <user>`, run as this process's own
+    /// user, then answers non-zero, and the failure names the account
+    /// instead of quoting `sudo`'s or `doas`'s words for it, which differ
+    /// between tools and versions. Asked only after a failure, so a helper
+    /// that starts costs nothing. A method that refuses to escalate at all
+    /// (`none`, or a name it does not know) says so whatever the account,
+    /// and an `id` that cannot answer leaves the failure as it was.
+    fn when_missing(&self, user: &str, failed: io::Error) -> io::Error {
+        if launch::escalation(&self.method, user, false, false).is_err() {
+            return failed;
+        }
+        let probe = Command::new("id")
+            .args(["-u", user])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match probe {
+            Ok(status) if !status.success() => io::Error::other(HelperGone {
+                what: missing_account(user),
+                note: None,
+            }),
+            _ => failed,
         }
     }
 
@@ -1362,6 +1390,13 @@ impl Spawner {
     fn connection(&self, user: &str, child: Child) -> Connection {
         Started::new(user, child, true, self.note.clone()).connection()
     }
+}
+
+/// The failure of a helper for an account that does not exist.
+fn missing_account(user: &str) -> String {
+    format!(
+        "account `{user}` does not exist; create it in an earlier step (`user::Present`) or fix the name"
+    )
 }
 
 /// How [`Spawner::start`] starts a child.
@@ -4242,6 +4277,39 @@ mod tests {
         assert!(killed < Duration::from_secs(3), "took {killed:?}");
     }
 
+    /// A helper that cannot start names the account when `id -u` says it
+    /// does not exist, and only then: an account that exists keeps the
+    /// tool's own failure, and a method that does not escalate says so
+    /// whatever the account. `doas` cannot start anything here: absent, it
+    /// cannot be spawned; present, it refuses without a configured rule.
+    #[test]
+    fn a_helper_that_cannot_start_names_a_missing_account_and_only_then() {
+        let spawner = |method: &str| Spawner {
+            method: method.into(),
+            exe: std::env::current_exe().unwrap(),
+            password: None,
+            note: Some("a note about the login".into()),
+        };
+        let failure = |method: &str, user: &str| match spawner(method).spawn(user) {
+            Ok(_) => panic!("a helper as `{user}` started through {method}"),
+            Err(e) => e.to_string(),
+        };
+        let ghost = "rustible-no-such-account-118";
+        assert_eq!(failure("doas", ghost), missing_account(ghost));
+
+        let me = Command::new("id").arg("-un").output().unwrap();
+        let me = String::from_utf8(me.stdout).unwrap().trim().to_string();
+        let err = failure("doas", &me);
+        assert!(!err.contains("does not exist"), "{err}");
+        assert!(err.contains("doas"), "{err}");
+
+        let err = failure("none", ghost);
+        assert_eq!(
+            err,
+            format!("cannot run as `{ghost}`: this host's escalation method is `none`")
+        );
+    }
+
     /// A playbook whose `ssh_user` attribute chose the login has the
     /// escalating account's origin on every report of a dead helper,
     /// including the latched one later primitives return.
@@ -4350,10 +4418,15 @@ mod tests {
     // re-runs this binary with a stand-in first on `PATH` and the inner one
     // does the work. The stand-in drops sudo's options, checks a password
     // the way `sudo -S` does when told to, and runs the rest as the test's
-    // own user, with the `HOME` and `TMPDIR` the outer test chose.
+    // own user, with the `HOME` and `TMPDIR` the outer test chose. Every
+    // account exists but `ghost`, which it refuses as `sudo` does, and a
+    // stand-in `id` agrees.
 
     const STAND_IN_SUDO: &str = r#"#!/bin/sh
 printf 'LC_ALL=%s cwd=%s | %s\n' "$LC_ALL" "$(pwd)" "$*" >> "$RUSTIBLE_TEST_SUDO_LOG"
+case " $* " in
+  *" -u ghost "*) echo "sudo: unknown user ghost" >&2; exit 1 ;;
+esac
 case "$RUSTIBLE_TEST_NO_READY $*" in
   1*"printf I"*) ( sleep 1; kill $$ ) & exec cat > "$RUSTIBLE_TEST_DIR/early" ;;
 esac
@@ -4374,6 +4447,10 @@ fi
 exec "$@"
 "#;
 
+    /// `id -u <account>`'s stand-in, which `Spawner::when_missing` runs
+    /// when a spawn fails.
+    const STAND_IN_ID: &str = "#!/bin/sh\n[ \"$2\" = ghost ] && { echo \"id: 'ghost': no such user\" >&2; exit 1; }\necho 1000\n";
+
     /// The playbook binary's stand-in: it says where it ran from and how.
     const STAND_IN_EXE: &str = "#!/bin/sh\necho \"ran $0 $*\"\n";
 
@@ -4388,6 +4465,7 @@ exec "$@"
         // Written by a child, or a fork on another test thread can hold it
         // open for writing and the `exec` of it fails with "Text file busy".
         crate::executable::write(&bin.join("sudo"), STAND_IN_SUDO.as_bytes(), 0o755);
+        crate::executable::write(&bin.join("id"), STAND_IN_ID.as_bytes(), 0o755);
         for d in ["home", "tmp"] {
             std::fs::create_dir(dir.path().join(d)).unwrap();
         }
@@ -4456,6 +4534,11 @@ exec "$@"
     #[test]
     fn no_byte_of_the_binary_is_written_before_the_install_answers() {
         behind_stand_in_sudo("no-ready");
+    }
+
+    #[test]
+    fn sudo_refusing_an_account_that_does_not_exist_names_the_account() {
+        behind_stand_in_sudo("missing");
     }
 
     /// The inner half of the tests above.
@@ -4643,6 +4726,22 @@ exec "$@"
                 assert!(err.to_string().starts_with("helper exited "), "{err}");
                 let early = std::fs::read(dir.join("early")).unwrap();
                 assert!(early.is_empty(), "{} bytes sent before `I`", early.len());
+            }
+            "missing" => {
+                // `sudo: unknown user ghost` is not what the step reads.
+                let Err(err) = spawner(None).spawn("ghost") else {
+                    panic!("spawned")
+                };
+                assert_eq!(err.to_string(), missing_account("ghost"));
+                assert_eq!(spawns(), ["try"]);
+                // With a password too, which `sudo` never reads: it refuses
+                // the account first.
+                // SAFETY: the inner test runs alone in its process.
+                unsafe { std::env::set_var("RUSTIBLE_TEST_PASSWORD", "right") };
+                let Err(err) = spawner(Some("right")).spawn("ghost") else {
+                    panic!("spawned")
+                };
+                assert_eq!(err.to_string(), missing_account("ghost"));
             }
             other => panic!("unknown case {other}"),
         }

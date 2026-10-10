@@ -362,6 +362,40 @@ impl System {
         s
     }
 
+    /// This handle as the process's own identity, whatever it was switched
+    /// to: on a real system the escalation's local backend, so nothing goes
+    /// through a helper or `sudo`; on a `Fake` the same backend with no
+    /// `sudo -n -u` prefix, so a test plants the command as it is spawned.
+    fn as_login(&self) -> System {
+        let mut s = self.clone();
+        s.identity = Identity::Own;
+        if let Some(esc) = &self.escalation {
+            s.backend = esc.local.clone();
+        }
+        s
+    }
+
+    /// Whether the account `name` exists on this machine, by `id -u <name>`
+    /// run as the process's own identity: exit 0 is yes, any other exit is
+    /// no. `id` answers through NSS, so an LDAP account counts and macOS
+    /// answers for every account, not only the system ones `/etc/passwd`
+    /// lists. An `id` that cannot be spawned is an error naming the probe:
+    /// it says nothing about the account.
+    pub(crate) fn account_exists(&self, name: &str) -> Result<bool> {
+        let out = self
+            .as_login()
+            .cmd("id")
+            .args(["-u", name])
+            .allow_failure()
+            .run()
+            .map_err(|e| {
+                e.context(format!(
+                    "checking whether account `{name}` exists with `id -u {name}`"
+                ))
+            })?;
+        Ok(out.success())
+    }
+
     pub(crate) fn set_phase(&self, p: Phase) {
         self.phase.store(p as u8, Ordering::SeqCst);
     }

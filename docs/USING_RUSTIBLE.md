@@ -1445,10 +1445,9 @@ Under `--check`:
   `for_user(&account)`, or dry-run again once the account exists). Refusals
   about the machine itself (not root, wrong platform, a masked unit, no
   `usermod` on BusyBox, a sysctl key this kernel lacks) hold in both modes.
-- ⚠️ **`ctx.as_user(name)` needs the account to exist, under `--check` too.**
-  A dry run of a playbook that creates `name` earlier fails at the first step
-  run as `name` with `sudo: unknown user`. Dry-run again once the account
-  exists.
+- **A step under `ctx.as_user(name)` waits for an account that does not
+  exist yet:** `would change`, ``waits for account `name` ``. A direct
+  `ctx.as_user(name).sys()` call still fails.
 - **Nothing outside the target is contacted.** A step whose answer is remote,
   such as `http::Request` (any method) or `rustible_github::UserKeys`,
   reports `would change` with no output.
