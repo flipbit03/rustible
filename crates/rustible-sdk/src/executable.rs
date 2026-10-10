@@ -13,6 +13,10 @@
 //! a pipe, and both have exited before [`write`] returns. This process never
 //! holds the descriptor, so nothing it forks can inherit one, and the race is
 //! closed rather than made rarer.
+//!
+//! `rustible-cli` has a copy, `write_executable` in `run.rs`'s tests, for its
+//! own stand-in `sudo`. One helper for both crates would have to be a public
+//! item of this crate, which is SDK surface, so each crate keeps its own.
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
