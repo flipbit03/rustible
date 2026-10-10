@@ -156,6 +156,18 @@ pub(crate) fn check_relative(requested: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// [`check_relative`] for a fetch destination, which must also name a
+/// file: `.`, or a path ending in `..`, does not. Applied on the target
+/// before a fetch reads anything, and by [`WorkspaceFiles::resolve_dest`],
+/// so both sides refuse the same strings.
+pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
+    check_relative(dest)?;
+    if Path::new(dest).file_name().is_none() {
+        return Err(format!("`{dest}` has no file name"));
+    }
+    Ok(())
+}
+
 /// The orchestrator's view of the workspace for streaming: files are served
 /// from under `root` and fetched files are written under it. A request that
 /// is absolute, contains `..`, or resolves (through a symlink) outside the
@@ -227,7 +239,8 @@ impl WorkspaceFiles {
     /// is repeated after `create_dir_all` because the last component of the
     /// path may itself be a symlink planted in between.
     pub fn resolve_dest(&self, dest: &str) -> Result<PathBuf, String> {
-        let joined = self.relative(dest)?;
+        check_dest(dest)?;
+        let joined = self.root.join(dest);
         let Some(name) = joined.file_name() else {
             return Err(format!("`{dest}` has no file name"));
         };

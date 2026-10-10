@@ -756,9 +756,9 @@ impl Ctx {
     /// <dest> (not under --check)` and returns `Ok(())`. A malformed call is
     /// refused in both modes, before anything is read: a `remote` with no
     /// file name under a `/` destination, and a destination that is empty,
-    /// absolute or contains `..`. One that leaves the workspace through a
-    /// symlink there is refused only by a real run, since only the
-    /// receiver sees the workspace. Code that reads the fetched copy
+    /// absolute, contains `..` or names no file (`.`). One that leaves the
+    /// workspace through a symlink there is refused only by a real run,
+    /// since only the receiver sees the workspace. Code that reads the fetched copy
     /// afterwards finds it missing, or as an earlier real run left it; that
     /// is the playbook's to handle, with [`Ctx::check_mode`].
     pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
@@ -772,7 +772,7 @@ impl Ctx {
         } else {
             dest
         };
-        crate::stream::check_relative(&dest)
+        crate::stream::check_dest(&dest)
             .map_err(|reason| Error::msg(format!("fetch to `{dest}` refused: {reason}")))?;
         if self.sys.check_mode() {
             self.log(format!(
@@ -1542,12 +1542,21 @@ mod tests {
             std::fs::read(dir.path().join("exact.txt")).unwrap(),
             b"box1\n"
         );
+        let err = ctx.fetch("/etc/hostname", "../x").unwrap_err().chain();
         assert!(
-            ctx.fetch("/etc/hostname", "../x")
-                .unwrap_err()
-                .chain()
-                .contains("contains `..`")
+            err.contains("fetch to `../x` refused") && err.contains("contains `..`"),
+            "{err}"
         );
+        // A symlink out of the workspace is the receiver's to see: it is
+        // denied there, and the denial comes back as this call's error.
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let err = ctx.fetch("/etc/hostname", "escape/x").unwrap_err().chain();
+        assert!(
+            err.contains("`escape/x` denied") && err.contains("outside the workspace"),
+            "{err}"
+        );
+        assert!(!outside.path().join("x").exists());
         assert!(ctx.fetch("/missing", "out/").is_err());
     }
 
@@ -1656,6 +1665,16 @@ mod tests {
         let err = ctx.fetch("/", "out/").unwrap_err().chain();
         assert!(err.contains("`/` has no file name"), "{err}");
 
+        // A symlink out of the workspace needs the workspace to see, so a
+        // dry run, which sends nothing, does not refuse it (the rustdoc
+        // says so); a real run does.
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        ctx.fetch("/etc/hostname", "escape/x").unwrap();
+        assert!(!outside.path().join("x").exists());
+        assert!(fake.reads().is_empty(), "{:?}", fake.reads());
+        std::fs::remove_file(dir.path().join("escape")).unwrap();
+
         // A destination outside the workspace is malformed: refused in both
         // modes, on the target, before anything is read.
         for check in [true, false] {
@@ -1674,10 +1693,12 @@ mod tests {
 
     /// Destinations the target refuses by itself, and a word of each
     /// refusal.
-    const MALFORMED_DESTS: [(&str, &str); 3] = [
+    const MALFORMED_DESTS: [(&str, &str); 5] = [
         ("../x", "contains `..`"),
         ("/tmp/x", "is absolute"),
         ("", "empty path"),
+        (".", "has no file name"),
+        ("./.", "has no file name"),
     ];
 
     /// Every one of [`MALFORMED_DESTS`] fails `ctx.fetch` as a refusal of
