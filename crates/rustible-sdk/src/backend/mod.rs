@@ -94,7 +94,7 @@ pub struct CmdSpec {
 impl CmdSpec {
     /// The argument vector actually executed: [`prefix`](Self::prefix), then
     /// [`program`](Self::program), then [`args`](Self::args). Error messages
-    /// and [`Fake::argvs`] show this, so it is what a test asserts on.
+    /// and `Fake::argvs` show this, so it is what a test asserts on.
     pub fn argv(&self) -> Vec<String> {
         let mut v = self.prefix.clone();
         v.push(self.program.clone());

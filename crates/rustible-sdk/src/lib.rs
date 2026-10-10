@@ -1,7 +1,7 @@
 //! Rustible SDK: everything a playbook or an operation crate needs.
 //!
 //! The test API sits behind the `testing` feature: the container harness
-//! ([`testing`]), the `Fake` backend, and the constructors that build a
+//! (the `testing` module), the `Fake` backend, and the constructors that build a
 //! `System` or a `Ctx` from parts. A crate whose tests use it enables the
 //! feature in `[dev-dependencies]` only, so no playbook binary can reach it:
 //!

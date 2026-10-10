@@ -43,9 +43,11 @@ jobs:
 
       # The libraries as a playbook links them: no dev-dependency is built,
       # so the `testing` feature is off and the test API is compiled out.
-      # The line above builds them with it on, through the dev-dependencies.
+      # The line above builds them with it on, through the dev-dependencies,
+      # and this is the only build that would catch a library (a collection
+      # above all) calling the test API outside its tests.
       - name: Clippy, default features (the test API compiled out)
-        run: cargo clippy -p rustible-sdk -p rustible -- -D warnings
+        run: cargo clippy -p rustible-sdk -p rustible -p rustible-std -p rustible-github -- -D warnings
 
       # `--lib` keeps the `rustible` facade crate's docs from colliding with
       # the `rustible` binary of rustible-cli in the output directory.

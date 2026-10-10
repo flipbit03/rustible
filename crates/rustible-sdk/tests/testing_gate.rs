@@ -1,13 +1,15 @@
 //! The test API is unreachable without the `testing` feature (T1).
 //!
-//! A crate that depends on `rustible-sdk` and `rustible` with default
-//! features, as every playbook and every collection's normal build does,
-//! cannot name any of it; the same crate with the feature on can, and even
-//! then cannot build a `Ctx` with `Ctx::new`. This spawns `cargo check` on a
-//! scratch crate outside this workspace, because inside it a `cargo test`
-//! turns the feature on for everything: the members' dev-dependencies enable
-//! it, and features unify across one build. So the check fails if `testing`
-//! becomes a default feature, or if an item loses its gate.
+//! A crate that depends on `rustible-sdk`, `rustible` and `rustible-github`
+//! with default features, as every playbook and every collection's normal
+//! build does, cannot name any of it; the same crate with the feature on
+//! can, and even then cannot build a `Ctx` with `Ctx::new`, `with_channel`
+//! or `for_run`. This spawns `cargo check` on a scratch crate outside this
+//! workspace, because inside it a `cargo test` turns the feature on for
+//! everything: the members' dev-dependencies enable it, and features unify
+//! across one build. So the check fails if `testing` becomes a default
+//! feature, if a library turns it on in `[dependencies]`, or if an item
+//! loses its gate.
 
 // This lays out a scratch crate and runs cargo on the test machine. Vision
 // 7.2's `sys` rule governs operations running on a target, not a harness
@@ -31,9 +33,14 @@ const GATED: [&str; 9] = [
     "let _ = rustible_sdk::launch::Launch::with_suffix;",
 ];
 
-/// Private with or without the feature: a test builds its `Ctx` with
-/// `testing::ctx`.
-const CTX_NEW: &str = "let _ = rustible_sdk::Ctx::new;";
+/// The `Ctx` constructors, private with or without the feature: a test
+/// builds its `Ctx` with `testing::ctx`, and a run is handed one. Without
+/// the feature `new` and `with_channel` do not exist at all.
+const PRIVATE: [&str; 3] = [
+    "let _ = rustible_sdk::Ctx::new;",
+    "let _ = rustible_sdk::Ctx::with_channel;",
+    "let _ = rustible_sdk::Ctx::for_run;",
+];
 
 /// After `main`: the facade's re-export of the attribute, gated itself so a
 /// missing feature fails where the author wrote it.
@@ -45,30 +52,38 @@ const ATTRIBUTE: &str = "#[rustible::integration_test(images = [\"debian:12\"])]
 /// else means the scratch crate is broken, not that the gate held.
 const NOT_FOUND: [&str; 4] = ["E0425", "E0432", "E0433", "E0599"];
 
+/// What rustc reports for a private associated function.
+const PRIVATE_FN: &str = "E0624";
+
 #[test]
 fn the_test_api_needs_the_testing_feature() {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("testing-gate");
-    let mut lines = GATED.to_vec();
-    lines.push(CTX_NEW);
+    let lines: Vec<&str> = GATED.iter().chain(&PRIVATE).copied().collect();
     // `fn main() {` is line 1, so `lines[i]` is line `i + 2`; then the
     // closing brace and a blank line, then the attribute.
-    let ctx_new_line = lines.len() + 1;
+    let line_of = |i: usize| i + 2;
+    let private_lines: Vec<usize> = (GATED.len()..lines.len()).map(line_of).collect();
     let attribute_line = lines.len() + 4;
 
     // Default features: every line fails, each at its own line, and only
-    // because the name is not there.
+    // because the name is not there (or, for a constructor, is private).
     let out = check(&tmp, "default", "", &lines);
     out.expect_compile_errors();
-    let mut expected: Vec<(usize, &str)> = (0..lines.len()).map(|i| (i + 2, lines[i])).collect();
+    let mut expected: Vec<(usize, &str)> =
+        (0..lines.len()).map(|i| (line_of(i), lines[i])).collect();
     expected.push((attribute_line, "#[rustible::integration_test]"));
     for (line, what) in &expected {
+        let allowed = |e: &&str| {
+            NOT_FOUND.iter().any(|c| e.contains(c))
+                || (private_lines.contains(line) && e.contains(PRIVATE_FN))
+        };
         match out.errors_at(*line).as_slice() {
             [] => panic!(
                 "`{what}` compiled without the `testing` feature (no error at \
                  src/main.rs:{line}); the gate is gone:\n{}",
                 out.stderr
             ),
-            errs if !errs.iter().all(|e| NOT_FOUND.iter().any(|c| e.contains(c))) => panic!(
+            errs if !errs.iter().all(allowed) => panic!(
                 "`{what}` failed without the `testing` feature, but not because it was \
                  not found, so this says nothing about the gate:\n{}",
                 out.stderr
@@ -85,17 +100,19 @@ fn the_test_api_needs_the_testing_feature() {
         out.stderr
     );
 
-    // With the feature: everything resolves but `Ctx::new`, which is
-    // private whatever the features.
+    // With the feature: everything resolves but the `Ctx` constructors,
+    // which are private whatever the features.
     let out = check(&tmp, "testing", r#", features = ["testing"]"#, &lines);
     out.expect_compile_errors();
-    out.expect_no_errors_but_at(&[ctx_new_line]);
-    let errs = out.errors_at(ctx_new_line);
-    assert!(
-        !errs.is_empty() && errs.iter().all(|e| e.contains("E0624")),
-        "with `testing`, `Ctx::new` must still fail as private (E0624):\n{}",
-        out.stderr
-    );
+    out.expect_no_errors_but_at(&private_lines);
+    for (line, what) in private_lines.iter().zip(PRIVATE) {
+        let errs = out.errors_at(*line);
+        assert!(
+            !errs.is_empty() && errs.iter().all(|e| e.contains(PRIVATE_FN)),
+            "with `testing`, `{what}` must still fail as private ({PRIVATE_FN}):\n{}",
+            out.stderr
+        );
+    }
 }
 
 /// The outcome of one `cargo check` of the scratch crate.
@@ -149,10 +166,13 @@ impl Checked {
 /// `cargo check` a binary crate in `<tmp>/<name>` whose `main` holds
 /// `lines`, followed by [`ATTRIBUTE`], depending on this checkout's
 /// `rustible-sdk` and `rustible` by path, with `features` appended to both
-/// dependencies.
+/// dependencies, and on `rustible-github` as a collection is used, with no
+/// features: if it turned `testing` on for itself, the default build would
+/// see the test API.
 fn check(tmp: &Path, name: &str, features: &str, lines: &[&str]) -> Checked {
     let sdk = Path::new(env!("CARGO_MANIFEST_DIR"));
     let facade = sdk.join("../rustible");
+    let github = sdk.join("../rustible-github");
     let dir = tmp.join(name);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -161,7 +181,8 @@ fn check(tmp: &Path, name: &str, features: &str, lines: &[&str]) -> Checked {
             "[package]\nname = \"gate-{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
              publish = false\n\n[dependencies]\n\
              rustible-sdk = {{ path = {sdk:?}{features} }}\n\
-             rustible = {{ path = {facade:?}{features} }}\n\n\
+             rustible = {{ path = {facade:?}{features} }}\n\
+             rustible-github = {{ path = {github:?} }}\n\n\
              # Not part of the workspace this sits under.\n[workspace]\n"
         ),
     )

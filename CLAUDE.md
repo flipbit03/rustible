@@ -249,7 +249,7 @@ which is these, in the order that fails soonest:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p rustible-sdk -p rustible -- -D warnings      # the test API compiled out
+cargo clippy -p rustible-sdk -p rustible -p rustible-std -p rustible-github -- -D warnings   # the test API compiled out
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib --all-features
 cargo build --manifest-path examples/workspace/Cargo.toml
@@ -527,6 +527,7 @@ start using it needs the same line there, never in `[dependencies]`:
 ```toml
 [dev-dependencies]
 rustible-sdk = { workspace = true, features = ["testing"] }
+rustible = { path = "../rustible", features = ["testing"] }  # only for #[rustible::integration_test]
 ```
 
 **T2 lives in `crates/rustible-std/tests/it_<op>.rs`** — usually one file

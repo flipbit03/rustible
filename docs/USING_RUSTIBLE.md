@@ -1519,15 +1519,16 @@ Its tests reach the test API, which is the `Fake` backend, `System::fake`,
 `event::Collect`, `testing::ctx` and `testing::dry`, and
 `#[rustible::integration_test]`, through the `testing` feature. Enable it in
 `[dev-dependencies]` only, at the same version as the normal dependency, so
-nothing a playbook builds contains it:
+nothing a playbook builds contains it. `X.Y.Z` is the release your workspace
+uses, `$V` in "Upgrading Rustible and a workspace":
 
 ```toml
 [dependencies]
-rustible-sdk = "0.5.0"
+rustible-sdk = "X.Y.Z"
 
 [dev-dependencies]
-rustible-sdk = { version = "0.5.0", features = ["testing"] }
-rustible = { version = "0.5.0", features = ["testing"] }  # only for #[rustible::integration_test]
+rustible-sdk = { version = "X.Y.Z", features = ["testing"] }
+rustible = { version = "X.Y.Z", features = ["testing"] }  # only for #[rustible::integration_test]
 ```
 
 Without it the compiler says ``could not find `testing` in `rustible_sdk` ``

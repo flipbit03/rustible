@@ -350,8 +350,10 @@ impl<W: Write> Renderer<W> {
                 let st = self.state(host);
                 // Its chain printed before this frame, and its command with
                 // it, when a later step began or just now by the flush. A
-                // frame that took the held chain prints the command, even
-                // beside a twin from another `Ctx` printed with the same key.
+                // frame that took the held chain prints the command. (The
+                // `pending.is_none()` clause matters only if another failure
+                // was printed under the same key, which needs a second `Ctx`
+                // family; a run has one, so it is a guard, kept untested.)
                 // One with no id names the step only by name, which another
                 // failure can borrow, so the command must be the same too.
                 let printed = match &key {
