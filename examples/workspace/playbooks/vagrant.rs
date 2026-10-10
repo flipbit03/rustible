@@ -128,9 +128,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         let copy = format!("/home/{LOGIN_ACCOUNT}/large-copy");
         let mut login = ctx.as_user(LOGIN_ACCOUNT);
         login.step(format!("50 MiB copy as {LOGIN_ACCOUNT}"), file::Copy::from_local_path(LARGE).to(&copy))?;
-        if !login.check_mode() {
-            login.fetch(&copy, FETCHED)?;
-        }
+        login.fetch(&copy, FETCHED)?;
     }
 
     // The 50 MiB file as a tarball member, made by the guest's own `tar`:

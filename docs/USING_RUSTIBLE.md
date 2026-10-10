@@ -555,7 +555,8 @@ it is zeroized on drop, and its `Debug` prints `Secret(<n> bytes)`.
 `ctx.fetch` goes the other way. `local_dest` is relative to the workspace
 root, and anything outside it is refused. With a trailing `/` the file lands
 at `<dest>/<host>/<file>`; without one, every host writes the same path. The
-destination is replaced only once the whole file has arrived.
+destination is replaced only once the whole file has arrived. Under `--check`
+it does nothing (§15).
 
 ## 9. Reading what a step returns
 
@@ -1455,6 +1456,7 @@ Under `--check`:
   lists are older than the age you gave (with `Duration::ZERO`, always), the
   step reports `would change` with "candidate versions unknown"; a real run
   refreshes and decides.
+- **`ctx.fetch` does nothing.** It logs what it would fetch, and to where.
 
 **`.changed` is `true` in check mode** when the step would have changed
 something. So `if conf.changed { ... reload ... }` fires under `--check` too,

@@ -125,6 +125,49 @@ impl<R: Read> Iterator for Chunks<R> {
     }
 }
 
+/// The lexical half of the workspace's confinement: `requested` is
+/// relative, not empty, and has no `..`, prefix or root component. A pure
+/// function of the string, so the target applies it too, before a fetch
+/// reads anything (`Ctx::fetch`); a symlink escape needs the workspace
+/// itself and is caught only by [`WorkspaceFiles`].
+pub(crate) fn check_relative(requested: &str) -> Result<(), String> {
+    let p = Path::new(requested);
+    if requested.is_empty() {
+        return Err("empty path".into());
+    }
+    if p.is_absolute() {
+        return Err(format!(
+            "`{requested}` is absolute; paths are relative to the workspace root"
+        ));
+    }
+    for c in p.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "`{requested}` contains `..`; only paths inside the workspace are served"
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("`{requested}` is not a relative path"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`check_relative`] for a fetch destination, which must also name a
+/// file: `.`, or a path ending in `..`, does not. Applied on the target
+/// before a fetch reads anything, and by [`WorkspaceFiles::resolve_dest`],
+/// so both sides refuse the same strings.
+pub(crate) fn check_dest(dest: &str) -> Result<(), String> {
+    check_relative(dest)?;
+    if Path::new(dest).file_name().is_none() {
+        return Err(format!("`{dest}` has no file name"));
+    }
+    Ok(())
+}
+
 /// The orchestrator's view of the workspace for streaming: files are served
 /// from under `root` and fetched files are written under it. A request that
 /// is absolute, contains `..`, or resolves (through a symlink) outside the
@@ -150,32 +193,11 @@ impl WorkspaceFiles {
         &self.root
     }
 
-    /// Lexical check shared by reads and writes: relative, no `..`, no
-    /// prefix or root components.
+    /// Lexical check shared by reads and writes ([`check_relative`]),
+    /// joined onto the root.
     fn relative(&self, requested: &str) -> Result<PathBuf, String> {
-        let p = Path::new(requested);
-        if requested.is_empty() {
-            return Err("empty path".into());
-        }
-        if p.is_absolute() {
-            return Err(format!(
-                "`{requested}` is absolute; paths are relative to the workspace root"
-            ));
-        }
-        for c in p.components() {
-            match c {
-                Component::Normal(_) | Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err(format!(
-                        "`{requested}` contains `..`; only paths inside the workspace are served"
-                    ));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(format!("`{requested}` is not a relative path"));
-                }
-            }
-        }
-        Ok(self.root.join(p))
+        check_relative(requested)?;
+        Ok(self.root.join(requested))
     }
 
     /// Resolve a `FileRequest` path to a regular file inside the root.
@@ -217,7 +239,8 @@ impl WorkspaceFiles {
     /// is repeated after `create_dir_all` because the last component of the
     /// path may itself be a symlink planted in between.
     pub fn resolve_dest(&self, dest: &str) -> Result<PathBuf, String> {
-        let joined = self.relative(dest)?;
+        check_dest(dest)?;
+        let joined = self.root.join(dest);
         let Some(name) = joined.file_name() else {
             return Err(format!("`{dest}` has no file name"));
         };
