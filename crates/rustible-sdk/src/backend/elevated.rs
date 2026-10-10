@@ -1780,6 +1780,10 @@ pub struct Elevated {
     /// The most bytes this side puts in one chunk of a write or of a
     /// command's stdin: [`CHUNK_SIZE`], lowered by tests.
     chunk: usize,
+    /// The thread an in-process helper runs on, so a test can wait for it
+    /// to finish ([`Elevated::quiesce`]).
+    #[cfg(test)]
+    helper: Option<std::thread::JoinHandle<()>>,
 }
 
 /// A mutex's guard whether or not another thread panicked holding it. The
@@ -1807,6 +1811,8 @@ impl Elevated {
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
             chunk: CHUNK_SIZE,
+            #[cfg(test)]
+            helper: None,
         }
     }
 
@@ -1836,6 +1842,8 @@ impl Elevated {
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
             chunk: CHUNK_SIZE,
+            #[cfg(test)]
+            helper: None,
         }
     }
 
@@ -1844,7 +1852,8 @@ impl Elevated {
     /// [`Local`], as this process's own user, without `sudo`. `wrap_tx` and
     /// `wrap_rx` may put something between this side and the pipes, which
     /// is how a test watches the frames. The thread ends when this is
-    /// dropped and the helper sees EOF.
+    /// dropped and the helper sees EOF; [`Elevated::quiesce`] waits for
+    /// that.
     pub(crate) fn in_process_with(
         user: &str,
         phase: Arc<AtomicU8>,
@@ -1854,14 +1863,35 @@ impl Elevated {
     ) -> io::Result<Elevated> {
         let (req_r, req_w) = io::pipe()?;
         let (resp_r, resp_w) = io::pipe()?;
-        std::thread::spawn(move || {
+        let helper = std::thread::spawn(move || {
             let (mut rx, mut tx) = (req_r, resp_w);
             let _ = serve(&mut rx, &mut tx, limits);
         });
         let mut e = Elevated::connected(user, wrap_tx(req_w), wrap_rx(resp_r), phase);
         e.max_frame = limits.frame;
         e.chunk = limits.chunk;
+        #[cfg(test)]
+        {
+            e.helper = Some(helper);
+        }
+        #[cfg(not(test))]
+        drop(helper);
         Ok(e)
+    }
+
+    /// Close the connection and wait for an in-process helper's thread to
+    /// end, so everything it frees on the way out is freed before this
+    /// returns. A test that watches freed memory ([`crate::freed`]) calls
+    /// this inside its watched window: what the helper drops once it sees
+    /// EOF is then counted against the test that started it, rather than
+    /// landing in whichever test watches next.
+    #[cfg(test)]
+    pub(crate) fn quiesce(mut self) {
+        let helper = self.helper.take();
+        drop(self);
+        if let Some(helper) = helper {
+            helper.join().expect("the in-process helper panicked");
+        }
     }
 
     /// The user the helper runs as, as messages name it. Never the calling
@@ -2792,9 +2822,9 @@ mod tests {
             let mut got = Zeroizing::new(Vec::with_capacity(2 * body.len()));
             e.open_read(&f).unwrap().read_to_end(&mut got).unwrap();
             assert!(*got == body);
-            // One more round trip, inside the window: the helper answers it
-            // only after it has dropped what it held for the last one.
-            e.stat(&f).unwrap();
+            // The helper's own teardown, inside the window too: it is this
+            // test's, and must not run on into the next test that watches.
+            e.quiesce();
         });
         assert_eq!(left, 0, "buffers freed with the file in them");
     }
@@ -4081,6 +4111,7 @@ mod tests {
             failed: Mutex::new(None),
             max_frame: MAX_FRAME,
             chunk: CHUNK_SIZE,
+            helper: None,
         }
     }
 

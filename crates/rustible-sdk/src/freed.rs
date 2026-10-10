@@ -8,6 +8,10 @@
 //! `realloc` is left to `GlobalAlloc`'s default, which allocates the new
 //! buffer, copies, and frees the old one through `dealloc`, so a `Vec` that
 //! grows is seen too.
+//!
+//! The look covers the whole buffer, spare capacity included, so every
+//! buffer starts zeroed: what one holds when it is freed was written into
+//! it, never left there by an earlier owner of the same memory.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -32,11 +36,18 @@ fn holds(buf: &[u8], needle: &[u8]) -> bool {
     buf.windows(needle.len()).any(|w| w == needle)
 }
 
-// SAFETY: every call goes to `System` unchanged; `dealloc` only reads the
+// SAFETY: every call goes to `System` with its layout unchanged, `alloc` to
+// `alloc_zeroed`, which meets the same contract; `dealloc` only reads the
 // buffer it is handed, which is still allocated and `layout.size()` long.
 unsafe impl GlobalAlloc for Probe {
+    /// Zeroed, so what a buffer holds when it is freed was written into it
+    /// by whoever allocated it. `dealloc` looks at the whole buffer, spare
+    /// capacity included, and memory from the system allocator still holds
+    /// whatever was last freed there: a buffer that never held the marker
+    /// would otherwise be counted for marker data an earlier test freed
+    /// unwiped into the same memory, in whatever test watches next (#110).
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
