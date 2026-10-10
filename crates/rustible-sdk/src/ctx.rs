@@ -753,11 +753,14 @@ impl Ctx {
     ///
     /// Under `--check` it does nothing: it reads nothing on the target,
     /// writes nothing to the workspace, logs `would fetch <remote> to
-    /// <dest> (not under --check)` and returns `Ok(())`. A `remote` with no
-    /// file name under a `/` destination is still refused. Code that reads
-    /// the fetched copy afterwards finds it missing, or as an earlier real
-    /// run left it; that is the playbook's to handle, with
-    /// [`Ctx::check_mode`].
+    /// <dest> (not under --check)` and returns `Ok(())`. A malformed call is
+    /// refused in both modes, before anything is read: a `remote` with no
+    /// file name under a `/` destination, and a destination that is empty,
+    /// absolute or contains `..`. One that leaves the workspace through a
+    /// symlink there is refused only by a real run, since only the
+    /// receiver sees the workspace. Code that reads the fetched copy
+    /// afterwards finds it missing, or as an earlier real run left it; that
+    /// is the playbook's to handle, with [`Ctx::check_mode`].
     pub fn fetch(&mut self, remote: impl AsRef<Path>, local_dest: impl AsRef<Path>) -> Result<()> {
         let remote = remote.as_ref();
         let dest = path_str(local_dest.as_ref());
@@ -769,6 +772,8 @@ impl Ctx {
         } else {
             dest
         };
+        crate::stream::check_relative(&dest)
+            .map_err(|reason| Error::msg(format!("fetch to `{dest}` refused: {reason}")))?;
         if self.sys.check_mode() {
             self.log(format!(
                 "would fetch {} to {dest} (not under --check)",
@@ -1541,7 +1546,7 @@ mod tests {
             ctx.fetch("/etc/hostname", "../x")
                 .unwrap_err()
                 .chain()
-                .contains("denied")
+                .contains("contains `..`")
         );
         assert!(ctx.fetch("/missing", "out/").is_err());
     }
@@ -1650,6 +1655,41 @@ mod tests {
 
         let err = ctx.fetch("/", "out/").unwrap_err().chain();
         assert!(err.contains("`/` has no file name"), "{err}");
+
+        // A destination outside the workspace is malformed: refused in both
+        // modes, on the target, before anything is read.
+        for check in [true, false] {
+            let fake = Arc::new(Fake::new().with_file("/etc/hostname", "box1\n"));
+            let sink = Arc::new(Collect::default());
+            let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(check);
+            let (channel, _feeder) =
+                Channel::local(crate::stream::WorkspaceFiles::new(dir.path()).unwrap());
+            let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+            assert_malformed_dests_refused(&mut ctx, check);
+            assert!(fake.reads().is_empty(), "check={check}: {:?}", fake.reads());
+            assert_eq!(walkdir(dir.path()), Vec::<PathBuf>::new(), "check={check}");
+            assert_eq!(infos(&sink), Vec::<String>::new(), "check={check}");
+        }
+    }
+
+    /// Destinations the target refuses by itself, and a word of each
+    /// refusal.
+    const MALFORMED_DESTS: [(&str, &str); 3] = [
+        ("../x", "contains `..`"),
+        ("/tmp/x", "is absolute"),
+        ("", "empty path"),
+    ];
+
+    /// Every one of [`MALFORMED_DESTS`] fails `ctx.fetch` as a refusal of
+    /// the destination itself.
+    fn assert_malformed_dests_refused(ctx: &mut Ctx, check: bool) {
+        for (dest, why) in MALFORMED_DESTS {
+            let err = ctx.fetch("/etc/hostname", dest).unwrap_err().chain();
+            assert!(
+                err.contains(&format!("fetch to `{dest}` refused")) && err.contains(why),
+                "check={check} dest={dest:?}: {err}"
+            );
+        }
     }
 
     /// Under `--check`, `ctx.fetch` through the orchestrated channel sends
@@ -1671,10 +1711,33 @@ mod tests {
             infos(&sink),
             ["would fetch /var/log/big to out/local/big (not under --check)"]
         );
+        assert_eq!(
+            serde_json::to_value(ctx.summary()).unwrap(),
+            serde_json::to_value(Summary::default()).unwrap(),
+            "no counter moves"
+        );
 
         let err = ctx.fetch("/", "out/").unwrap_err().chain();
         assert!(err.contains("`/` has no file name"), "{err}");
         assert!(up.0.lock().unwrap().is_empty(), "nothing sent");
+
+        // A destination outside the workspace is malformed: refused in both
+        // modes, on the target, before anything is read or sent.
+        for check in [true, false] {
+            let fake = Arc::new(Fake::new().with_file("/etc/hostname", "box1\n"));
+            let sink = Arc::new(Collect::default());
+            let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(check);
+            let up = Arc::new(CaptureUp(std::sync::Mutex::new(vec![])));
+            let (channel, _feeder) = Channel::remote(up.clone());
+            let mut ctx = Ctx::with_channel(sys, HostInfo::local(), channel);
+            assert_malformed_dests_refused(&mut ctx, check);
+            assert!(fake.reads().is_empty(), "check={check}: {:?}", fake.reads());
+            assert!(
+                up.0.lock().unwrap().is_empty(),
+                "check={check}: nothing sent"
+            );
+            assert_eq!(infos(&sink), Vec::<String>::new(), "check={check}");
+        }
     }
 
     // ---- ctx.block ----
