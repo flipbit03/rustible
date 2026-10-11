@@ -540,7 +540,7 @@ host "h" connection="local"
         src,
         10,
         1,
-        "host `h`: var `x` is defined by both group `a` and group `b` at the same distance; set it on host `h` or on a common parent group",
+        "host `h`: var `x` is defined by both group `a` and group `b` at the same distance; set it on host `h`, or keep it on only one of the two groups",
     );
 }
 
@@ -561,6 +561,41 @@ host "h" connection="local" {
 }
 "#,
     );
+    let r = inv.resolve("h").unwrap();
+    assert_eq!(r.vars["x"], Scalar::Int(3));
+    assert_eq!(r.sources.vars["x"], Source::Host);
+}
+
+/// A common parent is farther from the host than the two groups it
+/// contains, so setting the key there leaves the tie in place; only the host
+/// (or dropping it from one of the two) breaks it. The message must not
+/// suggest the parent.
+#[test]
+fn sibling_conflict_survives_a_common_parent_and_yields_to_the_host() {
+    let groups = r#"
+group "top" {
+    members "a" "b"
+    vars { x 0 }
+}
+group "a" {
+    members "h"
+    vars { x 1 }
+}
+group "b" {
+    members "h"
+    vars { x 2 }
+}
+"#;
+    one_error(
+        &format!("{groups}host \"h\" connection=\"local\"\n"),
+        14,
+        1,
+        "host `h`: var `x` is defined by both group `a` and group `b` at the same distance; set it on host `h`, or keep it on only one of the two groups",
+    );
+
+    let inv = load(&format!(
+        "{groups}host \"h\" connection=\"local\" {{\n    vars {{ x 3 }}\n}}\n"
+    ));
     let r = inv.resolve("h").unwrap();
     assert_eq!(r.vars["x"], Scalar::Int(3));
     assert_eq!(r.sources.vars["x"], Source::Host);
@@ -604,7 +639,7 @@ host "h" addr="x"
         src,
         8,
         1,
-        "host `h`: parameter `port` is defined by both group `a` and group `b` at the same distance; set it on host `h` or on a common parent group",
+        "host `h`: parameter `port` is defined by both group `a` and group `b` at the same distance; set it on host `h`, or keep it on only one of the two groups",
     );
 }
 

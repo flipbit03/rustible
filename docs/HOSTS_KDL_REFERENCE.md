@@ -171,8 +171,15 @@ group "monitored" {
 
 A host in several groups inherits from the nearest; a cycle is a load error.
 Two groups at the same distance that both set a var or parameter, with nothing
-nearer setting it, are a load error; set it on the host, or move it from both
-groups to one that contains them.
+nearer setting it, are a load error. Had `web` and `monitored` above both set
+`log_level`, loading would fail at `web1` with:
+
+```
+host `web1`: var `log_level` is defined by both group `web` and group `monitored` at the same distance; set it on host `web1`, or keep it on only one of the two groups
+```
+
+Setting it on a group that contains both does not help: that group is farther
+from the host than either.
 
 ## Commenting a host out
 
