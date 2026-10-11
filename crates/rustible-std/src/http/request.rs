@@ -1,11 +1,12 @@
 //! [`Request`]: one HTTP request, as a step or from an operation's own
 //! code. Ansible's `ansible.builtin.uri`.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustible_sdk::mask::PLACEHOLDER;
+use rustible_sdk::mask::{self, PLACEHOLDER};
 use rustible_sdk::prelude::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -100,14 +101,11 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// `user:********@` wherever the URL is printed. Each of these, the Basic
 /// pair as it is encoded, and the URL's password are registered with the
 /// run's [masker](rustible_sdk::mask), so every event the run emits shows
-/// `<secret>` where one appears: a server's answer quoted in a status
-/// failure, or a body the diff shows, raw, as `.json` writes it, or as
-/// `.form` writes it. A secret that straddles the 2 KiB of a body the diff
-/// shows or the 512 bytes of an answer an error quotes, or that holds
-/// characters the quote or the diff rewrites (whitespace runs, control or
-/// invisible formatting characters), can show in part (#134). A body given
-/// with `.json`, `.form` or `.body` is not a secret, and the diff shows it.
-/// For a body that is secret, use
+/// `<secret>` where one appears, raw, as `.json` writes it, or as `.form`
+/// writes it: in a server's answer quoted in a status failure, or in a body
+/// the diff shows, masked whole even where the quote or the diff cuts it or
+/// escapes its characters. A body given with `.json`, `.form` or `.body` is
+/// not a secret, and the diff shows it. For a body that is secret, use
 /// [`Request::body_secret`]: to send a password in a JSON body,
 /// `.body_secret(&s).content_type("application/json")`.
 ///
@@ -951,26 +949,35 @@ fn is_json_content_type(ct: &str) -> bool {
 /// Reindenting changes only the whitespace between JSON's tokens: keys,
 /// their order, duplicates and every value are shown as they are sent. A
 /// body over [`WHOLE_BODY_BYTES`], or nested deeper than
-/// [`MAX_REINDENT_DEPTH`], is shown as it is sent. Past validation the work
-/// is bounded by what is shown, not by the body: only the start that is
-/// shown is reindented and escaped.
+/// [`MAX_REINDENT_DEPTH`], is shown as it is sent. The run's secrets are
+/// masked before the cut and the escaping. Past validation the work is
+/// bounded by what is shown and the masker's lookahead, not by the body:
+/// only that start is reindented, masked and escaped.
 fn body_summary(bytes: &[u8], content_type: Option<&str>) -> String {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return format!("<{} bytes of binary data>", bytes.len());
     };
-    let enough = SHOWN_BODY_BYTES + 1;
-    let reindented = (text.len() <= WHOLE_BODY_BYTES
-        && content_type.is_some_and(is_json_content_type))
-    .then(|| reindent_json(text, enough))
-    .flatten();
-    let (source, reformatted, mut cut) = match &reindented {
-        Some((r, true)) => (r.as_str(), r != text.trim_end(), false),
-        Some((r, false)) => (r.as_str(), !text.starts_with(r.as_str()), true),
-        None => (text, false, false),
-    };
-    let start = &source[..source.floor_char_boundary(SHOWN_BODY_BYTES)];
-    let (shown, whole) = escape_controls(start, SHOWN_BODY_BYTES);
-    cut |= start.len() < source.len() || !whole;
+    let json = text.len() <= WHOLE_BODY_BYTES && content_type.is_some_and(is_json_content_type);
+    let mut reformatted = false;
+    // Masked before the cut and the escaping, so a secret across the cut,
+    // or one holding characters the escaping rewrites, is masked whole.
+    // Reindenting changes only the whitespace between tokens, never a
+    // string, so it goes first, as far as the masker asks.
+    let (start, mut cut) = mask::apply_prefix(SHOWN_BODY_BYTES, |want| {
+        match json.then(|| reindent_json(text, want)).flatten() {
+            Some((r, whole)) => {
+                reformatted = if whole {
+                    r != text.trim_end()
+                } else {
+                    !text.starts_with(r.as_str())
+                };
+                Cow::Owned(r)
+            }
+            None => Cow::Borrowed(text),
+        }
+    });
+    let (shown, whole) = escape_controls(&start, SHOWN_BODY_BYTES);
+    cut |= !whole;
     let note = match (reformatted, cut) {
         (false, false) => return shown,
         (true, false) => "(reformatted",
@@ -1741,6 +1748,60 @@ mod tests {
         assert!(diff.contains("\"count\": 1,\n  \"id\": 210"), "{diff}");
     }
 
+    /// A secret across the 2 KiB the diff shows is masked whole, not cut in
+    /// two with its start shown: in a body shown as it is sent, and in one
+    /// reindented, however large the body.
+    #[test]
+    fn a_secret_across_the_shown_cut_is_masked_whole() {
+        const ACROSS: &str = "t0k3n-across-the-cut-and-longer-than-the-lookahead";
+        let shown = |body: String, ct: &str| {
+            let sent = body.len();
+            let op = Request::post("http://h/x")
+                .bearer(&Secret::new(ACROSS))
+                .body(body)
+                .content_type(ct);
+            (emitted_diff(op), sent)
+        };
+        let big = format!(
+            "{}{ACROSS}{}",
+            "x".repeat(SHOWN_BODY_BYTES - 5),
+            "y".repeat(300 << 10)
+        );
+        let (diff, sent) = shown(big, "text/plain");
+        assert!(!diff.contains("t0k"), "{diff}");
+        assert!(
+            diff.ends_with(&format!(
+                "{}<secret>\n... (cut for display; {sent} bytes are sent)",
+                "x".repeat(SHOWN_BODY_BYTES - 5)
+            )),
+            "{diff}"
+        );
+
+        // Reindented: `{\n  "k": "` and `",\n  "t": "` put the secret 5
+        // bytes before the cut.
+        let k = "x".repeat(SHOWN_BODY_BYTES - 25);
+        let json = serde_json::to_string(&json!({ "k": k, "t": ACROSS, "z": "z" })).unwrap();
+        let (diff, sent) = shown(json, "application/json");
+        assert!(!diff.contains("t0k"), "{diff}");
+        assert!(
+            diff.ends_with(&format!(
+                "{k}\",\n  \"t\": \"<secret>\n... (reformatted and cut for display; {sent} bytes are sent)"
+            )),
+            "{diff}"
+        );
+    }
+
+    /// A secret holding characters the diff escapes (a control character,
+    /// a bidi override) is masked before they are escaped, so it is masked
+    /// at all.
+    #[test]
+    fn a_secret_the_diff_would_escape_is_masked() {
+        let raw = "esc\x1bape\u{202e}-s3cret";
+        let _secret = Secret::new(raw);
+        let op = Request::post("http://h/x").body(format!("a {raw} b"));
+        assert_eq!(emitted_diff(op), "POST http://h/x\na <secret> b");
+    }
+
     /// A secret is masked raw, in the two JSON forms (as `.json` writes it
     /// and as an ASCII-only encoder does), and form-encoded as `.form`
     /// writes it, whatever the body's kind or content type, and in no
@@ -2372,8 +2433,8 @@ mod tests {
     /// A server that echoes the request into its error page (a `400` or a
     /// `422` often does) must not put the request's secrets into what the
     /// run emits, `StepFinished` and `--json`: every form of every secret is
-    /// masked in the quoted body. The error the playbook holds is the
-    /// server's answer as it came; the run masks it as it leaves.
+    /// masked in the quoted body. The quote is masked before it is cut, so
+    /// the error the playbook holds shows `<secret>` too.
     #[test]
     fn an_echoing_server_does_not_leak_secrets_into_the_status_error() {
         let s = serve(vec![(
@@ -2471,8 +2532,9 @@ mod tests {
         ];
         for (op, want) in cases {
             let (r, sink) = step(false, op);
-            // What the playbook holds is the server's answer as it came.
-            assert!(r.unwrap_err().chain().contains("zebra"));
+            // Masked where it is quoted: what the playbook holds, too.
+            let held = r.unwrap_err().chain();
+            assert!(held.ends_with(want), "{held}");
             let e = failure_note(&sink);
             assert!(e.ends_with(want), "{e}");
             assert!(!e.contains("zebra"), "{e}");
@@ -2492,6 +2554,69 @@ mod tests {
         let e = failure_note(&sink);
         assert!(e.ends_with("rejected <secret>"), "{e}");
         assert!(!e.contains("xyz") && !e.contains("abc"), "{e}");
+    }
+
+    /// A secret across the 512 bytes a status error quotes is masked whole:
+    /// the answer is read far enough past them to see it, and it never
+    /// shows in part, in the error the playbook holds or in what the run
+    /// emits.
+    #[test]
+    fn a_secret_across_the_quoted_cut_is_masked_whole() {
+        const ACROSS: &str = "t0k3n-across-the-cut-and-longer-than-the-lookahead";
+        let at = |before: usize| format!("{}{ACROSS}{}", "x".repeat(before), "y".repeat(5000));
+        let s = serve(vec![
+            (
+                "/fits",
+                400,
+                vec![],
+                at(QUOTED_BODY_BYTES - 12).into_bytes(),
+            ),
+            ("/over", 400, vec![], at(QUOTED_BODY_BYTES - 5).into_bytes()),
+        ]);
+        let cases = [
+            // The placeholder fits in the quote: it shows, whole.
+            (
+                "/fits",
+                format!("{}<secret>...", "x".repeat(QUOTED_BODY_BYTES - 12)),
+            ),
+            // It would not: the quote ends before it.
+            ("/over", format!("{}...", "x".repeat(QUOTED_BODY_BYTES - 5))),
+        ];
+        for (path, want) in cases {
+            let op = Request::get(s.url(path)).bearer(&Secret::new(ACROSS));
+            let (r, sink) = step(false, op);
+            let held = r.unwrap_err().chain();
+            let e = failure_note(&sink);
+            for text in [&held, &e] {
+                assert!(!text.contains("t0k"), "{text}");
+                assert!(text.ends_with(&want), "{text}");
+            }
+        }
+    }
+
+    /// A secret holding a newline, a tab, a double space and a control
+    /// character, which the quote collapses and escapes, is masked before
+    /// that, when a server echoes it back in an error.
+    #[test]
+    fn a_secret_the_quote_would_rewrite_is_masked() {
+        let raw = "multi\nline\tse  cret\x07bell";
+        let s = serve(vec![(
+            "/echo",
+            400,
+            vec![("X-Echo", String::new())],
+            vec![],
+        )]);
+        let op = Request::post(s.url("/echo")).body_secret(&Secret::new(raw));
+        let (r, sink) = step(false, op);
+        let held = r.unwrap_err().chain();
+        let e = failure_note(&sink);
+        assert_eq!(s.seen()[0].body, raw.as_bytes(), "the server got it");
+        for text in [&held, &e] {
+            assert!(text.ends_with(" <secret>"), "{text}");
+            for part in ["multi", "line", "bell", "\\u{7}"] {
+                assert!(!text.contains(part), "`{part}` in: {text}");
+            }
+        }
     }
 
     /// A failed response is quoted from its first bytes and never read to

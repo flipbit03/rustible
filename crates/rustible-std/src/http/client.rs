@@ -289,16 +289,24 @@ impl Incoming {
     /// Up to `n` bytes of the body as one line of text, for a message about
     /// a response that is already a failure: control characters escaped,
     /// whitespace runs collapsed to one space. A secret a server echoes back
-    /// is masked by the run where the message is emitted. A read error ends
-    /// it early rather than replacing the failure being reported.
+    /// is masked before the cut and the rewrite, so one across the cut, or
+    /// one holding whitespace or control characters, is masked whole; the
+    /// body is read only as far past `n` as the masker needs for that. A
+    /// read error ends it early rather than replacing the failure being
+    /// reported.
     pub(crate) fn snippet(mut self, n: usize) -> String {
         if self.head {
             return String::new();
         }
-        let mut out = Vec::new();
+        let idle = self.idle;
         let reader = self.resp.body_mut().as_reader();
-        let _ = idle_cap(self.idle, || reader.take(n as u64).read_to_end(&mut out));
-        one_line(&String::from_utf8_lossy(&out), n)
+        let (start, cut) = mask::apply_prefix(n, |want| {
+            let mut out = Vec::new();
+            let _ = idle_cap(idle, || reader.take(want as u64).read_to_end(&mut out));
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        let (line, squashed) = squash(&start, n);
+        if cut || squashed { line + "..." } else { line }
     }
 }
 
@@ -578,41 +586,56 @@ fn went_silent(e: &ureq::Error, idle: Option<Duration>) -> Option<String> {
 /// `text` as one line: control characters escaped (`\u{1b}`), every run of
 /// whitespace a single space. Only the first `max` bytes of that, then
 /// `...` when it was cut, so the result is at most `max + 3` bytes. The cut
-/// falls before a character or an escape that would not fit whole, and
-/// `text` is read only as far as the cut.
+/// falls before a character, an escape or a `<secret>` that would not fit
+/// whole, and `text` is read only as far as the cut.
 ///
 /// How a message quotes something a server sent, so that a body of any
-/// size makes a short message.
+/// size makes a short message. Text that may hold a secret goes through
+/// [`rustible_sdk::mask::apply_prefix`] first.
 pub fn one_line(text: &str, max: usize) -> String {
+    match squash(text, max) {
+        (line, true) => line + "...",
+        (line, false) => line,
+    }
+}
+
+/// [`one_line`] without the `...`: the line, and whether it was cut.
+fn squash(text: &str, max: usize) -> (String, bool) {
     let mut out = String::new();
     let mut space = false;
     let mut escape = String::new();
     let mut utf8 = [0; 4];
-    for c in text.chars() {
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
         if c.is_whitespace() {
             space = !out.is_empty();
+            rest = &rest[c.len_utf8()..];
             continue;
         }
         if space {
             if out.len() + 1 > max {
-                return out + "...";
+                return (out, true);
             }
             out.push(' ');
             space = false;
         }
-        let piece = if c.is_control() {
+        // What goes out for the text at the front, and how much text that is.
+        let (piece, read) = if rest.starts_with(mask::PLACEHOLDER) {
+            (mask::PLACEHOLDER, mask::PLACEHOLDER.len())
+        } else if c.is_control() {
             escape.clear();
             escape.extend(c.escape_default());
-            escape.as_str()
+            (escape.as_str(), c.len_utf8())
         } else {
-            &*c.encode_utf8(&mut utf8)
+            (&*c.encode_utf8(&mut utf8), c.len_utf8())
         };
         if out.len() + piece.len() > max {
-            return out + "...";
+            return (out, true);
         }
         out.push_str(piece);
+        rest = &rest[read..];
     }
-    out
+    (out, false)
 }
 
 // ---- pure ----
@@ -1124,6 +1147,11 @@ mod tests {
         assert_eq!(one_line("ab\x1bc", 8), "ab\\u{1b}...");
         for max in 2..8 {
             assert_eq!(one_line("ab\x1b", max), "ab...", "{max}");
+        }
+        // A `<secret>` is a piece of its own, too.
+        assert_eq!(one_line("ab <secret>", 11), "ab <secret>");
+        for max in 3..11 {
+            assert_eq!(one_line("ab <secret> c", max), "ab ...", "{max}");
         }
         let huge = format!("{}\x1b", "x".repeat(5 << 20));
         let line = one_line(&huge, 160);

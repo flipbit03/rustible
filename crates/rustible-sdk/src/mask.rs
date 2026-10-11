@@ -9,7 +9,8 @@
 //! the one call for a secret that arrives any other way (the password in a
 //! URL's `user:pass@`) or that an op derives itself (`Basic
 //! base64(user:pass)`, a token put in a query string). An op never masks
-//! anything itself.
+//! anything itself, with one exception: an op that cuts or reshapes text
+//! that may hold a secret before emitting it calls [`apply_prefix`] first.
 //!
 //! The rules are Ansible's `SecretMasker`
 //! (`lib/ansible/module_utils/_internal/_secrets.py`):
@@ -62,6 +63,11 @@ const MAX_SHORT_CHARS: usize = 6;
 const MAX_CHARS: usize = 65536;
 /// Stripped from both ends before a secret is registered.
 const STRIP: [char; 4] = [' ', '\t', '\r', '\n'];
+/// How far past `max` plus the longest form [`apply_prefix`] looks: a short
+/// occurrence on the cut (at most [`MAX_SHORT_CHARS`] characters of 4
+/// bytes) is masked when another touches it, which can reach the longest
+/// form past its end, and is a whole word or not by the character after it.
+const LOOKAHEAD: usize = 4 * (MAX_SHORT_CHARS + 1);
 
 /// Register `secret` with the run's masker, so that from now on every event
 /// the binary emits shows [`PLACEHOLDER`] wherever it appears, in any of
@@ -75,6 +81,47 @@ const STRIP: [char; 4] = [' ', '\t', '\r', '\n'];
 /// twice is harmless; one shorter than 4 characters is ignored.
 pub fn register(secret: &str) {
     registry().register(secret);
+}
+
+/// The start of a text, masked, for an op that cuts or reshapes text that
+/// may hold a secret before emitting it. **Call this first**, and cut or
+/// reshape only what it returns: the run masks every event as it leaves the
+/// binary, but by then a secret cut in two, or one whose whitespace or
+/// control characters were rewritten, no longer matches, and its visible
+/// part goes out as it is. Anything that is emitted as it came needs
+/// nothing.
+///
+/// `text` is called once, with the number of bytes the masker needs: the
+/// caller returns at least that many bytes of the text, or all of it when
+/// it is shorter; more is fine, and is not looked at. That is `max` and
+/// far enough past it to see whole a secret on the cut and one touching
+/// it, so a caller reading from a stream or building the text reads or
+/// builds no more than that. It returns the masked start: no more than
+/// `max` bytes of the text, cut on a character boundary, and at most `max`
+/// bytes long, except that a secret starting before the cut is kept whole
+/// as [`PLACEHOLDER`], which can run past `max` by less than its own
+/// length. The flag says whether that start is not all of the text, for
+/// the caller to say it was cut.
+///
+/// ```
+/// use rustible_sdk::mask;
+///
+/// let page = "token=0123-abcd-4567 rejected; see the log for the details";
+/// mask::register("0123-abcd-4567");
+/// let (start, cut) = mask::apply_prefix(20, |_| page);
+/// assert_eq!(start, "token=<secret>");
+/// assert!(cut);
+/// ```
+///
+/// It masks with the run's registry, as the run does where events leave,
+/// so the result is what the run would have emitted for that start.
+pub fn apply_prefix<T: AsRef<str>>(max: usize, text: impl FnOnce(usize) -> T) -> (String, bool) {
+    let registry = registry();
+    let want = max
+        .saturating_add(registry.longest())
+        .saturating_add(LOOKAHEAD);
+    let text = text(want);
+    registry.prefix(text.as_ref(), want, max)
 }
 
 /// Forget every registered secret, wiping each. The runtime calls it once
@@ -193,6 +240,62 @@ impl Registry {
         // The original may hold a secret: wipe it rather than free it as is.
         drop(Zeroizing::new(text));
         out
+    }
+
+    /// The length in bytes of the longest form registered, 0 for none.
+    fn longest(&self) -> usize {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .forms
+            .iter()
+            .map(|f| f.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`apply_prefix`] once it has the text: mask the first `want` bytes,
+    /// and keep at most `max` bytes of the text, as at most `max` bytes and
+    /// a placeholder that starts before them.
+    ///
+    /// Every occurrence that starts before `max` ends within `want`, and a
+    /// short one is seen with the character after it and with an occurrence
+    /// touching it, which decide whether it is masked. Text past `max` is
+    /// never shown, so an occurrence that the end of the window cuts in two
+    /// is never shown either.
+    fn prefix(&self, text: &str, want: usize, max: usize) -> (String, bool) {
+        let window = text
+            .get(..text.floor_char_boundary(want))
+            .unwrap_or_default();
+        let spans = {
+            let reg = self.0.read().unwrap_or_else(PoisonError::into_inner);
+            merge(window, occurrences(window, &reg.forms))
+        };
+        let mut spans = spans.into_iter();
+        let mut out = String::with_capacity(max.min(window.len()));
+        // How much of `window` is shown so far.
+        let mut at = 0;
+        loop {
+            let span = spans.next();
+            let plain_end = span.map_or(window.len(), |(start, _)| start);
+            // The text up to the next span, as far as both limits allow.
+            let stop = plain_end
+                .min(max.max(at))
+                .min(at.saturating_add(max.saturating_sub(out.len())));
+            let stop = window.floor_char_boundary(stop);
+            out.push_str(window.get(at..stop).unwrap_or_default());
+            if stop < plain_end {
+                return (out, true);
+            }
+            let Some((start, end)) = span else {
+                return (out, window.len() < text.len());
+            };
+            if start >= max || out.len() >= max {
+                return (out, true);
+            }
+            out.push_str(PLACEHOLDER);
+            at = end;
+        }
     }
 
     /// [`Registry::mask`] without waiting for the lock, for the panic hook:
@@ -840,6 +943,131 @@ mod tests {
         );
         register("this-tests-secret");
         assert_eq!(through(&sink, &collect, "this-tests-secret"), "<secret>");
+    }
+
+    // ---- apply_prefix ----
+
+    /// `apply_prefix` over `text` as a stream gives it: exactly the bytes
+    /// asked for, no more, so a test fails if the masker asks for too few.
+    fn prefix_of(text: &str, max: usize) -> (String, bool) {
+        apply_prefix(max, |want| {
+            assert!(want >= max, "asked for {want} bytes, under {max}");
+            text.get(..want.min(text.len())).unwrap().to_string()
+        })
+    }
+
+    /// A secret across the cut is masked whole, never shown in part: one
+    /// placeholder, kept whole, ends the start.
+    #[test]
+    fn a_secret_straddling_the_cut_is_masked_whole() {
+        // Longer than the lookahead alone: the masker must read past `max`
+        // by the longest form to see it whole.
+        let secret = &format!("straddling-s3cret-{}", "v".repeat(60));
+        register(secret);
+        let max = 128;
+        for before in max - secret.len() + 1..max {
+            let text = format!("{}{secret}{}", "x".repeat(before), "y".repeat(1000));
+            let (start, cut) = prefix_of(&text, max);
+            assert!(cut);
+            assert_eq!(start, format!("{}{S}", "x".repeat(before)), "{before}");
+        }
+        // Ending exactly at the end of the text: masked, and not cut.
+        let text = format!("{}{secret}", "x".repeat(50));
+        assert_eq!(
+            prefix_of(&text, 60),
+            (format!("{}{S}", "x".repeat(50)), false)
+        );
+        // Past the cut entirely: not reached, nothing of it shown.
+        let text = format!("{}{secret}", "x".repeat(max));
+        assert_eq!(prefix_of(&text, max), ("x".repeat(max), true));
+    }
+
+    /// A short secret on the cut is masked when a long one touches it past
+    /// the cut, as it would be in the whole text: the masker looks far
+    /// enough to see the long one.
+    #[test]
+    fn a_short_secret_on_the_cut_is_qualified_by_one_touching_it() {
+        register("abcdef");
+        register("LONG-SECRET-TOUCHING");
+        let max = 40;
+        let text = format!(
+            "{}zabcdefLONG-SECRET-TOUCHING{}",
+            "-".repeat(max - 2),
+            "-".repeat(500)
+        );
+        let (start, cut) = prefix_of(&text, max);
+        assert_eq!(start, format!("{}z{S}", "-".repeat(max - 2)));
+        assert!(cut);
+        // Inside a word and alone, it is not masked.
+        let text = format!("{}zabcdefz{}", "-".repeat(max - 2), "-".repeat(500));
+        assert_eq!(
+            prefix_of(&text, max).0,
+            format!("{}za", "-".repeat(max - 2))
+        );
+    }
+
+    /// Whatever the cut, a placeholder is whole or absent, the result runs
+    /// past `max` only by a placeholder that starts before it, and no
+    /// character of the secret shows.
+    #[test]
+    fn a_placeholder_is_never_split() {
+        register("pl4ceholder-secret");
+        let text = "ab pl4ceholder-secret cd pl4ceholder-secret";
+        for max in 0..=text.len() + 2 {
+            let (start, cut) = prefix_of(text, max);
+            assert!(
+                start.len() <= max || start.ends_with(S) && start.len() < max + S.len(),
+                "{max}: {start}"
+            );
+            assert!(!start.contains("pl4"), "{max}: {start}");
+            let opened = start.matches('<').count();
+            assert_eq!(opened, start.matches(S).count(), "{max}: {start}");
+            assert_eq!(cut, start != format!("ab {S} cd {S}"), "{max}: {start}");
+        }
+        // Cut on a character boundary, too.
+        assert_eq!(prefix_of("ééé", 3), ("é".to_string(), true));
+    }
+
+    /// A secret under 4 characters is not registered, so the start is the
+    /// text's own.
+    #[test]
+    fn apply_prefix_leaves_a_secret_under_four_characters() {
+        register("abc");
+        assert_eq!(prefix_of("x abc y", 100), ("x abc y".to_string(), false));
+        assert_eq!(prefix_of("x abc y", 5), ("x abc".to_string(), true));
+    }
+
+    /// Nothing registered: the start is the text cut at `max`, as it came.
+    #[test]
+    fn apply_prefix_with_nothing_registered_only_cuts() {
+        std::thread::spawn(|| {
+            assert!(registry().is_empty());
+            assert_eq!(
+                prefix_of("hello <secret> world", 100),
+                ("hello <secret> world".to_string(), false)
+            );
+            assert_eq!(prefix_of("hello world", 5), ("hello".to_string(), true));
+            assert_eq!(prefix_of("hello", 5), ("hello".to_string(), false));
+            assert_eq!(prefix_of("", 5), (String::new(), false));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The registry is the thread's under `testing`, as the sink's is: a
+    /// secret another test registers does not mask this one's text.
+    #[test]
+    fn apply_prefix_sees_only_this_threads_secrets() {
+        std::thread::spawn(|| register("other-threads-secret"))
+            .join()
+            .unwrap();
+        let text = "a other-threads-secret b this-threads-secret c";
+        assert_eq!(prefix_of(text, 100), (text.to_string(), false));
+        register("this-threads-secret");
+        assert_eq!(
+            prefix_of(text, 100),
+            (format!("a other-threads-secret b {S} c"), false)
+        );
     }
 
     #[test]
