@@ -16,7 +16,8 @@
 //! reports `would change` with the group named in its diff and the real run
 //! refuses if it is really missing. An existing account's missing group is
 //! refused in both modes. Both halves are what Ansible's `user` does (vision
-//! 12).
+//! 12 for the first; `[CHECK-MODE] 2026-09-24` in `docs/plan/DECISIONS.md`
+//! for the second).
 
 use std::path::PathBuf;
 

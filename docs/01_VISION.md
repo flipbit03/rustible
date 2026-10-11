@@ -423,8 +423,7 @@ ends with a recap per host (5.5).
   `ctx.as_root()` (section 11.3).
 - `ssh_user`, naming an account, makes this playbook log in as it instead
   of the inventory's `ssh_user`, overriding every inventory level (host,
-  group, `defaults`): an explicit per-file choice wins, unlike Ansible, where
-  an inventory `ansible_user` beats a play's `remote_user`. Escalation
+  group, `defaults`): an explicit per-file choice wins. Escalation
   (`escalate = true`, `as_root`, `as_user`) runs from that account. A
   `connection="local"` host has no login to change, so a run that targets one
   with this attribute is refused.
