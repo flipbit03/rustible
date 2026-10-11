@@ -15,10 +15,11 @@ use super::client::{self, Field, HeaderSpec, Outgoing, Timeout, mask_url};
 use super::validate_url;
 use crate::file::{AttrPlan, Owner, plan_attrs, write_from_with_backup};
 
-/// The default timeout of both ops. For [`Download`] it bounds connecting
-/// and the response head, and the body has none (Ansible's `get_url`
-/// default is 10 seconds); for [`Request`](super::Request) it bounds the
-/// whole exchange, body included (Ansible's `uri` default is 30 seconds).
+/// The default timeout of both ops. For [`Download`] it bounds connecting,
+/// the response head and each wait for more of the body, and the body as a
+/// whole has none (Ansible's `get_url` default is 10 seconds); for
+/// [`Request`](super::Request) it bounds the whole exchange, body included
+/// (Ansible's `uri` default is 30 seconds).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How much of a file or a body is hashed at a time.
@@ -231,13 +232,16 @@ impl Digests {
 /// [`Download::max_bytes`], fails the step and writes nothing, and so does
 /// a body that ends before the size its `Content-Length` declares, or
 /// before its chunked encoding's last chunk. A body framed only by the
-/// server closing the connection cannot be told from a whole one when the
-/// connection drops; `.checksum` is what catches that. A non-2xx
-/// status fails the step naming the status and the URL. Redirects are
-/// followed, up to ten, and a header given with [`Download::header_secret`]
-/// is dropped when one leaves the scheme, host and port it was meant for
-/// (the [module docs](super) have the policy). A URL's `user:pass@` is
-/// masked in every message and diff.
+/// server closing the connection is whole only when the connection closes
+/// cleanly (over HTTPS, with a TLS `close_notify`); a reset, or a TLS
+/// stream that just stops, fails the step. So does a server that sends
+/// nothing for [`Download::timeout`] while the body is under way. Any
+/// status but `200 OK` fails the step naming the status and the URL, a
+/// `204` or a `206` included. Redirects are followed, up to ten, and a
+/// header given with [`Download::header_secret`] is dropped when one leaves
+/// the scheme, host and port it was meant for (the [module docs](super)
+/// have the policy). A URL's `user:pass@` is masked in every message and
+/// diff.
 /// `check` never opens the connection: a dry run reports what would be
 /// fetched and why, and a step that would change has no output there
 /// (vision 12).
@@ -384,8 +388,10 @@ impl Download {
         self
     }
 
-    /// Connect and response-header timeout (default [`DEFAULT_TIMEOUT`]).
-    /// The body itself has no deadline, so a slow large download is not cut.
+    /// How long connecting, receiving the response head, and each wait for
+    /// more of the body may take (default [`DEFAULT_TIMEOUT`]). The body as
+    /// a whole has no deadline, so a slow large download that keeps
+    /// arriving is not cut; one silent for this long fails the step.
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
         self
@@ -496,9 +502,23 @@ impl Download {
             follow: true,
             timeout: Timeout::Head(self.timeout),
         })?;
-        if !(200..300).contains(&resp.status) {
+        if resp.status != 200 {
             let status = format!("{} {}", resp.status, resp.reason());
-            bail!("GET {} returned {}", mask_url(url), status.trim_end());
+            let status = status.trim_end();
+            if (200..300).contains(&resp.status) {
+                // After a redirect, the status came from another URL.
+                let at = if resp.url == mask_url(url) {
+                    String::new()
+                } else {
+                    format!(" (after redirects, at {})", resp.url)
+                };
+                bail!(
+                    "GET {} returned {status}{at}; only a 200 OK is written to {}",
+                    mask_url(url),
+                    self.dest.display()
+                );
+            }
+            bail!("GET {} returned {status}", mask_url(url));
         }
         resp.body(self.max_bytes)
             .map_err(|e| e.hinted(MAX_BYTES_HINT))
@@ -643,9 +663,19 @@ enum ContentState {
 #[derive(Debug)]
 pub struct DownloadIntent {
     dest: PathBuf,
-    /// `Some` when the content is missing or stale.
-    fetch: Option<Fetch>,
+    content: Content,
     attrs: AttrPlan,
+}
+
+/// What becomes of the content of `dest`.
+#[derive(Debug)]
+enum Content {
+    /// Missing or stale: fetch the URL and write it.
+    Fetch(Fetch),
+    /// Already right, so only the attributes change. What `check` saw of
+    /// the file, which `apply` reports without reading it again: its size,
+    /// and its SHA-256 when a `.checksum` made `check` hash it.
+    Keep { bytes: u64, sha256: Option<String> },
 }
 
 struct Fetch {
@@ -670,15 +700,17 @@ impl std::fmt::Debug for Fetch {
 
 impl Intent for DownloadIntent {
     fn diff(&self) -> Diff {
-        match &self.fetch {
+        match &self.content {
             // Size and digest are unknown until fetched; the diff says what
             // would be fetched and why.
-            Some(Fetch { url, reason, .. }) => Diff::summary(format!(
+            Content::Fetch(Fetch { url, reason, .. }) => Diff::summary(format!(
                 "GET {} -> {} ({reason})",
                 mask_url(url),
                 self.dest.display()
             )),
-            None => Diff::attrs(self.dest.display().to_string(), self.attrs.changes()),
+            Content::Keep { .. } => {
+                Diff::attrs(self.dest.display().to_string(), self.attrs.changes())
+            }
         }
     }
 }
@@ -705,19 +737,20 @@ impl Op for Download {
         let attrs = plan_attrs(stat.as_ref(), self.mode, self.owner);
         let reason = match state {
             ContentState::Current { sha256 } => {
+                let bytes = stat.as_ref().map(|s| s.size).unwrap_or_default();
                 if !attrs.differs() {
                     return Ok(Plan::Satisfied(DownloadReport {
                         url: self.url.clone(),
                         path: self.dest.clone(),
                         downloaded: false,
-                        bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
+                        bytes,
                         sha256,
                         backup_path: None,
                     }));
                 }
                 return Ok(Plan::Change(DownloadIntent {
                     dest: self.dest.clone(),
-                    fetch: None,
+                    content: Content::Keep { bytes, sha256 },
                     attrs,
                 }));
             }
@@ -726,7 +759,7 @@ impl Op for Download {
         };
         Ok(Plan::Change(DownloadIntent {
             dest: self.dest.clone(),
-            fetch: Some(Fetch {
+            content: Content::Fetch(Fetch {
                 url: self.url.clone(),
                 reason,
                 write: attrs.write_attrs(stat.as_ref().map(|s| s.mode)),
@@ -736,26 +769,29 @@ impl Op for Download {
     }
 
     fn apply(&self, sys: &System, intent: DownloadIntent) -> Result<DownloadReport> {
-        let checksum = self.parsed_checksum()?;
-        let DownloadIntent { dest, fetch, attrs } = intent;
-        let Some(Fetch { url, write, .. }) = fetch else {
-            // The content already matched: no fetch. The report reads the
-            // file as it is rather than carrying a copy of what `check` saw.
-            attrs.apply_differing(sys, &dest)?;
-            let (stat, state) = self.content_state(sys, checksum.as_ref())?;
-            let sha256 = match state {
-                ContentState::Current { sha256 } => sha256,
-                ContentState::Missing | ContentState::Stale(_) => None,
-            };
-            return Ok(DownloadReport {
-                url: self.url.clone(),
-                path: dest,
-                downloaded: false,
-                bytes: stat.as_ref().map(|s| s.size).unwrap_or_default(),
-                sha256,
-                backup_path: None,
-            });
+        let DownloadIntent {
+            dest,
+            content,
+            attrs,
+        } = intent;
+        let Fetch { url, write, .. } = match content {
+            Content::Fetch(fetch) => fetch,
+            // The content already matched: no fetch, and no read either.
+            // Setting the attributes changes neither the size nor the
+            // digest `check` saw, so the report is what `Satisfied` says.
+            Content::Keep { bytes, sha256 } => {
+                attrs.apply_differing(sys, &dest)?;
+                return Ok(DownloadReport {
+                    url: self.url.clone(),
+                    path: dest,
+                    downloaded: false,
+                    bytes,
+                    sha256,
+                    backup_path: None,
+                });
+            }
         };
+        let checksum = self.parsed_checksum()?;
         // The body streams into the file staged beside `dest`, with its
         // mode and owner, and is renamed over it only once it is whole and
         // verified: a mismatch, a body over `.max_bytes()`, a read that
@@ -979,7 +1015,7 @@ mod tests {
             "GET http://h/hello.txt -> /opt/hello.txt (force)"
         );
         // A download is an intent to fetch, which is what `apply` acts on.
-        assert!(c.fetch.is_some());
+        assert!(matches!(c.content, Content::Fetch(_)));
     }
 
     #[test]
@@ -1024,9 +1060,9 @@ mod tests {
             .owner(10, 20);
         let c = expect_change(&op, &sys);
         assert_eq!(c.diff().short(), "mode=0755 owner=10:20");
-        // An intent with no fetch is what `apply` branches on: no
+        // An intent that keeps the content is what `apply` branches on: no
         // fetch, and the host name above would fail one.
-        assert!(c.fetch.is_none());
+        assert!(matches!(c.content, Content::Keep { .. }));
         let r = op.apply(&sys, c).unwrap();
         // No `.checksum`, so the destination is never read or hashed and
         // the report carries no digest: the whole point of the laziness.
@@ -1040,6 +1076,36 @@ mod tests {
         let f = fake.file("/opt/hello.txt").unwrap();
         assert_eq!((f.mode, f.uid, f.gid), (0o755, 10, 20));
         assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// #112: `apply` executes the intent. On the attributes-only branch it
+    /// sets the attributes and reads nothing; the size and digest it
+    /// reports are the ones `check` saw, which is what `Satisfied` reports
+    /// once the attributes are right.
+    #[test]
+    fn an_attributes_only_apply_reads_nothing() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/opt")
+                .with_file("/opt/hello.txt", HELLO),
+        );
+        let sys = fake_sys(&fake);
+        let url = "http://nowhere.invalid/hello.txt";
+        let op = Download::get(url)
+            .to("/opt/hello.txt")
+            .checksum(format!("sha256:{HELLO_SHA256}"))
+            .mode(0o600);
+        let c = expect_change(&op, &sys);
+        let reads = fake.reads();
+        assert_eq!(reads.len(), 1, "check hashed the file: {reads:?}");
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!(fake.reads(), reads, "apply read nothing");
+        assert_eq!(fake.chmods(), [(PathBuf::from("/opt/hello.txt"), 0o600)]);
+        assert_eq!(r, report(url, false));
+        let Plan::Satisfied(again) = op.check(&sys).unwrap() else {
+            panic!("expected Satisfied");
+        };
+        assert_eq!(r, again);
     }
 
     #[test]
@@ -1424,25 +1490,157 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2, "redirect then target");
     }
 
-    /// `Download`'s timeout bounds connecting and the response head, not the
-    /// body: a release tarball that streams slowly is slow, not stuck. (The
-    /// opposite of `http::Request`, whose timeout covers everything.)
+    /// #112: `Download`'s timeout bounds each wait for the body, not the
+    /// body as a whole. A body that keeps arriving is written however long
+    /// it takes: here twenty bytes, one every 60 ms, over three times the
+    /// timeout. (`http::Request`'s timeout covers the whole exchange.)
     #[test]
-    fn a_slow_body_is_not_cut_by_the_timeout() {
+    fn a_slow_but_steady_body_is_not_cut_by_the_timeout() {
         let (base, _) = serve(vec![(
-            "/slow",
+            "/drip",
             200,
-            vec![("X-Stall-Body", "700".into())],
+            vec![("X-Drip", "60".into())],
             HELLO.to_vec(),
         )]);
         let fake = Arc::new(Fake::new().with_dir("/opt"));
         let sys = fake_sys(&fake);
-        let op = Download::get(format!("{base}/slow"))
+        let op = Download::get(format!("{base}/drip"))
             .to("/opt/hello.txt")
             .timeout(Duration::from_millis(300));
         let c = expect_change(&op, &sys);
+        let started = std::time::Instant::now();
         op.apply(&sys, c).unwrap();
+        assert!(started.elapsed() > Duration::from_millis(900));
         assert_eq!(fake.content("/opt/hello.txt").unwrap().as_bytes(), HELLO);
+    }
+
+    /// #112: a server silent for the timeout while the body is under way
+    /// fails the step, before the first byte of the body or after some of
+    /// it, and nothing is written. The server would resume after 3 s; the
+    /// step fails well before that, so the timeout is what ended it.
+    #[test]
+    fn a_body_that_stalls_for_the_timeout_fails() {
+        for (name, stall) in [("X-Stall-Body", "3000"), ("X-Stall-After", "5:3000")] {
+            let (base, _) = serve(vec![(
+                "/stall",
+                200,
+                vec![(name, stall.into())],
+                HELLO.to_vec(),
+            )]);
+            let fake = Arc::new(
+                Fake::new()
+                    .with_dir("/opt")
+                    .with_file("/opt/hello.txt", "old"),
+            );
+            let sys = fake_sys(&fake);
+            let url = format!("{base}/stall");
+            let op = Download::get(&url)
+                .to("/opt/hello.txt")
+                .force(true)
+                .timeout(Duration::from_millis(300));
+            let c = expect_change(&op, &sys);
+            let started = std::time::Instant::now();
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert!(started.elapsed() < Duration::from_millis(2500), "{name}");
+            assert_eq!(
+                err,
+                format!(
+                    "GET {url}: reading the body: timed out: no data from the server for 300ms \
+                     (the timeout bounds each wait for the body; raise it with .timeout())"
+                ),
+                "{name}"
+            );
+            assert_eq!(fake.content("/opt/hello.txt").unwrap(), "old", "{name}");
+            assert_eq!(
+                sys.read_dir("/opt").unwrap(),
+                [PathBuf::from("/opt/hello.txt")],
+                "{name}"
+            );
+        }
+    }
+
+    /// One connection on 127.0.0.1: wait for the request to arrive, send
+    /// `response`, wait 200 ms, and close without having read the request.
+    /// Closing a socket with unread input makes the kernel reset the
+    /// connection rather than close it cleanly (Linux and macOS alike).
+    /// Returns the base URL.
+    fn serve_then_reset(response: Vec<u8>) -> String {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = s.peek(&mut [0; 1]);
+            let _ = s.write_all(&response);
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        base
+    }
+
+    /// #112: a body framed only by the close of the connection is whole
+    /// only at a clean close. Cut by a reset, it fails the step and writes
+    /// nothing. A body with a `Content-Length` or chunked framing that is
+    /// complete when the reset comes is written, since ureq never asks the
+    /// connection for more of it; and a clean close still ends a body that
+    /// has neither.
+    #[test]
+    fn a_reset_fails_only_a_body_framed_by_the_close() {
+        let body = vec![b'x'; 1000];
+        let head = |extra: &str| {
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{extra}\r\n").into_bytes()
+        };
+
+        let fake = Arc::new(Fake::new().with_dir("/opt").with_file("/opt/cut", "old"));
+        let sys = fake_sys(&fake);
+        let url = format!(
+            "{}/cut",
+            serve_then_reset([head(""), body.clone()].concat())
+        );
+        let op = Download::get(&url).to("/opt/cut").force(true);
+        let c = expect_change(&op, &sys);
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            err.starts_with(&format!(
+                "GET {url}: reading the body: io: the server reset the connection before the response was complete ("
+            )),
+            "{err}"
+        );
+        assert_eq!(fake.content("/opt/cut").unwrap(), "old");
+
+        let sized = [head("Content-Length: 1000\r\n"), body.clone()].concat();
+        let chunked = [
+            head("Transfer-Encoding: chunked\r\n"),
+            b"3e8\r\n".to_vec(),
+            body.clone(),
+            b"\r\n0\r\n\r\n".to_vec(),
+        ]
+        .concat();
+        for (name, response) in [("sized", sized), ("chunked", chunked)] {
+            let url = format!("{}/{name}", serve_then_reset(response));
+            let dest = format!("/opt/{name}");
+            let op = Download::get(&url).to(&dest);
+            let c = expect_change(&op, &sys);
+            let r = op
+                .apply(&sys, c)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(r.bytes, 1000, "{name}");
+            assert_eq!(fake.file(&dest).unwrap().bytes, body, "{name}");
+        }
+
+        let (base, _) = serve(vec![(
+            "/unsized",
+            200,
+            vec![("X-Omit-Length", String::new())],
+            body.clone(),
+        )]);
+        let op = Download::get(format!("{base}/unsized")).to("/opt/unsized");
+        let c = expect_change(&op, &sys);
+        assert_eq!(op.apply(&sys, c).unwrap().bytes, 1000);
+        assert_eq!(fake.file("/opt/unsized").unwrap().bytes, body);
     }
 
     /// A header that cannot be sent is refused at `check`, before anything
@@ -1560,6 +1758,52 @@ mod tests {
             assert_eq!(err, format!("GET {url} returned {status}"));
         }
         assert!(fake.file("/opt/x").is_none());
+    }
+
+    /// #112: only a `200` writes a file (Ansible's `get_url`, `status !=
+    /// 200`). Any other success fails the step naming the status, and
+    /// `dest` is left as it was: a `204` would write an empty file, a
+    /// `206` a fragment. One reached through a redirect names where it
+    /// came from.
+    #[test]
+    fn a_success_other_than_200_fails_and_writes_nothing() {
+        let (base, _) = serve(vec![
+            ("/made", 201, vec![], HELLO.to_vec()),
+            ("/moved", 302, vec![("Location", "/empty".into())], vec![]),
+            ("/empty", 204, vec![], vec![]),
+            ("/reset", 205, vec![], vec![]),
+            (
+                "/part",
+                206,
+                vec![("Content-Range", "bytes 0-4/20".into())],
+                HELLO[..5].to_vec(),
+            ),
+        ]);
+        let moved = format!("204 No Content (after redirects, at {base}/empty)");
+        for (path, status) in [
+            ("/made", "201 Created"),
+            ("/empty", "204 No Content"),
+            ("/reset", "205 Reset Content"),
+            ("/part", "206 Partial Content"),
+            ("/moved", moved.as_str()),
+        ] {
+            let fake = Arc::new(Fake::new().with_dir("/opt").with_file("/opt/x", "old"));
+            let sys = fake_sys(&fake);
+            let url = format!("{base}{path}");
+            let op = Download::get(&url).to("/opt/x").force(true);
+            let c = expect_change(&op, &sys);
+            let err = op.apply(&sys, c).unwrap_err().chain();
+            assert_eq!(
+                err,
+                format!("GET {url} returned {status}; only a 200 OK is written to /opt/x")
+            );
+            assert_eq!(fake.content("/opt/x").unwrap(), "old", "{path}");
+            assert_eq!(
+                sys.read_dir("/opt").unwrap(),
+                [PathBuf::from("/opt/x")],
+                "{path}"
+            );
+        }
     }
 
     #[test]

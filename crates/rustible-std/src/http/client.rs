@@ -32,6 +32,7 @@ use rustible_sdk::mask;
 use rustible_sdk::prelude::*;
 use ureq::http::{self, HeaderName, HeaderValue, Method};
 
+use super::transport::{CheckedConnector, idle_cap};
 use super::validate_url;
 
 /// The most redirects a request follows before it fails.
@@ -39,22 +40,31 @@ pub const MAX_REDIRECTS: usize = 10;
 
 /// The agent every request goes through, built once: an `Agent` carries its
 /// connection pool and its lazily built rustls configuration, so building
-/// one per request would re-parse the bundled root store each time.
+/// one per request would re-parse the bundled root store each time. Its
+/// connections are ureq's own, wrapped in
+/// [`Checked`](super::transport::Checked).
 fn agent() -> &'static ureq::Agent {
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{Connector, DefaultConnector};
+
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         let tls = ureq::tls::TlsConfig::builder()
             .unversioned_rustls_crypto_provider(crate::tls::provider())
             .build();
-        ureq::Agent::config_builder()
+        let config = ureq::Agent::config_builder()
             .tls_config(tls)
             .http_status_as_error(false)
             // `send` follows redirects itself; see the module docs.
             .max_redirects(0)
             .allow_non_standard_methods(true)
             .user_agent(concat!("rustible/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into()
+            .build();
+        ureq::Agent::with_parts(
+            config,
+            DefaultConnector::new().chain(CheckedConnector),
+            DefaultResolver::default(),
+        )
     })
 }
 
@@ -155,8 +165,10 @@ pub(crate) fn secret_text<'a>(name: &str, s: &'a Secret) -> Result<&'a str> {
 pub(crate) enum Timeout {
     /// The whole exchange, redirects and body included.
     Total(Duration),
-    /// Connecting and receiving the response head, per hop; the body has no
-    /// deadline (a large download is slow, not stuck).
+    /// Connecting and receiving the response head, per hop, and each wait
+    /// for more of the body: the body as a whole has no deadline (a large
+    /// download is slow, not stuck), but a server silent that long while
+    /// sending it fails the request.
     Head(Duration),
 }
 
@@ -210,6 +222,8 @@ pub(crate) struct Incoming {
     pub(crate) what: String,
     head: bool,
     deadline: Option<(Instant, Duration)>,
+    /// The longest wait for more of the body ([`Timeout::Head`]).
+    idle: Option<Duration>,
     resp: http::Response<ureq::Body>,
 }
 
@@ -268,6 +282,7 @@ impl Incoming {
             max_bytes,
             read: 0,
             deadline: self.deadline,
+            idle: self.idle,
         })
     }
 
@@ -281,12 +296,8 @@ impl Incoming {
             return String::new();
         }
         let mut out = Vec::new();
-        let _ = self
-            .resp
-            .body_mut()
-            .as_reader()
-            .take(n as u64)
-            .read_to_end(&mut out);
+        let reader = self.resp.body_mut().as_reader();
+        let _ = idle_cap(self.idle, || reader.take(n as u64).read_to_end(&mut out));
         one_line(&String::from_utf8_lossy(&out), n)
     }
 }
@@ -295,8 +306,9 @@ impl Incoming {
 const BODY_BUF: usize = 64 << 10;
 
 /// A response body being read: [`Incoming::body`]. Each read is counted
-/// against the limit, if there is one, and a failure is worded as
-/// [`Incoming::read`]'s, a timeout named for its deadline.
+/// against the limit, if there is one, waits no longer than
+/// [`Timeout::Head`] says, and fails as [`Incoming::read`] does, a timeout
+/// named for its deadline or its wait.
 pub(crate) struct Body {
     /// `None` for an answer that has no body: to a `HEAD`, or a `1xx`, `204`
     /// or `304`.
@@ -305,6 +317,7 @@ pub(crate) struct Body {
     max_bytes: Option<u64>,
     read: u64,
     deadline: Option<(Instant, Duration)>,
+    idle: Option<Duration>,
 }
 
 impl Body {
@@ -315,14 +328,16 @@ impl Body {
         };
         let what = &self.what;
         let n = loop {
-            match reader.read(buf) {
+            match idle_cap(self.idle, || reader.read(buf)) {
                 Ok(n) => break n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     // Back to the `ureq::Error` it wraps, so a timeout is
                     // recognised and the text is what reading whole gave.
                     let e = ureq::Error::from(e);
-                    let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
+                    let e = timed_out(&e, self.deadline)
+                        .or_else(|| went_silent(&e, self.idle))
+                        .unwrap_or_else(|| e.to_string());
                     return Err(ReadError::Other(format!("{what}: reading the body: {e}")));
                 }
             }
@@ -351,9 +366,9 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
         timeout,
     } = req;
     let first = format!("{method} {}", mask_url(&url));
-    let deadline = match timeout {
-        Timeout::Total(d) => Some((Instant::now() + d, d)),
-        Timeout::Head(_) => None,
+    let (deadline, idle) = match timeout {
+        Timeout::Total(d) => (Some((Instant::now() + d, d)), None),
+        Timeout::Head(d) => (None, Some(d)),
     };
     let mut hops = 0;
     loop {
@@ -409,6 +424,7 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
             what: first,
             head: method == Method::HEAD,
             deadline,
+            idle,
             resp,
         });
     }
@@ -542,6 +558,18 @@ fn timed_out(e: &ureq::Error, deadline: Option<(Instant, Duration)>) -> Option<S
     match (e, deadline) {
         (ureq::Error::Timeout(_), Some((_, total))) => Some(format!(
             "timed out after {total:?} (the whole request, body included; raise it with .timeout())"
+        )),
+        _ => None,
+    }
+}
+
+/// A wait for the body cut by [`Timeout::Head`]'s cap says how long the
+/// server was silent: under that timeout, ureq sets no deadline of its own
+/// on the body, so a timeout there is the cap's.
+fn went_silent(e: &ureq::Error, idle: Option<Duration>) -> Option<String> {
+    match (e, idle) {
+        (ureq::Error::Timeout(_), Some(d)) => Some(format!(
+            "timed out: no data from the server for {d:?} (the timeout bounds each wait for the body; raise it with .timeout())"
         )),
         _ => None,
     }
