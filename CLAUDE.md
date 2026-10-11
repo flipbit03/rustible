@@ -350,8 +350,8 @@ never the op's internals; do not edit `docs/01_VISION.md` yourself.
   as it leaves the binary. A secret the op receives any other way, or
   derives itself (a URL's password, `base64(user:pass)`), it registers with
   `rustible_sdk::mask::register`. It formats a `Secret`'s plaintext into
-  nothing but the command stdin, file or request that needs it, and it
-  masks nothing itself but as the next rule says.
+  nothing but the command stdin, file or request that needs it, and masks
+  nothing itself, except as the next rule says.
 - **Cut or reshape only after `mask::apply_prefix`.** Text that may hold a
   secret and that the op cuts or reshapes before emitting it (a server's
   answer it quotes, a body its diff shows) goes through

@@ -381,7 +381,8 @@ JSON-escaped or form-encoded, it shows as `<secret>`. A secret you hold as a
 plain string is masked once you pass it to `rustible::sdk::mask::register(&s)`.
 Text that may hold a secret and that you cut or reshape before it reaches an
 event goes through `rustible::sdk::mask::apply_prefix` first, or a secret the
-cut halves, or whose whitespace the reshaping rewrites, shows in part.
+cut halves shows its first part, and one the reshaping rewrites shows as
+rewritten.
 ⚠️ A secret shorter than 4 characters is never masked, and one of 4 to 6
 characters only as a whole word. ⚠️ Masking covers what the run reports, not
 where the plaintext goes: an argument built with `as_str()` is in the target's

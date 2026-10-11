@@ -91,12 +91,14 @@ pub fn register(secret: &str) {
 /// part goes out as it is. Anything that is emitted as it came needs
 /// nothing.
 ///
-/// `text` is called once, with the number of bytes the masker needs: the
-/// caller returns at least that many bytes of the text, or all of it when
-/// it is shorter; more is fine, and is not looked at. That is `max` and
-/// far enough past it to see whole a secret on the cut and one touching
-/// it, so a caller reading from a stream or building the text reads or
-/// builds no more than that. It returns the masked start: no more than
+/// `text` is called once, with the number of bytes to return: the caller
+/// returns at least that many bytes of the text, or all of it when it is
+/// shorter; more is fine, and is not looked at. Never cut it to `max`
+/// yourself: that is the cut this call exists to make safe. That number is
+/// `max` and far enough past it to see whole a secret on the cut and one
+/// touching it, and a byte more to tell whether the text goes on, so a
+/// caller reading from a stream or building the text reads or builds no
+/// more than that. It returns the masked start: no more than
 /// `max` bytes of the text, cut on a character boundary, and at most `max`
 /// bytes long, except that a secret starting before the cut is kept whole
 /// as [`PLACEHOLDER`], which can run past `max` by less than its own
@@ -120,7 +122,9 @@ pub fn apply_prefix<T: AsRef<str>>(max: usize, text: impl FnOnce(usize) -> T) ->
     let want = max
         .saturating_add(registry.longest())
         .saturating_add(LOOKAHEAD);
-    let text = text(want);
+    // A byte past the window, so a masked run that ends exactly at its end
+    // is still known to be followed by more text.
+    let text = text(want.saturating_add(1));
     registry.prefix(text.as_ref(), want, max)
 }
 
@@ -1003,6 +1007,44 @@ mod tests {
         assert_eq!(
             prefix_of(&text, max).0,
             format!("{}za", "-".repeat(max - 2))
+        );
+        // Six 4-byte characters, the first before the cut, touched by the
+        // longest form: the masker must look past the cut by the short
+        // one's whole length too. (The long one outgrows the emoji's
+        // ASCII-escaped form, 72 bytes, so `longest` alone does not cover
+        // it.)
+        let long = "L".repeat(100);
+        register(&long);
+        register("😀😀😀😀😀😀");
+        let text = format!(
+            "{}z😀😀😀😀😀😀{long}{}",
+            "-".repeat(max - 5),
+            "-".repeat(500)
+        );
+        assert_eq!(
+            prefix_of(&text, max).0,
+            format!("{}z{S}", "-".repeat(max - 5))
+        );
+    }
+
+    /// A masked run reaching the end of what was read still reports a cut
+    /// when the text goes on.
+    #[test]
+    fn a_run_reaching_the_end_of_what_was_read_is_still_a_cut() {
+        let s = "w".repeat(44);
+        register(&s);
+        let max = 100;
+        let text = format!("{}{s}{s}{}", "x".repeat(max - 16), "y".repeat(100));
+        assert_eq!(
+            prefix_of(&text, max),
+            (format!("{}{S}", "x".repeat(max - 16)), true)
+        );
+        // And plain text cut at `max`, or a placeholder ending the text, is
+        // reported as cut or whole as it is.
+        assert_eq!(prefix_of("abcdef", 3), ("abc".to_string(), true));
+        assert_eq!(
+            prefix_of(&format!("ab {s}"), 10),
+            (format!("ab {S}"), false)
         );
     }
 
