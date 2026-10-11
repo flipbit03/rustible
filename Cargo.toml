@@ -40,8 +40,8 @@ similar = "2"
 # x86-64. See `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` and `docs/plan/M8.md`.
 # At least 3.4.1, the version the tests ran against: `rustible-std` uses
 # ureq's `unversioned` API, which a minor release may change. Not capped
-# below 3.5, so a user's crate that needs a newer 3.x still resolves; the
-# scheduled `ureq-newest.yml` workflow tests the newest 3.x instead.
+# below 3.5, so a user's crate that needs a newer 3.x still resolves; a minor
+# that breaks that API is fixed when it is reported.
 ureq = { version = "3.4.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 regex = "1"
