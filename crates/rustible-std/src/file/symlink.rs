@@ -16,7 +16,8 @@ use rustible_sdk::prelude::*;
 ///
 /// A link pointing elsewhere is replaced. A regular file in the way is an
 /// error unless `.force(true)`, which replaces it; a directory in the way
-/// is always an error (as Ansible refuses too). The target need not exist.
+/// is always an error, even with `.force(true)` (Ansible's `force` replaces
+/// an empty one; this op never does). The target need not exist.
 #[derive(Debug, Clone)]
 pub struct Symlink {
     link: PathBuf,
@@ -398,6 +399,11 @@ mod tests {
                 );
                 assert!(err.contains(&format!("{refused} ")), "{err}");
                 assert!(err.contains("refused (test)"), "{err}");
+                // The temporary link is made in the link's own directory, so
+                // the rename never crosses a filesystem.
+                if refused == "symlink" {
+                    assert!(err.contains("symlink /etc/.rustible-"), "{err}");
+                }
                 let after = fake.file("/etc/l").unwrap();
                 assert_eq!(
                     (after.kind, after.bytes),
