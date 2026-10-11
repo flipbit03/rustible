@@ -506,8 +506,14 @@ impl Download {
             let status = format!("{} {}", resp.status, resp.reason());
             let status = status.trim_end();
             if (200..300).contains(&resp.status) {
+                // After a redirect, the status came from another URL.
+                let at = if resp.url == mask_url(url) {
+                    String::new()
+                } else {
+                    format!(" (after redirects, at {})", resp.url)
+                };
                 bail!(
-                    "GET {} returned {status}; only a 200 OK is written to {}",
+                    "GET {} returned {status}{at}; only a 200 OK is written to {}",
                     mask_url(url),
                     self.dest.display()
                 );
@@ -1757,11 +1763,13 @@ mod tests {
     /// #112: only a `200` writes a file (Ansible's `get_url`, `status !=
     /// 200`). Any other success fails the step naming the status, and
     /// `dest` is left as it was: a `204` would write an empty file, a
-    /// `206` a fragment.
+    /// `206` a fragment. One reached through a redirect names where it
+    /// came from.
     #[test]
     fn a_success_other_than_200_fails_and_writes_nothing() {
         let (base, _) = serve(vec![
             ("/made", 201, vec![], HELLO.to_vec()),
+            ("/moved", 302, vec![("Location", "/empty".into())], vec![]),
             ("/empty", 204, vec![], vec![]),
             ("/reset", 205, vec![], vec![]),
             (
@@ -1771,11 +1779,13 @@ mod tests {
                 HELLO[..5].to_vec(),
             ),
         ]);
+        let moved = format!("204 No Content (after redirects, at {base}/empty)");
         for (path, status) in [
             ("/made", "201 Created"),
             ("/empty", "204 No Content"),
             ("/reset", "205 Reset Content"),
             ("/part", "206 Partial Content"),
+            ("/moved", moved.as_str()),
         ] {
             let fake = Arc::new(Fake::new().with_dir("/opt").with_file("/opt/x", "old"));
             let sys = fake_sys(&fake);
