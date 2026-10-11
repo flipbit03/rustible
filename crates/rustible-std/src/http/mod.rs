@@ -117,6 +117,7 @@ mod download;
 mod request;
 #[cfg(test)]
 mod test_server;
+mod transport;
 
 pub use client::{MAX_REDIRECTS, mask_url, one_line};
 pub use download::{

@@ -1172,9 +1172,10 @@ Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`
 streams it to disk, so fetch large files with `Download`.
 
-⚠️ `Download`'s `.timeout` bounds connecting and the response head, not the
-body; `Request`'s bounds the whole exchange. When the file's integrity
-matters, give `Download` a `.checksum(..)`.
+⚠️ `Download`'s `.timeout` bounds connecting, the response head and each
+wait for more of the body, so a slow download that keeps arriving is never
+cut; `Request`'s bounds the whole exchange. `Download` writes only a `200`
+response, and fails on any other status, `204` and `206` included.
 
 ⚠️ A `.json(..)` body is not a secret: the diff shows it (`-v`, `--json`),
 and a server that echoes it into an error puts it in the step's error. To

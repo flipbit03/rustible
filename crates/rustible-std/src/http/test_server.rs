@@ -15,8 +15,9 @@ use std::time::Duration;
 /// sends its head and then waits that many milliseconds before the body;
 /// one carrying `X-Stall-Head` waits that long before sending anything;
 /// one carrying `X-Stall-After: <bytes>:<ms>` sends that many bytes of the
-/// body, then waits, then sends the rest; one carrying
-/// `X-Declare-Length: <bytes>` sends that as its `Content-Length` whatever
+/// body, then waits, then sends the rest; one carrying `X-Drip: <ms>`
+/// sends the body a byte at a time, waiting that long before each; one
+/// carrying `X-Declare-Length: <bytes>` sends that as its `Content-Length` whatever
 /// the body is, so a body can end before what its head declared; and
 /// one carrying `X-Echo` answers with the request as it arrived, head and
 /// body, as a misbehaving API's error page might.
@@ -123,6 +124,8 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                 200 => "OK",
                 201 => "Created",
                 204 => "No Content",
+                205 => "Reset Content",
+                206 => "Partial Content",
                 301 => "Moved Permanently",
                 302 => "Found",
                 303 => "See Other",
@@ -140,7 +143,7 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                     .find(|(k, _)| *k == name)
                     .and_then(|(_, v)| v.parse::<u64>().ok())
             };
-            let (stall, stall_head) = (ms("X-Stall-Body"), ms("X-Stall-Head"));
+            let (stall, stall_head, drip) = (ms("X-Stall-Body"), ms("X-Stall-Head"), ms("X-Drip"));
             let body = if headers.iter().any(|(k, _)| *k == "X-Echo") {
                 raw_request
             } else {
@@ -165,6 +168,7 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                     || k.starts_with("X-Stall")
                     || k.starts_with("X-Declare")
                     || *k == "X-Echo"
+                    || *k == "X-Drip"
                 {
                     continue;
                 }
@@ -181,7 +185,15 @@ pub(crate) fn serve(routes: Vec<Route>) -> Server {
                 .find(|(k, _)| *k == "X-Stall-After")
                 .and_then(|(_, v)| v.split_once(':'))
                 .and_then(|(n, ms)| Some((n.parse::<usize>().ok()?, ms.parse::<u64>().ok()?)));
-            if method != "HEAD" {
+            if method != "HEAD"
+                && let Some(ms) = drip
+            {
+                for b in &body {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    let _ = s.write_all(&[*b]);
+                    let _ = s.flush();
+                }
+            } else if method != "HEAD" {
                 match split {
                     Some((n, ms)) if n < body.len() => {
                         let _ = s.write_all(&body[..n]);
