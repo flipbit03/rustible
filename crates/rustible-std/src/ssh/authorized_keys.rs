@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rustible_sdk::backend::{FileKind, Stat};
+use rustible_sdk::backend::{FileKind, Stat, WriteAttrs};
 use rustible_sdk::prelude::*;
 
 use crate::file::{AttrPlan, Owner, plan_attrs};
@@ -700,6 +700,32 @@ fn attr_context(path: &Path, owner: Option<Owner>) -> String {
     }
 }
 
+/// Context for a failed write of the keys. The write carries the mode and
+/// owner `check` found wrong, so it can fail for want of root as well as for
+/// a full disk; this names all three, where [`attr_context`] would call a
+/// full disk a failed `chown`. Either way the file is left as it was: the
+/// new keys are staged beside it and renamed over it only once they have
+/// their mode and owner.
+fn write_context(path: &Path, attrs: Option<WriteAttrs>) -> String {
+    let attrs = attrs.unwrap_or_default();
+    let mode = attrs.mode.map(|m| format!(" at mode {m:04o}"));
+    match attrs.owner {
+        Some((uid, gid)) => format!(
+            "writing the keys to {} owned by {uid}:{gid}{}: ssh::authorized_keys gives the \
+             new file the owner and mode sshd needs before it replaces the old one, and the \
+             file is left as it was. Changing an owner needs root, so a step that is not \
+             escalated fails here",
+            path.display(),
+            mode.unwrap_or_default()
+        ),
+        None => format!(
+            "writing the keys to {}{}; the file is left as it was",
+            path.display(),
+            mode.unwrap_or_default()
+        ),
+    }
+}
+
 /// What `check` decided for one `authorized_keys` file: the file as it
 /// resolved it, the account's `~/.ssh` (user forms), the text it read and
 /// what the pure planner made of it, and the file's attributes. The intent
@@ -752,6 +778,10 @@ impl KeysWrite {
         Ok(())
     }
 
+    /// The file's attributes `check` found wrong, set on the file itself:
+    /// for a `Present` that writes no keys, and for `Absent` before its
+    /// rewrite. A write of new keys carries them instead
+    /// ([`AttrPlan::differing_write_attrs`]).
     fn fix_file_attrs(&self, sys: &System) -> Result<()> {
         self.file_attrs
             .apply_differing(sys, &self.path)
@@ -1064,12 +1094,22 @@ impl Op for Present {
         }
         write.fix_dir_attrs(sys)?;
 
-        // Absent when only the attributes were wrong: the keys in the file
-        // are already the ones asked for.
-        if let Some(after) = &write.planned.text {
-            sys.write_atomic(&write.path, after.as_bytes())?;
+        match &write.planned.text {
+            // New keys carry the mode and owner `check` found wrong: the
+            // staged file gets them before the rename, so the keys are never
+            // in place at 0644 or owned by root, and an owner that cannot be
+            // given fails the write with the old file still there. Only
+            // what differs is passed, so a write by the account itself asks
+            // for no `chown`.
+            Some(after) => {
+                let attrs = write.file_attrs.differing_write_attrs();
+                sys.write_from(&write.path, after.as_bytes(), attrs)
+                    .with_context(|| write_context(&write.path, attrs))?;
+            }
+            // Only the attributes were wrong: the keys in the file are
+            // already the ones asked for.
+            None => write.fix_file_attrs(sys)?,
         }
-        write.fix_file_attrs(sys)?;
         Ok(write.into_report(created_dir))
     }
 }
@@ -1201,11 +1241,13 @@ impl Op for Absent {
     }
 
     fn apply(&self, sys: &System, intent: KeysWrite) -> Result<KeysReport> {
-        // Attributes first, and the directory's before the file's, the same
-        // order `Present` uses: `write_atomic` makes its temporary file
-        // inside the directory, so a `~/.ssh` this identity cannot write to
-        // fails the write — even when the `mode: 0500 -> 0700` this step
-        // just planned is exactly what would have made it writable.
+        // Attributes first. The directory's before the write, as `Present`
+        // does: `write_atomic` makes its temporary file inside the
+        // directory, so a `~/.ssh` this identity cannot write to fails the
+        // write — even when the `mode: 0500 -> 0700` this step just planned
+        // is exactly what would have made it writable. The file's before
+        // the write too, which keeps them, so the rewritten keys are never
+        // in place at the old attributes.
         intent.fix_dir_attrs(sys)?;
         intent.fix_file_attrs(sys)?;
         // The file exists: `check` found keys in it, so this never creates.
@@ -1750,6 +1792,227 @@ mod tests {
                 },
             ]
         );
+    }
+
+    const KEYS: &str = "/home/cadu/.ssh/authorized_keys";
+
+    /// The path of the staged file the `Fake`'s `write_from` gave its
+    /// attributes to, from the first call it made, after asserting that it
+    /// is a `.rustible-fake-*` sibling of `KEYS`, not `KEYS` itself.
+    fn staged_path(calls: &[AttrCall]) -> PathBuf {
+        let path = match calls.first() {
+            Some(AttrCall::Chmod { path, .. } | AttrCall::Chown { path, .. }) => path.clone(),
+            other => panic!("no attribute call to read a path from: {other:?}"),
+        };
+        assert_eq!(path.parent(), Path::new(KEYS).parent(), "{calls:?}");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".rustible-fake-"),
+            "the attributes went to {}, not to a staged file: {calls:?}",
+            path.display()
+        );
+        path
+    }
+
+    /// Keys written for an account carry their mode and owner: the staged
+    /// file gets 0600 and the account before the rename, so the keys are
+    /// never in place at 0644 or owned by root, and nothing is set on the
+    /// final path afterwards.
+    #[test]
+    fn a_new_file_gets_its_mode_and_owner_before_the_rename() {
+        let fake = fake_with_user_and_ssh_dir();
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&sys, c).unwrap();
+
+        let calls = fake.attr_calls()[planted..].to_vec();
+        let staged = staged_path(&calls);
+        assert_eq!(
+            calls,
+            [
+                AttrCall::Chmod {
+                    path: staged.clone(),
+                    mode: 0o600
+                },
+                AttrCall::Chown {
+                    path: staged.clone(),
+                    uid: 1000,
+                    gid: 1001
+                },
+            ],
+            "the directory is already right, so the file's two calls are all there is"
+        );
+        assert!(fake.file(&staged).is_none(), "renamed into place");
+        let file = fake.file(KEYS).unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
+        assert_eq!(fake.content(KEYS).unwrap(), format!("{K1}\n"));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// A rewrite of a file whose mode and owner are already right passes no
+    /// attributes, so it is a plain write and asks for no `chown`: one that
+    /// changes the owner needs root, which a step run as the account itself
+    /// lacks. Passing every wanted attribute, as `file::Copy` does, would
+    /// make the account's owner a required `chown` of the staged file.
+    #[test]
+    fn a_rewrite_with_the_attributes_already_right_asks_for_no_chown() {
+        let fake = fake_with_user_and_ssh_dir();
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new(KEYS),
+            format!("{K1}\n").as_bytes(),
+        )
+        .unwrap();
+        set_attrs(&fake, KEYS, 0o600, 1000, 1001);
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1, K2]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("K2 is missing")
+        };
+        op.apply(&sys, c).unwrap();
+
+        assert_eq!(fake.attr_calls()[planted..], [], "no attribute differed");
+        assert_eq!(fake.content(KEYS).unwrap(), format!("{K1}\n{K2}\n"));
+        let file = fake.file(KEYS).unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// A rewrite of a 0644 file sets 0600 on the staged file, once, and
+    /// nothing on the final path. The `chown` beside it is the write keeping
+    /// the owner the file already has, which is best effort and cannot fail
+    /// the step; the owner was right, so none is required.
+    #[test]
+    fn a_rewrite_with_a_wrong_mode_sets_it_on_the_staged_file_once() {
+        let fake = fake_with_user_and_ssh_dir();
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new(KEYS),
+            format!("{K1}\n").as_bytes(),
+        )
+        .unwrap();
+        set_attrs(&fake, KEYS, 0o644, 1000, 1001);
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1, K2]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("K2 is missing and the mode is wrong")
+        };
+        op.apply(&sys, c).unwrap();
+
+        let calls = fake.attr_calls()[planted..].to_vec();
+        let staged = staged_path(&calls);
+        assert_eq!(
+            calls,
+            [
+                AttrCall::Chmod {
+                    path: staged.clone(),
+                    mode: 0o600
+                },
+                AttrCall::Chown {
+                    path: staged,
+                    uid: 1000,
+                    gid: 1001
+                },
+            ]
+        );
+        assert_eq!(fake.content(KEYS).unwrap(), format!("{K1}\n{K2}\n"));
+        let file = fake.file(KEYS).unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// An owner the write cannot give fails it before the rename: no keys
+    /// in place, owned by whoever ran the step, and nothing left beside
+    /// them. root's own account, because its `.ssh` is legitimately
+    /// root-owned: the `Fake` refuses every `chown`, so an account whose
+    /// directory needed one would fail there, before the write, and pass
+    /// whatever the write did.
+    #[test]
+    fn a_refused_owner_writes_no_keys() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", PASSWD)
+                .with_dir("/root")
+                .with_dir("/root/.ssh")
+                .with_chown_refused(),
+        );
+        rustible_sdk::backend::Backend::set_mode(&*fake, Path::new("/root/.ssh"), 0o700).unwrap();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("root").keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("expected change")
+        };
+        assert!(
+            matches!(&c, KeysIntent(Keys::Write(w)) if w.dir.as_ref().is_some_and(|d| !d.changes())),
+            "the directory is right, so the write is the first thing to fail"
+        );
+
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert!(
+            fake.file("/root/.ssh/authorized_keys").is_none(),
+            "the keys were put in place before their owner was refused: {err}"
+        );
+        assert_eq!(
+            rustible_sdk::backend::Backend::read_dir(&*fake, Path::new("/root/.ssh")).unwrap(),
+            Vec::<PathBuf>::new(),
+            "no staged file left behind"
+        );
+        assert!(
+            err.contains(
+                "writing the keys to /root/.ssh/authorized_keys owned by 0:0 at mode 0600"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("Operation not permitted"), "{err}");
+    }
+
+    /// Keys already right with the mode and owner wrong: nothing is
+    /// written, and the attributes are set on the file itself, in
+    /// `set_mode_and_owner`'s order, mode before owner.
+    #[test]
+    fn attributes_alone_are_set_on_the_file_itself() {
+        let fake = fake_with_user_and_ssh_dir();
+        // 0644, root-owned: a plain write of a new file.
+        rustible_sdk::backend::Backend::write(
+            &*fake,
+            Path::new(KEYS),
+            format!("{K1}\n").as_bytes(),
+        )
+        .unwrap();
+        let planted = fake.attr_calls().len();
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("the mode and owner are wrong")
+        };
+        op.apply(&sys, c).unwrap();
+
+        assert_eq!(
+            fake.attr_calls()[planted..],
+            [
+                AttrCall::Chmod {
+                    path: KEYS.into(),
+                    mode: 0o600
+                },
+                AttrCall::Chown {
+                    path: KEYS.into(),
+                    uid: 1000,
+                    gid: 1001
+                },
+            ]
+        );
+        assert_eq!(fake.content(KEYS).unwrap(), format!("{K1}\n"));
+        let file = fake.file(KEYS).unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 1000, 1001));
+        assert!(matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)));
     }
 
     /// The attributes are a change in their own right: the keys can be
