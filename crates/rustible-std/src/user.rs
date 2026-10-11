@@ -16,7 +16,8 @@
 //! reports `would change` with the group named in its diff and the real run
 //! refuses if it is really missing. An existing account's missing group is
 //! refused in both modes. Both halves are what Ansible's `user` does (vision
-//! 12).
+//! 12 for the first; `[CHECK-MODE] 2026-09-24` in `docs/plan/DECISIONS.md`
+//! for the second).
 
 use std::path::PathBuf;
 
@@ -615,7 +616,8 @@ impl Present {
     /// diff and not refused: an earlier `group::Present` in the run may
     /// create it, and Ansible's `user` validates nothing before it reports
     /// a new account `changed` in check mode. For an existing account it is
-    /// refused in both modes, as Ansible refuses it (vision 12).
+    /// refused in both modes, as Ansible refuses it (`[CHECK-MODE]
+    /// 2026-09-24` in `docs/plan/DECISIONS.md`).
     fn resolve_primary(
         &self,
         sys: &System,
@@ -696,7 +698,8 @@ impl Present {
         // A missing supplementary group is refused, except under --check for
         // an account that does not exist yet, where an earlier step may
         // create it; an existing account's is refused in both modes, as
-        // Ansible refuses it (vision 12).
+        // Ansible refuses it (`[CHECK-MODE] 2026-09-24` in
+        // `docs/plan/DECISIONS.md`).
         let deferred = sys.check_mode() && current.is_none();
         for g in self.groups.iter().flatten() {
             if lookup_group(&group_text, g)?.is_none() && !deferred {
@@ -1248,7 +1251,8 @@ pub struct Member {
 /// user that does not exist yet is not refused, whatever its group's state,
 /// and the step reports `would change` (Ansible reports a new account
 /// `changed` without validating its groups); an existing user's missing
-/// group is refused in both modes, as Ansible refuses it (vision 12).
+/// group is refused in both modes, as Ansible refuses it (`[CHECK-MODE]
+/// 2026-09-24` in `docs/plan/DECISIONS.md`).
 #[derive(Debug, Clone)]
 pub struct Membership {
     user: String,
@@ -1307,7 +1311,7 @@ impl Op for Membership {
         // create the user, and its group with it, and Ansible's `user`
         // validates neither before it reports a new account `changed`. An
         // existing user's missing group is refused in both modes, as Ansible
-        // refuses it (vision 12).
+        // refuses it (`[CHECK-MODE] 2026-09-24` in `docs/plan/DECISIONS.md`).
         let passwd = sys.read_to_string("/etc/passwd")?;
         let entry = match lookup_user(&passwd, &self.user)? {
             Some(e) => Some(e),

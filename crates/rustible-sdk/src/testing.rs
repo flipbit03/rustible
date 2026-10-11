@@ -4,6 +4,12 @@
 //! test API: a crate whose tests use it enables the feature in
 //! `[dev-dependencies]` only.
 //!
+//! A check-mode step through `ctx.as_user(name)`, for any account but root
+//! and the process's own user, first runs `id -u <name>` as the process's
+//! own user, so a `Fake` test that does that plants it:
+//! `.with_cmd("id", Some(&["-u", name]), 0, "1000\n")` for an account that
+//! exists, a non-zero status for one that does not.
+//!
 //! An op author writes one integration test per op and marks it with
 //! `#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]`.
 //! The body receives a `&mut Ctx` bound to the real `Local` backend and real
@@ -337,6 +343,9 @@ pub fn ctx(sys: System) -> Ctx {
 /// continue `ctx`'s numbering, inside whatever blocks are open, and they
 /// are counted in the same summary, so a twin's steps show up in the
 /// parent's recap, and in a container body's report, beside the parent's.
+/// It shares the run's answers too: whether an account a dry step ran as
+/// exists is asked once per run, so after creating that account for real,
+/// use a new [`ctx`] to dry-run as it.
 ///
 /// ```
 /// use std::sync::Arc;

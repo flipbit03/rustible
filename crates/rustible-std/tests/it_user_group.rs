@@ -5,14 +5,19 @@
 //! over the real machine, which is the proof of vision 12's rule that a dry
 //! run does not refuse a prerequisite an earlier step would create — and of
 //! the two places Ansible refuses anyway, which Rustible refuses too.
+//! Last, on Alpine as well, a dry run's step as an account the run would
+//! create waits for it (#118), on the real `id`, GNU's and BusyBox's.
 //! Runs with `RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --test it_user_group`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rustible::prelude::*;
+use rustible::sdk::System;
+use rustible::sdk::event::{Collect, Event, Status};
 use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{group, user};
+use rustible_std::{file, group, user};
 
 // Distinct names: `useradd` on Debian creates a private group named after
 // the user, so a group step with the user's name would make it fail.
@@ -251,5 +256,85 @@ fn users_and_groups_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
     assert!(line_of(&etc_group, GRP).is_none() && line_of(&etc_group, GRP2).is_none());
     // useradd's private group went with the user.
     assert!(line_of(&etc_group, USR).is_none(), "{etc_group}");
+    Ok(())
+}
+
+/// A dry run of the fresh-host shape the issue names: an account, then a
+/// step run as it. The account does not exist, so the second step waits
+/// for it instead of starting a helper as it: `would change`, no diff, the
+/// note naming the account, and one `id -u` run as root, the process's own
+/// user, however many steps wait. None of these images has `sudo`, so a
+/// helper started for the account would fail the step. The real run fails
+/// the same step naming the account, from the helper that could not start,
+/// and so does a direct `sys()` call under `--check`.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04", "alpine:3.20"])]
+fn a_dry_run_waits_for_an_account_it_would_create(_ctx: &mut Ctx) -> Result<()> {
+    const WAITING: &str = "rustible-waiting";
+    let config = || file::Copy::from_str("x\n").to(format!("/home/{WAITING}/config"));
+    let missing = format!(
+        "account `{WAITING}` does not exist; create it in an earlier step (`user::Present`) \
+         or fix the name"
+    );
+    // A `Ctx` of its own rather than the body's, so its events can be read.
+    let sink = Arc::new(Collect::default());
+    let real = testing::ctx(System::local(false, sink.clone()));
+    let mut dry = testing::dry(&real);
+
+    let account = dry.step("account", user::Present::new(WAITING))?;
+    assert!(account.changed && !account.is_available());
+    let mut as_waiting = dry.as_user(WAITING);
+    for name in ["config as the account", "config again"] {
+        let planned = as_waiting.step(name, config())?;
+        assert!(planned.changed && !planned.is_available() && planned.diff.is_none());
+    }
+    let finished: Vec<(Status, Option<String>)> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::StepFinished {
+                identity,
+                status,
+                note,
+                ..
+            } if identity == WAITING => Some((status, note)),
+            _ => None,
+        })
+        .collect();
+    let waits = (
+        Status::WouldChange,
+        Some(format!("waits for account `{WAITING}`")),
+    );
+    assert_eq!(finished, [waits.clone(), waits]);
+    let probes: Vec<(String, Vec<String>, i32)> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::CmdRan {
+                identity,
+                argv,
+                status,
+                ..
+            } if argv.first().map(String::as_str) == Some("id") => Some((identity, argv, status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    let (identity, argv, status) = &probes[0];
+    assert_eq!(identity, "self");
+    assert_eq!(argv, &["id", "-u", WAITING]);
+    assert_ne!(*status, 0);
+
+    // No allowance for a direct call: it starts the helper, which fails.
+    let err = dry.as_user(WAITING).sys().exists("/").unwrap_err().chain();
+    assert!(err.contains(&missing), "{err}");
+
+    // The real run refuses at the step, naming the account.
+    let err = real
+        .as_user(WAITING)
+        .step("config for real", config())
+        .unwrap_err()
+        .chain();
+    assert!(err.contains(&missing), "{err}");
+    assert!(!real.sys().exists(format!("/home/{WAITING}"))?);
     Ok(())
 }

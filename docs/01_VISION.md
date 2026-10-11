@@ -423,8 +423,7 @@ ends with a recap per host (5.5).
   `ctx.as_root()` (section 11.3).
 - `ssh_user`, naming an account, makes this playbook log in as it instead
   of the inventory's `ssh_user`, overriding every inventory level (host,
-  group, `defaults`): an explicit per-file choice wins, unlike Ansible, where
-  an inventory `ansible_user` beats a play's `remote_user`. Escalation
+  group, `defaults`): an explicit per-file choice wins. Escalation
   (`escalate = true`, `as_root`, `as_user`) runs from that account. A
   `connection="local"` host has no login to change, so a run that targets one
   with this attribute is refused.
@@ -624,26 +623,19 @@ limits.
 
 ### 6.8 Translations of real Ansible modules
 
-Each translation is which op replaces the module, and where the meaning
-differs. How the op does it is in its source.
+Each translation is which op replaces the module. How the op does it is in
+its source.
 
 **`ansible.builtin.apt`** becomes three ops, one per `state` (6.3):
 `apt::Present`, `apt::Absent` and `apt::Latest`. They refuse a host without
-apt, or a run without root. Two defaults differ from Ansible's: recommended
-packages are installed only when the playbook asks, where Ansible follows
-the system's apt configuration, and `Present` refreshes
-the package lists only when it is about to install, so it is not a way to
-refresh them for later steps.
+apt, or a run without root.
 
 `Latest` decides from the candidate versions in the package lists, so a
 real run may refresh stale lists from `check`, before it decides: the one
 op that changes the machine from `check` (7.3). A dry run never refreshes
 (12), so with stale lists `Latest` says it cannot know, reporting `would
 change` with no output; with fresh ones the dry run plans exactly as the
-real run will. Ansible also skips the refresh under check mode (`apt.py`
-guards its cache update with `check_mode`) but then plans against the stale
-lists, so its dry run can call a package current that the real run
-upgrades.
+real run will.
 
 **`ansible.builtin.lineinfile`** becomes `file::Line`, which replaces the
 line a pattern matches, or adds it when nothing matches, as Ansible does.
@@ -1330,15 +1322,12 @@ Ansible's check mode has neither mechanism and one rule for a step that
 would create something: report `changed` and ask no further questions
 (`user.py`'s `main()` exits `changed` under check mode before it validates
 the group; `ansible.posix.authorized_key` does not look at the directory
-under check mode). That rule is adopted, and Ansible's behaviour is
-authoritative where the rule could have been read more broadly (decided
-2026-09-24): an *existing* account's missing group is refused under
-`--check` as in a real run (`user.py` validates it before anything that
-respects check mode), and keys for an account that does not exist yet are
-refused too (`authorized_key`: "Either user must exist or you must provide
-full path to key file in check mode"). Added on top is what Ansible lacks
-when a later step reads what a dry run could not produce: a warning saying
-where the dry run stopped seeing.
+under check mode). That rule is adopted. Where it could be read more
+broadly, Ansible's behaviour is the starting point, not the authority:
+Rustible compares against it, keeps it unless there is a reason to diverge,
+and records each divergence with its reason in `docs/plan/DECISIONS.md`.
+Added on top is what Ansible lacks when a later step reads what a dry run
+could not produce: a warning saying where the dry run stopped seeing.
 
 **The rules:**
 - In check mode, a would-change step reports `would change` with its diff and
@@ -1359,14 +1348,15 @@ where the dry run stopped seeing.
   seeing.
 - **Prerequisites are verified when the run is about to act.** An op that
   would refuse for want of something another step in the run could create
-  (a group, an account, a directory, a unit), within the two limits Ansible
-  draws above, reports `would change` under `--check`, its diff saying what
-  it would set or what it waits for, naming the prerequisite when the op
-  knows it. A real run's `check` still refuses, so the refusal is never
-  skipped on a run that can act. The trade accepted: a dry run does not
-  catch a forgotten prerequisite step, and the real run refuses at that
-  step, before it touches anything, with the steps before it applied. 6.7
-  still holds at the step.
+  (a group, an account, a directory, a unit) reports `would change` under
+  `--check`, its diff saying what it would set or what it waits for, naming
+  the prerequisite when the op knows it; where a refusal is kept under
+  `--check` anyway, `docs/plan/DECISIONS.md` records it and why. A real
+  run's `check` still refuses, so the refusal is never skipped on a run that
+  can act. The trade accepted: a dry run does not catch a forgotten
+  prerequisite step, and the real run refuses at that step, before it
+  touches anything, with the steps before it applied. 6.7 still holds at
+  the step.
 - That deferral covers only what another step could supply. A refusal about
   the machine or the request itself (wrong platform, not root, a missing
   tool, a malformed input) stands in check mode as in a real run, because

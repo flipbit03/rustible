@@ -1,6 +1,7 @@
 //! What `main` receives.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::ops::Deref;
 use std::panic::resume_unwind;
@@ -19,7 +20,7 @@ use crate::facts::Facts;
 use crate::op::{Applied, Intent, Op, Plan};
 use crate::secret::Secret;
 use crate::stream::{Chunk, chunks, write_chunks};
-use crate::system::{Phase, System};
+use crate::system::{Identity, Phase, System};
 
 /// The inventory's view of the host this process is configuring: its name,
 /// the groups it inherits from, and the connection and escalation parameters
@@ -157,6 +158,11 @@ pub(crate) struct Shared {
     channel: Arc<Channel>,
     run_id: String,
     tempdir: OnceCell<RunDir>,
+    /// Under `--check`, whether each account a step has run as exists,
+    /// asked once per run (`id -u`, see [`Ctx::step`]). A dry run creates
+    /// no account, so the answer cannot change before the run ends; a real
+    /// run never asks.
+    accounts: RefCell<BTreeMap<String, bool>>,
 }
 
 /// The run's temp directory, removed when the run's last `Ctx` drops.
@@ -279,6 +285,7 @@ impl Ctx {
                 run_id: run_id.into(),
                 tempdir: OnceCell::new(),
                 blocks: RefCell::new(Vec::new()),
+                accounts: RefCell::new(BTreeMap::new()),
             }),
         }
     }
@@ -316,6 +323,18 @@ impl Ctx {
     /// `Deref` or [`Applied::output`], ends the innermost enclosing
     /// [`Ctx::block`] with a warning, or the playbook body when there is no
     /// block. [`Applied::is_available`] is for branching instead.
+    ///
+    /// In check mode, a step through [`Ctx::as_user`] first asks whether
+    /// that account exists, with `id -u <name>` run as the process's own
+    /// user, once per account per run. When it does not, the step reports
+    /// `would change` with the note ``waits for account `<name>` `` and no
+    /// diff, and `check` is not called: an earlier step may create the
+    /// account (vision doc 12). Root and the process's own user
+    /// ([`Facts::user`]) are never asked about, and neither is any account
+    /// on a host whose escalation method reaches no other account (`none`):
+    /// there the step fails as it would in a real run. An `id` that cannot
+    /// be spawned fails the step, naming the probe. A real run asks nothing
+    /// here.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
@@ -373,6 +392,24 @@ impl Ctx {
             );
             e.context(layer.of_step(self.shared.token, id, blocks.clone()))
         };
+
+        // Under `--check`, a step run as an account that does not exist yet
+        // waits for it, as any prerequisite an earlier step could create
+        // does (vision doc 12): `check` would need a helper running as that
+        // account, and there is none to start. After `StepStarted`, so the
+        // probe's `CmdRan` is reported under this step.
+        match self.missing_account() {
+            Err(e) => return Err(failed(e, None, StepFailed::at(&name))),
+            Ok(Some(account)) => {
+                finish(
+                    Status::WouldChange,
+                    None,
+                    Some(format!("waits for account `{account}`")),
+                );
+                return Ok(Applied::new(name, None, true, None, t0.elapsed()));
+            }
+            Ok(None) => {}
+        }
 
         // A missing output read inside the op itself (an op holding another
         // step's `Applied`) is this step's failure, not a gap in the dry run:
@@ -719,6 +756,16 @@ impl Ctx {
     }
 
     /// A `Ctx` whose ops run as another user. Same host, same counters.
+    ///
+    /// Nothing runs as `name` until something on the returned `Ctx` needs
+    /// to. In a real run, an account that does not exist then fails that
+    /// step: ``account `<name>` does not exist; create it in an earlier step
+    /// (`user::Present`) or fix the name``. Under `--check`, a
+    /// [`Ctx::step`] run as an account that does not exist yet reports
+    /// `would change`, waiting for the account, since an earlier step may
+    /// create it. Calls through [`Ctx::sys`] get no such allowance: they
+    /// fail with the message above, in both modes, so guard them with
+    /// [`Ctx::check_mode`].
     pub fn as_user(&self, name: &str) -> Ctx {
         self.sharing(self.sys.as_user(name))
     }
@@ -810,6 +857,40 @@ impl Ctx {
             host: self.host.clone(),
             shared: self.shared.clone(),
         }
+    }
+
+    /// Under `--check`, the account this `Ctx` runs as when it does not
+    /// exist on the machine; `None` in a real run, for the process's own
+    /// identity or user, for root, which always exists, for an account that
+    /// exists, and on a host whose escalation method reaches no other
+    /// account, where the step goes on to be refused as in a real run (a
+    /// refusal about the machine holds in both modes, vision doc 12). Asked
+    /// once per account per run and remembered in [`Shared`]. An `id` that
+    /// cannot be spawned is an error, in a dry run as it would be in a real
+    /// one: it is about the machine, not the account.
+    fn missing_account(&self) -> Result<Option<String>> {
+        if !self.sys.check_mode() {
+            return Ok(None);
+        }
+        let Identity::User(name) = self.sys.identity() else {
+            return Ok(None);
+        };
+        if name == "root" || *name == self.sys.facts().user || !self.sys.can_reach(name) {
+            return Ok(None);
+        }
+        let known = self.shared.accounts.borrow().get(name).copied();
+        let exists = match known {
+            Some(exists) => exists,
+            None => {
+                let exists = self.sys.account_exists(name)?;
+                self.shared
+                    .accounts
+                    .borrow_mut()
+                    .insert(name.clone(), exists);
+                exists
+            }
+        };
+        Ok((!exists).then(|| name.clone()))
     }
 
     fn next_id(&self) -> u32 {
@@ -2973,5 +3054,284 @@ mod tests {
         assert!(cfg.changed);
         assert_eq!(*cfg.output().unwrap(), 7);
         assert_eq!(**cfg.value().unwrap(), 7);
+    }
+
+    // ---- an account a dry run waits for (#118) ----
+
+    /// A dry `Ctx` over `fake`, the `Fake` itself and the events.
+    fn dry_over(fake: Fake) -> (Ctx, Arc<Fake>, Arc<Collect>) {
+        let fake = Arc::new(fake);
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(fake.clone(), sink.clone()).with_check_mode(true);
+        (Ctx::new(sys, HostInfo::local()), fake, sink)
+    }
+
+    /// A [`Probe`] and its `check` counter.
+    fn counted() -> (Probe, Arc<AtomicU32>) {
+        let checks = Arc::new(AtomicU32::new(0));
+        let probe = Probe {
+            checks: checks.clone(),
+            applies: Arc::new(AtomicU32::new(0)),
+            cancel_in_check: None,
+        };
+        (probe, checks)
+    }
+
+    /// How many times `id -u <name>` ran, as the process's own user.
+    fn id_probes(fake: &Fake, name: &str) -> usize {
+        fake.argvs()
+            .iter()
+            .filter(|a| *a == &["id", "-u", name])
+            .count()
+    }
+
+    /// The account is missing: the step waits for it, with the note and no
+    /// diff, without calling `check`; the probe ran once, as the process's
+    /// own user, reported between the step's start and its end.
+    #[test]
+    fn under_check_a_step_as_a_missing_account_waits_without_checking() {
+        let (ctx, fake, sink) = dry_over(Fake::new().with_cmd("id", Some(&["-u", "svc"]), 1, ""));
+        let (probe, checks) = counted();
+        let step = ctx.as_user("svc").step("config", probe).unwrap();
+        assert!(step.changed && !step.is_available() && step.diff.is_none());
+        assert_eq!(checks.load(Ordering::SeqCst), 0, "check ran");
+        assert_eq!(
+            finished(&sink),
+            (
+                Status::WouldChange,
+                None,
+                Some("waits for account `svc`".into())
+            )
+        );
+        assert_eq!(fake.argvs(), [["id", "-u", "svc"]]);
+        let order: Vec<String> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::StepStarted { identity, .. } => Some(format!("started as {identity}")),
+                Event::CmdRan {
+                    identity,
+                    argv,
+                    status,
+                    ..
+                } => Some(format!("{} as {identity}: {status}", argv.join(" "))),
+                Event::StepFinished { identity, .. } => Some(format!("finished as {identity}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["started as svc", "id -u svc as self: 1", "finished as svc"]
+        );
+        assert_eq!(ctx.summary().would_change, 1);
+    }
+
+    /// The account exists: the step goes on to `check` as it always did.
+    #[test]
+    fn under_check_a_step_as_an_existing_account_runs_its_check() {
+        let (ctx, fake, sink) =
+            dry_over(Fake::new().with_cmd("id", Some(&["-u", "svc"]), 0, "1001\n"));
+        let (probe, checks) = counted();
+        let step = ctx.as_user("svc").step("config", probe).unwrap();
+        assert!(step.changed && !step.is_available());
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            finished(&sink),
+            (Status::WouldChange, Some("do it".into()), None)
+        );
+        assert_eq!(fake.argvs(), [["id", "-u", "svc"]]);
+    }
+
+    /// `id` cannot be spawned: that is about the machine, so the step fails,
+    /// naming the probe, and `check` is not reached.
+    #[test]
+    fn under_check_an_id_that_cannot_be_spawned_fails_the_step_naming_the_probe() {
+        let (ctx, _fake, sink) = dry_over(Fake::new());
+        let (probe, checks) = counted();
+        let err = ctx
+            .as_user("svc")
+            .step("config", probe)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.starts_with(
+                "step `config`: checking whether account `svc` exists with `id -u svc`: \
+                 could not spawn `id`"
+            ),
+            "{err}"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 0, "check ran");
+        assert_eq!(finished(&sink).0, Status::Failed);
+        assert_eq!(ctx.failures().len(), 1);
+    }
+
+    /// One probe per account per run, through every `Ctx` of the run: the
+    /// same `as_user` value, a new one, and another dry twin of the same
+    /// parent. A real step asks nothing.
+    #[test]
+    fn each_account_is_asked_about_once_per_run() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_cmd("id", Some(&["-u", "svc"]), 1, "")
+                .with_cmd("id", Some(&["-u", "app"]), 0, "1002\n"),
+        );
+        let sink = Arc::new(Collect::default());
+        let parent = Ctx::new(System::fake(fake.clone(), sink), HostInfo::local());
+        let dry = crate::testing::dry(&parent);
+        let mut svc = dry.as_user("svc");
+        for name in ["first", "second"] {
+            assert!(svc.step(name, counted().0).unwrap().diff.is_none());
+        }
+        let (probe, checks) = counted();
+        let twin = crate::testing::dry(&parent);
+        assert!(twin.as_user("svc").step("third", probe).is_ok());
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        let (probe, checks) = counted();
+        dry.as_user("app").step("app once", probe).unwrap();
+        twin.as_user("app").step("app twice", counted().0).unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        let (probe, checks) = counted();
+        let real = parent.as_user("svc").step("real", probe).unwrap();
+        assert!(real.is_available());
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(id_probes(&fake, "svc"), 1);
+        assert_eq!(id_probes(&fake, "app"), 1);
+        assert_eq!(fake.argvs().len(), 2, "{:?}", fake.argvs());
+    }
+
+    /// Root always exists, so `as_root`, `as_escalated` (root unless the
+    /// inventory says otherwise) and the process's own identity never ask.
+    /// No `id` is planted, so a probe would fail the step.
+    #[test]
+    fn root_and_the_own_identity_are_never_asked_about() {
+        let (mut ctx, fake, _sink) = dry_over(Fake::new());
+        let (probe, checks) = counted();
+        ctx.as_root().step("as root", probe).unwrap();
+        ctx.as_escalated().step("escalated", counted().0).unwrap();
+        ctx.as_user("root").step("named root", counted().0).unwrap();
+        ctx.step("own", counted().0).unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+
+        // The process's own user by name, on a system that does not map it
+        // back to the own identity (a `Fake`).
+        let fake = Arc::new(Fake::new());
+        let sys = System::fake(fake.clone(), Arc::new(Collect::default()));
+        let facts = Facts {
+            user: "alice".into(),
+            is_root: false,
+            ..sys.facts().clone()
+        };
+        let sys = sys.with_facts(facts).with_check_mode(true);
+        let ctx = Ctx::new(sys, HostInfo::local());
+        let (probe, checks) = counted();
+        ctx.as_user("alice")
+            .step("own user by name", probe)
+            .unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// A host whose escalation method reaches no other account refuses a
+    /// step as another account in a real run, whether the account exists or
+    /// not: a refusal about the machine. A dry run refuses it too, through
+    /// the step's `check`, and asks `id` nothing.
+    #[test]
+    fn under_check_a_host_that_cannot_escalate_refuses_as_a_real_run_does() {
+        struct Stats;
+        impl Op for Stats {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> Result<Plan<Self>> {
+                sys.exists("/")?;
+                Ok(Plan::Satisfied(()))
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
+            }
+        }
+        let sink = Arc::new(Collect::default());
+        let sys = System::local(false, sink.clone()).with_escalation("none", None);
+        let ctx = Ctx::new(sys, HostInfo::local());
+        let dry = crate::testing::dry(&ctx);
+        let user = "rustible-no-such-account-118-none";
+        let err = dry
+            .as_user(user)
+            .step("as a missing account", Stats)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(&format!(
+                "cannot run as `{user}`: this host's escalation method is `none`"
+            )),
+            "{err}"
+        );
+        let probes = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::CmdRan { argv, .. } if argv[0] == "id"))
+            .count();
+        assert_eq!(probes, 0);
+    }
+
+    /// A real run asks nothing before a step: an account that is missing
+    /// fails where its helper cannot start instead (below).
+    #[test]
+    fn a_real_step_asks_nothing() {
+        let (ctx, _sink) = ctx_in(false);
+        let (probe, checks) = counted();
+        ctx.as_user("svc").step("config", probe).unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+    }
+
+    /// A real system, escalating through `doas`, which cannot do anything
+    /// here: absent, it cannot be spawned; present, it refuses an account
+    /// that does not exist. A real run's step as a missing account fails
+    /// naming the account, from the helper that could not start; so does a
+    /// direct `sys()` call under `--check`, which gets no allowance; and a
+    /// dry run's step waits for it, on the real `id`'s answer.
+    #[test]
+    fn a_missing_account_is_named_by_a_real_system_in_both_modes() {
+        struct Stats;
+        impl Op for Stats {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> Result<Plan<Self>> {
+                sys.exists("/")?;
+                Ok(Plan::Satisfied(()))
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
+            }
+        }
+        let missing = |user: &str| {
+            format!(
+                "account `{user}` does not exist; create it in an earlier step \
+                 (`user::Present`) or fix the name"
+            )
+        };
+        let sink = Arc::new(Collect::default());
+        let sys = System::local(false, sink).with_escalation("doas", None);
+        let ctx = Ctx::new(sys, HostInfo::local());
+
+        let real = "rustible-no-such-account-118";
+        let err = ctx
+            .as_user(real)
+            .step("as a missing account", Stats)
+            .unwrap_err()
+            .chain();
+        assert_eq!(
+            err,
+            format!("step `as a missing account`: /: {}", missing(real))
+        );
+
+        let dry = crate::testing::dry(&ctx);
+        let direct = "rustible-no-such-account-118-direct";
+        let err = dry.as_user(direct).sys().exists("/").unwrap_err().chain();
+        assert_eq!(err, format!("/: {}", missing(direct)));
+
+        let waits = "rustible-no-such-account-118-dry";
+        let step = dry.as_user(waits).step("waits", Stats).unwrap();
+        assert!(step.changed && step.diff.is_none());
     }
 }

@@ -336,10 +336,13 @@ never the op's internals; do not edit `docs/01_VISION.md` yourself.
   `sys.check_mode()`, so a real run's `check` still refuses; a dry run's plan
   never reaches `apply`. A refusal about the machine itself — not root, wrong
   platform, a masked unit, `systemctl` unable to answer, no `usermod` on
-  BusyBox — holds in both modes, and the tolerance must not swallow it. And
-  where Ansible refuses under check mode, so do we: an *existing* account's
-  missing group, keys for an account that does not exist. Check what the
-  Ansible module does before deferring a refusal, and cite the line.
+  BusyBox — holds in both modes, and the tolerance must not swallow it.
+  Check what the Ansible module does before deciding a refusal, and cite the
+  line. Ansible is the starting point, not the authority: follow it unless
+  there is a reason not to, and record a divergence and its reason in
+  `docs/plan/DECISIONS.md`. (It is followed today for an *existing*
+  account's missing group and for keys for an account that does not exist,
+  both refused under check mode.)
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
 - Everything the operation does to the machine goes through `sys`, including
@@ -517,7 +520,11 @@ wiring. `with_check_mode(true)` is a consuming builder on it —
 `System::fake(..).with_check_mode(true)` — and gives you the dry `System` a
 check-mode test needs. A test that runs steps rather than `check` and
 `apply` builds its `Ctx` with `rustible_sdk::testing::ctx(sys)`; a playbook
-is handed its `Ctx` and cannot build one.
+is handed its `Ctx` and cannot build one. A check-mode step through
+`ctx.as_user(name)` (any account but root and the process's own user) first
+runs `id -u <name>` as the process's own user, so a `Ctx`-level `Fake` test
+plants it: `.with_cmd("id", Some(&["-u", name]), 0, "1000\n")`, or a
+non-zero status for an account that does not exist yet.
 
 All of this is the test API, behind the `testing` feature of `rustible-sdk`
 (and of `rustible`, which re-exports `#[integration_test]` only with it).
