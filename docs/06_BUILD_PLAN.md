@@ -152,6 +152,11 @@ Each op is one task. The brief is the template above with these fixed parts:
   archive member's name, a line of a file) quotes it bounded and on one line
   (`http::one_line`, `archive`'s `named`), so the error stays small however
   large the input.
+- Secrets: taken as `&Secret`. One the op receives any other way or
+  derives itself (a URL's password, an encoded credential) is registered
+  with `rustible_sdk::mask::register`. A secret's plaintext goes only into
+  the stdin, file or request that needs it, never into a message; the op
+  masks nothing itself.
 - Docs beyond rustdoc: a row in the README's operations table, and the
   module in `docs/USING_RUSTIBLE.md`'s list if it is new. The manual lists no
   signatures, so it gains a line only for a new builder shape or a trap.

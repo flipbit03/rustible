@@ -784,6 +784,15 @@ impl System {
         });
     }
 
+    /// This system with its sink wrapped in the run's masker, as the
+    /// runtime wraps the one it builds: what a test's `Ctx` gets, so a test
+    /// sees the events a run would emit.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn masked(mut self) -> System {
+        self.sink = Arc::new(crate::mask::Masking::new(self.sink));
+        self
+    }
+
     pub(crate) fn sink(&self) -> &SharedSink {
         &self.sink
     }

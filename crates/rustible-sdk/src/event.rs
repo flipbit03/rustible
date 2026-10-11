@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::diff::Diff;
 use crate::error::CmdFailed;
-use crate::facts::Facts;
+use crate::facts::{Arch, Distro, Facts, Init, Os};
 
 /// How a step turned out. [`Ctx::step`](crate::ctx::Ctx::step) picks exactly
 /// one from what [`Op::check`](crate::op::Op::check) planned and what
@@ -274,6 +274,153 @@ impl Event {
             blocks: step.map(|s| s.blocks.clone()).unwrap_or_default(),
             error: e.chain(),
             cmd: e.cmd_failed().cloned(),
+        }
+    }
+
+    /// This event with `f` applied to every string in it, and nothing else
+    /// changed: what the run's masker does to each event before it leaves
+    /// the binary. Every variant and field is spelled out, so a string
+    /// added to an event does not compile until it is decided here.
+    pub(crate) fn map_text(self, f: &mut dyn FnMut(String) -> String) -> Event {
+        fn all(v: Vec<String>, f: &mut dyn FnMut(String) -> String) -> Vec<String> {
+            v.into_iter().map(f).collect()
+        }
+        match self {
+            Event::Facts(facts) => {
+                let Facts {
+                    os,
+                    distro,
+                    distro_version,
+                    arch,
+                    kernel,
+                    hostname,
+                    package_managers,
+                    init,
+                    cpus,
+                    memory_mb,
+                    user,
+                    is_root,
+                } = facts;
+                Event::Facts(Facts {
+                    os: match os {
+                        Os::Other(s) => Os::Other(f(s)),
+                        os => os,
+                    },
+                    distro: match distro {
+                        Distro::Other(s) => Distro::Other(f(s)),
+                        d => d,
+                    },
+                    distro_version: f(distro_version),
+                    arch: match arch {
+                        Arch::Other(s) => Arch::Other(f(s)),
+                        a => a,
+                    },
+                    kernel: f(kernel),
+                    hostname: f(hostname),
+                    package_managers,
+                    init: match init {
+                        Init::Other(s) => Init::Other(f(s)),
+                        i => i,
+                    },
+                    cpus,
+                    memory_mb,
+                    user: f(user),
+                    is_root,
+                })
+            }
+            Event::BlockStarted { blocks } => Event::BlockStarted {
+                blocks: all(blocks, f),
+            },
+            Event::BlockFinished { blocks } => Event::BlockFinished {
+                blocks: all(blocks, f),
+            },
+            Event::StepStarted {
+                id,
+                blocks,
+                name,
+                identity,
+            } => Event::StepStarted {
+                id,
+                blocks: all(blocks, f),
+                name: f(name),
+                identity: f(identity),
+            },
+            Event::StepFinished {
+                id,
+                blocks,
+                name,
+                identity,
+                status,
+                diff,
+                note,
+                elapsed_ms,
+                cmd,
+            } => Event::StepFinished {
+                id,
+                blocks: all(blocks, f),
+                name: f(name),
+                identity: f(identity),
+                status,
+                diff: diff.map(|d| d.map_text(f)),
+                note: note.map(&mut *f),
+                elapsed_ms,
+                cmd: cmd.map(|c| c.map_text(f)),
+            },
+            Event::StepSkipped {
+                id,
+                blocks,
+                name,
+                reason,
+            } => Event::StepSkipped {
+                id,
+                blocks: all(blocks, f),
+                name: f(name),
+                reason: f(reason),
+            },
+            Event::Log { level, msg } => Event::Log { level, msg: f(msg) },
+            Event::CmdRan {
+                identity,
+                argv,
+                status,
+                elapsed_ms,
+            } => Event::CmdRan {
+                identity: f(identity),
+                argv: all(argv, f),
+                status,
+                elapsed_ms,
+            },
+            Event::Failed {
+                step,
+                id,
+                blocks,
+                error,
+                cmd,
+            } => Event::Failed {
+                step: step.map(&mut *f),
+                id,
+                blocks: all(blocks, f),
+                error: f(error),
+                cmd: cmd.map(|c| c.map_text(f)),
+            },
+            Event::Finished(summary) => Event::Finished(summary),
+        }
+    }
+}
+
+impl CmdFailed {
+    /// [`Event::map_text`] for the command an event carries.
+    fn map_text(self, f: &mut dyn FnMut(String) -> String) -> CmdFailed {
+        let CmdFailed {
+            argv,
+            status,
+            signal,
+            stderr,
+        } = self;
+        CmdFailed {
+            argv: argv.into_iter().map(&mut *f).collect(),
+            status,
+            signal,
+            stderr: f(stderr),
         }
     }
 }

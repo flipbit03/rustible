@@ -30,6 +30,7 @@ pub mod facts;
 #[cfg(test)]
 mod freed;
 pub mod launch;
+pub mod mask;
 pub mod op;
 pub mod protocol;
 pub mod registry;

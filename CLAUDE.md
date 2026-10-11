@@ -345,6 +345,13 @@ never the op's internals; do not edit `docs/01_VISION.md` yourself.
   both refused under check mode.)
 - **Every message is read by someone at 2am.** Name the thing, say why, say
   what to do about it.
+- **Secrets are taken as `&Secret`, and masking is the SDK's job.** A
+  `Secret` registers itself with the run's masker, which masks every event
+  as it leaves the binary. A secret the op receives any other way, or
+  derives itself (a URL's password, `base64(user:pass)`), it registers with
+  `rustible_sdk::mask::register`. It formats a `Secret`'s plaintext into
+  nothing but the command stdin, file or request that needs it, and it
+  never masks anything itself.
 - Everything the operation does to the machine goes through `sys`, including
   reads, so the `Fake` is meaningful. **`clippy.toml` enforces this**: an op
   reaching for `std::fs` or `std::process::Command` fails the lint job, with
