@@ -117,8 +117,12 @@ impl<W: Write> Renderer<W> {
         self.hosts.entry(host.to_string()).or_default()
     }
 
+    /// Every line the renderer prints but the summary table goes through
+    /// here, so whatever it carries from the target (a diff, stderr, a log
+    /// message) prints with its control characters escaped.
     fn line(&mut self, host: &str, text: &str) {
-        let _ = writeln!(self.w, "[{host:<w$}]  {text}", w = self.width);
+        let line = format!("[{host:<w$}]  {text}", w = self.width);
+        let _ = writeln!(self.w, "{}", escape_controls(&line));
     }
 
     /// A line that belongs to the step in flight when there is one, else
@@ -452,14 +456,15 @@ impl<W: Write> Renderer<W> {
                 }
             }
         }
-        let _ = self.w.write_all(out.as_bytes());
+        let _ = self.w.write_all(escape_controls(&out).as_bytes());
         let _ = self.w.flush();
         any_failed
     }
 }
 
 /// A command line on one line: arguments with whitespace or control
-/// characters are shown quoted and escaped.
+/// characters are shown quoted and escaped. The SDK's `Compact` printer has
+/// its own copy.
 fn argv_text(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
@@ -604,6 +609,45 @@ fn drop_step_layer(step: &str, error: &str) -> String {
         from = at + 1;
     }
     error.to_string()
+}
+
+/// `text` with every control character escaped (`\u{1b}`, `\r`) except a
+/// newline, a tab and the `\r` of a `\r\n`, so nothing printed can move
+/// the cursor, recolour the terminal or overwrite the `[host]` prefix; and
+/// the characters that reorder, hide or break text: U+00AD, U+061C, U+180E,
+/// U+200B–U+200F, U+2028–U+202E, U+2060–U+2064, U+2066–U+2069 and U+FEFF.
+/// Everything else outside ASCII prints as it is. The SDK's `Compact` and
+/// `http::Request`'s shown body have their own copies.
+fn escape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' if chars.peek() == Some(&'\n') => out.push(c),
+            c if c.is_control() || invisible(c) => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The characters [`escape_controls`] escapes that are not controls: they
+/// reorder (bidi marks, embeddings, overrides and isolates), hide
+/// (zero-width characters, invisible operators, the soft hyphen, the
+/// byte-order mark) or break (line and paragraph separators) text.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 /// A reason reduced to one line of at most `max` characters, for the summary
@@ -1983,6 +2027,144 @@ web1    4        1             0        0       0          2         0
             "dpkg-query \"-f=${Status}\\t${Version}\\n\" mc"
         );
         assert_eq!(argv_text(&["a b".to_string()]), "\"a b\"");
+    }
+
+    /// Text that came from the target, with an escape sequence, a lone
+    /// `\r`, a right-to-left override and a tab in it.
+    const RAW: &str = "a\u{1b}[2Jb\rc\u{202e}d\te";
+    /// The same as it prints: the tab kept, the rest escaped.
+    const SHOWN: &str = "a\\u{1b}[2Jb\\rc\\u{202e}d\te";
+
+    /// Whatever the target sends, every field prints with its control and
+    /// invisible formatting characters escaped: a step line's `short()`, a
+    /// text diff, a failure chain, a failed command's argv and stderr, a
+    /// log message, the facts, the binary's own stderr, and the summary
+    /// table.
+    #[test]
+    fn control_and_invisible_characters_print_escaped() {
+        let facts = rustible_sdk::facts::Facts {
+            os: rustible_sdk::facts::Os::Linux,
+            distro: rustible_sdk::facts::Distro::Debian,
+            distro_version: RAW.into(),
+            arch: rustible_sdk::facts::Arch::X86_64,
+            kernel: "6.1".into(),
+            hostname: "h".into(),
+            package_managers: Default::default(),
+            init: rustible_sdk::facts::Init::Systemd,
+            cpus: 2,
+            memory_mb: 2048,
+            user: "root".into(),
+            is_root: true,
+        };
+        let mut short = step_finished(1, "short", Status::Changed);
+        let mut full = step_finished(2, "full", Status::Changed);
+        if let Event::StepFinished { diff, .. } = &mut short {
+            *diff = Some(rustible_sdk::Diff::summary(RAW));
+        }
+        if let Event::StepFinished { diff, .. } = &mut full {
+            *diff = Some(rustible_sdk::Diff::text("/etc/x", "", format!("{RAW}\n")));
+        }
+        let mut failed = failing(3, "failed", &format!("chain {RAW}"));
+        if let Event::StepFinished { cmd, .. } = &mut failed {
+            *cmd = Some(CmdFailed {
+                argv: vec!["job".into(), RAW.into()],
+                status: 1,
+                signal: None,
+                stderr: format!("{RAW}\n"),
+            });
+        }
+        let out = render(2, |r| {
+            r.event("local", &Event::Facts(facts));
+            r.event("local", &step_started(1, "short"));
+            r.event("local", &short);
+            r.event("local", &step_started(2, "full"));
+            r.event("local", &full);
+            r.event("local", &step_started(3, "failed"));
+            r.event(
+                "local",
+                &Event::CmdRan {
+                    identity: "self".into(),
+                    argv: vec!["job".into(), RAW.into()],
+                    status: 1,
+                    elapsed_ms: 4,
+                },
+            );
+            r.event("local", &failed);
+            r.event(
+                "local",
+                &Event::Log {
+                    level: Level::Warn,
+                    msg: RAW.into(),
+                },
+            );
+            r.event("local", &Event::Finished(Summary::default()));
+            r.stderr("local", RAW);
+            r.exited("local", 0);
+            r.failed("arm", RAW);
+            r.finish();
+        });
+        // A quoted argument escapes the tab too, as `argv_text` always has.
+        let q = "\"a\\u{1b}[2Jb\\rc\\u{202e}d\\te\"";
+        // The text diff counts the lone `\r` as a line end, as `similar`
+        // does, and `lines()` does not: the two halves print on one line,
+        // the `\r` between them escaped.
+        assert_eq!(
+            out,
+            format!(
+                "[local]  facts: Debian {SHOWN} X86_64 {{}} cpus=2 mem=2048MB user=root\n\
+                 [local]  short ................................................... changed         {SHOWN}\n\
+                 [local]  full .................................................... changed         +2 -0 lines\n\
+                 [local]      | --- /etc/x (before)\n\
+                 [local]      | +++ /etc/x (after)\n\
+                 [local]      | @@ -0,0 +1,2 @@\n\
+                 [local]      | +a\\u{{1b}}[2Jb\\r+c\\u{{202e}}d\te\n\
+                 [local]  failed .................................................. FAILED\n\
+                 [local]    $ job {q} (as self, exit 1, 4ms)\n\
+                 [local]  FAILED at `failed`: chain {SHOWN}\n\
+                 [local]    $ job {q} (exit 1)\n\
+                 [local]      {SHOWN}\n\
+                 [local]    WARNING: {SHOWN}\n\
+                 [local]    stderr: {SHOWN}\n\
+                 [arm  ]  FAILED: {SHOWN}\n\
+                 \n\
+                 host    ok  changed  would change  skipped  failed  recovered  warnings\n\
+                 local    0        0             0        0       0          0         0\n\
+                 arm    failed: {SHOWN}\n"
+            )
+        );
+    }
+
+    /// A newline is not escaped: a message of several lines prints on
+    /// several lines, the first carrying the host's prefix.
+    #[test]
+    fn a_multi_line_message_still_prints_on_several_lines() {
+        let out = render(0, |r| {
+            r.event(
+                "local",
+                &Event::Log {
+                    level: Level::Warn,
+                    msg: "first\nsecond\r\nthird\r".into(),
+                },
+            );
+        });
+        assert_eq!(out, "[local]    WARNING: first\nsecond\r\nthird\\r\n");
+    }
+
+    /// The set is `http::Request`'s, at every range's ends: each copy of it
+    /// is written by hand, so a drift in any of them fails here.
+    #[test]
+    fn the_escaped_set_is_request_rs_set_at_every_boundary() {
+        assert_eq!(
+            escape_controls(
+                "\0\u{7f}\u{80}\u{9b}\u{9f}\u{ad}\u{61c}\u{180e}\u{200b}\u{200f}\u{2028}\
+                 \u{202e}\u{2060}\u{2064}\u{2066}\u{2069}\u{feff}"
+            ),
+            "\\u{0}\\u{7f}\\u{80}\\u{9b}\\u{9f}\\u{ad}\\u{61c}\\u{180e}\\u{200b}\\u{200f}\
+             \\u{2028}\\u{202e}\\u{2060}\\u{2064}\\u{2066}\\u{2069}\\u{feff}"
+        );
+        // Just outside each range, and ordinary non-ASCII: kept.
+        let kept = "\u{a0}\u{200a}\u{2010}\u{2027}\u{202f}\u{205f}\u{2065}\u{206a}\u{fefe}é漢";
+        assert_eq!(escape_controls(kept), kept);
     }
 
     #[test]

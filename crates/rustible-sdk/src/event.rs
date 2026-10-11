@@ -628,27 +628,45 @@ impl<W: Write + Send> Compact<W> {
 
 /// A failed command at `-v`: `$ argv (exit N)`, or `(killed by signal N)`
 /// for a process a signal ended, then its stderr, one line at a time,
-/// indented under it. `rustible`'s renderer prints the same, with
-/// arguments quoted.
-fn cmd_block(w: &mut impl Write, c: &CmdFailed) {
-    let _ = writeln!(w, "  $ {} ({})", c.argv.join(" "), how_it_ended(c));
-    for line in c.stderr.lines() {
-        let _ = writeln!(w, "    {line}");
+/// indented under it. `rustible`'s renderer prints the same.
+fn cmd_block(out: &mut String, c: &CmdFailed) {
+    line(
+        out,
+        format_args!("  $ {} ({})", argv_text(&c.argv), how_it_ended(c)),
+    );
+    for l in c.stderr.lines() {
+        line(out, format_args!("    {l}"));
     }
+}
+
+/// Appends one printed line to `out`, its control characters escaped
+/// before the newline that ends it, so a trailing `\r` is escaped too.
+/// Every line `Compact` prints goes through here.
+fn line(out: &mut String, text: std::fmt::Arguments<'_>) {
+    out.push_str(&escape_controls(&text.to_string()));
+    out.push('\n');
 }
 
 impl<W: Write + Send> EventSink for Compact<W> {
     fn emit(&self, event: Event) {
-        let mut w = self.w.lock().unwrap();
-        let _ = match event {
-            Event::Facts(f) => writeln!(
-                w,
-                "facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
-                f.distro, f.distro_version, f.arch, f.package_managers, f.cpus, f.memory_mb, f.user
+        let mut out = String::new();
+        match event {
+            Event::Facts(f) => line(
+                &mut out,
+                format_args!(
+                    "facts: {:?} {} {:?} {:?} cpus={} mem={}MB user={}",
+                    f.distro,
+                    f.distro_version,
+                    f.arch,
+                    f.package_managers,
+                    f.cpus,
+                    f.memory_mb,
+                    f.user
+                ),
             ),
             Event::BlockStarted { .. }
             | Event::BlockFinished { .. }
-            | Event::StepStarted { .. } => Ok(()),
+            | Event::StepStarted { .. } => {}
             Event::StepFinished {
                 id,
                 blocks,
@@ -676,22 +694,25 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 if identity != "self" {
                     tail.push_str(&format!("  as {identity}"));
                 }
-                let r = writeln!(w, "{status_s}: {}{name}{tail}", step_prefix(&blocks));
+                line(
+                    &mut out,
+                    format_args!("{status_s}: {}{name}{tail}", step_prefix(&blocks)),
+                );
                 // Whatever the status (a satisfied step carries no diff),
                 // unless the step line already shows all of it.
                 if self.verbosity >= 1
                     && let Some(d) = diff
                     && !on_the_step_line(&d)
                 {
-                    for line in d.render().lines() {
-                        let _ = writeln!(w, "    | {line}");
+                    for l in d.render().lines() {
+                        line(&mut out, format_args!("    | {l}"));
                     }
                 }
                 if status == Status::Failed {
                     if self.verbosity >= 1
                         && let Some(c) = &cmd
                     {
-                        cmd_block(&mut *w, c);
+                        cmd_block(&mut out, c);
                     }
                     // Read only to pair a command at `-v`, so not kept
                     // below it.
@@ -702,31 +723,35 @@ impl<W: Write + Send> EventSink for Compact<W> {
                         cmd: cmd.filter(|_| self.verbosity >= 1),
                     });
                 }
-                r
             }
             Event::StepSkipped {
                 blocks,
                 name,
                 reason,
                 ..
-            } => writeln!(w, "skipped: {}{name}  {reason}", step_prefix(&blocks)),
+            } => line(
+                &mut out,
+                format_args!("skipped: {}{name}  {reason}", step_prefix(&blocks)),
+            ),
             Event::Log { level, msg } => match level {
-                Level::Debug if self.verbosity < 1 => Ok(()),
-                Level::Debug => writeln!(w, "debug: {msg}"),
-                Level::Info => writeln!(w, "{msg}"),
-                Level::Warn => writeln!(w, "WARNING: {msg}"),
+                Level::Debug if self.verbosity < 1 => {}
+                Level::Debug => line(&mut out, format_args!("debug: {msg}")),
+                Level::Info => line(&mut out, format_args!("{msg}")),
+                Level::Warn => line(&mut out, format_args!("WARNING: {msg}")),
             },
             Event::CmdRan {
                 identity,
                 argv,
                 status,
                 elapsed_ms,
-            } if self.verbosity >= 2 => writeln!(
-                w,
-                "$ {} (as {identity}, exit {status}, {elapsed_ms}ms)",
-                argv.join(" ")
+            } if self.verbosity >= 2 => line(
+                &mut out,
+                format_args!(
+                    "$ {} (as {identity}, exit {status}, {elapsed_ms}ms)",
+                    argv_text(&argv)
+                ),
             ),
-            Event::CmdRan { .. } => Ok(()),
+            Event::CmdRan { .. } => {}
             Event::Failed {
                 step,
                 id,
@@ -734,10 +759,13 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 error,
                 cmd,
             } => {
-                let r = match &step {
-                    Some(s) => writeln!(w, "FAILED at {}`{s}`: {error}", step_prefix(&blocks)),
-                    None => writeln!(w, "FAILED: {error}"),
-                };
+                match &step {
+                    Some(s) => line(
+                        &mut out,
+                        format_args!("FAILED at {}`{s}`: {error}", step_prefix(&blocks)),
+                    ),
+                    None => line(&mut out, format_args!("FAILED: {error}")),
+                }
                 // A step's chain is on its own line, so a step printed
                 // already printed its command too. Without an id, a name
                 // can be borrowed: the command has to be the same as well.
@@ -759,17 +787,76 @@ impl<W: Write + Send> EventSink for Compact<W> {
                     && !printed
                     && let Some(c) = cmd
                 {
-                    cmd_block(&mut *w, &c);
+                    cmd_block(&mut out, &c);
                 }
-                r
             }
-            Event::Finished(s) => writeln!(
-                w,
-                "ok={} changed={} would_change={} skipped={} failed={} recovered={} warnings={}",
-                s.ok, s.changed, s.would_change, s.skipped, s.failed, s.recovered, s.warnings
+            Event::Finished(s) => line(
+                &mut out,
+                format_args!(
+                    "ok={} changed={} would_change={} skipped={} failed={} recovered={} warnings={}",
+                    s.ok, s.changed, s.would_change, s.skipped, s.failed, s.recovered, s.warnings
+                ),
             ),
-        };
+        }
+        if !out.is_empty() {
+            let _ = self.w.lock().unwrap().write_all(out.as_bytes());
+        }
     }
+}
+
+/// A command line on one line: arguments with whitespace or control
+/// characters are shown quoted and escaped. `rustible`'s renderer has its
+/// own copy.
+fn argv_text(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty() || a.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                format!("{a:?}")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `text` with every control character escaped (`\u{1b}`, `\r`) except a
+/// newline, a tab and the `\r` of a `\r\n`, so nothing printed can move
+/// the cursor or recolour the terminal; and the characters that reorder,
+/// hide or break text: U+00AD, U+061C, U+180E, U+200B–U+200F,
+/// U+2028–U+202E, U+2060–U+2064, U+2066–U+2069 and U+FEFF. Everything else
+/// outside ASCII prints as it is. `rustible`'s renderer and
+/// `http::Request`'s shown body have their own copies.
+fn escape_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' if chars.peek() == Some(&'\n') => out.push(c),
+            c if c.is_control() || invisible(c) => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The characters [`escape_controls`] escapes that are not controls: they
+/// reorder (bidi marks, embeddings, overrides and isolates), hide
+/// (zero-width characters, invisible operators, the soft hyphen, the
+/// byte-order mark) or break (line and paragraph separators) text.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
 }
 
 /// How a failed command ended, for its `$` line: the signal that killed
@@ -1087,7 +1174,7 @@ mod tests {
         );
         let once = "FAILED: [b] try  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n    \
                     | PATCH http://h/x\n    | {}\n  \
-                    $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n";
+                    $ /bin/sh -c \"exit 3\" (exit 3)\n    nope\n    still nope\n";
         assert_eq!(print(1, events()), format!("{once}{once}"));
     }
 
@@ -1120,11 +1207,11 @@ mod tests {
             out,
             "FAILED: [b] x  PATCH http://h/x …  `/bin/sh -c exit 3` exited 3\n    \
              | PATCH http://h/x\n    | {}\n  \
-             $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n\
+             $ /bin/sh -c \"exit 3\" (exit 3)\n    nope\n    still nope\n\
              ok: cleanup\n\
              FAILED at [b] `x`: `/bin/sh -c exit 3` exited 3\n"
         );
-        let from_frame = "  $ /bin/sh -c exit 3 (exit 3)\n    nope\n    still nope\n";
+        let from_frame = "  $ /bin/sh -c \"exit 3\" (exit 3)\n    nope\n    still nope\n";
         assert_eq!(
             print(1, vec![failed_frame(None, None)]),
             format!("FAILED: `/bin/sh -c exit 3` exited 3\n{from_frame}")
@@ -1274,6 +1361,146 @@ mod tests {
             print(1, vec![frame(exited(), why)]),
             "FAILED: `job --long` exited 2\n  $ job --long (exit 2)\n    working\n"
         );
+    }
+
+    /// Text that came from the target, with an escape sequence, a lone
+    /// `\r`, a right-to-left override and a tab in it.
+    const RAW: &str = "a\u{1b}[2Jb\rc\u{202e}d\te";
+    /// The same as it prints: the tab kept, the rest escaped.
+    const SHOWN: &str = "a\\u{1b}[2Jb\\rc\\u{202e}d\te";
+
+    /// Every line prints with its control and invisible formatting
+    /// characters escaped: the facts, a step line's `short()`, a text diff,
+    /// a failure chain, a failed command's argv (quoted, as `rustible`'s
+    /// renderer quotes it) and stderr, and a log message.
+    #[test]
+    fn compact_prints_control_and_invisible_characters_escaped() {
+        let facts = Facts {
+            os: Os::Linux,
+            distro: Distro::Debian,
+            distro_version: RAW.into(),
+            arch: Arch::X86_64,
+            kernel: "6.1".into(),
+            hostname: "h".into(),
+            package_managers: Default::default(),
+            init: Init::Systemd,
+            cpus: 2,
+            memory_mb: 2048,
+            user: "root".into(),
+            is_root: true,
+        };
+        let step = |id, name: &str, status, diff, note: Option<String>, cmd| Event::StepFinished {
+            id,
+            blocks: vec![],
+            name: name.into(),
+            identity: "self".into(),
+            status,
+            diff: Some(diff),
+            note,
+            elapsed_ms: 0,
+            cmd,
+        };
+        let job = CmdFailed {
+            argv: vec!["job".into(), RAW.into()],
+            status: 1,
+            signal: None,
+            stderr: format!("{RAW}\n"),
+        };
+        let out = print(
+            2,
+            vec![
+                Event::Facts(facts),
+                step(1, "short", Status::Changed, Diff::summary(RAW), None, None),
+                step(
+                    2,
+                    "full",
+                    Status::Changed,
+                    Diff::text("/etc/x", "", format!("{RAW}\n")),
+                    None,
+                    None,
+                ),
+                Event::CmdRan {
+                    identity: "self".into(),
+                    argv: job.argv.clone(),
+                    status: 1,
+                    elapsed_ms: 4,
+                },
+                step(
+                    3,
+                    "failed",
+                    Status::Failed,
+                    Diff::summary("x"),
+                    Some(format!("chain {RAW}")),
+                    Some(job.clone()),
+                ),
+                Event::Failed {
+                    step: None,
+                    id: None,
+                    blocks: vec![],
+                    error: RAW.into(),
+                    cmd: None,
+                },
+                Event::Log {
+                    level: Level::Warn,
+                    msg: RAW.into(),
+                },
+            ],
+        );
+        // A quoted argument escapes the tab too, as `argv_text` always has.
+        let q = "\"a\\u{1b}[2Jb\\rc\\u{202e}d\\te\"";
+        // The text diff counts the lone `\r` as a line end, as `similar`
+        // does, and `lines()` does not: the two halves print on one line,
+        // the `\r` between them escaped.
+        assert_eq!(
+            out,
+            format!(
+                "facts: Debian {SHOWN} X86_64 {{}} cpus=2 mem=2048MB user=root\n\
+                 changed: short  {SHOWN}\n\
+                 changed: full  +2 -0 lines\n    \
+                 | --- /etc/x (before)\n    \
+                 | +++ /etc/x (after)\n    \
+                 | @@ -0,0 +1,2 @@\n    \
+                 | +a\\u{{1b}}[2Jb\\r+c\\u{{202e}}d\te\n\
+                 $ job {q} (as self, exit 1, 4ms)\n\
+                 FAILED: failed  x  chain {SHOWN}\n  \
+                 $ job {q} (exit 1)\n    \
+                 {SHOWN}\n\
+                 FAILED: {SHOWN}\n\
+                 WARNING: {SHOWN}\n"
+            )
+        );
+    }
+
+    /// A newline is not escaped: a message of several lines prints on
+    /// several lines, and so does the `\r` of a `\r\n`. A lone `\r` at the
+    /// end is escaped, though the line's own newline follows it.
+    #[test]
+    fn compact_prints_a_multi_line_message_on_several_lines() {
+        let out = print(
+            0,
+            vec![Event::Log {
+                level: Level::Warn,
+                msg: "first\nsecond\r\nthird\r".into(),
+            }],
+        );
+        assert_eq!(out, "WARNING: first\nsecond\r\nthird\\r\n");
+    }
+
+    /// The set is `http::Request`'s, at every range's ends: each copy of it
+    /// is written by hand, so a drift in any of them fails here.
+    #[test]
+    fn the_escaped_set_is_request_rs_set_at_every_boundary() {
+        assert_eq!(
+            escape_controls(
+                "\0\u{7f}\u{80}\u{9b}\u{9f}\u{ad}\u{61c}\u{180e}\u{200b}\u{200f}\u{2028}\
+                 \u{202e}\u{2060}\u{2064}\u{2066}\u{2069}\u{feff}"
+            ),
+            "\\u{0}\\u{7f}\\u{80}\\u{9b}\\u{9f}\\u{ad}\\u{61c}\\u{180e}\\u{200b}\\u{200f}\
+             \\u{2028}\\u{202e}\\u{2060}\\u{2064}\\u{2066}\\u{2069}\\u{feff}"
+        );
+        // Just outside each range, and ordinary non-ASCII: kept.
+        let kept = "\u{a0}\u{200a}\u{2010}\u{2027}\u{202f}\u{205f}\u{2065}\u{206a}\u{fefe}é漢";
+        assert_eq!(escape_controls(kept), kept);
     }
 
     /// Below `-v` no command prints, so the printed history keeps none.
