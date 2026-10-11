@@ -156,7 +156,9 @@ Each op is one task. The brief is the template above with these fixed parts:
   derives itself (a URL's password, an encoded credential) is registered
   with `rustible_sdk::mask::register`. A secret's plaintext goes only into
   the stdin, file or request that needs it, never into a message; the op
-  masks nothing itself.
+  masks nothing itself. Text that may hold a secret and that the op cuts or
+  reshapes before emitting it goes through `rustible_sdk::mask::apply_prefix`
+  first.
 - Docs beyond rustdoc: a row in the README's operations table, and the
   module in `docs/USING_RUSTIBLE.md`'s list if it is new. The manual lists no
   signatures, so it gains a line only for a new builder shape or a trap.

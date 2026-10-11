@@ -379,6 +379,10 @@ on the target before it is sent: wherever one appears in an event's text (a
 command's stderr, an error, a warning, a diff) or in a panic's message, raw,
 JSON-escaped or form-encoded, it shows as `<secret>`. A secret you hold as a
 plain string is masked once you pass it to `rustible::sdk::mask::register(&s)`.
+Text that may hold a secret and that you cut or reshape before it reaches an
+event goes through `rustible::sdk::mask::apply_prefix` first, or a secret the
+cut halves shows its first part, and one the reshaping rewrites shows as
+rewritten.
 ⚠️ A secret shorter than 4 characters is never masked, and one of 4 to 6
 characters only as a whole word. ⚠️ Masking covers what the run reports, not
 where the plaintext goes: an argument built with `as_str()` is in the target's
@@ -1159,13 +1163,7 @@ lists the codes. Read the response into a struct with `json_as`;
 `rustible_std::http` re-exports `json!` and `Value` for the untyped case.
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 `.basic_auth(user, &s)`. The diff never shows them, and they are masked like
-any secret (§6), as is a URL's `user:pass@` password. ⚠️ A secret cut by the
-2 KiB a diff shows of a body, or by the 512 bytes an error quotes of a
-server's answer, can show in part there. So can one an error quotes that
-holds a control character or any whitespace but single spaces (the quote
-escapes the first and makes every run of the second one space), and one a
-diff shows that holds a control character other than a newline or tab, or
-an invisible formatting character (the diff escapes those).
+any secret (§6), as is a URL's `user:pass@` password.
 
 Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`

@@ -47,8 +47,9 @@ use zeroize::{Zeroize, Zeroizing};
 ///   message. The value is in clear in an `Error` the playbook holds, in a
 ///   command's argv on the target (its process list), in anything the
 ///   playbook writes to stdout or stderr itself, and in any text cut or
-///   rewritten before it reaches an event, which masking may no longer
-///   recognise.
+///   rewritten before it reaches an event without
+///   [`mask::apply_prefix`](crate::mask::apply_prefix), which masking may
+///   no longer recognise.
 /// - [`Secret::as_bytes`] and [`Secret::as_str`] hand back the plaintext.
 ///   Whatever the caller then writes to a file, sends, or passes as a
 ///   command argument is outside this type.

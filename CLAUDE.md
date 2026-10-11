@@ -350,8 +350,15 @@ never the op's internals; do not edit `docs/01_VISION.md` yourself.
   as it leaves the binary. A secret the op receives any other way, or
   derives itself (a URL's password, `base64(user:pass)`), it registers with
   `rustible_sdk::mask::register`. It formats a `Secret`'s plaintext into
-  nothing but the command stdin, file or request that needs it, and it
-  never masks anything itself.
+  nothing but the command stdin, file or request that needs it, and masks
+  nothing itself, except as the next rule says.
+- **Cut or reshape only after `mask::apply_prefix`.** Text that may hold a
+  secret and that the op cuts or reshapes before emitting it (a server's
+  answer it quotes, a body its diff shows) goes through
+  `rustible_sdk::mask::apply_prefix` first, and the op cuts and reshapes
+  what that returns: the run masks events as they leave, and by then a
+  secret cut in two, or with its whitespace collapsed or its control
+  characters escaped, no longer matches.
 - Everything the operation does to the machine goes through `sys`, including
   reads, so the `Fake` is meaningful. **`clippy.toml` enforces this**: an op
   reaching for `std::fs` or `std::process::Command` fails the lint job, with
