@@ -52,6 +52,9 @@ const EXIT_USAGE: u8 = 3;
 
 /// The generated `src/main.rs` calls this.
 pub fn main(playbooks: &[Named]) -> ExitCode {
+    // Before anything can be registered: the escalation password arrives
+    // in the `Start` frame, before the run.
+    crate::mask::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.iter().find(|a| {
         matches!(
@@ -92,7 +95,11 @@ pub fn main(playbooks: &[Named]) -> ExitCode {
             // Removed when the run ends, not now: this run's own helpers are
             // started from the same path.
             let _copy = EphemeralCopy::from_args(&args);
-            remote(playbooks)
+            let code = remote(playbooks);
+            // `execute` wipes the run's secrets once it is over; a run
+            // refused after its `Start` frame never got there.
+            crate::mask::wipe();
+            code
         }
         Some("--helper") => {
             // A helper starts nothing from its own path, so it goes at once,
@@ -555,6 +562,8 @@ fn execute(
     // frame writer or the local printer: a secret never leaves the binary
     // in clear, whichever op, tool or playbook line wrote it.
     let sink: SharedSink = Arc::new(crate::mask::Masking::new(sink));
+    // And the panic hook masks a panic's message, which goes to stderr.
+    crate::mask::install_panic_hook();
     // Every warning is counted here, at the one point every event passes,
     // rather than by each of the three places that write one.
     let counter = Arc::new(WarnCounter::new(sink));
@@ -1061,6 +1070,62 @@ mod tests {
         },
         check_vars: |_| Ok(()),
     };
+
+    static PANICS_WITH_A_SECRET: Playbook = Playbook {
+        hosts: "local",
+        escalate: false,
+        ssh_user: None,
+        schema: vars::no_schema,
+        entry: |_, _| {
+            let token = Secret::new("t0ken-in-a-panic");
+            panic!("login failed with {}", token.as_str().unwrap());
+        },
+        check_vars: |_| Ok(()),
+    };
+
+    /// Not a test on its own: the body of the subprocess run below, which
+    /// reads its stderr. Ignored, so a normal run does not report it as a
+    /// pass that checked nothing.
+    #[test]
+    #[ignore = "run by a_panic_prints_its_message_masked in a child process"]
+    fn probe_a_panic_holding_a_secret() {
+        let (code, events) = run(&PANICS_WITH_A_SECRET, false);
+        assert_eq!(code, ExitCode::from(EXIT_FAILED));
+        assert_eq!(failed_in(&events), ["panic: login failed with <secret>"]);
+    }
+
+    /// A panic's message goes to the binary's stderr, which `rustible`
+    /// prints and puts in `--json`: the hook the run installs prints it
+    /// masked, where the default one prints it as it is. The hook is
+    /// process-wide, so the probe runs in a child process whose stderr is
+    /// read here.
+    #[test]
+    fn a_panic_prints_its_message_masked() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime::tests::probe_a_panic_holding_a_secret",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "the probe ran: {stdout}");
+        assert!(
+            stderr.contains("panicked at crates/rustible-sdk/src/runtime.rs:"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("\nlogin failed with <secret>\n"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("t0ken-in-a-panic"), "{stderr}");
+        assert!(!stdout.contains("t0ken-in-a-panic"), "{stdout}");
+    }
 
     /// Every event of a run passes the masker before the sink behind it: a
     /// command's stderr, a warning, a log line, a step's note and the

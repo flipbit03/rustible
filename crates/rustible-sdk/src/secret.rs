@@ -31,7 +31,9 @@ use zeroize::{Zeroize, Zeroizing};
 ///   binary emits shows `<secret>` where the value appears, raw,
 ///   JSON-escaped or form-encoded, whoever wrote the text: a command's
 ///   stderr echoing it, an error, a warning, a diff. Masked on the target,
-///   before the event is sent.
+///   before the event is sent. A panic's message, which goes to the
+///   binary's stderr, is masked the same way by the panic hook the runtime
+///   installs.
 ///
 /// Not covered:
 ///
@@ -41,10 +43,12 @@ use zeroize::{Zeroize, Zeroizing};
 ///   as a whole word (its neighbours not letters or digits), so `test` does
 ///   not mask `testing`. Its bytes are masked as text; bytes that are not
 ///   UTF-8 as their lossy decoding.
-/// - Masking applies to events, as they leave the binary. The value is in
-///   clear in an `Error` the playbook holds, in a command's argv on the
-///   target (its process list), and in any text cut or rewritten before it
-///   reaches an event, which masking may no longer recognise.
+/// - Masking applies to events, as they leave the binary, and to a panic's
+///   message. The value is in clear in an `Error` the playbook holds, in a
+///   command's argv on the target (its process list), in anything the
+///   playbook writes to stdout or stderr itself, and in any text cut or
+///   rewritten before it reaches an event, which masking may no longer
+///   recognise.
 /// - [`Secret::as_bytes`] and [`Secret::as_str`] hand back the plaintext.
 ///   Whatever the caller then writes to a file, sends, or passes as a
 ///   command argument is outside this type.
@@ -53,7 +57,11 @@ use zeroize::{Zeroize, Zeroizing};
 ///   there is the transport plus `protocol` zeroizing the frame buffer after
 ///   decoding, not this type.
 /// - Only this value's own buffer is wiped. A copy the caller made, or the
-///   `Vec` a secret was built from, lives and dies on its own.
+///   `Vec` a secret was built from, lives and dies on its own. The run's
+///   masker keeps a copy of the value (and of its encoded forms) in buffers
+///   wiped when the run ends, not when this value drops; the `rustible`
+///   command, which builds the escalation password it forwards as a
+///   `Secret`, keeps its masker's copy until it exits.
 /// - Nothing is pinned in RAM: a swapped page or a core dump can still hold
 ///   the bytes. The SDK does not `mlock`.
 ///

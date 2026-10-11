@@ -35,13 +35,17 @@
 //! ASCII-only encoder writes it (`\u00fc`); and form-encoded as
 //! `http::Request::form` writes it (`p@ss` as `p%40ss`).
 //!
+//! The runtime also installs a panic hook that masks a panic's message the
+//! same way before it is printed to stderr, which `rustible` shows.
+//!
 //! What is registered is kept in buffers that are wiped when they are
 //! dropped, and when the run ends; it is never written anywhere. Masking has
 //! no error to report: it cannot fail, and it never panics with a value in
 //! the message.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, PanicHookInfo, catch_unwind};
+use std::sync::{Arc, Once, PoisonError, RwLock, TryLockError};
 
 use zeroize::Zeroizing;
 
@@ -117,7 +121,9 @@ fn registry() -> Arc<Registry> {
     thread_local! {
         static SCOPED: Arc<Registry> = Arc::default();
     }
-    SCOPED.with(Arc::clone)
+    // An empty one once the thread's own is gone: a panic hook can run
+    // while a thread is being torn down.
+    SCOPED.try_with(Arc::clone).unwrap_or_default()
 }
 
 /// The secrets registered so far, and every form each is matched in.
@@ -178,25 +184,29 @@ impl Registry {
     pub(crate) fn mask(&self, text: String) -> String {
         let spans = {
             let reg = self.0.read().unwrap_or_else(PoisonError::into_inner);
-            if reg.forms.is_empty() {
-                return text;
-            }
             merge(&text, occurrences(&text, &reg.forms))
         };
         if spans.is_empty() {
             return text;
         }
-        let mut out = String::with_capacity(text.len());
-        let mut at = 0;
-        for (start, end) in spans {
-            out.push_str(text.get(at..start).unwrap_or_default());
-            out.push_str(PLACEHOLDER);
-            at = end;
-        }
-        out.push_str(text.get(at..).unwrap_or_default());
+        let out = replaced(&text, &spans);
         // The original may hold a secret: wipe it rather than free it as is.
         drop(Zeroizing::new(text));
         out
+    }
+
+    /// [`Registry::mask`] without waiting for the lock, for the panic hook:
+    /// `None` when the lock is held for writing (a registration on another
+    /// thread, or the very one that panicked), rather than block or
+    /// deadlock in the hook.
+    fn try_mask(&self, text: &str) -> Option<String> {
+        let reg = match self.0.try_read() {
+            Ok(reg) => reg,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        let spans = merge(text, occurrences(text, &reg.forms));
+        Some(replaced(text, &spans))
     }
 
     /// `event` with every string in it masked.
@@ -206,6 +216,19 @@ impl Registry {
         }
         event.map_text(&mut |s| self.mask(s))
     }
+}
+
+/// `text` with each of `spans` replaced by [`PLACEHOLDER`].
+fn replaced(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for &(start, end) in spans {
+        out.push_str(text.get(at..start).unwrap_or_default());
+        out.push_str(PLACEHOLDER);
+        at = end;
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
+    out
 }
 
 /// Every occurrence of every form in `text`, overlapping ones included, as
@@ -363,12 +386,79 @@ impl EventSink for Masking {
             return self.inner.emit(event);
         }
         // Masking does not panic (every slice is checked), but if it ever
-        // did, the event must not go out as it is, and the panic's own
-        // message must not carry it either. Every string is replaced.
-        let masked = catch_unwind(AssertUnwindSafe(|| self.registry.mask_event(event.clone())))
-            .unwrap_or_else(|_| event.map_text(&mut |_| "secret masking failed".to_string()));
+        // did, the event must not go out as it is: every string of it is
+        // replaced instead. The copy kept for that is wiped either way.
+        let kept = event.clone();
+        let masked = match catch_unwind(AssertUnwindSafe(|| self.registry.mask_event(event))) {
+            Ok(masked) => {
+                wipe_strings(kept);
+                masked
+            }
+            Err(_) => kept.map_text(&mut |s| {
+                drop(Zeroizing::new(s));
+                "secret masking failed".to_string()
+            }),
+        };
         self.inner.emit(masked);
     }
+}
+
+/// Wipe every string of `event` rather than free them as they are.
+fn wipe_strings(event: Event) {
+    let _ = event.map_text(&mut |s| {
+        drop(Zeroizing::new(s));
+        String::new()
+    });
+}
+
+/// Install, once per process, a panic hook that masks the panic's message
+/// before it is printed to stderr, which `rustible` shows and puts in
+/// `--json`. A message with nothing to mask, or a payload that is not text,
+/// goes to the hook that was there before (the default one: same text,
+/// location and backtrace). One that held a secret is printed the way the
+/// default hook prints, with `<secret>` in its place. The runtime installs
+/// it before anything is registered.
+pub(crate) fn install_panic_hook() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| match masked_panic(info.payload()) {
+            None => previous(info),
+            Some(message) => print_panic(info, &message),
+        }));
+    });
+}
+
+/// The panic's message with every registered secret masked, when there is
+/// one to mask; `None` when the message is not text or holds no secret. A
+/// message the registry cannot be read for right now is withheld.
+fn masked_panic(payload: &(dyn Any + Send)) -> Option<String> {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    match registry().try_mask(message) {
+        Some(masked) if masked == message => None,
+        Some(masked) => Some(masked),
+        None => Some("(message withheld: the secret masker was busy)".to_string()),
+    }
+}
+
+/// What the default hook prints, with `message` for the panic's own.
+fn print_panic(info: &PanicHookInfo<'_>, message: &str) {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("<unnamed>");
+    let at = info
+        .location()
+        .map(|l| format!(" at {l}"))
+        .unwrap_or_default();
+    let backtrace = std::backtrace::Backtrace::capture();
+    let tail = match backtrace.status() {
+        std::backtrace::BacktraceStatus::Captured => format!("stack backtrace:\n{backtrace}"),
+        _ => "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+            .to_string(),
+    };
+    eprint!("\nthread '{name}' panicked{at}:\n{message}\n{tail}");
 }
 
 #[cfg(test)]
@@ -710,6 +800,29 @@ mod tests {
         // Not UTF-8: as a lossy decoding shows it.
         let lossy = String::from_utf8_lossy(b"not-utf8-\xff-secret").into_owned();
         assert_eq!(through(&sink, &collect, &lossy), "<secret>");
+    }
+
+    /// The panic hook's decision: a text message holding a secret is
+    /// printed masked, any other goes to the previous hook untouched, and
+    /// one that cannot be masked right now is withheld rather than printed.
+    #[test]
+    fn a_panic_message_is_masked_only_when_it_holds_a_secret() {
+        let payload = |p: &(dyn Any + Send)| masked_panic(p);
+        register("s3cret-in-a-panic");
+        assert_eq!(
+            payload(&String::from("token s3cret-in-a-panic rejected")),
+            Some("token <secret> rejected".to_string())
+        );
+        assert_eq!(
+            payload(&"token s3cret-in-a-panic"),
+            Some("token <secret>".into())
+        );
+        assert_eq!(payload(&String::from("nothing secret")), None);
+        assert_eq!(payload(&42u8), None, "not text: the previous hook's");
+        let held = registry();
+        let _writing = held.0.write().unwrap();
+        let withheld = payload(&String::from("s3cret-in-a-panic")).unwrap();
+        assert!(withheld.contains("withheld"), "{withheld}");
     }
 
     /// Tests run in parallel in one process: a secret another test (another

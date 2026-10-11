@@ -374,15 +374,16 @@ If `ssh user@host` works from your shell, Rustible works.
 There is no vault. Keep secrets out of `hosts.kdl` and bring them in at run
 time with `ctx.local_secret(path)` (§8).
 
-Every `Secret` and the escalation password are masked in everything a run
-prints, on the target before it is sent: wherever one appears in an event's
-text (a command's stderr, an error, a warning, a diff), raw, JSON-escaped or
-form-encoded, it shows as `<secret>`. A secret you hold as a plain string is
-masked once you pass it to `rustible::sdk::mask::register(&s)`. ⚠️ A secret
-shorter than 4 characters is never masked, and one of 4 to 6 characters only
-as a whole word. ⚠️ Masking covers what the run prints, not where the
-plaintext goes: an argument built with `as_str()` is in the target's process
-list.
+Every `Secret` and the escalation password are masked in what a run reports,
+on the target before it is sent: wherever one appears in an event's text (a
+command's stderr, an error, a warning, a diff) or in a panic's message, raw,
+JSON-escaped or form-encoded, it shows as `<secret>`. A secret you hold as a
+plain string is masked once you pass it to `rustible::sdk::mask::register(&s)`.
+⚠️ A secret shorter than 4 characters is never masked, and one of 4 to 6
+characters only as a whole word. ⚠️ Masking covers what the run reports, not
+where the plaintext goes: an argument built with `as_str()` is in the target's
+process list, and what your playbook writes to stderr itself is printed as
+written.
 
 Validate before running:
 
@@ -1160,9 +1161,11 @@ lists the codes. Read the response into a struct with `json_as`;
 Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 `.basic_auth(user, &s)`. The diff never shows them, and they are masked like
 any secret (§6), as is a URL's `user:pass@` password. ⚠️ A secret cut by the
-2 KiB a diff shows of a body, or the 512 bytes an error quotes of a server's
-answer, or containing a tab, newline or control character, can show in part
-there.
+2 KiB a diff shows of a body, or by the 512 bytes an error quotes of a
+server's answer, can show in part there. So can one an error quotes that
+holds any whitespace but single spaces (the quote makes every run of it one
+space), and one a diff or an error shows that holds a control or invisible
+formatting character (both escape those).
 
 Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`

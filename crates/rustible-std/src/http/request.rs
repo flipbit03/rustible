@@ -1712,6 +1712,33 @@ mod tests {
         assert_eq!(emitted_diff(lone), "POST http://********@h/x\n<secret>");
     }
 
+    /// The masker's form-encoded form is exactly what `.form` writes, for
+    /// every printable ASCII character: the SDK keeps its own encoder, and
+    /// this pins the two together.
+    #[test]
+    fn the_masker_knows_the_form_encoding_form_writes() {
+        // The space inside: one at either end is trimmed before registering.
+        let every: String = ('!'..='~').chain(" end".chars()).collect();
+        let op = Request::post("http://h/x")
+            .bearer(&Secret::new(every.clone()))
+            .form([("v", every.as_str())]);
+        assert_eq!(emitted_diff(op), "POST http://h/x\nv=<secret>");
+    }
+
+    /// #92 item 1: a short secret after a scheme (`Token 1`) masks nothing
+    /// in a body that happens to hold a `1`: the part after the scheme is
+    /// under 4 characters and is not registered, and the whole value does
+    /// not appear.
+    #[test]
+    fn a_short_credential_does_not_garble_the_shown_body() {
+        let op = Request::post("http://h/x")
+            .header_secret("Authorization", &Secret::new("Token 1"))
+            .json(&json!({ "count": 1, "id": 210 }));
+        let diff = emitted_diff(op);
+        assert!(!diff.contains("<secret>"), "{diff}");
+        assert!(diff.contains("\"count\": 1,\n  \"id\": 210"), "{diff}");
+    }
+
     /// A secret is masked raw, in the two JSON forms (as `.json` writes it
     /// and as an ASCII-only encoder does), and form-encoded as `.form`
     /// writes it, whatever the body's kind or content type, and in no
