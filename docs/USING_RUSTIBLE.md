@@ -1093,10 +1093,12 @@ cannot use `brew::Present`/`Absent` directly: run it unescalated or use
 `ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
 It gates on `Pm::Brew` being found, not on the OS, so Linuxbrew works.
 `brew::Absent` refuses a pinned formula, under `--check` too: `brew unpin` it
-first. It removes only the formulae it names: orphaned dependencies are not
-removed, so add a step running `brew autoremove` if you want that. Name the formula, not an alias or old name (`python3`): one brew did not
-link at `<prefix>/opt/<name>` makes `Present` report `changed` every run and
-`Absent` report `ok` with the formula still installed.
+first. `brew::Absent` removes only the formulae it names, and `brew::Present`
+removes none: orphaned dependencies stay, so add a step running
+`brew autoremove` if you want them gone. Name the formula, not an alias or old
+name (`python3`): one brew did not link at `<prefix>/opt/<name>` makes
+`Present` report `changed` every run and `Absent` report `ok` with the formula
+still installed.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
 mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and

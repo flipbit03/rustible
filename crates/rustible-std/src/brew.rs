@@ -20,12 +20,16 @@
 //! symlink at `<prefix>/var/homebrew/pinned/<name>`, read like the Cellar,
 //! without running `brew`.
 //!
-//! [`Absent`] removes exactly the formulae its diff names. `brew uninstall`
-//! runs with `HOMEBREW_NO_AUTOREMOVE=1`, because Homebrew's autoremove is
-//! global: it removes every formula not installed on request that nothing
-//! depends on, not only the uninstalled formula's dependencies, and the diff
-//! could name none of them. Dependencies left orphaned stay installed; a
-//! playbook that wants them gone runs `brew autoremove` in a step of its own.
+//! Every `brew` these ops run, `brew install` and `brew uninstall`, runs with
+//! `HOMEBREW_NO_AUTOREMOVE=1`, so [`Absent`] removes exactly the formulae its
+//! diff names and [`Present`] removes none. Homebrew's autoremove is global:
+//! it removes every formula not installed on request that nothing depends
+//! on, not only the uninstalled formula's dependencies, and no diff could
+//! name them. `brew uninstall` runs it every time, and `brew install` at the
+//! end of the periodic cleanup it runs once the last one is 30 days old; the
+//! rest of that cleanup (old versions, the download cache) still runs.
+//! Dependencies left orphaned stay installed; a playbook that wants them gone
+//! runs `brew autoremove` in a step of its own.
 //!
 //! An alias or an old name (`python3`, `pkg-config`) has no rack of its own.
 //! When no rack has the name, both ops follow `<prefix>/opt/<name>`. A link
@@ -634,7 +638,14 @@ impl Op for Present {
             brew,
             names: missing,
         } = intent;
+        // Autoremove off, so the install removes nothing: `brew install` ends
+        // with `Install.finish_installation`, whose `Cleanup.periodic_clean!`
+        // runs `Cleanup#clean!` once the last cleanup is 30 days old, and
+        // `clean!` ends with the same global `Cleanup.autoremove` as `brew
+        // uninstall` (Homebrew 7.0.1, `install.rb`, `cleanup.rb`). The rest
+        // of that cleanup still runs.
         sys.cmd(&brew)
+            .env("HOMEBREW_NO_AUTOREMOVE", "1")
             .arg("install")
             .args(missing.iter().cloned())
             .run()?;
@@ -673,7 +684,8 @@ impl Op for Present {
 ///
 /// Only the formulae the diff names are removed: `brew uninstall` runs with
 /// `HOMEBREW_NO_AUTOREMOVE=1`, so the dependencies they leave orphaned stay
-/// installed. Run `brew autoremove` in a later step to remove those.
+/// installed, and no later [`Present`] step removes them either. Run `brew
+/// autoremove` in a later step to remove those.
 ///
 /// A formula that another installed formula or cask depends on is refused
 /// by brew, before it removes anything from the step, and the step fails with
@@ -1441,6 +1453,31 @@ mod tests {
         assert_eq!(
             fake.argvs(),
             vec![vec![BREW, "uninstall", "--force", "--formula", "nethack"]]
+        );
+    }
+
+    /// `brew install` runs with autoremove off: its periodic cleanup would
+    /// otherwise end in Homebrew's global autoremove, removing formulae the
+    /// step never named (#99).
+    #[test]
+    fn present_installs_with_autoremove_off() {
+        let fake = mac_fake(&[("agg", &["1.7.0"])]);
+        let s = mac_sys(&fake);
+        let op = Present::new(["nethack", "agg"]);
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&s, c).unwrap();
+        let ran = fake.commands();
+        assert_eq!(
+            ran.iter().map(|c| c.argv()).collect::<Vec<_>>(),
+            vec![vec![BREW, "install", "nethack"]]
+        );
+        assert_eq!(
+            ran[0].env,
+            [("HOMEBREW_NO_AUTOREMOVE".to_string(), "1".to_string())]
+                .into_iter()
+                .collect()
         );
     }
 
