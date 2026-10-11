@@ -329,9 +329,12 @@ impl Ctx {
     /// user, once per account per run. When it does not, the step reports
     /// `would change` with the note ``waits for account `<name>` `` and no
     /// diff, and `check` is not called: an earlier step may create the
-    /// account (vision doc 12). Root and the process's own user are never
-    /// asked about. An `id` that cannot be spawned fails the step, naming
-    /// the probe. A real run asks nothing here.
+    /// account (vision doc 12). Root and the process's own user
+    /// ([`Facts::user`]) are never asked about, and neither is any account
+    /// on a host whose escalation method reaches no other account (`none`):
+    /// there the step fails as it would in a real run. An `id` that cannot
+    /// be spawned fails the step, naming the probe. A real run asks nothing
+    /// here.
     pub fn step<O: Op>(&mut self, name: impl Into<String>, op: O) -> Result<Applied<O::Output>> {
         let name = name.into();
         // A cancelled run stops between steps: nothing is interrupted
@@ -858,10 +861,13 @@ impl Ctx {
 
     /// Under `--check`, the account this `Ctx` runs as when it does not
     /// exist on the machine; `None` in a real run, for the process's own
-    /// identity, for root, which always exists, and for an account that
-    /// exists. Asked once per account per run and remembered in [`Shared`].
-    /// An `id` that cannot be spawned is an error, in a dry run as it would
-    /// be in a real one: it is about the machine, not the account.
+    /// identity or user, for root, which always exists, for an account that
+    /// exists, and on a host whose escalation method reaches no other
+    /// account, where the step goes on to be refused as in a real run (a
+    /// refusal about the machine holds in both modes, vision doc 12). Asked
+    /// once per account per run and remembered in [`Shared`]. An `id` that
+    /// cannot be spawned is an error, in a dry run as it would be in a real
+    /// one: it is about the machine, not the account.
     fn missing_account(&self) -> Result<Option<String>> {
         if !self.sys.check_mode() {
             return Ok(None);
@@ -869,7 +875,7 @@ impl Ctx {
         let Identity::User(name) = self.sys.identity() else {
             return Ok(None);
         };
-        if name == "root" {
+        if name == "root" || *name == self.sys.facts().user || !self.sys.can_reach(name) {
             return Ok(None);
         }
         let known = self.shared.accounts.borrow().get(name).copied();
@@ -3206,6 +3212,66 @@ mod tests {
         ctx.step("own", counted().0).unwrap();
         assert_eq!(checks.load(Ordering::SeqCst), 1);
         assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+
+        // The process's own user by name, on a system that does not map it
+        // back to the own identity (a `Fake`).
+        let fake = Arc::new(Fake::new());
+        let sys = System::fake(fake.clone(), Arc::new(Collect::default()));
+        let facts = Facts {
+            user: "alice".into(),
+            is_root: false,
+            ..sys.facts().clone()
+        };
+        let sys = sys.with_facts(facts).with_check_mode(true);
+        let ctx = Ctx::new(sys, HostInfo::local());
+        let (probe, checks) = counted();
+        ctx.as_user("alice")
+            .step("own user by name", probe)
+            .unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+    }
+
+    /// A host whose escalation method reaches no other account refuses a
+    /// step as another account in a real run, whether the account exists or
+    /// not: a refusal about the machine. A dry run refuses it too, through
+    /// the step's `check`, and asks `id` nothing.
+    #[test]
+    fn under_check_a_host_that_cannot_escalate_refuses_as_a_real_run_does() {
+        struct Stats;
+        impl Op for Stats {
+            type Output = ();
+            type Intent = std::convert::Infallible;
+            fn check(&self, sys: &System) -> Result<Plan<Self>> {
+                sys.exists("/")?;
+                Ok(Plan::Satisfied(()))
+            }
+            fn apply(&self, _: &System, intent: Self::Intent) -> Result<()> {
+                match intent {}
+            }
+        }
+        let sink = Arc::new(Collect::default());
+        let sys = System::local(false, sink.clone()).with_escalation("none", None);
+        let ctx = Ctx::new(sys, HostInfo::local());
+        let dry = crate::testing::dry(&ctx);
+        let user = "rustible-no-such-account-118-none";
+        let err = dry
+            .as_user(user)
+            .step("as a missing account", Stats)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(&format!(
+                "cannot run as `{user}`: this host's escalation method is `none`"
+            )),
+            "{err}"
+        );
+        let probes = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::CmdRan { argv, .. } if argv[0] == "id"))
+            .count();
+        assert_eq!(probes, 0);
     }
 
     /// A real run asks nothing before a step: an account that is missing

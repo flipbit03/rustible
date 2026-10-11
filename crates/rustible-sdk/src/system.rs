@@ -375,6 +375,17 @@ impl System {
         s
     }
 
+    /// Whether this handle's escalation could start a helper as `name` at
+    /// all: false when the host's method refuses every other account
+    /// (`none`, or a name it does not know), so a step as `name` is refused
+    /// in a real run whether the account exists or not. True without an
+    /// escalation, as on a `Fake`.
+    pub(crate) fn can_reach(&self, name: &str) -> bool {
+        self.escalation
+            .as_ref()
+            .is_none_or(|esc| esc.spawner.reaches(name))
+    }
+
     /// Whether the account `name` exists on this machine, by `id -u <name>`
     /// run as the process's own identity: exit 0 is yes, any other exit is
     /// no. `id` answers through NSS, so an LDAP account counts and macOS

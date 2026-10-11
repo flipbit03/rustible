@@ -1235,6 +1235,13 @@ impl Spawner {
         }
     }
 
+    /// Whether this method could start a helper as `user` at all: false
+    /// when it refuses every account (`none`, or a name it does not know),
+    /// a refusal about the host that no earlier step changes. Runs nothing.
+    pub(crate) fn reaches(&self, user: &str) -> bool {
+        launch::escalation(&self.method, user, false, false).is_ok()
+    }
+
     /// A helper for `user` that could not be started, explained when the
     /// account does not exist: `id -u <user>`, run as this process's own
     /// user, then answers non-zero, and the failure names the account
@@ -1244,7 +1251,7 @@ impl Spawner {
     /// (`none`, or a name it does not know) says so whatever the account,
     /// and an `id` that cannot answer leaves the failure as it was.
     fn when_missing(&self, user: &str, failed: io::Error) -> io::Error {
-        if launch::escalation(&self.method, user, false, false).is_err() {
+        if !self.reaches(user) {
             return failed;
         }
         let probe = Command::new("id")
