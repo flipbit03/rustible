@@ -395,11 +395,11 @@ impl Target {
     /// A user that is not in `/etc/passwd` is refused in both modes, under
     /// `--check` too: `ansible.posix.authorized_key` does the same ("Either
     /// user must exist or you must provide full path to key file in check
-    /// mode"), and Ansible's behaviour is authoritative here (vision 12). A
-    /// dry run of a first provision therefore stops at the keys step; chain
-    /// from `user::Present` with `for_user(&account)` inside a `ctx.block`,
-    /// which under `--check` ends there with a warning, or dry-run once the
-    /// account exists.
+    /// mode"), and Rustible follows it here (`[CHECK-MODE] 2026-09-24` in
+    /// `docs/plan/DECISIONS.md`). A dry run of a first provision therefore
+    /// stops at the keys step; chain from `user::Present` with
+    /// `for_user(&account)` inside a `ctx.block`, which under `--check` ends
+    /// there with a warning, or dry-run once the account exists.
     fn resolve(&self, sys: &System) -> Result<Resolved> {
         match self {
             Target::File(path) => Ok(Resolved {
@@ -1958,11 +1958,11 @@ mod tests {
 
     /// An account that is not in `/etc/passwd` is refused by both ops in both
     /// modes, `--check` included: `ansible.posix.authorized_key` fails a
-    /// check-mode run for a missing user too, and Ansible's behaviour is
-    /// authoritative here (vision 12). The dry run of a first provision
-    /// therefore stops at the keys step unless it chains from the user step
-    /// with `for_user(&account)`, inside a `ctx.block` that ends there under
-    /// `--check`.
+    /// check-mode run for a missing user too, and Rustible follows it here
+    /// (`[CHECK-MODE] 2026-09-24` in `docs/plan/DECISIONS.md`). The dry run
+    /// of a first provision therefore stops at the keys step unless it
+    /// chains from the user step with `for_user(&account)`, inside a
+    /// `ctx.block` that ends there under `--check`.
     #[test]
     fn a_missing_user_is_refused_in_both_modes_as_ansible_does() {
         let fake = fake_with_user();
