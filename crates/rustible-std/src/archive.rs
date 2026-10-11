@@ -23,7 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use rustible_sdk::backend::{FileKind, WriteAttrs};
 use rustible_sdk::prelude::*;
 
-use crate::file::{Owner, set_mode_and_owner};
+use crate::file::{Owner, replace_with_symlink, set_mode_and_owner};
 
 /// A supported archive format, as detected from the first bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,23 +660,9 @@ impl Extracted {
                 if let Some(parent) = full.parent() {
                     sys.mkdir_all(parent)?;
                 }
-                // Made beside `full` under a temporary name and renamed over
-                // it, so whatever was at `full` stays there until the new link
-                // replaces it: a failed `symlink` leaves it as it was, and a
-                // failed `rename` takes the temporary link away again. The
-                // name is short and random, not `full`'s with a suffix: a
-                // member's name may already be near `NAME_MAX`, and a link
-                // left by a killed run never collides with the next.
-                let tmp = full.with_file_name(format!(".rustible-{}", random_hex()));
-                let link = || -> Result<()> {
-                    sys.symlink(target, &tmp)?;
-                    if let Err(e) = sys.rename(&tmp, &full) {
-                        let _ = sys.remove(&tmp);
-                        return Err(e);
-                    }
-                    Ok(())
-                };
-                link().with_context(|| {
+                // Whatever was at `full` stays there until the new link
+                // replaces it whole.
+                replace_with_symlink(sys, target, &full).with_context(|| {
                     format!("linking member `{}` at {}", named(&m.path), named(&full))
                 })?;
                 // `set_mode` and `set_owner` follow links; neither is
@@ -1087,16 +1073,6 @@ impl Read for Declared<'_> {
         self.read += n as u64;
         Ok(n)
     }
-}
-
-/// Sixteen hex digits nobody can predict, for a temporary name. Each
-/// `RandomState` is keyed from the OS's randomness (per thread, then stepped
-/// for every new one), so hashing nothing with a fresh one is enough and
-/// needs no dependency, as the SDK's backup names do.
-fn random_hex() -> String {
-    use std::hash::BuildHasher;
-    let h = std::collections::hash_map::RandomState::new().hash_one(());
-    format!("{h:016x}")
 }
 
 /// What a member is, for a collision message.
@@ -1629,13 +1605,11 @@ impl Op for Extracted {
 mod tests {
     use std::sync::Arc;
 
-    use rustible_sdk::backend::{
-        AttrCall, Backend, CmdSpec, Fake, Output, ReadCall, Stat, WriteAttrs,
-    };
+    use rustible_sdk::backend::{AttrCall, Fake, ReadCall};
     use rustible_sdk::event::Collect;
 
     use super::*;
-    use crate::file::testing::{Set, expect_change, fake_sys, staged};
+    use crate::file::testing::{Failing, Set, expect_change, fake_sys, staged};
 
     /// `archive::Extracted` claims a mac — it is a pure-Rust extractor
     /// writing through `sys`, and the macOS spike unpacked a tarball the
@@ -2858,111 +2832,6 @@ mod tests {
     /// What `/opt` holds, read through the `Fake` itself.
     fn sys_read_dir(fake: &Arc<Fake>) -> Vec<PathBuf> {
         fake_sys(fake).read_dir("/opt").unwrap()
-    }
-
-    /// A `Fake` that refuses a path with a component over `NAME_MAX` (255
-    /// bytes) as a real filesystem does, and whose `symlink` or `rename`
-    /// fails on request, as a full disk or a read-only mount would. The
-    /// `Fake` does neither, so this wraps it through [`System::new`];
-    /// everything else passes through.
-    struct Failing {
-        fake: Arc<Fake>,
-        symlink: bool,
-        rename: bool,
-    }
-
-    impl Failing {
-        fn sys(fake: &Arc<Fake>, symlink: bool, rename: bool) -> System {
-            let facts = fake_sys(fake).facts().clone();
-            let backend = Arc::new(Failing {
-                fake: fake.clone(),
-                symlink,
-                rename,
-            });
-            System::new(backend, facts, false, Arc::new(Collect::default()))
-        }
-
-        fn refused(what: &str, p: &Path) -> std::io::Error {
-            std::io::Error::other(format!("{what} {}: refused (test)", p.display()))
-        }
-
-        fn name_max(p: &Path) -> std::io::Result<()> {
-            match p.components().any(|c| c.as_os_str().len() > 255) {
-                true => Err(std::io::Error::other("File name too long (os error 36)")),
-                false => Ok(()),
-            }
-        }
-    }
-
-    impl Backend for Failing {
-        fn read(&self, p: &Path) -> std::io::Result<Vec<u8>> {
-            self.fake.read(p)
-        }
-        fn write(&self, p: &Path, bytes: &[u8]) -> std::io::Result<()> {
-            Self::name_max(p)?;
-            self.fake.write(p, bytes)
-        }
-        fn write_from(
-            &self,
-            p: &Path,
-            src: &mut dyn std::io::Read,
-            attrs: Option<WriteAttrs>,
-        ) -> std::io::Result<u64> {
-            Self::name_max(p)?;
-            self.fake.write_from(p, src, attrs)
-        }
-        fn open_read(&self, p: &Path) -> std::io::Result<Box<dyn std::io::Read + Send + '_>> {
-            self.fake.open_read(p)
-        }
-        fn stat(&self, p: &Path) -> std::io::Result<Option<Stat>> {
-            self.fake.stat(p)
-        }
-        fn stat_follow(&self, p: &Path) -> std::io::Result<Option<Stat>> {
-            self.fake.stat_follow(p)
-        }
-        fn mkdir_all(&self, p: &Path) -> std::io::Result<()> {
-            Self::name_max(p)?;
-            self.fake.mkdir_all(p)
-        }
-        fn remove(&self, p: &Path) -> std::io::Result<()> {
-            self.fake.remove(p)
-        }
-        fn remove_all(&self, p: &Path) -> std::io::Result<()> {
-            self.fake.remove_all(p)
-        }
-        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            if self.rename {
-                return Err(Self::refused("rename", to));
-            }
-            Self::name_max(from)?;
-            Self::name_max(to)?;
-            self.fake.rename(from, to)
-        }
-        fn set_mode(&self, p: &Path, mode: u32) -> std::io::Result<()> {
-            self.fake.set_mode(p, mode)
-        }
-        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-            self.fake.set_owner(p, uid, gid)
-        }
-        fn copy(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            self.fake.copy(from, to)
-        }
-        fn symlink(&self, target: &Path, link: &Path) -> std::io::Result<()> {
-            if self.symlink {
-                return Err(Self::refused("symlink", link));
-            }
-            Self::name_max(link)?;
-            self.fake.symlink(target, link)
-        }
-        fn read_link(&self, p: &Path) -> std::io::Result<PathBuf> {
-            self.fake.read_link(p)
-        }
-        fn read_dir(&self, p: &Path) -> std::io::Result<Vec<PathBuf>> {
-            self.fake.read_dir(p)
-        }
-        fn spawn(&self, spec: &CmdSpec) -> std::io::Result<Output> {
-            self.fake.spawn(spec)
-        }
     }
 
     /// A symlink member is made under a temporary name and renamed over its

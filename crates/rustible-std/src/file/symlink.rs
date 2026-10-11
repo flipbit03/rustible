@@ -16,7 +16,8 @@ use rustible_sdk::prelude::*;
 ///
 /// A link pointing elsewhere is replaced. A regular file in the way is an
 /// error unless `.force(true)`, which replaces it; a directory in the way
-/// is always an error (as Ansible refuses too). The target need not exist.
+/// is always an error, even with `.force(true)` (Ansible's `force` replaces
+/// an empty one; this op never does). The target need not exist.
 #[derive(Debug, Clone)]
 pub struct Symlink {
     link: PathBuf,
@@ -186,11 +187,15 @@ impl Op for Symlink {
             Link::Create { link, target } => sys.symlink(&target, &link)?,
             Link::Retarget { link, target, .. } | Link::Replace { link, target, .. } => {
                 // Replace atomically: a reader never sees the path missing.
-                let mut tmp = link.clone().into_os_string();
-                tmp.push(format!(".rustible-tmp-{}", std::process::id()));
-                let tmp = std::path::PathBuf::from(tmp);
-                sys.symlink(&target, &tmp)?;
-                sys.rename(&tmp, &link)?;
+                // The error names the link, not only the temporary name
+                // beside it that a failed `symlink` reports.
+                super::replace_with_symlink(sys, &target, &link).with_context(|| {
+                    format!(
+                        "replacing {} with a symlink to {}",
+                        link.display(),
+                        target.display()
+                    )
+                })?
             }
         }
         Ok(self.report())
@@ -204,7 +209,7 @@ mod tests {
     use rustible_sdk::backend::Fake;
     use rustible_sdk::event::Collect;
 
-    use super::super::testing::{expect_change, fake_sys};
+    use super::super::testing::{Failing, expect_change, fake_sys};
     use super::*;
 
     /// The two platform claims every portable op makes, in one place: it
@@ -318,18 +323,99 @@ mod tests {
 
     #[test]
     fn replacing_a_link_is_atomic_and_leaves_no_temp_link() {
-        let fake = Arc::new(Fake::new().with_symlink("/etc/l", "/old").with_dir("/new"));
+        let fake = Arc::new(
+            Fake::new()
+                .with_dir("/etc")
+                .with_symlink("/etc/l", "/old")
+                .with_dir("/new"),
+        );
         let sys = fake_sys(&fake);
         let op = Symlink::at("/etc/l").pointing_to("/new");
         let c = expect_change(&op, &sys);
         op.apply(&sys, c).unwrap();
+        assert_eq!(sys.read_link("/etc/l").unwrap(), PathBuf::from("/new"));
         assert_eq!(
-            sys.read_link("/etc/l").unwrap(),
-            std::path::PathBuf::from("/new")
+            sys.read_dir("/etc").unwrap(),
+            vec![PathBuf::from("/etc/l")],
+            "only the link is left in its directory"
         );
-        assert!(
-            fake.file(format!("/etc/l.rustible-tmp-{}", std::process::id()))
-                .is_none()
+    }
+
+    /// A link whose name is near `NAME_MAX` (255 bytes) is still repointed:
+    /// the temporary link beside it has a short name of its own, not the
+    /// link's with a suffix that would push it over.
+    #[test]
+    fn a_link_with_a_long_name_is_repointed() {
+        let link = PathBuf::from("/etc").join("l".repeat(250));
+        let fake = Arc::new(Fake::new().with_dir("/etc").with_symlink(&link, "/old"));
+        let sys = Failing::sys(&fake, false, false);
+        let op = Symlink::at(&link).pointing_to("/new");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(sys.read_link(&link).unwrap(), PathBuf::from("/new"));
+        assert_eq!(sys.read_dir("/etc").unwrap(), vec![link]);
+    }
+
+    /// A temporary link a killed run left under the old pid-derived name
+    /// is not in the way: the name is random, so it is never reused.
+    #[test]
+    fn a_stale_temp_link_from_a_killed_run_does_not_matter() {
+        let stale = format!("/etc/l.rustible-tmp-{}", std::process::id());
+        let fake = Arc::new(
+            Fake::new()
+                .with_symlink("/etc/l", "/old")
+                .with_symlink(&stale, "/stale"),
         );
+        let sys = fake_sys(&fake);
+        let op = Symlink::at("/etc/l").pointing_to("/new");
+        let c = expect_change(&op, &sys);
+        op.apply(&sys, c).unwrap();
+        assert_eq!(sys.read_link("/etc/l").unwrap(), PathBuf::from("/new"));
+        assert_eq!(sys.read_link(&stale).unwrap(), PathBuf::from("/stale"));
+    }
+
+    /// The entry at the link's path, a link or (forced) a file, is replaced
+    /// whole or not at all: a failed `symlink` leaves it untouched, and a
+    /// failed `rename` leaves it too and takes the temporary link away, so
+    /// nothing named `.rustible-*` is left beside it. The error names the
+    /// link.
+    #[test]
+    fn a_failed_replace_leaves_the_old_entry_and_no_temp_link() {
+        for old in ["symlink", "file"] {
+            for (symlink, rename, refused) in [(true, false, "symlink"), (false, true, "rename")] {
+                let fake = Fake::new().with_dir("/etc");
+                let fake = Arc::new(match old {
+                    "symlink" => fake.with_symlink("/etc/l", "/old"),
+                    _ => fake.with_file("/etc/l", "old contents"),
+                });
+                let before = fake.file("/etc/l").unwrap();
+                let sys = Failing::sys(&fake, symlink, rename);
+                let op = Symlink::at("/etc/l").pointing_to("/new").force(true);
+                let c = expect_change(&op, &sys);
+                let err = op.apply(&sys, c).unwrap_err().chain();
+                assert!(
+                    err.contains("replacing /etc/l with a symlink to /new: "),
+                    "{err}"
+                );
+                assert!(err.contains(&format!("{refused} ")), "{err}");
+                assert!(err.contains("refused (test)"), "{err}");
+                // The temporary link is made in the link's own directory, so
+                // the rename never crosses a filesystem.
+                if refused == "symlink" {
+                    assert!(err.contains("symlink /etc/.rustible-"), "{err}");
+                }
+                let after = fake.file("/etc/l").unwrap();
+                assert_eq!(
+                    (after.kind, after.bytes),
+                    (before.kind, before.bytes),
+                    "{old} after a failed {refused}"
+                );
+                assert_eq!(
+                    sys.read_dir("/etc").unwrap(),
+                    vec![PathBuf::from("/etc/l")],
+                    "no temporary link left beside the {old} after a failed {refused}"
+                );
+            }
+        }
     }
 }

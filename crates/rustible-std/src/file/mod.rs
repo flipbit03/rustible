@@ -513,6 +513,35 @@ pub(crate) fn write_from_with_backup(
     }
 }
 
+/// Make `link` a symlink to `target`, replacing whatever is there whole or
+/// not at all. The new link is made beside `link` under a temporary name
+/// and renamed over it, so a reader never finds the path missing: a failed
+/// `symlink` leaves the old entry as it was, and a failed `rename` leaves
+/// it too and takes the temporary link away again. The temporary name is
+/// `.rustible-<random hex>`, not `link`'s own with a suffix: a name near
+/// `NAME_MAX` stays within it, and a link left by a killed run never
+/// collides with the next. A directory at `link` is not replaced (`rename`
+/// refuses one), so callers refuse it before they get here.
+pub(crate) fn replace_with_symlink(sys: &System, target: &Path, link: &Path) -> Result<()> {
+    let tmp = link.with_file_name(format!(".rustible-{}", random_hex()));
+    sys.symlink(target, &tmp)?;
+    if let Err(e) = sys.rename(&tmp, link) {
+        let _ = sys.remove(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Sixteen hex digits nobody can predict, for a temporary name. Each
+/// `RandomState` is keyed from the OS's randomness (per thread, then stepped
+/// for every new one), so hashing nothing with a fresh one is enough and
+/// needs no dependency, as the SDK's backup names do.
+fn random_hex() -> String {
+    use std::hash::BuildHasher;
+    let h = std::collections::hash_map::RandomState::new().hash_one(());
+    format!("{h:016x}")
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use std::io;
@@ -661,6 +690,111 @@ pub(crate) mod testing {
         }
         fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
             self.0.spawn(spec)
+        }
+    }
+
+    /// A `Fake` that refuses a path with a component over `NAME_MAX` (255
+    /// bytes) as a real filesystem does, and whose `symlink` or `rename`
+    /// fails on request, as a full disk or a read-only mount would. The
+    /// `Fake` does neither, so this wraps it through [`System::new`];
+    /// everything else passes through.
+    pub struct Failing {
+        fake: Arc<Fake>,
+        symlink: bool,
+        rename: bool,
+    }
+
+    impl Failing {
+        pub fn sys(fake: &Arc<Fake>, symlink: bool, rename: bool) -> System {
+            let facts = fake_sys(fake).facts().clone();
+            let backend = Arc::new(Failing {
+                fake: fake.clone(),
+                symlink,
+                rename,
+            });
+            System::new(backend, facts, false, Arc::new(Collect::default()))
+        }
+
+        fn refused(what: &str, p: &Path) -> io::Error {
+            io::Error::other(format!("{what} {}: refused (test)", p.display()))
+        }
+
+        fn name_max(p: &Path) -> io::Result<()> {
+            match p.components().any(|c| c.as_os_str().len() > 255) {
+                true => Err(io::Error::other("File name too long (os error 36)")),
+                false => Ok(()),
+            }
+        }
+    }
+
+    impl Backend for Failing {
+        fn read(&self, p: &Path) -> io::Result<Vec<u8>> {
+            self.fake.read(p)
+        }
+        fn write(&self, p: &Path, bytes: &[u8]) -> io::Result<()> {
+            Self::name_max(p)?;
+            self.fake.write(p, bytes)
+        }
+        fn write_from(
+            &self,
+            p: &Path,
+            src: &mut dyn io::Read,
+            attrs: Option<WriteAttrs>,
+        ) -> io::Result<u64> {
+            Self::name_max(p)?;
+            self.fake.write_from(p, src, attrs)
+        }
+        fn open_read(&self, p: &Path) -> io::Result<Box<dyn io::Read + Send + '_>> {
+            self.fake.open_read(p)
+        }
+        fn stat(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.fake.stat(p)
+        }
+        fn stat_follow(&self, p: &Path) -> io::Result<Option<Stat>> {
+            self.fake.stat_follow(p)
+        }
+        fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+            Self::name_max(p)?;
+            self.fake.mkdir_all(p)
+        }
+        fn remove(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove(p)
+        }
+        fn remove_all(&self, p: &Path) -> io::Result<()> {
+            self.fake.remove_all(p)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if self.rename {
+                return Err(Self::refused("rename", to));
+            }
+            Self::name_max(from)?;
+            Self::name_max(to)?;
+            self.fake.rename(from, to)
+        }
+        fn set_mode(&self, p: &Path, mode: u32) -> io::Result<()> {
+            self.fake.set_mode(p, mode)
+        }
+        fn set_owner(&self, p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+            self.fake.set_owner(p, uid, gid)
+        }
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.fake.copy(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+            if self.symlink {
+                return Err(Self::refused("symlink", link));
+            }
+            Self::name_max(link)?;
+            self.fake.symlink(target, link)
+        }
+        fn read_link(&self, p: &Path) -> io::Result<PathBuf> {
+            self.fake.read_link(p)
+        }
+        fn read_dir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+            self.fake.read_dir(p)
+        }
+        fn spawn(&self, spec: &CmdSpec) -> io::Result<Output> {
+            self.fake.spawn(spec)
         }
     }
 
