@@ -234,6 +234,21 @@ impl AttrPlan {
         (w.mode.is_some() || w.owner.is_some()).then_some(w)
     }
 
+    /// The attributes that differ, as `System::write_from`'s `WriteAttrs`:
+    /// what an op that sets only what differs ([`AttrPlan::apply_differing`])
+    /// gives a write of new content, so the staged file has them before the
+    /// rename. A mode or owner already right is left out, and the write
+    /// keeps it from the file it replaces; an owner left out is never a
+    /// required `chown`. `None` when nothing differs, and the write is a
+    /// plain one. `ssh::authorized_keys` writes its keys with it.
+    pub(crate) fn differing_write_attrs(&self) -> Option<WriteAttrs> {
+        let w = WriteAttrs {
+            mode: self.mode.filter(Wanted::differs).map(|m| m.want),
+            owner: self.owner_to_set().map(|o| (o.uid, o.gid)),
+        };
+        (w.mode.is_some() || w.owner.is_some()).then_some(w)
+    }
+
     /// The owner this plan changes the path to, when it changes it.
     pub(crate) fn owner_to_set(&self) -> Option<Owner> {
         self.owner.filter(Wanted::differs).map(|o| o.want)
@@ -282,9 +297,10 @@ pub(crate) fn cleared_by_chown(mode: u32) -> u32 {
 /// exists at `0666 & ~umask`, and a rewrite carries the old mode, from the
 /// write until the mode is set. An op that writes new content with
 /// `System::write_from` and its `WriteAttrs` has no such time, because the
-/// staged file gets its mode and owner before the rename; `file::Copy` and
-/// `http::Download` do, and so does `archive::Extracted` for its file
-/// members. Its directory members still come here.
+/// staged file gets its mode and owner before the rename; `file::Copy`,
+/// `http::Download` and `ssh::authorized_keys::Present` do, and so does
+/// `archive::Extracted` for its file members. Its directory members still
+/// come here.
 pub(crate) fn set_mode_and_owner(
     sys: &System,
     path: &Path,
