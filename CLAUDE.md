@@ -215,6 +215,7 @@ against:
 | `Test (T2): Docker (Debian/Ubuntu/Alpine)` | T2 |
 | `Test (T3): VM (Debian 12/x86_64)` | T3, on a KVM-accelerated guest |
 | `Test (T3): VM (Debian 12/aarch64)` | T3, on an emulated guest |
+| `Test (T1): unit & fake (Linux, newest ureq 3.x)` | scheduled weekly and run by hand, never on a pull request (`ureq-newest.yml`): `rustible-std`'s and `rustible-github`'s T1 tests after `cargo update -p ureq`, because ureq's `unversioned` API may change in a minor |
 
 Keep that shape when adding a job: `<verb> (<tier>): <mechanism> (<what it
 ran against>)`, and `<verb>: <mechanism>` for a job that runs no tests. A job

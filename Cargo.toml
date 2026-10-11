@@ -38,7 +38,11 @@ similar = "2"
 # C, which is the reason zig is in the dependency rule (vision 5.3, M8); in
 # exchange it detects CPU features at runtime and runs down to baseline
 # x86-64. See `docs/plan/reports/C-TOOLCHAIN-SPIKE.md` and `docs/plan/M8.md`.
-ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+# At least 3.4.1, the version the tests ran against: `rustible-std` uses
+# ureq's `unversioned` API, which a minor release may change. Not capped
+# below 3.5, so a user's crate that needs a newer 3.x still resolves; the
+# scheduled `ureq-newest.yml` workflow tests the newest 3.x instead.
+ureq = { version = "3.4.1",default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 regex = "1"
 tempfile = "3"
