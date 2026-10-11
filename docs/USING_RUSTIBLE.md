@@ -1163,9 +1163,10 @@ Credentials go in as a `Secret` — `.header_secret(name, &s)`, `.bearer(&s)`,
 any secret (§6), as is a URL's `user:pass@` password. ⚠️ A secret cut by the
 2 KiB a diff shows of a body, or by the 512 bytes an error quotes of a
 server's answer, can show in part there. So can one an error quotes that
-holds any whitespace but single spaces (the quote makes every run of it one
-space), and one a diff or an error shows that holds a control or invisible
-formatting character (both escape those).
+holds a control character or any whitespace but single spaces (the quote
+escapes the first and makes every run of the second one space), and one a
+diff shows that holds a control character other than a newline or tab, or
+an invisible formatting character (the diff escapes those).
 
 Neither `http::Request` nor `http::Download` limits a response's size unless
 `.max_bytes(n)` sets one. `Request` holds the body in memory; `Download`

@@ -102,8 +102,12 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// run's [masker](rustible_sdk::mask), so every event the run emits shows
 /// `<secret>` where one appears: a server's answer quoted in a status
 /// failure, or a body the diff shows, raw, as `.json` writes it, or as
-/// `.form` writes it. A body given with `.json`, `.form` or `.body` is not
-/// a secret, and the diff shows it. For a body that is secret, use
+/// `.form` writes it. A secret that straddles the 2 KiB of a body the diff
+/// shows or the 512 bytes of an answer an error quotes, or that holds
+/// characters the quote or the diff rewrites (whitespace runs, control or
+/// invisible formatting characters), can show in part (#134). A body given
+/// with `.json`, `.form` or `.body` is not a secret, and the diff shows it.
+/// For a body that is secret, use
 /// [`Request::body_secret`]: to send a password in a JSON body,
 /// `.body_secret(&s).content_type("application/json")`.
 ///
