@@ -703,7 +703,8 @@ fn attr_context(path: &Path, owner: Option<Owner>) -> String {
 /// Context for a failed write of the keys. The write carries the mode and
 /// owner `check` found wrong, so it can fail for want of root as well as for
 /// a full disk; this names all three, where [`attr_context`] would call a
-/// full disk a failed `chown`. Either way the file is left as it was: the
+/// full disk a failed `chown`. Root is named as a possible cause, not the
+/// cause: the error beneath says which. Either way the file is left as it was: the
 /// new keys are staged beside it and renamed over it only once they have
 /// their mode and owner.
 fn write_context(path: &Path, attrs: Option<WriteAttrs>) -> String {
@@ -711,10 +712,9 @@ fn write_context(path: &Path, attrs: Option<WriteAttrs>) -> String {
     let mode = attrs.mode.map(|m| format!(" at mode {m:04o}"));
     match attrs.owner {
         Some((uid, gid)) => format!(
-            "writing the keys to {} owned by {uid}:{gid}{}: ssh::authorized_keys gives the \
-             new file the owner and mode sshd needs before it replaces the old one, and the \
-             file is left as it was. Changing an owner needs root, so a step that is not \
-             escalated fails here",
+            "writing the keys to {} owned by {uid}:{gid}{}; the file is left as it was. \
+             Giving it that owner, or writing in another account's ~/.ssh, needs root: if \
+             the error below is a permission error, escalate the step",
             path.display(),
             mode.unwrap_or_default()
         ),
@@ -1972,6 +1972,47 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("Operation not permitted"), "{err}");
+    }
+
+    /// An existing file whose owner the write cannot give keeps its keys:
+    /// the new ones are refused before the rename, not left in place under
+    /// the old owner. The owners are planted before `with_chown_refused`,
+    /// which consumes the `Fake`, so the directory is already the
+    /// account's and the write is the first `chown` refused.
+    #[test]
+    fn a_refused_owner_leaves_an_existing_file_as_it_was() {
+        use rustible_sdk::backend::Backend;
+        let fake = Fake::new()
+            .with_file("/etc/passwd", PASSWD)
+            .with_dir("/home/cadu")
+            .with_dir("/home/cadu/.ssh")
+            .with_file_mode(KEYS, format!("{K1}\n"), 0o600);
+        Backend::set_owner(&fake, Path::new("/home/cadu/.ssh"), 1000, 1001).unwrap();
+        Backend::set_mode(&fake, Path::new("/home/cadu/.ssh"), 0o700).unwrap();
+        let fake = Arc::new(fake.with_chown_refused());
+        let sys = fake_sys(&fake);
+        let op = Present::for_user_name("cadu").keys([K1, K2]);
+        let Plan::Change(c) = op.check(&sys).unwrap() else {
+            panic!("K2 is missing and the owner is wrong")
+        };
+        assert!(
+            matches!(&c, KeysIntent(Keys::Write(w)) if w.dir.as_ref().is_some_and(|d| !d.changes())),
+            "the directory is right, so the write is the first thing to fail"
+        );
+
+        let err = op.apply(&sys, c).unwrap_err().chain();
+        assert_eq!(fake.content(KEYS).unwrap(), format!("{K1}\n"), "{err}");
+        let file = fake.file(KEYS).unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 0, 0));
+        assert_eq!(
+            Backend::read_dir(&*fake, Path::new("/home/cadu/.ssh")).unwrap(),
+            [PathBuf::from(KEYS)],
+            "no staged file left behind"
+        );
+        assert!(
+            err.contains("writing the keys to /home/cadu/.ssh/authorized_keys owned by 1000:1001"),
+            "{err}"
+        );
     }
 
     /// Keys already right with the mode and owner wrong: nothing is
