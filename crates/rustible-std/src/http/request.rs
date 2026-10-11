@@ -954,8 +954,6 @@ fn body_summary(bytes: &[u8], content_type: Option<&str>) -> String {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return format!("<{} bytes of binary data>", bytes.len());
     };
-    let text = client::before_reshaping(text);
-    let text = text.as_ref();
     let enough = SHOWN_BODY_BYTES + 1;
     let reindented = (text.len() <= WHOLE_BODY_BYTES
         && content_type.is_some_and(is_json_content_type))

@@ -287,7 +287,7 @@ impl Incoming {
             .as_reader()
             .take(n as u64)
             .read_to_end(&mut out);
-        one_line(&before_reshaping(&String::from_utf8_lossy(&out)), n)
+        one_line(&String::from_utf8_lossy(&out), n)
     }
 }
 
@@ -545,16 +545,6 @@ fn timed_out(e: &ureq::Error, deadline: Option<(Instant, Duration)>) -> Option<S
         )),
         _ => None,
     }
-}
-
-/// Where text an op is about to cut or reshape for a message or a diff
-/// passes before it is cut. The run masks every event where it is emitted,
-/// which is after this: a secret cut in two, or rewritten (a whitespace run
-/// collapsed, a control character escaped), before then is not recognised
-/// there. Nothing is done here today; `docs/plan/DECISIONS.md` records the
-/// gap (ISSUE-126).
-pub(crate) fn before_reshaping(text: &str) -> std::borrow::Cow<'_, str> {
-    std::borrow::Cow::Borrowed(text)
 }
 
 /// `text` as one line: control characters escaped (`\u{1b}`), every run of
