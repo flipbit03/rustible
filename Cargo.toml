@@ -42,7 +42,7 @@ similar = "2"
 # ureq's `unversioned` API, which a minor release may change. Not capped
 # below 3.5, so a user's crate that needs a newer 3.x still resolves; the
 # scheduled `ureq-newest.yml` workflow tests the newest 3.x instead.
-ureq = { version = "3.4.1",default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+ureq = { version = "3.4.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 regex = "1"
 tempfile = "3"

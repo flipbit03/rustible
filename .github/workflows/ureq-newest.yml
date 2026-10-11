@@ -53,6 +53,7 @@ jobs:
           cargo update -p ureq
           cargo tree -i ureq --depth 0
 
-      # `rustible-std` holds both `unversioned` uses (the crypto provider and
-      # `http::transport`); `rustible-github` sends through `rustible_std::http`.
+      # `rustible-std` holds every `unversioned` use (the crypto provider, and
+      # `http`'s connector chain and transport wrapper); `rustible-github`
+      # sends through `rustible_std::http`.
       - run: cargo test -p rustible-std -p rustible-github
