@@ -25,6 +25,29 @@ cat a.zst skip b.zst > hello-frames.tar.zst
 skippable frame ahead of the zstd frame, which detection must take as
 zstd: `pzstd -q -19 -p 1 -c hello.tar > hello-pzstd.tar.zst`.
 
+## `git-archive.tar.gz`
+
+What `git archive` writes, byte for byte, as GitHub serves a release's
+source code: a pax global header (`pax_global_header`, one `comment` record
+holding the commit id) ahead of the tree, which `archive::Extracted` skips
+as metadata (issue #103). Made with git 2.43.0 in an empty directory:
+
+```sh
+mkdir bin
+printf 'hello from rustible\n' > README.txt
+printf '#!/bin/sh\necho hi\n' > bin/run
+chmod 755 bin/run
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=rustible GIT_AUTHOR_EMAIL=rustible@example.invalid
+export GIT_COMMITTER_NAME=rustible GIT_COMMITTER_EMAIL=rustible@example.invalid
+export GIT_AUTHOR_DATE=2000-01-01T00:00:00Z GIT_COMMITTER_DATE=2000-01-01T00:00:00Z
+git init -q -b main && git add . && git commit -q -m hello
+git archive --format=tar.gz --prefix=hello-1.0/ -o git-archive.tar.gz HEAD
+```
+
+`git archive` applies its default umask of 002, so the members are 0664 and
+0775.
+
 ## `pax-sparse-*.tar` and `gnu-sparse.tar`
 
 One sparse file in each of GNU tar's three pax sparse formats, which

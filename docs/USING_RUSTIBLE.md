@@ -1060,10 +1060,6 @@ reports `ok` for the directory step while it happens.
 A tarball with pax sparse members (GNU tar `-S --format=posix`, macOS `tar` on
 a sparse file) is refused at `check`; the error says how to recreate it.
 
-⚠️ A `git archive` tarball, which is what GitHub serves as a release's source
-code, needs `.strip_components(1)` or more: at 0 its `pax_global_header` is
-refused as a special file.
-
 **A new unit file is invisible until systemd re-reads.** Writing
 `/etc/systemd/system/x.service` and then `systemd::Enabled::new("x")` fails
 with `not found`. Put a `systemd::DaemonReload::new()` between them.
