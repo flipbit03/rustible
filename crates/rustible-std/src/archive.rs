@@ -230,7 +230,8 @@ pub struct ExtractReport {
     /// what lands on disk. Saturating, since the headers are untrusted.
     pub bytes: u64,
     /// Members dropped by `.strip_components` (fewer components than
-    /// stripped) or with an empty path such as `./`.
+    /// stripped) or with an empty path such as `./`. A pax global header
+    /// is not a member and is not counted.
     pub skipped: usize,
     /// Whether the archive was (or would be) extracted.
     pub extracted: bool,
@@ -1282,9 +1283,26 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
                  `--no-read-sparse`)"
             );
         }
+        // A pax global header (`g`, which `git archive` writes first) is
+        // metadata, not a member: past the sparse refusal above, its
+        // records are ignored, as the `tar` crate's own `unpack` ignores
+        // them. Its name is no path either; GNU tar's is
+        // `$TMPDIR/GlobalHead.%n`, absolute, so it is not validated.
+        if entry.header().entry_type().is_pax_global_extensions() {
+            out.push(PlannedEntry {
+                raw,
+                member: None,
+                metadata: true,
+            });
+            continue;
+        }
         let normalised = validate_entry_path(&raw).map_err(Error::msg)?;
         let Some(path) = strip_components(&normalised, strip) else {
-            out.push(PlannedEntry { raw, member: None });
+            out.push(PlannedEntry {
+                raw,
+                member: None,
+                metadata: false,
+            });
             continue;
         };
         if let Some(why) = too_long(&path, "a path") {
@@ -1397,6 +1415,7 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
         out.push(PlannedEntry {
             raw,
             member: Some(member),
+            metadata: false,
         });
     }
     Ok(out)
@@ -1404,11 +1423,15 @@ fn walk<R: Read>(archive: &mut tar::Archive<R>, strip: usize) -> Result<Vec<Plan
 
 /// One entry of the archive as `check` walked it: the path the archive
 /// gives it, and the validated member it extracts to (`None` for one
-/// `.strip_components` or an empty path drops).
+/// `.strip_components` or an empty path drops, and for a pax global
+/// header). `apply` reads the archive's entries in step with these, so a
+/// global header has a slot here although it is no member.
 #[derive(Debug, Clone)]
 struct PlannedEntry {
     raw: PathBuf,
     member: Option<Member>,
+    /// A pax global header: metadata, so not counted as `skipped`.
+    metadata: bool,
 }
 
 /// What [`Extracted`]'s `check` decided: extract these validated members, in
@@ -1440,7 +1463,9 @@ impl Extraction {
         };
         for e in &self.entries {
             let Some(m) = &e.member else {
-                r.skipped += 1;
+                if !e.metadata {
+                    r.skipped += 1;
+                }
                 continue;
             };
             match m.kind {
@@ -2697,6 +2722,104 @@ mod tests {
                 "strip {strip}: {err}"
             );
         }
+    }
+
+    /// `git archive --format=tar.gz --prefix=hello-1.0/` byte for byte,
+    /// which is what GitHub serves as a release's source code: a pax global
+    /// header named `pax_global_header` first, then the tree.
+    const GIT_ARCHIVE: &[u8] = include_bytes!("../fixtures/archive/git-archive.tar.gz");
+
+    /// The global header is metadata, not a member: the tarball extracts
+    /// at `.strip_components(0)` as at 1, the header is not counted in
+    /// `skipped`, and with a `creates` marker the second check is `ok`.
+    #[test]
+    fn a_git_archive_tarball_extracts_at_strip_0_and_1() {
+        for (strip, root, dirs, skipped) in [(0, "/opt/hello-1.0", 2, 0), (1, "/opt", 1, 1)] {
+            let fake = Arc::new(
+                Fake::new()
+                    .with_dir("/opt")
+                    .with_file("/tmp/a.tar.gz", GIT_ARCHIVE),
+            );
+            let sys = fake_sys(&fake);
+            let op = Extracted::from_path("/tmp/a.tar.gz")
+                .to("/opt")
+                .strip_components(strip)
+                .creates(format!("{root}/bin/run"));
+            let c = expect_change(&op, &sys);
+            assert_eq!(
+                c.diff().short(),
+                format!(
+                    "extract /tmp/a.tar.gz (tar.gz: 2 files, {dirs} dirs, 0 symlinks, 38 bytes) \
+                     into /opt"
+                ),
+                "strip {strip}"
+            );
+            let r = op.apply(&sys, c).unwrap();
+            assert_eq!(
+                (r.files, r.dirs, r.symlinks, r.skipped),
+                (2, dirs, 0, skipped),
+                "strip {strip}"
+            );
+            assert_eq!(
+                fake.content(format!("{root}/README.txt")).unwrap(),
+                "hello from rustible\n"
+            );
+            let run = fake.file(format!("{root}/bin/run")).unwrap();
+            assert_eq!(
+                (run.mode, run.bytes.as_slice()),
+                (0o775, b"#!/bin/sh\necho hi\n".as_slice())
+            );
+            assert!(fake.file("/opt/pax_global_header").is_none());
+            assert!(
+                matches!(op.check(&sys).unwrap(), Plan::Satisfied(_)),
+                "strip {strip}"
+            );
+        }
+    }
+
+    /// GNU tar names its global header `$TMPDIR/GlobalHead.%n`, an absolute
+    /// path, which as a member's would be refused as tar-slip. It is no
+    /// member, so it is skipped, unvalidated and uncounted.
+    #[test]
+    fn a_gnu_tar_global_header_with_an_absolute_name_is_skipped() {
+        let archive = raw_tar(&[
+            (
+                "/tmp/GlobalHead.1",
+                b'g',
+                &pax_record("comment", b"hello"),
+                "",
+            ),
+            ("f", b'0', b"data", ""),
+        ]);
+        let (fake, sys) = sys_with(&archive);
+        let op = Extracted::from_path("/tmp/a.tar").to("/opt");
+        let c = expect_change(&op, &sys);
+        let r = op.apply(&sys, c).unwrap();
+        assert_eq!((r.files, r.dirs, r.skipped), (1, 0, 0));
+        assert_eq!(fake.content("/opt/f").unwrap(), "data");
+        assert!(fake.file("/tmp/GlobalHead.1").is_none());
+    }
+
+    /// A pax header in a header with neither ustar nor GNU magic is not
+    /// read as one by the `tar` crate, and surfaces as an entry of its own;
+    /// that is still refused as a special file. (A tar is recognised by
+    /// its first header's magic, so a member with one comes first.)
+    #[test]
+    fn a_pax_header_without_ustar_magic_is_still_a_special_file() {
+        let mut archive = raw_tar(&[("d/", b'5', b"", "")]);
+        archive.truncate(512);
+        let mut h = tar::Header::new_old();
+        h.set_path("PaxHeaders/f").unwrap();
+        h.set_entry_type(tar::EntryType::XHeader);
+        h.set_size(0);
+        h.set_cksum();
+        archive.extend_from_slice(h.as_bytes());
+        archive.extend(std::iter::repeat_n(0u8, 1024));
+        let err = check_err(&archive);
+        assert!(
+            err.contains("member `PaxHeaders/f` is a special file (type XHeader)"),
+            "{err}"
+        );
     }
 
     /// The name comes from the archive: control characters are escaped, so
