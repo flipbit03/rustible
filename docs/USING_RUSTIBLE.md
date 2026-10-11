@@ -1322,7 +1322,9 @@ Each step is a line:
 ```
 
 `-v` adds diffs, facts, and a failed command's stderr, caught or not. `-vv`
-adds every command executed.
+adds every command executed. Control characters other than a newline or
+tab, and invisible formatting characters, print escaped (`\u{1b}`, `\r`);
+`--json` carries them as they are.
 
 Every run ends with one row per host:
 
