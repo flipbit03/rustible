@@ -1163,8 +1163,8 @@ group vars outermost to innermost, then host vars, then `--var key=value` on the
 command line. **Sibling-group conflicts are an error** (decided 2026-09-06): when
 a host belongs to two groups at the same distance that both define a var and
 the host does not override it, loading fails naming both groups and the host,
-with the fix being "set it on the host or on a common parent". Consistent with
-everything else here failing loudly before a run.
+with the fix being to set it on the host, or to keep it on only one of the two
+groups. Consistent with everything else here failing loudly before a run.
 
 ### 10.4 Workspace
 

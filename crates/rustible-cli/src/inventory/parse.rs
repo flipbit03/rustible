@@ -875,7 +875,7 @@ impl<'a> Parser<'a> {
 
 pub(crate) fn conflict_message(c: &Conflict) -> String {
     format!(
-        "host `{}`: {} `{}` is defined by both group `{}` and group `{}` at the same distance; set it on host `{}` or on a common parent group",
+        "host `{}`: {} `{}` is defined by both group `{}` and group `{}` at the same distance; set it on host `{}`, or keep it on only one of the two groups",
         c.host, c.kind, c.key, c.groups.0, c.groups.1, c.host
     )
 }
