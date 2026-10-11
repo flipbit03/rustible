@@ -319,6 +319,13 @@ pub fn changed_then_ok<O: Op>(
 /// `local_file`, `local_secret` and `fetch` fail. It starts a run of its
 /// own, numbering its steps from 1.
 ///
+/// Its events pass the run's secret masker on their way to `sys`'s sink, as
+/// a real run's do, so a test asserts on what a run would emit. Under this
+/// feature the masker's registry is per thread rather than per process, so
+/// tests running in parallel do not mask each other's output: a test sees
+/// the secrets registered on its own thread, before or after this call, and
+/// not those registered on a thread it spawned.
+///
 /// ```
 /// use std::sync::Arc;
 ///
@@ -332,7 +339,7 @@ pub fn changed_then_ok<O: Op>(
 /// assert!(!ctx.check_mode());
 /// ```
 pub fn ctx(sys: System) -> Ctx {
-    Ctx::new(sys, HostInfo::local())
+    Ctx::new(sys.masked(), HostInfo::local())
 }
 
 /// A check-mode twin of `ctx`: the same machine, host and identity, with
@@ -402,7 +409,7 @@ fn inside(spec: &Spec, image: &str, body: Body) {
         collect.clone(),
         Arc::new(Compact::new(std::io::stdout(), 2)),
     ]));
-    let sys = System::local(false, sink);
+    let sys = System::local(false, sink).masked();
     let facts = sys.facts().clone();
     let mut ctx = Ctx::new(
         sys,

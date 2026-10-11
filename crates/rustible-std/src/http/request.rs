@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustible_sdk::mask::PLACEHOLDER;
 use rustible_sdk::prelude::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,14 +22,11 @@ const SHOWN_BODY_BYTES: usize = 2048;
 
 /// The largest JSON request body a diff validates and reindents. Above it
 /// the body is shown as it is sent. Either way, only the start that is
-/// shown is scrubbed and escaped.
+/// shown is escaped.
 const WHOLE_BODY_BYTES: usize = 64 << 10;
 
 /// The deepest JSON a diff reindents; deeper, it is shown as it is sent.
 const MAX_REINDENT_DEPTH: usize = 128;
-
-/// What [`client::scrub`] puts in place of a secret.
-const SCRUBBED: &str = "<secret>";
 
 /// How much of an unexpected response's body a status failure quotes.
 const QUOTED_BODY_BYTES: usize = 512;
@@ -97,18 +95,20 @@ type Predicate = Arc<dyn Fn(&Response) -> bool + Send + Sync>;
 /// **Secrets.** A header given with [`Request::header_secret`], the
 /// credentials of [`Request::bearer`] and [`Request::basic_auth`], and a
 /// body given with [`Request::body_secret`] show as `<secret, N bytes>` in
-/// `Debug`, and are scrubbed from every message, including a server's
-/// answer quoted in a status failure, so they never reach `--json` output.
-/// The diff never names a header or a credential; a `body_secret` shows
-/// there as `<secret, N bytes>`. A URL's `user:pass@` is masked everywhere
-/// too. A body given with `.json`, `.form` or `.body` is not a secret, and
-/// the diff shows it. A value given as a `Secret` anywhere on the request
-/// (a header, the bearer token, the basic-auth password, the URL's
-/// password) shows inside it as `<secret>` where it appears as it is, as
-/// `.json` writes it, or as `.form` writes it. A secret inside a body you
-/// encoded yourself (`.body(..)`) in any other way is shown as you wrote
-/// it. For a body that is secret, use [`Request::body_secret`]: to send a
-/// password in a JSON body,
+/// `Debug`. The diff never names a header or a credential; a `body_secret`
+/// shows there as `<secret, N bytes>`. A URL's `user:pass@` shows as
+/// `user:********@` wherever the URL is printed. Each of these, the Basic
+/// pair as it is encoded, and the URL's password are registered with the
+/// run's [masker](rustible_sdk::mask), so every event the run emits shows
+/// `<secret>` where one appears: a server's answer quoted in a status
+/// failure, or a body the diff shows, raw, as `.json` writes it, or as
+/// `.form` writes it. A secret that straddles the 2 KiB of a body the diff
+/// shows or the 512 bytes of an answer an error quotes, or that holds
+/// characters the quote or the diff rewrites (whitespace runs, control or
+/// invisible formatting characters), can show in part (#134). A body given
+/// with `.json`, `.form` or `.body` is not a secret, and the diff shows it.
+/// For a body that is secret, use
+/// [`Request::body_secret`]: to send a password in a JSON body,
 /// `.body_secret(&s).content_type("application/json")`.
 ///
 /// **Redirects** are followed for `GET` and `HEAD` and not for anything
@@ -212,9 +212,11 @@ impl Request {
     /// extension method such as `PROPFIND`. The name is upper-cased. Only
     /// `GET`, `HEAD` and `OPTIONS` count as reads (see the type's docs).
     pub fn method(method: impl Into<String>, url: impl Into<String>) -> Self {
+        let url = url.into();
+        client::register_userinfo(&url);
         Request {
             method: method.into().to_ascii_uppercase(),
-            url: url.into(),
+            url,
             headers: vec![],
             auth: None,
             body: Body::None,
@@ -271,10 +273,7 @@ impl Request {
     /// trailing newline is stripped. Never shown; dropped on a redirect to
     /// another origin.
     pub fn header_secret(mut self, name: impl Into<String>, value: &Secret) -> Self {
-        self.headers.push(HeaderSpec {
-            name: name.into(),
-            value: Field::Secret(value.clone()),
-        });
+        self.headers.push(HeaderSpec::secret(name.into(), value));
         self
     }
 
@@ -340,7 +339,7 @@ impl Request {
     }
 
     /// A body that is secret, sent as it is: `<secret, N bytes>` in the
-    /// diff, scrubbed from any message that would quote it, and never
+    /// diff, `<secret>` in any event that would quote it, and never
     /// resent to another origin by a redirect. Set its type with
     /// [`Request::content_type`].
     pub fn body_secret(mut self, body: &Secret) -> Self {
@@ -448,24 +447,12 @@ impl Request {
         }
         // A header that cannot be sent, a secret one included, fails here,
         // in `check`, rather than on the wire.
-        for h in self.wire_headers()? {
-            h.to_wire()
-                .map_err(|e| Error::msg(format!("{} {}: {e}", self.method, mask_url(&self.url))))?;
+        let refused =
+            |e: String| Error::msg(format!("{} {}: {e}", self.method, mask_url(&self.url)));
+        for h in self.wire_headers().map_err(|e| refused(e.chain()))? {
+            h.to_wire().map_err(refused)?;
         }
         Ok(method)
-    }
-
-    /// What the client cannot find in the headers for itself to scrub from
-    /// messages: the basic-auth password, which crosses the wire only in
-    /// base64 but which a server that decodes it can name back. (The
-    /// header's value whole and the part after `Bearer `/`Basic ` — the
-    /// token, the base64 pair — a secret body and the URL's userinfo, the
-    /// client finds itself.)
-    fn raw_secrets(&self) -> Vec<Secret> {
-        match &self.auth {
-            Some(Auth::Basic { password, .. }) => vec![password.clone()],
-            None | Some(Auth::Bearer(_)) => vec![],
-        }
     }
 
     /// The headers as sent: the given ones, the content type, and the
@@ -503,9 +490,13 @@ impl Request {
                     let password = password
                         .as_str()
                         .map_err(|_| Error::msg("the basic-auth password is not UTF-8"))?;
-                    // Built in a `Secret` too, so the pair is wiped on drop.
+                    // Built in `Secret`s, so each is wiped on drop and
+                    // registered with the run's masker: a server that
+                    // rejects the credentials may name the base64 back.
                     let pair = Secret::new(format!("{user}:{password}"));
-                    Secret::new(format!("Basic {}", base64(pair.as_bytes())))
+                    let encoded = Secret::new(base64(pair.as_bytes()));
+                    let encoded = encoded.as_str()?;
+                    Secret::new(format!("Basic {encoded}"))
                 }
             };
             headers.push(HeaderSpec {
@@ -537,26 +528,18 @@ impl Request {
         })
     }
 
-    /// The body as a diff shows it, with every secret the request carries
-    /// scrubbed from it: a token given to `.bearer` that is also in a
-    /// `.json` body shows there as `<secret>`.
-    fn shown_body(&self) -> Result<Shown> {
-        Ok(match &self.body {
+    /// The body as a diff shows it. A secret in it is masked by the run
+    /// where the diff is emitted: a token given to `.bearer` that is also
+    /// in a `.json` body shows there as `<secret>`.
+    fn shown_body(&self) -> Shown {
+        match &self.body {
             Body::None | Body::Invalid(_) => Shown::None,
             Body::Plain { bytes, .. } if bytes.is_empty() => Shown::None,
             Body::Plain { bytes, .. } => {
-                let scrubs = body_scrubs(
-                    client::scrub_list(&self.url, &self.wire_headers()?, None, &self.raw_secrets()),
-                    &self.url,
-                );
-                Shown::Text(body_summary(
-                    bytes,
-                    self.content_type_to_send().as_deref(),
-                    &scrubs,
-                ))
+                Shown::Text(body_summary(bytes, self.content_type_to_send().as_deref()))
             }
             Body::Secret(s) => Shown::Secret(s.len()),
-        })
+        }
     }
 
     /// Send, follow, and judge the status. The one place a request leaves.
@@ -583,7 +566,6 @@ impl Request {
             body,
             follow,
             timeout: Timeout::Total(self.timeout),
-            secrets: self.raw_secrets(),
         })
         .map_err(other)?;
         let status = resp.status;
@@ -679,7 +661,7 @@ impl Op for Request {
         Ok(Plan::Change(RequestIntent {
             method,
             url: self.url.clone(),
-            body: self.shown_body()?,
+            body: self.shown_body(),
         }))
     }
 
@@ -959,84 +941,24 @@ fn is_json_content_type(ct: &str) -> bool {
     sub == "json" || sub.ends_with("+json")
 }
 
-/// What to scrub from a shown body: the client's list, with the URL's
-/// userinfo and password percent-decoded as the server reads them, and each
-/// of those in the two forms Rustible's own encoders write: JSON-escaped as
-/// `.json` writes it (a `"` in it is `\"`), and form-encoded as `.form`
-/// writes it (`p@ss` is `p%40ss`, a space `+`). Both, whatever the body's
-/// kind or content type. A secret in a body encoded by hand any other way
-/// is not recognised, and is shown as written (Decision 4 on #83).
-fn body_scrubs(mut list: Vec<String>, url: &str) -> Vec<String> {
-    let add = |list: &mut Vec<String>, s: String| {
-        if !s.is_empty() && !list.contains(&s) {
-            list.push(s);
-        }
-    };
-    if let Some(info) = client::userinfo(url) {
-        for part in [Some(info), info.split_once(':').map(|(_, pw)| pw)]
-            .into_iter()
-            .flatten()
-        {
-            if let Some(decoded) = percent_decode(part) {
-                add(&mut list, decoded);
-            }
-        }
-    }
-    for s in list.clone() {
-        if let Ok(quoted) = serde_json::to_string(&s) {
-            add(&mut list, quoted[1..quoted.len() - 1].to_string());
-        }
-        add(&mut list, form_component(&s));
-    }
-    list
-}
-
-/// `%XX` decoded, everything else as it is; `None` when the result is not
-/// UTF-8 (and so cannot appear in a body shown as text).
-fn percent_decode(s: &str) -> Option<String> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let hex = |c: u8| (c as char).to_digit(16);
-        if b[i] == b'%'
-            && let (Some(hi), Some(lo)) = (
-                b.get(i + 1).copied().and_then(hex),
-                b.get(i + 2).copied().and_then(hex),
-            )
-        {
-            out.push((hi * 16 + lo) as u8);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
 /// A request body as a diff shows it: reindented when it is JSON, as text
-/// when it is text, as a size when it is neither. Every one of `secrets` is
-/// scrubbed, control characters but a newline and a tab and the characters
-/// [`escape_controls`] lists are escaped (`\u{1b}`, `\u{202e}`), and the
-/// result is cut at about 2 KiB. A note on the last line says when it was
-/// reindented or cut, and how many bytes are sent.
+/// when it is text, as a size when it is neither. Control characters but a
+/// newline and a tab and the characters [`escape_controls`] lists are
+/// escaped (`\u{1b}`, `\u{202e}`), and the result is cut at about 2 KiB. A
+/// note on the last line says when it was reindented or cut, and how many
+/// bytes are sent.
 ///
 /// Reindenting changes only the whitespace between JSON's tokens: keys,
 /// their order, duplicates and every value are shown as they are sent. A
 /// body over [`WHOLE_BODY_BYTES`], or nested deeper than
 /// [`MAX_REINDENT_DEPTH`], is shown as it is sent. Past validation the work
-/// is bounded by what is shown and by the longest secret, not by the body:
-/// only the start that is shown is reindented, scrubbed and escaped, and
-/// that start ends where no secret is cut in two.
-fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) -> String {
+/// is bounded by what is shown, not by the body: only the start that is
+/// shown is reindented and escaped.
+fn body_summary(bytes: &[u8], content_type: Option<&str>) -> String {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return format!("<{} bytes of binary data>", bytes.len());
     };
-    let longest = secrets.iter().map(String::len).max().unwrap_or(0);
-    // Room past the shown 2 KiB for `clean_prefix` to see a secret on its
-    // cut whole: it extends by at most `longest`, and checks `longest` on.
-    let enough = SHOWN_BODY_BYTES + 2 * longest + 1;
+    let enough = SHOWN_BODY_BYTES + 1;
     let reindented = (text.len() <= WHOLE_BODY_BYTES
         && content_type.is_some_and(is_json_content_type))
     .then(|| reindent_json(text, enough))
@@ -1046,8 +968,8 @@ fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) ->
         Some((r, false)) => (r.as_str(), !text.starts_with(r.as_str()), true),
         None => (text, false, false),
     };
-    let start = clean_prefix(source, secrets);
-    let (shown, whole) = escape_controls(&client::scrub(start, secrets), SHOWN_BODY_BYTES);
+    let start = &source[..source.floor_char_boundary(SHOWN_BODY_BYTES)];
+    let (shown, whole) = escape_controls(start, SHOWN_BODY_BYTES);
     cut |= start.len() < source.len() || !whole;
     let note = match (reformatted, cut) {
         (false, false) => return shown,
@@ -1061,41 +983,6 @@ fn body_summary(bytes: &[u8], content_type: Option<&str>, secrets: &[String]) ->
     )
 }
 
-/// The start of `text` a diff shows: [`SHOWN_BODY_BYTES`] of it, ending
-/// where no secret is cut in two, so the scrub sees each secret it shows
-/// whole. It extends past a secret on the cut, at most by the longest
-/// secret; where overlapping secrets would carry it further, it ends
-/// before them instead, at worst at the start. The work is bounded by what
-/// is shown and by the longest secret, not by the body.
-fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
-    // The first start and the last end of the secrets that span `end`.
-    let spanning = |end: usize| {
-        secrets
-            .iter()
-            .filter(|s| !s.is_empty())
-            .flat_map(|s| {
-                (end.saturating_sub(s.len() - 1)..end)
-                    .filter(|&i| text.is_char_boundary(i) && text[i..].starts_with(s.as_str()))
-                    .map(|i| (i, i + s.len()))
-            })
-            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
-    };
-    let first = text.floor_char_boundary(SHOWN_BODY_BYTES);
-    let cap = SHOWN_BODY_BYTES + secrets.iter().map(String::len).max().unwrap_or(0);
-    let mut end = first;
-    while let Some((_, past)) = spanning(end) {
-        if past > cap {
-            end = first;
-            while let Some((before, _)) = spanning(end) {
-                end = before;
-            }
-            break;
-        }
-        end = past;
-    }
-    &text[..end]
-}
-
 /// `text` with every control character escaped (`\u{1b}`, `\r`) except a
 /// newline, a tab, and the `\r` of a `\r\n`, so a body cannot move the
 /// cursor or recolour the terminal it is shown on; and these characters
@@ -1106,7 +993,7 @@ fn clean_prefix<'a>(text: &'a str, secrets: &[String]) -> &'a str {
 /// overrides U+202A–U+202E, the word joiner and invisible operators
 /// U+2060–U+2064, the bidi isolates U+2066–U+2069, and the byte-order mark
 /// U+FEFF. Stops once `budget` bytes are written, never inside an escape or
-/// a `<secret>`; the flag says whether all of `text` was.
+/// a [`PLACEHOLDER`]; the flag says whether all of `text` was.
 fn escape_controls(text: &str, budget: usize) -> (String, bool) {
     let format = |c: char| {
         matches!(
@@ -1127,8 +1014,8 @@ fn escape_controls(text: &str, budget: usize) -> (String, bool) {
         if out.len() >= budget {
             return (out, false);
         }
-        if let Some(after) = rest.strip_prefix(SCRUBBED) {
-            out.push_str(SCRUBBED);
+        if let Some(after) = rest.strip_prefix(PLACEHOLDER) {
+            out.push_str(PLACEHOLDER);
             rest = after;
             continue;
         }
@@ -1302,6 +1189,23 @@ mod tests {
         (ctx.step("request", op), sink)
     }
 
+    /// The diff a dry run of `op` emits, as `-v` renders it: through the
+    /// run's masker, as every event leaves.
+    fn emitted_diff(op: Request) -> String {
+        let (r, sink) = step(true, op);
+        r.unwrap();
+        finished(&sink)[0].2.clone().expect("a diff")
+    }
+
+    /// The error chain the failed step in `sink` emitted, masked.
+    fn failure_note(sink: &Collect) -> String {
+        finished(sink)
+            .into_iter()
+            .find_map(|(status, note, _)| (status == Status::Failed).then_some(note))
+            .flatten()
+            .expect("a failed step")
+    }
+
     fn folder_server() -> Server {
         serve(vec![
             (
@@ -1394,34 +1298,34 @@ mod tests {
     #[test]
     fn a_body_is_shown_pretty_and_cut_at_about_2_kib() {
         assert_eq!(
-            body_summary(br#"{"type":"receiveonly"}"#, Some("application/json"), &[]),
+            body_summary(br#"{"type":"receiveonly"}"#, Some("application/json")),
             "{\n  \"type\": \"receiveonly\"\n}\n(reformatted for display; 22 bytes are sent)"
         );
         // Keys keep the order they are sent in.
         assert!(
-            body_summary(b"{\"b\":1,\"a\":[]}", Some("application/json"), &[])
+            body_summary(b"{\"b\":1,\"a\":[]}", Some("application/json"))
                 .starts_with("{\n  \"b\": 1,\n  \"a\": []\n}\n(reformatted")
         );
         let as_sent = "{\n  \"a\": 1\n}";
         assert_eq!(
-            body_summary(as_sent.as_bytes(), Some("application/json"), &[]),
+            body_summary(as_sent.as_bytes(), Some("application/json")),
             as_sent,
             "already as it would be shown: no note"
         );
         // Not declared JSON: shown as the text it is.
         assert_eq!(
-            body_summary(br#"{"a":1}"#, Some("text/plain"), &[]),
+            body_summary(br#"{"a":1}"#, Some("text/plain")),
             r#"{"a":1}"#
         );
-        assert_eq!(body_summary(b"a=1&b=2", None, &[]), "a=1&b=2");
+        assert_eq!(body_summary(b"a=1&b=2", None), "a=1&b=2");
         let long = "é".repeat(3000); // 6000 bytes, two per character
-        let shown = body_summary(long.as_bytes(), None, &[]);
+        let shown = body_summary(long.as_bytes(), None);
         let (head, note) = shown.split_once("\n... (").unwrap();
         assert_eq!(head.len(), SHOWN_BODY_BYTES);
         assert_eq!(note, "cut for display; 6000 bytes are sent)");
         // Cut on a character boundary.
         let odd = format!("a{}", "é".repeat(3000));
-        let shown = body_summary(odd.as_bytes(), None, &[]);
+        let shown = body_summary(odd.as_bytes(), None);
         let (head, note) = shown.split_once("\n... (").unwrap();
         assert_eq!(head.len(), SHOWN_BODY_BYTES - 1);
         assert_eq!(note, "cut for display; 6001 bytes are sent)");
@@ -1435,8 +1339,7 @@ mod tests {
         assert_eq!(
             body_summary(
                 br#"{"a":1,"a":2,"n":340282366920938463463374607431768211455}"#,
-                Some("application/json"),
-                &[]
+                Some("application/json")
             ),
             "{\n  \"a\": 1,\n  \"a\": 2,\n  \"n\": 340282366920938463463374607431768211455\n}\n\
              (reformatted for display; 57 bytes are sent)"
@@ -1444,15 +1347,14 @@ mod tests {
         assert_eq!(
             body_summary(
                 br#" [1.50, {"s": "a,b:{\"c\"}[]"}, {}, [ ] ]"#,
-                Some("application/json"),
-                &[]
+                Some("application/json")
             ),
             "[\n  1.50,\n  {\n    \"s\": \"a,b:{\\\"c\\\"}[]\"\n  },\n  {},\n  []\n]\n\
              (reformatted for display; 41 bytes are sent)"
         );
         // Not JSON after all: the text as it is, with no note.
         assert_eq!(
-            body_summary(b"{\"a\":", Some("application/json"), &[]),
+            body_summary(b"{\"a\":", Some("application/json")),
             "{\"a\":"
         );
         // A struct's fields stay in their declared order.
@@ -1469,7 +1371,7 @@ mod tests {
             panic!()
         };
         assert!(
-            body_summary(bytes, Some("application/json"), &[])
+            body_summary(bytes, Some("application/json"))
                 .starts_with("{\n  \"id\": \"dcim\",\n  \"kind\": \"receiveonly\"\n}")
         );
     }
@@ -1483,7 +1385,7 @@ mod tests {
         let deep = format!("{}1{}", "[".repeat(32000), "]".repeat(32000));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(body_summary(deep.as_bytes(), Some("application/json"), &[]));
+            let _ = tx.send(body_summary(deep.as_bytes(), Some("application/json")));
         });
         let shown = rx
             .recv_timeout(Duration::from_secs(5))
@@ -1503,9 +1405,7 @@ mod tests {
         );
 
         // Within the depth, only the start that is shown is reindented (all
-        // of it would be 180 KB), and a secret on its cut is still scrubbed
-        // whole: one of these spans it.
-        let secrets = vec!["t0k3n-on-the-cut".to_string()];
+        // of it would be 180 KB).
         let wide = format!(
             "{}\"{}\",{}{}",
             "[".repeat(20),
@@ -1516,11 +1416,7 @@ mod tests {
         let sent = wide.len();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(body_summary(
-                wide.as_bytes(),
-                Some("application/json"),
-                &secrets,
-            ));
+            let _ = tx.send(body_summary(wide.as_bytes(), Some("application/json")));
         });
         let shown = rx
             .recv_timeout(Duration::from_secs(5))
@@ -1530,8 +1426,6 @@ mod tests {
             "{} bytes",
             shown.len()
         );
-        assert!(!shown.contains("t0k"), "{shown}");
-        assert!(shown.contains("\"<secret>\""), "{shown}");
         assert!(
             shown.ends_with(&format!(
                 "\n... (reformatted and cut for display; {sent} bytes are sent)"
@@ -1558,42 +1452,6 @@ mod tests {
         assert_eq!(out, "[\n  1,\n  2\n]");
     }
 
-    /// However secrets overlap, the start a large body shows stays about
-    /// 2 KiB: the extension past a secret on the cut is capped, and where
-    /// overlapping secrets would carry it further it ends before them. It
-    /// is as long as it can be without showing part of a secret.
-    #[test]
-    fn the_shown_start_of_a_body_is_bounded() {
-        let aa = ["aa".to_string()];
-        // No secret near the cut: exactly 2 KiB.
-        let plain = "x".repeat(300 << 10);
-        assert_eq!(clean_prefix(&plain, &aa).len(), SHOWN_BODY_BYTES);
-        // One on the cut: past it, by no more than its length.
-        let one = format!("{}aa{}", "x".repeat(SHOWN_BODY_BYTES - 1), plain);
-        assert_eq!(clean_prefix(&one, &aa).len(), SHOWN_BODY_BYTES + 1);
-        // A run of overlapping ones across the cut: before the run.
-        let run = format!("{}{}", "x".repeat(1000), "a".repeat(300 << 10));
-        assert_eq!(clean_prefix(&run, &aa), "x".repeat(1000));
-        let shown = body_summary(run.as_bytes(), None, &aa);
-        assert_eq!(
-            shown,
-            format!(
-                "{}\n... (cut for display; {} bytes are sent)",
-                "x".repeat(1000),
-                run.len()
-            ),
-            "no part of a secret"
-        );
-        // All of it one run: nothing, rather than part of a secret.
-        let all = "a".repeat(300 << 10);
-        assert_eq!(clean_prefix(&all, &aa), "");
-        let shown = body_summary(all.as_bytes(), None, &aa);
-        assert_eq!(
-            shown,
-            format!("\n... (cut for display; {} bytes are sent)", all.len())
-        );
-    }
-
     /// Format characters reorder or hide text (`safe\u{202e}txt.exe` reads
     /// as `safeexe.txt`), so they are escaped too; and the cut never splits
     /// an escape.
@@ -1602,8 +1460,7 @@ mod tests {
         assert_eq!(
             body_summary(
                 "safe\u{202e}txt.exe\u{2066}\u{200b}\u{feff}".as_bytes(),
-                None,
-                &[]
+                None
             ),
             "safe\\u{202e}txt.exe\\u{2066}\\u{200b}\\u{feff}"
         );
@@ -1611,16 +1468,16 @@ mod tests {
             '\u{61c}', '\u{ad}', '\u{180e}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}',
         ] {
             assert_eq!(
-                body_summary(format!("a{c}b").as_bytes(), None, &[]),
+                body_summary(format!("a{c}b").as_bytes(), None),
                 format!("a{}b", c.escape_default()),
                 "{:?}",
                 c
             );
         }
-        assert_eq!(body_summary("é ü 日本".as_bytes(), None, &[]), "é ü 日本");
+        assert_eq!(body_summary("é ü 日本".as_bytes(), None), "é ü 日本");
         let body = format!("{}\x1byyyy", "x".repeat(SHOWN_BODY_BYTES - 2));
         assert_eq!(
-            body_summary(body.as_bytes(), None, &[]),
+            body_summary(body.as_bytes(), None),
             format!(
                 "{}\\u{{1b}}\n... (cut for display; 2051 bytes are sent)",
                 "x".repeat(SHOWN_BODY_BYTES - 2)
@@ -1634,7 +1491,7 @@ mod tests {
     fn a_trailing_newline_is_not_a_reformat() {
         let body = "{\n  \"a\": 1\n}\n";
         assert_eq!(
-            body_summary(body.as_bytes(), Some("application/json"), &[]),
+            body_summary(body.as_bytes(), Some("application/json")),
             "{\n  \"a\": 1\n}"
         );
     }
@@ -1655,36 +1512,16 @@ mod tests {
     }
 
     /// Above `WHOLE_BODY_BYTES` only the start that is shown is read: it is
-    /// not reindented, the note counts the bytes sent, and a secret across
-    /// the cut is still scrubbed whole.
+    /// not reindented, and the note counts the bytes sent.
     #[test]
     fn a_large_body_is_shown_from_its_start_only() {
         let big = format!("{{\"k\":\"{}\"}}", "v".repeat(300 << 10));
-        let shown = body_summary(big.as_bytes(), Some("application/json"), &[]);
+        let shown = body_summary(big.as_bytes(), Some("application/json"));
         let (head, note) = shown.split_once("\n... (").unwrap();
         assert_eq!(head, &big[..SHOWN_BODY_BYTES], "as sent, not reindented");
         assert_eq!(
             note,
             format!("cut for display; {} bytes are sent)", big.len())
-        );
-        let secrets = ["t0k3n-across-the-cut".to_string()];
-        let big = format!(
-            "{}t0k3n-across-the-cut{}",
-            "x".repeat(SHOWN_BODY_BYTES - 5),
-            "y".repeat(300 << 10)
-        );
-        let shown = body_summary(big.as_bytes(), None, &secrets);
-        assert!(!shown.contains("t0k"), "{shown}");
-        assert!(
-            shown.starts_with(&format!("{}<secret>", "x".repeat(SHOWN_BODY_BYTES - 5))),
-            "{shown}"
-        );
-        assert!(
-            shown.ends_with(&format!(
-                "\n... (cut for display; {} bytes are sent)",
-                big.len()
-            )),
-            "{shown}"
         );
     }
 
@@ -1692,39 +1529,12 @@ mod tests {
     #[test]
     fn a_binary_body_is_shown_as_its_size() {
         assert_eq!(
-            body_summary(&[0xff, 0xfe, 0], None, &[]),
+            body_summary(&[0xff, 0xfe, 0], None),
             "<3 bytes of binary data>"
         );
         assert_eq!(
-            body_summary(&[0xff, 0xfe, 0], Some("application/json"), &[]),
+            body_summary(&[0xff, 0xfe, 0], Some("application/json")),
             "<3 bytes of binary data>"
-        );
-    }
-
-    /// Scrubbed before the cut, so a secret across the 2 KiB line is not
-    /// left half shown; in JSON, in its escaped form too.
-    #[test]
-    fn a_shown_body_is_scrubbed_of_every_secret() {
-        let secrets = body_scrubs(vec!["t0k\"en".to_string()], "http://h/");
-        assert_eq!(
-            body_summary(b"x t0k\"en y", Some("text/plain"), &secrets),
-            "x <secret> y"
-        );
-        assert_eq!(
-            body_summary(br#"{"t":"t0k\"en"}"#, Some("application/json"), &secrets),
-            "{\n  \"t\": \"<secret>\"\n}\n(reformatted for display; 15 bytes are sent)"
-        );
-        // Across the cut: scrubbed whole, and the `<secret>` kept whole.
-        let straddling = format!(
-            "{}t0k\"en{}",
-            "x".repeat(SHOWN_BODY_BYTES - 3),
-            "z".repeat(10)
-        );
-        let shown = body_summary(straddling.as_bytes(), None, &secrets);
-        assert!(!shown.contains("t0k"), "{shown}");
-        assert!(
-            shown.ends_with("x<secret>\n... (cut for display; 2061 bytes are sent)"),
-            "{shown}"
         );
     }
 
@@ -1824,152 +1634,163 @@ mod tests {
         assert_no_secret(&format!("{i:?}"));
     }
 
-    /// A value given as a `Secret` anywhere on the request is scrubbed from
-    /// the body the diff shows, so a bearer token that is also in a `.json`
-    /// body never reaches `-v`, `Debug` or `--json`.
+    /// A value given as a `Secret` anywhere on the request shows as
+    /// `<secret>` in the body the emitted diff shows, so a bearer token that
+    /// is also in a `.json` body never reaches `-v` or `--json`. The masking
+    /// is the run's, where the event leaves: the intent's own diff, which
+    /// nothing prints, still holds the body as it is sent.
     #[test]
-    fn a_secret_in_a_plain_body_is_scrubbed_from_the_diff_debug_and_events() {
+    fn a_secret_in_a_plain_body_is_masked_in_the_emitted_diff() {
         let body = json!({ "key": KEY, "token": TOKEN, "u": "u5er-pw" });
         let sent = serde_json::to_vec(&body).unwrap().len();
-        let bearer = with_secrets(Request::patch("http://bob:u5er-pw@h/x")).json(&body);
-        let basic = Request::post("http://h/x")
-            .basic_auth("bob", &Secret::new(PASSWORD))
-            .json(&json!({ "pw": PASSWORD }));
-        let (s, sink) = sys(true);
-        let Plan::Change(i) = bearer.check(&s).unwrap() else {
-            panic!()
+        let bearer = || with_secrets(Request::patch("http://bob:u5er-pw@h/x")).json(&body);
+        let basic = || {
+            Request::post("http://h/x")
+                .basic_auth("bob", &Secret::new(PASSWORD))
+                .json(&json!({ "pw": PASSWORD }))
         };
         assert_eq!(
-            i.diff().render(),
+            emitted_diff(bearer()),
             format!(
                 "PATCH http://bob:********@h/x\n{{\n  \"key\": \"<secret>\",\n  \
                  \"token\": \"<secret>\",\n  \"u\": \"<secret>\"\n}}\n\
                  (reformatted for display; {sent} bytes are sent)"
             )
         );
+        assert!(
+            emitted_diff(basic()).contains("\"pw\": \"<secret>\""),
+            "{}",
+            emitted_diff(basic())
+        );
         // `Debug` shows the URL, masked, and the body only as its size, by
         // construction: these cover the URL, and that no body text is there.
-        let dbg = format!("{i:?}");
-        assert_no_secret(&dbg);
-        assert!(dbg.contains("bytes shown"), "{dbg}");
-        assert!(!dbg.contains("token") && !dbg.contains("<secret>"), "{dbg}");
-        let Plan::Change(i) = basic.check(&s).unwrap() else {
-            panic!()
-        };
-        assert!(
-            i.diff().render().contains("\"pw\": \"<secret>\""),
-            "{}",
-            i.diff().render()
-        );
-        assert_no_secret(&format!("{i:?}"));
+        let (s, _) = sys(true);
+        for op in [bearer(), basic()] {
+            let Plan::Change(i) = op.check(&s).unwrap() else {
+                panic!()
+            };
+            let dbg = format!("{i:?}");
+            assert_no_secret(&dbg);
+            assert!(dbg.contains("bytes shown"), "{dbg}");
+            assert!(!dbg.contains("token") && !dbg.contains("<secret>"), "{dbg}");
+        }
 
         // And what `--json` prints: every event of both steps.
+        let (s, sink) = sys(true);
         let mut ctx = rustible_sdk::testing::ctx(s);
-        ctx.step("bearer", bearer).unwrap();
-        ctx.step("basic", basic).unwrap();
+        ctx.step("bearer", bearer()).unwrap();
+        ctx.step("basic", basic()).unwrap();
         for ev in sink.events() {
             assert_no_secret(&format!("{ev:?}"));
             assert_no_secret(&serde_json::to_string(&ev).unwrap());
         }
-        let steps = finished(&sink);
-        assert!(
-            steps[0]
-                .2
-                .as_deref()
-                .unwrap()
-                .contains("\"token\": \"<secret>\""),
-            "{steps:?}"
-        );
-        assert!(
-            steps[1]
-                .2
-                .as_deref()
-                .unwrap()
-                .contains("\"pw\": \"<secret>\""),
-            "{steps:?}"
-        );
     }
 
-    /// A secret is scrubbed in whatever form the body carries it: form-
+    /// A secret is masked in whatever form the body carries it: form-
     /// encoded in a form, JSON-escaped in JSON (whatever the content type
     /// says), and the URL's password as the server decodes it.
     #[test]
-    fn a_secret_is_scrubbed_in_the_form_the_body_carries_it() {
-        let (s, _) = sys(false);
-        let render = |op: Request| {
-            let Plan::Change(i) = op.check(&s).unwrap() else {
-                panic!()
-            };
-            i.diff().render()
-        };
+    fn a_secret_is_masked_in_the_form_the_body_carries_it() {
         let form = Request::post("http://h/token")
             .basic_auth("client", &Secret::new("p@ss/w0rd="))
             .form([("client_secret", "p@ss/w0rd=")]);
-        assert_eq!(render(form), "POST http://h/token\nclient_secret=<secret>");
+        assert_eq!(
+            emitted_diff(form),
+            "POST http://h/token\nclient_secret=<secret>"
+        );
 
         let json = Request::post("http://h/x")
             .bearer(&Secret::new("t0k\"en"))
             .json(&json!({ "t": "t0k\"en" }))
             .content_type("application/vnd.foo");
-        assert_eq!(render(json), "POST http://h/x\n{\"t\":\"<secret>\"}");
+        assert_eq!(emitted_diff(json), "POST http://h/x\n{\"t\":\"<secret>\"}");
 
         let url = Request::post("http://bob:p%40ss@h/x").body("pw=p@ss");
-        assert_eq!(render(url), "POST http://bob:********@h/x\npw=<secret>");
-        let lone = Request::post("http://t%2Fk@h/x").body("t/k");
-        assert_eq!(render(lone), "POST http://********@h/x\n<secret>");
+        assert_eq!(
+            emitted_diff(url),
+            "POST http://bob:********@h/x\npw=<secret>"
+        );
+        let lone = Request::post("http://t%2Fk3n@h/x").body("t/k3n");
+        assert_eq!(emitted_diff(lone), "POST http://********@h/x\n<secret>");
     }
 
-    /// Decision 4 on #83: a secret is scrubbed raw and in the two forms
-    /// Rustible's own encoders write, whatever the body's kind or content
-    /// type, and in no other. A body encoded by hand some other way (PHP's
-    /// `\/`, Python's `\u00e4`, lowercase hex, `%20`) shows it as written:
-    /// that is the documented limit, and `.body_secret` is the way to send
-    /// a body that is secret.
+    /// The masker's form-encoded form is exactly what `.form` writes, for
+    /// every printable ASCII character: the SDK keeps its own encoder, and
+    /// this pins the two together.
+    #[test]
+    fn the_masker_knows_the_form_encoding_form_writes() {
+        // The space inside: one at either end is trimmed before registering.
+        let every: String = ('!'..='~').chain(" end".chars()).collect();
+        let op = Request::post("http://h/x")
+            .bearer(&Secret::new(every.clone()))
+            .form([("v", every.as_str())]);
+        assert_eq!(emitted_diff(op), "POST http://h/x\nv=<secret>");
+    }
+
+    /// #92 item 1: a short secret after a scheme (`Token 1`) masks nothing
+    /// in a body that happens to hold a `1`: the part after the scheme is
+    /// under 4 characters and is not registered, and the whole value does
+    /// not appear.
+    #[test]
+    fn a_short_credential_does_not_garble_the_shown_body() {
+        let op = Request::post("http://h/x")
+            .header_secret("Authorization", &Secret::new("Token 1"))
+            .json(&json!({ "count": 1, "id": 210 }));
+        let diff = emitted_diff(op);
+        assert!(!diff.contains("<secret>"), "{diff}");
+        assert!(diff.contains("\"count\": 1,\n  \"id\": 210"), "{diff}");
+    }
+
+    /// A secret is masked raw, in the two JSON forms (as `.json` writes it
+    /// and as an ASCII-only encoder does), and form-encoded as `.form`
+    /// writes it, whatever the body's kind or content type, and in no
+    /// other. A body encoded by hand some other way (PHP's `\/`, lowercase
+    /// hex, `%20`) shows it as written: that is the documented limit, and
+    /// `.body_secret` is the way to send a body that is secret.
     #[test]
     fn a_secret_encoded_by_hand_another_way_is_shown_as_written() {
-        let (s, _) = sys(false);
-        let render = |secret: &str, body: &str, ct: &str| {
-            let op = Request::post("http://h/x")
-                .bearer(&Secret::new(secret))
-                .body(body)
-                .content_type(ct);
-            let Plan::Change(i) = op.check(&s).unwrap() else {
-                panic!()
-            };
-            i.diff().render()
+        let shown = |secret: &str, body: &str, ct: &str| {
+            emitted_diff(
+                Request::post("http://h/x")
+                    .bearer(&Secret::new(secret))
+                    .body(body)
+                    .content_type(ct),
+            )
         };
         // Our own forms, whatever the content type says.
         assert_eq!(
-            render("t0k\"en", r#"{"t":"t0k\"en"}"#, "text/plain"),
+            shown("t0k\"en", r#"{"t":"t0k\"en"}"#, "text/plain"),
             r#"POST http://h/x
 {"t":"<secret>"}"#
         );
         assert_eq!(
-            render("p@ss w/rd", r#"{"s":"p%40ss+w%2Frd"}"#, "application/json"),
+            shown("p@ss w/rd", r#"{"s":"p%40ss+w%2Frd"}"#, "application/json"),
             "POST http://h/x\n{\n  \"s\": \"<secret>\"\n}\n\
              (reformatted for display; 21 bytes are sent)"
         );
-        // Other encoders' forms: shown as written.
         assert_eq!(
-            render("t/k", r#"{"t":"t\/k"}"#, "application/json"),
-            "POST http://h/x\n{\n  \"t\": \"t\\/k\"\n}\n\
-             (reformatted for display; 12 bytes are sent)"
-        );
-        assert!(
-            render(
+            shown(
                 "pässwörd",
                 r#"{"t":"p\u00e4ssw\u00f6rd"}"#,
                 "application/json"
-            )
-            .contains(r#""p\u00e4ssw\u00f6rd""#)
+            ),
+            "POST http://h/x\n{\n  \"t\": \"<secret>\"\n}\n\
+             (reformatted for display; 26 bytes are sent)",
+            "as an ASCII-only JSON encoder writes it"
+        );
+        // Other encoders' forms: shown as written.
+        assert_eq!(
+            shown("t/k3n", r#"{"t":"t\/k3n"}"#, "application/json"),
+            "POST http://h/x\n{\n  \"t\": \"t\\/k3n\"\n}\n\
+             (reformatted for display; 14 bytes are sent)"
         );
         let form = "application/x-www-form-urlencoded";
         assert_eq!(
-            render("p@ss w/rd", "s=p%40ss%20w%2frd", form),
+            shown("p@ss w/rd", "s=p%40ss%20w%2frd", form),
             "POST http://h/x\ns=p%40ss%20w%2frd"
         );
         assert_eq!(
-            render("p@ss w/rd", "s=p%40ss+w%2Frd", form),
+            shown("p@ss w/rd", "s=p%40ss+w%2Frd", form),
             "POST http://h/x\ns=<secret>",
             "as .form writes it"
         );
@@ -2022,7 +1843,18 @@ mod tests {
         assert!(e.contains("`X-Key` is not a valid header value"), "{e}");
         assert!(!e.contains("a\nb"));
         let e = err(Request::get("http://h/").header_secret("X-Key", &Secret::new(vec![0xff])));
-        assert!(e.contains("not UTF-8"), "{e}");
+        assert_eq!(
+            e,
+            "GET http://h/: the secret for header `X-Key` is not UTF-8"
+        );
+        // Every refusal names the request it is about, a header's included.
+        let e = err(Request::post("http://h/x").bearer(&Secret::new(vec![0xff])));
+        assert_eq!(e, "POST http://h/x: the bearer token is not UTF-8");
+        let e = err(Request::get("http://u:pw0rd@h/").basic_auth("bob", &Secret::new(vec![0xff])));
+        assert_eq!(
+            e,
+            "GET http://u:********@h/: the basic-auth password is not UTF-8"
+        );
         let e = err(Request::get("ftp://bob:u5er-pw@h/"));
         assert_no_secret(&e);
     }
@@ -2538,9 +2370,10 @@ mod tests {
     // ---- review round: secrets in echoes, one-line errors, json_as ----
 
     /// A server that echoes the request into its error page (a `400` or a
-    /// `422` often does) must not put the request's secrets into the step's
-    /// error, and so into `StepFinished` and `--json`: every form of every
-    /// secret is scrubbed from the quoted body.
+    /// `422` often does) must not put the request's secrets into what the
+    /// run emits, `StepFinished` and `--json`: every form of every secret is
+    /// masked in the quoted body. The error the playbook holds is the
+    /// server's answer as it came; the run masks it as it leaves.
     #[test]
     fn an_echoing_server_does_not_leak_secrets_into_the_status_error() {
         let s = serve(vec![(
@@ -2552,11 +2385,12 @@ mod tests {
         let url = s.url("/echo").replace("http://", "http://bob:u5er-pw@");
         let op = with_secrets(Request::post(&url)).body_secret(&Secret::new(BODY_SECRET));
         let (r, sink) = step(false, op);
-        let e = r.unwrap_err().chain();
+        assert!(r.is_err());
+        let e = failure_note(&sink);
         assert!(e.contains("returned 422 Unprocessable Entity"), "{e}");
         assert!(
             e.contains("x-api-key: <secret>"),
-            "the echo is there, scrubbed: {e}"
+            "the echo is there, masked: {e}"
         );
         assert_no_secret(&e);
         for ev in sink.events() {
@@ -2568,14 +2402,15 @@ mod tests {
         assert_eq!(seen.body, BODY_SECRET.as_bytes());
 
         let basic = Request::get(s.url("/echo")).basic_auth("bob", &Secret::new(PASSWORD));
-        let e = basic.send().unwrap_err().chain();
+        let (_, sink) = step(false, basic);
+        let e = failure_note(&sink);
         let b64 = base64(format!("bob:{PASSWORD}").as_bytes());
         assert!(!e.contains(&b64), "{e}");
         assert!(e.contains("authorization: <secret>"), "{e}");
         assert_no_secret(&e);
 
         // A server that decodes the credentials and names them back: the
-        // password never crossed the wire in clear, and is scrubbed anyway.
+        // password never crossed the wire in clear, and is masked anyway.
         let says = serve(vec![(
             "/login",
             401,
@@ -2583,11 +2418,80 @@ mod tests {
             format!("no user bob with password {PASSWORD}; got {b64}").into_bytes(),
         )]);
         let basic = Request::get(says.url("/login")).basic_auth("bob", &Secret::new(PASSWORD));
-        let e = basic.send().unwrap_err().chain();
+        let (_, sink) = step(false, basic);
+        let e = failure_note(&sink);
         assert!(
             e.ends_with("no user bob with password <secret>; got <secret>"),
             "{e}"
         );
+    }
+
+    /// #122: a server that answers with the secret as the request carried
+    /// it, form-encoded, JSON-escaped, or raw, has it masked in the status
+    /// error the run emits, each form as `.form`, `.json` and `.body` wrote
+    /// it.
+    #[test]
+    fn a_secret_echoed_in_any_form_is_masked_in_the_status_error() {
+        let secret = Secret::new("p@ss \"zebra\"");
+        let pw = secret.as_str().unwrap().to_string();
+        let as_json = serde_json::to_string(&pw).unwrap();
+        let s = serve(vec![
+            (
+                "/form",
+                400,
+                vec![],
+                b"invalid field password=p%40ss+%22zebra%22".to_vec(),
+            ),
+            (
+                "/json",
+                400,
+                vec![],
+                format!("{{\"error\":\"bad password\",\"got\":{as_json}}}").into_bytes(),
+            ),
+            (
+                "/raw",
+                400,
+                vec![],
+                format!("wrong password: {pw}").into_bytes(),
+            ),
+        ]);
+        let cases = [
+            (
+                Request::post(s.url("/form")).form([("password", pw.as_str())]),
+                "invalid field password=<secret>",
+            ),
+            (
+                Request::post(s.url("/json")).json(&json!({ "password": pw })),
+                "{\"error\":\"bad password\",\"got\":\"<secret>\"}",
+            ),
+            (
+                Request::post(s.url("/raw")).body(pw.clone()),
+                "wrong password: <secret>",
+            ),
+        ];
+        for (op, want) in cases {
+            let (r, sink) = step(false, op);
+            // What the playbook holds is the server's answer as it came.
+            assert!(r.unwrap_err().chain().contains("zebra"));
+            let e = failure_note(&sink);
+            assert!(e.ends_with(want), "{e}");
+            assert!(!e.contains("zebra"), "{e}");
+        }
+    }
+
+    /// #92: a bearer token next to the URL's password, overlapping in a
+    /// body the server echoes, leaves no fragment of either visible.
+    #[test]
+    fn overlapping_secrets_leave_no_fragment() {
+        let s = serve(vec![("/x", 400, vec![], b"rejected abc123xyz".to_vec())]);
+        let url = s.url("/x").replace("http://", "http://u:123xyz@");
+        let op = Request::post(&url)
+            .bearer(&Secret::new("abc123"))
+            .body("abc123xyz");
+        let (_, sink) = step(false, op);
+        let e = failure_note(&sink);
+        assert!(e.ends_with("rejected <secret>"), "{e}");
+        assert!(!e.contains("xyz") && !e.contains("abc"), "{e}");
     }
 
     /// A failed response is quoted from its first bytes and never read to

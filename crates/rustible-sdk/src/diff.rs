@@ -240,6 +240,39 @@ impl Diff {
                 .join(" "),
         }
     }
+
+    /// This diff with `f` applied to every string in it: the path when it
+    /// is UTF-8, both texts, every attribute's name and values, the
+    /// summary. How the masker reaches text it cannot otherwise read.
+    pub(crate) fn map_text(self, f: &mut dyn FnMut(String) -> String) -> Diff {
+        Diff(match self.0 {
+            Repr::Text {
+                path,
+                before,
+                after,
+            } => Repr::Text {
+                path: match path.into_os_string().into_string() {
+                    Ok(p) => f(p).into(),
+                    Err(p) => p.into(),
+                },
+                before: f(before),
+                after: f(after),
+            },
+            Repr::Attrs { subject, changes } => Repr::Attrs {
+                subject: f(subject),
+                changes: changes
+                    .into_iter()
+                    .map(|AttrChange { name, from, to }| AttrChange {
+                        name: f(name),
+                        from: f(from),
+                        to: f(to),
+                    })
+                    .collect(),
+            },
+            Repr::Summary(s) => Repr::Summary(f(s)),
+            Repr::Many(parts) => Repr::Many(parts.into_iter().map(|d| d.map_text(f)).collect()),
+        })
+    }
 }
 
 #[cfg(test)]

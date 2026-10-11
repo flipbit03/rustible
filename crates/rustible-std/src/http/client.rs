@@ -28,6 +28,7 @@ use std::io::Read;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use rustible_sdk::mask;
 use rustible_sdk::prelude::*;
 use ureq::http::{self, HeaderName, HeaderValue, Method};
 
@@ -88,6 +89,22 @@ pub(crate) struct HeaderSpec {
 }
 
 impl HeaderSpec {
+    /// A header whose value is secret. The value registered itself when it
+    /// became a `Secret`; for one with a scheme in front (`Token x`,
+    /// `Bearer x`), the credential after it is registered too, since a
+    /// server that rejects it may name it back alone.
+    pub(crate) fn secret(name: String, value: &Secret) -> HeaderSpec {
+        if let Ok(text) = value.as_str()
+            && let Some((_, credential)) = text.split_once(' ')
+        {
+            mask::register(credential);
+        }
+        HeaderSpec {
+            name,
+            value: Field::Secret(value.clone()),
+        }
+    }
+
     /// The header as `ureq` sends it, or why it cannot be sent. An op calls
     /// this from `check` too, so a malformed header is refused before the
     /// wire; a message never quotes a secret value.
@@ -152,10 +169,6 @@ pub(crate) struct Outgoing<'a> {
     pub(crate) body: Option<(&'a [u8], bool)>,
     pub(crate) follow: bool,
     pub(crate) timeout: Timeout,
-    /// Secrets that reach the wire inside a header but are not one whole
-    /// (a bearer token, a basic-auth password), so they are scrubbed from
-    /// any message on their own too.
-    pub(crate) secrets: Vec<Secret>,
 }
 
 /// Why reading a body failed: over the size limit, which the op's own
@@ -198,7 +211,6 @@ pub(crate) struct Incoming {
     head: bool,
     deadline: Option<(Instant, Duration)>,
     resp: http::Response<ureq::Body>,
-    scrub: Vec<String>,
 }
 
 impl Incoming {
@@ -256,31 +268,26 @@ impl Incoming {
             max_bytes,
             read: 0,
             deadline: self.deadline,
-            scrub: self.scrub,
         })
     }
 
     /// Up to `n` bytes of the body as one line of text, for a message about
-    /// a response that is already a failure: every secret of the request
-    /// scrubbed (a server that echoes the request back would otherwise put
-    /// them in the error), control characters escaped, whitespace runs
-    /// collapsed to one space. A read error ends it early rather than
-    /// replacing the failure being reported.
+    /// a response that is already a failure: control characters escaped,
+    /// whitespace runs collapsed to one space. A secret a server echoes back
+    /// is masked by the run where the message is emitted. A read error ends
+    /// it early rather than replacing the failure being reported.
     pub(crate) fn snippet(mut self, n: usize) -> String {
         if self.head {
             return String::new();
         }
-        // Read past `n` by the longest secret, so one that straddles the
-        // cut is still whole when it is scrubbed.
-        let extra = self.scrub.iter().map(String::len).max().unwrap_or(0);
         let mut out = Vec::new();
         let _ = self
             .resp
             .body_mut()
             .as_reader()
-            .take((n + extra) as u64)
+            .take(n as u64)
             .read_to_end(&mut out);
-        one_line(&scrub(&String::from_utf8_lossy(&out), &self.scrub), n)
+        one_line(&String::from_utf8_lossy(&out), n)
     }
 }
 
@@ -289,8 +296,7 @@ const BODY_BUF: usize = 64 << 10;
 
 /// A response body being read: [`Incoming::body`]. Each read is counted
 /// against the limit, if there is one, and a failure is worded as
-/// [`Incoming::read`]'s, a timeout named for its deadline and every secret
-/// of the request scrubbed.
+/// [`Incoming::read`]'s, a timeout named for its deadline.
 pub(crate) struct Body {
     /// `None` for an answer that has no body: to a `HEAD`, or a `1xx`, `204`
     /// or `304`.
@@ -299,7 +305,6 @@ pub(crate) struct Body {
     max_bytes: Option<u64>,
     read: u64,
     deadline: Option<(Instant, Duration)>,
-    scrub: Vec<String>,
 }
 
 impl Body {
@@ -318,10 +323,7 @@ impl Body {
                     // recognised and the text is what reading whole gave.
                     let e = ureq::Error::from(e);
                     let e = timed_out(&e, self.deadline).unwrap_or_else(|| e.to_string());
-                    return Err(ReadError::Other(scrub(
-                        &format!("{what}: reading the body: {e}"),
-                        &self.scrub,
-                    )));
+                    return Err(ReadError::Other(format!("{what}: reading the body: {e}")));
                 }
             }
         };
@@ -347,12 +349,8 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
         mut body,
         follow,
         timeout,
-        secrets,
     } = req;
     let first = format!("{method} {}", mask_url(&url));
-    // Every secret is scrubbed from the text of a transport error, and from
-    // the quoted body of a failed response, before it becomes a message.
-    let scrubs = scrub_list(&url, &headers, body, &secrets);
     let deadline = match timeout {
         Timeout::Total(d) => Some((Instant::now() + d, d)),
         Timeout::Head(_) => None,
@@ -368,7 +366,7 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
             timeout,
             deadline,
         )
-        .map_err(|e| Error::msg(scrub(&format!("{what}: {e}"), &scrubs)))?;
+        .map_err(|e| Error::msg(format!("{what}: {e}")))?;
         let status = resp.status().as_u16();
         let location = resp
             .headers()
@@ -412,7 +410,6 @@ pub(crate) fn send(req: Outgoing<'_>) -> Result<Incoming> {
             head: method == Method::HEAD,
             deadline,
             resp,
-            scrub: scrubs,
         });
     }
 }
@@ -550,62 +547,6 @@ fn timed_out(e: &ureq::Error, deadline: Option<(Instant, Duration)>) -> Option<S
     }
 }
 
-/// `text` with every non-empty string in `secrets` replaced, longest first
-/// so a secret that contains another is replaced whole.
-pub(crate) fn scrub(text: &str, secrets: &[String]) -> String {
-    let mut sorted: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    sorted
-        .into_iter()
-        .fold(text.to_string(), |t, s| t.replace(s.as_str(), "<secret>"))
-}
-
-/// Everything a message must never quote: each secret header's value whole
-/// and, for a value with a scheme in front (`Bearer x`, `Basic x`), the part
-/// after it; the `extra` secrets; a secret body; and the URL's userinfo
-/// whole, its password, and a lone user part (often the token itself).
-pub(crate) fn scrub_list(
-    url: &str,
-    headers: &[HeaderSpec],
-    body: Option<(&[u8], bool)>,
-    extra: &[Secret],
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut add = |s: &str| {
-        let s = s.trim_end_matches(['\r', '\n']);
-        if !s.is_empty() && !out.iter().any(|o| o == s) {
-            out.push(s.to_string());
-        }
-    };
-    for h in headers {
-        if let Field::Secret(s) = &h.value
-            && let Ok(v) = s.as_str()
-        {
-            add(v);
-            if let Some((_, rest)) = v.split_once(' ') {
-                add(rest.trim());
-            }
-        }
-    }
-    for s in extra {
-        if let Ok(v) = s.as_str() {
-            add(v);
-        }
-    }
-    if let Some((bytes, true)) = body
-        && let Ok(v) = std::str::from_utf8(bytes)
-    {
-        add(v);
-    }
-    if let Some(info) = userinfo(url) {
-        add(info);
-        if let Some((_, password)) = info.split_once(':') {
-            add(password);
-        }
-    }
-    out
-}
-
 /// `text` as one line: control characters escaped (`\u{1b}`), every run of
 /// whitespace a single space. Only the first `max` bytes of that, then
 /// `...` when it was cut, so the result is at most `max + 3` bytes. The cut
@@ -647,6 +588,44 @@ pub fn one_line(text: &str, max: usize) -> String {
 }
 
 // ---- pure ----
+
+/// Register the secret in a URL's userinfo with the run's masker: the
+/// password of a `user:pass@`, or a lone user part (often the token itself),
+/// as written and percent-decoded as the server reads it. The user name
+/// beside a password is not a secret, and is not registered.
+pub(crate) fn register_userinfo(url: &str) {
+    let Some(info) = userinfo(url) else {
+        return;
+    };
+    let secret = info.split_once(':').map_or(info, |(_, password)| password);
+    mask::register(secret);
+    // Made a `Secret`, which registers it, and wipes it when dropped.
+    let _ = Secret::new(percent_decode(secret));
+}
+
+/// `%XX` decoded, everything else as it is. Never longer than `s`, so the
+/// buffer never grows and leaves no copy behind.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                b.get(i + 1).copied().and_then(hex),
+                b.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
 
 /// The URL's `user:pass` (or `user`), if it has one.
 pub(crate) fn userinfo(url: &str) -> Option<&str> {
@@ -1127,43 +1106,6 @@ mod tests {
         assert!(line.ends_with("}..."), "{line}");
     }
 
-    /// What a message must never quote, every form of it.
-    #[test]
-    fn the_scrub_list_has_every_form_of_every_secret() {
-        let h = |n: &str, v: &str| HeaderSpec {
-            name: n.into(),
-            value: Field::Secret(Secret::new(v)),
-        };
-        let list = scrub_list(
-            "https://bob:pw0rd@h/x",
-            &[
-                h("X-API-Key", "k3y\n"),
-                h("Authorization", "Basic Ym9iOnB3"),
-            ],
-            Some((b"body-s3cret", true)),
-            &[Secret::new("raw-t0ken")],
-        );
-        for want in [
-            "k3y",
-            "Basic Ym9iOnB3",
-            "Ym9iOnB3",
-            "raw-t0ken",
-            "body-s3cret",
-            "bob:pw0rd",
-            "pw0rd",
-        ] {
-            assert!(list.iter().any(|s| s == want), "{want}: {list:?}");
-        }
-        // A plain body is not a secret; a lone user part is.
-        assert!(scrub_list("http://h/", &[], Some((b"plain", false)), &[]).is_empty());
-        assert_eq!(scrub_list("http://t0k@h/", &[], None, &[]), ["t0k"]);
-        // Longest first, so `Basic x` goes whole rather than leaving `Basic`.
-        assert_eq!(
-            scrub("Basic Ym9iOnB3 and Ym9iOnB3", &list),
-            "<secret> and <secret>"
-        );
-    }
-
     #[test]
     fn base64_matches_rfc_4648() {
         for (plain, enc) in [
@@ -1176,14 +1118,6 @@ mod tests {
         ] {
             assert_eq!(base64(plain.as_bytes()), enc);
         }
-    }
-
-    #[test]
-    fn scrub_replaces_every_secret() {
-        assert_eq!(
-            scrub("a tok b tok", &["tok".to_string()]),
-            "a <secret> b <secret>"
-        );
     }
 
     #[test]

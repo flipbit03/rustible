@@ -1,6 +1,7 @@
 //! Bytes that must not outlive their use: the escalation password and what
 //! `ctx.local_secret` returns (vision doc 5.6, 11). Zeroized on drop, never
-//! written to disk by the SDK, redacted in `Debug`.
+//! written to disk by the SDK, redacted in `Debug`, and masked in every
+//! event the run emits.
 
 use std::fmt;
 
@@ -24,18 +25,43 @@ use zeroize::{Zeroize, Zeroizing};
 ///   (`-S`), so it appears in no argv, no `CmdRan` event, no
 ///   [`CmdFailed`](crate::error::CmdFailed), and not in the host's process
 ///   list.
+/// - Making one registers it with the run's [masker](crate::mask): `new`,
+///   `From<String>`, `Deserialize` (the escalation password) and
+///   `ctx.local_secret`. From then on every string of every event the
+///   binary emits shows `<secret>` where the value appears, raw,
+///   JSON-escaped or form-encoded, whoever wrote the text: a command's
+///   stderr echoing it, an error, a warning, a diff. Masked on the target,
+///   before the event is sent. A panic's message, which goes to the
+///   binary's stderr, is masked the same way by the panic hook the runtime
+///   installs.
 ///
 /// Not covered:
 ///
+/// - A secret shorter than 4 characters, once surrounding whitespace is
+///   stripped, is never masked: it would turn every occurrence of a common
+///   short string into `<secret>`. One of 4 to 6 characters is masked only
+///   as a whole word (its neighbours not letters or digits), so `test` does
+///   not mask `testing`. Its bytes are masked as text; bytes that are not
+///   UTF-8 as their lossy decoding.
+/// - Masking applies to events, as they leave the binary, and to a panic's
+///   message. The value is in clear in an `Error` the playbook holds, in a
+///   command's argv on the target (its process list), in anything the
+///   playbook writes to stdout or stderr itself, and in any text cut or
+///   rewritten before it reaches an event, which masking may no longer
+///   recognise.
 /// - [`Secret::as_bytes`] and [`Secret::as_str`] hand back the plaintext.
-///   Whatever the caller then prints, formats into a message, or passes as a
-///   command argument is entirely outside this type.
+///   Whatever the caller then writes to a file, sends, or passes as a
+///   command argument is outside this type.
 /// - `Serialize` writes the plaintext as a JSON string; that is how the
 ///   escalation password travels in the `Start` frame. What protects it
 ///   there is the transport plus `protocol` zeroizing the frame buffer after
 ///   decoding, not this type.
 /// - Only this value's own buffer is wiped. A copy the caller made, or the
-///   `Vec` a secret was built from, lives and dies on its own.
+///   `Vec` a secret was built from, lives and dies on its own. The run's
+///   masker keeps a copy of the value (and of its encoded forms) in buffers
+///   wiped when the run ends, not when this value drops; the `rustible`
+///   command, which builds the escalation password it forwards as a
+///   `Secret`, keeps its masker's copy until it exits.
 /// - Nothing is pinned in RAM: a swapped page or a core dump can still hold
 ///   the bytes. The SDK does not `mlock`.
 ///
@@ -47,8 +73,12 @@ impl Secret {
     /// Moves the bytes into a buffer that is wiped on drop. Any copy the
     /// caller kept is untouched, so build the `Secret` from the buffer that
     /// read the bytes rather than from a clone of it.
+    ///
+    /// Registers the value with the run's masker
+    /// ([`mask`](crate::mask)), so it shows as `<secret>` in every event
+    /// from then on.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Secret(Zeroizing::new(bytes.into()))
+        Secret(Zeroizing::new(bytes.into())).registered()
     }
 
     /// The plaintext, for writing to a process's stdin or a file. Use
@@ -85,6 +115,14 @@ impl Secret {
     pub(crate) fn push(&mut self, bytes: &[u8]) {
         extend_wiping(&mut self.0, bytes);
     }
+
+    /// Register the value with the run's masker, and hand it back. Every
+    /// way of making a `Secret` from a value ends here; one built chunk by
+    /// chunk with [`Secret::push`] is registered by its builder once whole.
+    pub(crate) fn registered(self) -> Self {
+        crate::mask::register_bytes(&self.0);
+        self
+    }
 }
 
 /// `buf.extend_from_slice(bytes)`, except that when `buf` has to grow, the
@@ -119,7 +157,7 @@ impl fmt::Debug for Secret {
 
 impl From<String> for Secret {
     fn from(s: String) -> Self {
-        Secret(Zeroizing::new(s.into_bytes()))
+        Secret(Zeroizing::new(s.into_bytes())).registered()
     }
 }
 
@@ -137,7 +175,7 @@ impl Serialize for Secret {
 impl<'de> Deserialize<'de> for Secret {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let text = Zeroizing::new(String::deserialize(d)?);
-        Ok(Secret(Zeroizing::new(text.as_bytes().to_vec())))
+        Ok(Secret(Zeroizing::new(text.as_bytes().to_vec())).registered())
     }
 }
 

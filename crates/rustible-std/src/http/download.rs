@@ -336,7 +336,9 @@ impl std::fmt::Debug for DownloadReport {
 impl Download {
     /// The URL to fetch. `http://` or `https://`.
     pub fn get(url: impl Into<String>) -> DownloadBuilder {
-        DownloadBuilder { url: url.into() }
+        let url = url.into();
+        client::register_userinfo(&url);
+        DownloadBuilder { url }
     }
 
     /// Expected digest as `"<algorithm>:<hex>"`, see [`parse_checksum`]. A
@@ -417,10 +419,7 @@ impl Download {
     /// and port it was sent to; a redirect from `https://` to `http://` is
     /// refused while it is attached.
     pub fn header_secret(mut self, name: impl Into<String>, value: &Secret) -> Self {
-        self.headers.push(HeaderSpec {
-            name: name.into(),
-            value: Field::Secret(value.clone()),
-        });
+        self.headers.push(HeaderSpec::secret(name.into(), value));
         self
     }
 
@@ -496,7 +495,6 @@ impl Download {
             body: None,
             follow: true,
             timeout: Timeout::Head(self.timeout),
-            secrets: vec![],
         })?;
         if !(200..300).contains(&resp.status) {
             let status = format!("{} {}", resp.status, resp.reason());

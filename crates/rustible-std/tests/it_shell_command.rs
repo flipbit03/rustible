@@ -90,3 +90,55 @@ fn command_options_against_a_real_shell(ctx: &mut Ctx) -> Result<()> {
     assert!(!ctx.sys().exists(never)?);
     Ok(())
 }
+
+/// A command that prints a `Secret` to stderr, as a database CLI prints a
+/// password it rejected: the failure the run emits shows `<secret>` in the
+/// step's error and in the command's stderr, on a real shell, while the
+/// error the playbook holds is the command's as it came.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn a_secret_a_command_prints_is_masked_in_the_emitted_failure(_ctx: &mut Ctx) -> Result<()> {
+    use std::sync::Arc;
+
+    use rustible::sdk::System;
+    use rustible::sdk::event::{Collect, Event};
+
+    let password = Secret::new("hunter2-db-password\n");
+    let collect = Arc::new(Collect::default());
+    let mut run = testing::ctx(System::local(false, collect.clone()));
+    let err = run
+        .step(
+            "log in",
+            Command::sh("echo \"FATAL: password $(cat) rejected\" >&2; exit 2")
+                .stdin(password.as_bytes()),
+        )
+        .unwrap_err();
+    let in_hand = err
+        .cmd_failed()
+        .map(|c| c.stderr.clone())
+        .unwrap_or_default();
+    ensure!(
+        in_hand.contains("hunter2-db-password"),
+        "the playbook's own error is the command's: {in_hand:?}"
+    );
+
+    let (note, stderr) = collect
+        .events()
+        .into_iter()
+        .find_map(|e| match e {
+            Event::StepFinished {
+                note,
+                cmd: Some(cmd),
+                ..
+            } => Some((note.unwrap_or_default(), cmd.stderr)),
+            _ => None,
+        })
+        .expect("the failed step carries its command");
+    ensure!(
+        stderr == "FATAL: password <secret> rejected\n",
+        "stderr as emitted: {stderr:?}"
+    );
+    ensure!(!note.contains("hunter2"), "note as emitted: {note}");
+    let json = serde_json::to_string(&collect.events())?;
+    ensure!(!json.contains("hunter2"), "{json}");
+    Ok(())
+}

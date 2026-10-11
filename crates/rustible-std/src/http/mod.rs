@@ -100,13 +100,17 @@
 //!
 //! Values given as a [`Secret`](rustible_sdk::prelude::Secret): a diff
 //! names no secret header or credential, and shows a secret body
-//! ([`Request::body_secret`]) as `<secret, N bytes>`. A message carries
-//! `<secret>` where a secret appears in it as it is, and only then: a
-//! secret a server echoes back JSON- or form-encoded is not hidden in a
-//! message. A body the diff shows carries `<secret>` where a secret appears
-//! as it is, or as `.json` or `.form` encoded it. `Debug` shows each as
+//! ([`Request::body_secret`]) as `<secret, N bytes>`. `Debug` shows each as
 //! `<secret, N bytes>`. A URL's userinfo is masked as `user:********@`
-//! everywhere a URL is printed ([`mask_url`]).
+//! everywhere a URL is printed ([`mask_url`]). Every event the run emits
+//! shows `<secret>` wherever one of these secrets, the URL's password, or
+//! the Basic pair as it is encoded appears, in the forms
+//! [`rustible_sdk::mask`] lists. A secret that straddles the 2 KiB of a
+//! body the diff shows or the 512 bytes of an answer an error quotes, or
+//! that holds characters the quote or the diff rewrites (whitespace runs,
+//! control or invisible formatting characters), can show in part (#134). A
+//! URL with credentials but no `http://` (`bob:t0ken@host/x`) is refused as
+//! not an http(s) URL, and quoted as written.
 
 mod client;
 mod download;

@@ -578,6 +578,8 @@ impl Ctx {
     /// disk, zeroized when the `Secret` drops (vision doc 5.6, 11).
     pub fn local_secret(&mut self, path: impl AsRef<Path>) -> Result<Secret> {
         let requested = path_str(path.as_ref());
+        // Empty, so registering it here is a no-op; it is registered below,
+        // once whole.
         let mut secret = Secret::new(Vec::new());
         let mut received = 0u64;
         self.shared.channel.stream_file(&requested, &mut |chunk| {
@@ -591,6 +593,7 @@ impl Ctx {
             secret.push(&chunk.bytes);
             Ok(())
         })?;
+        let secret = secret.registered();
         self.debug(format!("{requested}: {received} secret bytes in memory"));
         Ok(secret)
     }
