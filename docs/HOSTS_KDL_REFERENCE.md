@@ -178,8 +178,8 @@ nearer setting it, are a load error. Had `web` and `monitored` above both set
 host `web1`: var `log_level` is defined by both group `web` and group `monitored` at the same distance; set it on host `web1`, or keep it on only one of the two groups
 ```
 
-Setting it on a group that contains both does not help: that group is farther
-from the host than either.
+Setting it on a group that contains both does not help: such a group is never
+nearer to `web1` than they are.
 
 ## Commenting a host out
 
