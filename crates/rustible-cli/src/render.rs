@@ -463,7 +463,8 @@ impl<W: Write> Renderer<W> {
 }
 
 /// A command line on one line: arguments with whitespace or control
-/// characters are shown quoted and escaped.
+/// characters are shown quoted and escaped. The SDK's `Compact` printer has
+/// its own copy.
 fn argv_text(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
@@ -2147,6 +2148,23 @@ web1    4        1             0        0       0          2         0
             );
         });
         assert_eq!(out, "[local]    WARNING: first\nsecond\r\nthird\\r\n");
+    }
+
+    /// The set is `http::Request`'s, at every range's ends: each copy of it
+    /// is written by hand, so a drift in any of them fails here.
+    #[test]
+    fn the_escaped_set_is_request_rs_set_at_every_boundary() {
+        assert_eq!(
+            escape_controls(
+                "\0\u{7f}\u{80}\u{9b}\u{9f}\u{ad}\u{61c}\u{180e}\u{200b}\u{200f}\u{2028}\
+                 \u{202e}\u{2060}\u{2064}\u{2066}\u{2069}\u{feff}"
+            ),
+            "\\u{0}\\u{7f}\\u{80}\\u{9b}\\u{9f}\\u{ad}\\u{61c}\\u{180e}\\u{200b}\\u{200f}\
+             \\u{2028}\\u{202e}\\u{2060}\\u{2064}\\u{2066}\\u{2069}\\u{feff}"
+        );
+        // Just outside each range, and ordinary non-ASCII: kept.
+        let kept = "\u{a0}\u{200a}\u{2010}\u{2027}\u{202f}\u{205f}\u{2065}\u{206a}\u{fefe}é漢";
+        assert_eq!(escape_controls(kept), kept);
     }
 
     #[test]
