@@ -626,11 +626,12 @@ impl<W: Write + Send> Compact<W> {
     }
 }
 
-/// A failed command at `-v`: `$ argv (exit N)`, then its stderr, one line
-/// at a time, indented under it. `rustible`'s renderer prints the same,
-/// with arguments quoted.
+/// A failed command at `-v`: `$ argv (exit N)`, or `(killed by signal N)`
+/// for a process a signal ended, then its stderr, one line at a time,
+/// indented under it. `rustible`'s renderer prints the same, with
+/// arguments quoted.
 fn cmd_block(w: &mut impl Write, c: &CmdFailed) {
-    let _ = writeln!(w, "  $ {} (exit {})", c.argv.join(" "), c.status);
+    let _ = writeln!(w, "  $ {} ({})", c.argv.join(" "), how_it_ended(c));
     for line in c.stderr.lines() {
         let _ = writeln!(w, "    {line}");
     }
@@ -768,6 +769,16 @@ impl<W: Write + Send> EventSink for Compact<W> {
                 s.ok, s.changed, s.would_change, s.skipped, s.failed, s.recovered, s.warnings
             ),
         };
+    }
+}
+
+/// How a failed command ended, for its `$` line: the signal that killed
+/// it, which leaves `status` at `-1`, or else its exit status.
+/// `rustible`'s renderer has its own copy.
+fn how_it_ended(c: &CmdFailed) -> String {
+    match c.signal {
+        Some(s) => format!("killed by signal {s}"),
+        None => format!("exit {}", c.status),
     }
 }
 
@@ -1199,10 +1210,70 @@ mod tests {
         assert_eq!(out.matches("Job failed").count(), 2, "{out}");
         assert_eq!(out.matches("lock held").count(), 1, "{out}");
         let out = feed(run("x\n", Some(9)), run("x\n", Some(15)));
-        assert_eq!(out.matches("$ job (exit 3)").count(), 2, "{out}");
+        for s in [9, 15] {
+            let line = format!("$ job (killed by signal {s})\n");
+            assert_eq!(out.matches(&line).count(), 1, "{out}");
+        }
         let fake = "… (many earlier bytes of stderr not shown: more than one frame carries)";
         let out = feed(run("tail\n", None), run(&format!("{fake}\ntail\n"), None));
         assert_eq!(out.matches("many earlier").count(), 1, "{out}");
+    }
+
+    /// A command a signal killed says so on its `$` line, under a step and
+    /// under a frame, rather than the `-1` its status falls back to. A
+    /// command that exited still shows its status.
+    #[test]
+    fn compact_names_the_signal_that_killed_a_command() {
+        let job = |status: i32, signal: Option<i32>| CmdFailed {
+            argv: vec!["job".into(), "--long".into()],
+            status,
+            signal,
+            stderr: "working\n".into(),
+        };
+        let step = |cmd: CmdFailed, why: &str| Event::StepFinished {
+            id: 1,
+            blocks: vec![],
+            name: "x".into(),
+            identity: "self".into(),
+            status: Status::Failed,
+            diff: None,
+            note: Some(why.into()),
+            elapsed_ms: 0,
+            cmd: Some(cmd),
+        };
+        let frame = |cmd: CmdFailed, why: &str| Event::Failed {
+            step: None,
+            id: None,
+            blocks: vec![],
+            error: why.into(),
+            cmd: Some(cmd),
+        };
+
+        let killed = || job(-1, Some(9));
+        let why = "`job --long` was killed by signal 9";
+        assert_eq!(why, killed().to_string());
+        assert_eq!(
+            print(1, vec![step(killed(), why)]),
+            "FAILED: x  `job --long` was killed by signal 9\n  \
+             $ job --long (killed by signal 9)\n    working\n"
+        );
+        assert_eq!(
+            print(1, vec![frame(killed(), why)]),
+            "FAILED: `job --long` was killed by signal 9\n  \
+             $ job --long (killed by signal 9)\n    working\n"
+        );
+
+        let exited = || job(2, None);
+        let why = "`job --long` exited 2";
+        assert_eq!(why, exited().to_string());
+        assert_eq!(
+            print(1, vec![step(exited(), why)]),
+            "FAILED: x  `job --long` exited 2\n  $ job --long (exit 2)\n    working\n"
+        );
+        assert_eq!(
+            print(1, vec![frame(exited(), why)]),
+            "FAILED: `job --long` exited 2\n  $ job --long (exit 2)\n    working\n"
+        );
     }
 
     /// Below `-v` no command prints, so the printed history keeps none.

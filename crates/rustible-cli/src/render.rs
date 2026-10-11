@@ -164,12 +164,13 @@ impl<W: Write> Renderer<W> {
     }
 
     /// The failed command under its `FAILED` line at `-v`: `$ argv (exit
-    /// N)`, then its stderr. Printed once per failure, wherever its chain is.
+    /// N)`, or `(killed by signal N)` for a process a signal ended, then
+    /// its stderr. Printed once per failure, wherever its chain is.
     fn cmd_block(&mut self, host: &str, c: &CmdFailed) {
         if self.verbosity >= 1 {
             self.line(
                 host,
-                &format!("  $ {} (exit {})", argv_text(&c.argv), c.status),
+                &format!("  $ {} ({})", argv_text(&c.argv), how_it_ended(c)),
             );
             for l in c.stderr.lines() {
                 self.line(host, &format!("    {l}"));
@@ -470,6 +471,16 @@ fn argv_text(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// How a failed command ended, for its `$` line: the signal that killed
+/// it, which leaves `status` at `-1`, or else its exit status. The SDK's
+/// `Compact` printer has its own copy.
+fn how_it_ended(c: &CmdFailed) -> String {
+    match c.signal {
+        Some(s) => format!("killed by signal {s}"),
+        None => format!("exit {}", c.status),
+    }
 }
 
 /// Whether `a` and `b` are one failed command: the same argv, status and
@@ -1552,10 +1563,93 @@ web1    4        1             0        0       0          2         0
         assert_eq!(out.matches("Job failed").count(), 2, "{out}");
         assert_eq!(out.matches("lock held").count(), 1, "{out}");
         let out = feed(run("x\n", Some(9)), run("x\n", Some(15)));
-        assert_eq!(out.matches("$ job (exit 3)").count(), 2, "{out}");
+        for s in [9, 15] {
+            let line = format!("$ job (killed by signal {s})\n");
+            assert_eq!(out.matches(&line).count(), 1, "{out}");
+        }
         let fake = "… (many earlier bytes of stderr not shown: more than one frame carries)";
         let out = feed(run("tail\n", None), run(&format!("{fake}\ntail\n"), None));
         assert_eq!(out.matches("many earlier").count(), 1, "{out}");
+    }
+
+    /// A command a signal killed says so on its `$` line, under a step and
+    /// under a frame, rather than the `-1` its status falls back to. A
+    /// command that exited still shows its status.
+    #[test]
+    fn a_command_killed_by_a_signal_names_the_signal() {
+        let job = |status: i32, signal: Option<i32>| CmdFailed {
+            argv: vec!["job".into(), "--long".into()],
+            status,
+            signal,
+            stderr: "working\n".into(),
+        };
+        // The step's reason is held until the next step begins, and prints
+        // with the command then.
+        let from_step = |cmd: CmdFailed, why: &str| {
+            render(1, |r| {
+                r.event("local", &step_started(1, "x"));
+                let mut step = failing(1, "x", why);
+                if let Event::StepFinished { cmd: c, .. } = &mut step {
+                    *c = Some(cmd);
+                }
+                r.event("local", &step);
+                r.event("local", &step_started(2, "next"));
+                r.event("local", &step_finished(2, "next", Status::Ok));
+            })
+        };
+        let from_frame = |cmd: CmdFailed, why: &str| {
+            render(1, |r| {
+                let mut frame = failed_frame(None, None, why);
+                if let Event::Failed { cmd: c, .. } = &mut frame {
+                    *c = Some(cmd);
+                }
+                r.event("local", &frame);
+            })
+        };
+
+        let killed = || job(-1, Some(9));
+        let why = "`job --long` was killed by signal 9";
+        assert_eq!(why, killed().to_string());
+        assert_eq!(
+            from_step(killed(), why),
+            "\
+[local]  x ....................................................... FAILED
+[local]  FAILED at `x`: `job --long` was killed by signal 9
+[local]    $ job --long (killed by signal 9)
+[local]      working
+[local]  next .................................................... ok
+"
+        );
+        assert_eq!(
+            from_frame(killed(), why),
+            "\
+[local]  FAILED: `job --long` was killed by signal 9
+[local]    $ job --long (killed by signal 9)
+[local]      working
+"
+        );
+
+        let exited = || job(2, None);
+        let why = "`job --long` exited 2";
+        assert_eq!(why, exited().to_string());
+        assert_eq!(
+            from_step(exited(), why),
+            "\
+[local]  x ....................................................... FAILED
+[local]  FAILED at `x`: `job --long` exited 2
+[local]    $ job --long (exit 2)
+[local]      working
+[local]  next .................................................... ok
+"
+        );
+        assert_eq!(
+            from_frame(exited(), why),
+            "\
+[local]  FAILED: `job --long` exited 2
+[local]    $ job --long (exit 2)
+[local]      working
+"
+        );
     }
 
     /// A frame with no `step` field is not paired with a printed step by
