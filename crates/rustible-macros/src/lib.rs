@@ -649,7 +649,8 @@ fn integration_test_impl(
 /// printed, iterated, compared or tested for truth is an error, never empty
 /// text. Handed on before that, minijinja lets it pass as a value left out,
 /// and the template renders: given to a filter (`v.itmes | join(",")`
-/// renders `""`, `join(v.seperator)` joins with nothing), an attribute a
+/// renders `""`, `join(v.seperator)` joins with nothing), given to an `is`
+/// test (`v.nope is none` and `v.nope is eq(1)` are false), an attribute a
 /// filter looks up itself (`selectattr("admn")` keeps nobody), a value
 /// inside a list or map printed whole (`{{ [v.nope] }}` prints
 /// `[undefined]`, `{"port": v.nope} | tojson` writes `null`), or a macro's

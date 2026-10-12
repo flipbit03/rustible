@@ -1167,9 +1167,10 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   `--check` renders every template it reaches (not one fed from a
   would-change step's output: §9).
 - **Strict undefined**: a missing name or field that is printed, looped
-  over or tested is an error, never empty text. ⚠️ Handed to a filter first,
-  it passes silently: `v.itmes | join(",")` renders `""`,
-  `selectattr("admn")` keeps nobody. Every top-level name is passed, so an optional value is an `Option`: `None` renders `None`,
+  over, compared or tested for truth (`{% if %}`) is an error, never empty
+  text. ⚠️ Handed to a filter or an `is` test first, it passes silently:
+  `v.itmes | join(",")` renders `""`, `selectattr("admn")` keeps nobody,
+  `v.nope is none` is false. Every top-level name is passed, so an optional value is an `Option`: `None` renders `None`,
   `{% if x %}` is false for it, and `x | default("off", true)` replaces it.
   `is defined` and `default(..)` are for names that may be absent: a
   spread's, an included file's.

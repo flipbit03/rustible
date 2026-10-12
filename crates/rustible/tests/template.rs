@@ -135,6 +135,17 @@ fn nothing_is_autoescaped_whatever_the_file_is_called() {
 
 #[test]
 fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
+    // Printed, looped over, compared, tested for truth: each fails.
+    for text in [
+        "{% if v.upstrem %}y{% endif %}",
+        "{% for x in v.nope %}{% endfor %}",
+        "{{ v.nope == 1 }}",
+        "{{ v.nope in [1] }}",
+    ] {
+        let dynamic = text.to_string();
+        let err = template!(&dynamic, v = &vhosts()[0]).unwrap_err().chain();
+        assert!(err.contains("undefined value"), "{text}: {err}");
+    }
     let dynamic = "{{ host }} {{ v.upstrem }}".to_string();
     let err = template!(&dynamic, host = "h", v = &vhosts()[0])
         .unwrap_err()

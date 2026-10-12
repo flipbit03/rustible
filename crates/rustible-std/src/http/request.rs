@@ -1802,12 +1802,12 @@ mod tests {
         assert_eq!(emitted_diff(op), "POST http://h/x\na <secret> b");
     }
 
-    /// A secret is masked raw, in the two JSON forms (as `.json` writes it
-    /// and as an ASCII-only encoder does), and form-encoded as `.form`
-    /// writes it, whatever the body's kind or content type, and in no
-    /// other. A body encoded by hand some other way (PHP's `\/`, lowercase
-    /// hex, `%20`) shows it as written: that is the documented limit, and
-    /// `.body_secret` is the way to send a body that is secret.
+    /// A secret is masked raw and in the spellings `mask` registers (the
+    /// JSON forms, form- and percent-encoded, HTML-escaped), whatever the
+    /// body's kind or content type, and in no other. A body encoded by hand
+    /// some other way (PHP's `\/`, lowercase hex) shows it as written: that
+    /// is the documented limit, and `.body_secret` is the way to send a body
+    /// that is secret.
     #[test]
     fn a_secret_encoded_by_hand_another_way_is_shown_as_written() {
         let shown = |secret: &str, body: &str, ct: &str| {

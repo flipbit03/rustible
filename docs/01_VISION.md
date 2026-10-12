@@ -409,8 +409,8 @@ templates, whatever renders them:
 - **Mistakes surface as early as the information allows.** What is known
   when the playbook compiles is checked when it compiles. What is only known
   at run time fails before anything is written. A missing value a template
-  prints, loops over or tests fails the render; it is never written as
-  empty text.
+  prints, loops over, compares or tests for truth fails the render; it is
+  never written as empty text.
 - **Rendering happens on the target,** inside the playbook binary, like
   every other part of a run. The target installs nothing for it, and a dry
   run renders every template, so `--check` finds template errors without

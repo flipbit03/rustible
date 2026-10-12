@@ -445,7 +445,7 @@ fn json_escaped(s: &str, ascii: bool) -> Zeroizing<String> {
 }
 
 /// `s` inside a JSON string as an encoder that makes JSON safe to embed in
-/// HTML writes it (minijinja's and Jinja2's `tojson`): [`json_escaped`],
+/// HTML writes it (minijinja's `tojson`): [`json_escaped`],
 /// and `<`, `>`, `&` and `'` as `\u003c`, `\u003e`, `\u0026` and `\u0027`.
 fn json_html_safe(s: &str) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(s.len() * 6));
@@ -461,7 +461,7 @@ fn json_html_safe(s: &str) -> Zeroizing<String> {
 /// `s` percent-encoded as a URL's path or a DSN's password is usually
 /// written (minijinja's `urlencode`): letters, digits, `/`, `.`, `-` and
 /// `_` as they are, a space as `%20`, every other byte `%XX`. It differs
-/// from [`form_encoded`] in `/`, `*`, `~` and the space.
+/// from [`form_encoded`] in `/`, `*` and the space.
 fn percent_encoded(s: &str) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(s.len() * 3));
     for b in s.bytes() {

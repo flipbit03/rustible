@@ -10,9 +10,9 @@
 //! The environment, the same for every template:
 //!
 //! - **Strict undefined**, minijinja's: a missing name or attribute that is
-//!   printed, iterated, compared or tested fails the render. Handed to a
-//!   filter or a macro argument it passes as an argument left out (the
-//!   `template!` rustdoc lists the cases).
+//!   printed, iterated, compared or tested for truth fails the render.
+//!   Handed to a filter, an `is` test or a macro argument it passes as a
+//!   value left out (the `template!` rustdoc lists the cases).
 //! - **`trim_blocks`**, as Ansible's `template` module renders: the newline
 //!   after a `{% … %}` tag is removed. **`keep_trailing_newline`**: a
 //!   template, and an included one, keeps its final newline, so an include
