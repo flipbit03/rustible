@@ -303,7 +303,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<Value, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined("filter", name, &args, input_may_be_undefined)?;
+                refuse_undefined(&args, input_may_be_undefined)?;
                 builtins().empty_state().apply_filter(name, &args)
             },
         );
@@ -315,7 +315,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<bool, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined("test", name, &args, false)?;
+                refuse_undefined(&args, false)?;
                 builtins().empty_state().perform_test(name, &args)
             },
         );
@@ -332,7 +332,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<Value, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined("function", name, &args, false)?;
+                refuse_undefined(&args, false)?;
                 function.call(&mut builtins().empty_state(), &args)
             },
         );
@@ -357,67 +357,46 @@ fn builtins() -> &'static Environment<'static> {
     BUILTINS.get_or_init(base_environment)
 }
 
-/// Fail when a built-in is given an undefined value: directly, as a
-/// keyword argument, or inside a list or map it is given (what `map(attribute
-/// = ..)` makes of a missing attribute). minijinja's own strict mode lets
-/// one through here: a filter takes it as an argument left out.
+/// Fail when a built-in is given an undefined value: as the input (but
+/// `default`'s), as an argument or a keyword argument, or as an item of a
+/// list it is given (what `map(attribute=..)` makes of a missing attribute).
+/// minijinja's own strict mode lets one through here: a filter takes it as
+/// an argument left out. Only a list's own items are looked at, not deeper
+/// and not inside a map or an object (a `loop`, a `namespace`): the check
+/// runs on every call, inside loops too, so it stays linear in what it was
+/// given and never follows a value that contains itself.
 fn refuse_undefined(
-    kind: &str,
-    name: &str,
     args: &[Value],
     input_may_be_undefined: bool,
 ) -> std::result::Result<(), minijinja::Error> {
-    let undefined = |what: &str| {
-        Err(minijinja::Error::new(
-            minijinja::ErrorKind::UndefinedError,
-            format!("{kind} `{name}` was given {what}"),
-        ))
-    };
     for (i, arg) in args.iter().enumerate() {
         if i == 0 && input_may_be_undefined {
             continue;
         }
         if arg.is_kwargs() {
             for key in arg.try_iter()? {
-                if holds_undefined(&arg.get_item(&key)?) {
-                    return undefined(&format!("an undefined value for `{key}`"));
-                }
+                undefined_fails(&arg.get_item(&key)?)?;
             }
-        } else if arg.is_undefined() {
-            return undefined(if i == 0 && kind != "function" {
-                "an undefined value"
-            } else {
-                "an undefined argument"
-            });
-        } else if holds_undefined(arg) {
-            return undefined("a list or map holding an undefined value");
+        } else if arg.kind() == ValueKind::Seq {
+            for item in arg.try_iter()? {
+                undefined_fails(&item)?;
+            }
+        } else {
+            undefined_fails(arg)?;
         }
     }
     Ok(())
 }
 
-/// An undefined value, or a list or map with one inside, at any depth.
-fn holds_undefined(value: &Value) -> bool {
-    match value.kind() {
-        ValueKind::Undefined => true,
-        ValueKind::Seq | ValueKind::Map => {
-            let Ok(items) = value.try_iter() else {
-                return false;
-            };
-            for item in items {
-                if holds_undefined(&item) {
-                    return true;
-                }
-                if value.kind() == ValueKind::Map
-                    && value.get_item(&item).is_ok_and(|v| holds_undefined(&v))
-                {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
+/// The error strict mode raises for this undefined value, which names the
+/// expression it came from (`` `v.itmes` is undefined ``): looking anything
+/// up on it is an error in strict mode, and minijinja attaches the origin.
+fn undefined_fails(value: &Value) -> std::result::Result<(), minijinja::Error> {
+    if value.is_undefined() {
+        value.get_attr("undefined")?;
+        return Err(minijinja::Error::from(minijinja::ErrorKind::UndefinedError));
     }
+    Ok(())
 }
 
 /// Strict undefined, no autoescape, the syntax, and Rustible's `tojson`.
@@ -889,6 +868,61 @@ mod tests {
             );
             assert!(err.contains("secret is not utf-8"), "{err}");
         }
+    }
+
+    #[test]
+    fn every_built_in_refuses_an_undefined_value() {
+        // minijinja 3.0.0 ships 49 filters, 42 tests and 4 functions
+        // (`defaults.rs`; `template_builtins.rs` renders each): all but
+        // `defined`, `undefined` and `debug` are checked. Re-count on an
+        // upgrade, so a new built-in is not left unchecked.
+        assert_eq!((FILTERS.len(), TESTS.len(), FUNCTIONS.len()), (49, 40, 3));
+        let env = environment();
+        let undefined = Value::UNDEFINED;
+        for &name in FILTERS {
+            let mut state = env.empty_state();
+            let args = if matches!(name, "default" | "d") {
+                vec![Value::from(1), undefined.clone()]
+            } else {
+                vec![undefined.clone()]
+            };
+            let err = state.apply_filter(name, &args).expect_err(name);
+            assert_eq!(
+                err.kind(),
+                ErrorKind::UndefinedError,
+                "filter {name}: {err}"
+            );
+        }
+        for &name in TESTS {
+            let err = env
+                .empty_state()
+                .perform_test(name, std::slice::from_ref(&undefined))
+                .expect_err(name);
+            assert_eq!(err.kind(), ErrorKind::UndefinedError, "test {name}: {err}");
+        }
+        for &name in FUNCTIONS {
+            let (_, function) = env.globals().find(|(g, _)| *g == name).unwrap();
+            let err = function
+                .call(&mut env.empty_state(), std::slice::from_ref(&undefined))
+                .expect_err(name);
+            assert_eq!(
+                err.kind(),
+                ErrorKind::UndefinedError,
+                "function {name}: {err}"
+            );
+        }
+        // And the ones that exist to take it, do.
+        let mut state = env.empty_state();
+        assert!(
+            state
+                .perform_test("defined", std::slice::from_ref(&undefined))
+                .is_ok()
+        );
+        assert!(
+            state
+                .apply_filter("default", &[undefined, Value::from(1)])
+                .is_ok()
+        );
     }
 
     #[test]

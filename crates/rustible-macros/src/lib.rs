@@ -649,13 +649,16 @@ fn integration_test_impl(
 /// reached through. A file template's error ends with the call it was
 /// `rendered at`, since one file may be rendered from several calls.
 ///
-/// **Strict undefined**: a missing name or attribute is an error, never
-/// empty text: printed, iterated, compared, tested, or given to a built-in
-/// filter, test or function (`join(v.seperator)`, `v.itmes | join(",")`),
-/// as an argument or inside a list (what `map(attribute="x")` makes of a
-/// missing `x`). Two places minijinja offers no hook, which stay silent: a
-/// macro's keyword argument (`f(a=v.nope)` takes `a`'s default) and a list
-/// or map literal printed whole (`{{ [v.nope] }}` prints `[undefined]`).
+/// **Strict undefined**: a missing name or attribute is an error: printed,
+/// iterated, compared, tested, or given to a built-in filter, test or
+/// function (`join(v.seperator)`, `v.itmes | join(",")`), as an argument or
+/// as an item of a list (what `map(attribute="x")` makes of a missing `x`).
+/// What stays silent, where minijinja gives no hook: an attribute a filter
+/// looks up itself (`selectattr("admn")` keeps nobody, `sort(attribute=
+/// "nmae")` leaves the order, `unique(attribute=..)`, `rejectattr`), a
+/// macro's keyword argument (`f(a=v.nope)` takes `a`'s default), a list or
+/// map literal printed whole (`{{ [v.nope] }}` prints `[undefined]`), and an
+/// undefined value deeper than a list's own items.
 /// A literal or `include_str!` template must be passed every
 /// name it reads, so an optional value is an `Option`: `None` is `none`,
 /// `{% if x %}` is false for it, and `{{ x | default("off", true) }}`
@@ -754,7 +757,9 @@ fn integration_test_impl(
 /// - **Functions**: `range`, `dict`, `namespace`, `debug`.
 /// - **Tags**: `for` (with `loop`, `loop.previtem`, `loop.nextitem`, and
 ///   `break` and `continue`), `if`, `set`, `with`, `filter`, `macro`,
-///   `call`, `do`, `autoescape`, `raw`, `block`, and the loads above.
+///   `call`, `do`, `autoescape` (which escapes what is printed; a filter
+///   inside it does not escape for it), `raw`, `block`, and the loads
+///   above.
 ///
 /// minijinja's documentation describes each:
 /// <https://docs.rs/minijinja/3.0.0/minijinja/filters/index.html>,

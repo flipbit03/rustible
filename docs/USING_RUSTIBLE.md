@@ -1162,7 +1162,8 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   `--check` renders every template it reaches (not one fed from a
   would-change step's output: §9).
 - **Strict undefined**: a missing name or field is an error, never empty
-  text, given to a filter too (`join(v.seperator)`); not as a macro's
+  text, given to a filter too (`join(v.seperator)`); not an attribute a
+  filter looks up itself (`selectattr("admn")` keeps nobody) or a macro's
   keyword argument, which then takes its default. Every top-level name is
   passed, so an optional value is an `Option`: `None` renders `None`,
   `{% if x %}` is false for it, and `x | default("off", true)` replaces it.

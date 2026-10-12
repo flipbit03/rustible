@@ -182,57 +182,67 @@ fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
 fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
     let v = rustible::json!({ "names": ["a", "b"], "items": [{ "a": 1 }], "sep": "," });
     for (text, said) in [
-        // An argument, the input, a keyword argument.
+        // An argument, the input, a keyword argument: each named.
         (
             "{{ v.names | join(v.seperator) }}",
-            "filter `join` was given an undefined argument",
+            "`v.seperator` is undefined",
         ),
-        (
-            "{{ v.itmes | join(',') }}",
-            "filter `join` was given an undefined value",
-        ),
-        (
-            "{{ v.itmes | tojson }}",
-            "filter `tojson` was given an undefined value",
-        ),
-        (
-            "{{ 'ab' | indent(v.indnet) }}",
-            "filter `indent` was given an undefined argument",
-        ),
+        ("{{ v.itmes | join(',') }}", "`v.itmes` is undefined"),
+        ("{{ v.itmes | tojson }}", "`v.itmes` is undefined"),
+        ("{{ 'ab' | indent(v.indnet) }}", "`v.indnet` is undefined"),
         (
             "{{ v.names | sort(reverse=v.rev) }}",
-            "filter `sort` was given an undefined value for `reverse`",
+            "`v.rev` is undefined",
         ),
-        // Inside a list a built-in is given: a missing attribute `map` made.
+        ("{{ v.nope | default(v.nope2) }}", "`v.nope2` is undefined"),
+        ("{{ dict(a=v.nope) }}", "`v.nope` is undefined"),
+        ("{{ range(v.nope) }}", "`v.nope` is undefined"),
+        ("{{ v.nope is string }}", "`v.nope` is undefined"),
+        // An item of a list: what `map` makes of a missing attribute.
         (
             "{{ v.items | map(attribute='b') | join(',') }}",
-            "filter `join` was given a list or map holding an undefined value",
+            "undefined value",
         ),
-        (
-            "{{ v.nope | default(v.nope2) }}",
-            "filter `default` was given an undefined argument",
-        ),
-        (
-            "{{ dict(a=v.nope) }}",
-            "function `dict` was given an undefined value for `a`",
-        ),
-        (
-            "{{ range(v.nope) }}",
-            "function `range` was given an undefined argument",
-        ),
-        (
-            "{{ v.nope is string }}",
-            "test `string` was given an undefined value",
-        ),
+        ("{{ [v.nope] | join(',') }}", "`v.nope` is undefined"),
     ] {
         let dynamic = text.to_string();
         let err = template!(&dynamic, v = &v).unwrap_err().chain();
         assert!(err.contains(said), "{text}: {err}");
-        assert!(err.contains(", line 1: undefined value: "), "{text}: {err}");
+        assert!(err.contains(", line 1: undefined value"), "{text}: {err}");
     }
-    // What exists to take an undefined value still does.
-    let fine = "{{ v.nope | default('d') }} {{ v.nope is defined }} {{ v.nope is undefined }} {{ v.names | join(v.sep) }}".to_string();
-    assert_eq!(template!(&fine, v = &v).unwrap(), "d False True a,b");
+    // What exists to take an undefined value still does, and a defined
+    // value that holds one (a `loop` at its edges) or holds itself (a
+    // `namespace`) is given to a built-in as before.
+    let fine = "{{ v.nope | default('d') }} {{ v.nope is defined }} {{ v.nope is undefined }} \
+                {{ v.names | join(v.sep) }}\
+                {% for n in v.names %} {{ loop | length }}{% endfor %}\
+                {% set ns = namespace(a=1) %}{% set ns.me = ns %} {{ ns | length }}"
+        .to_string();
+    assert_eq!(
+        template!(&fine, v = &v).unwrap(),
+        "d False True a,b 11 11 2"
+    );
+}
+
+#[test]
+fn the_check_stays_linear_in_a_loop_over_large_data() {
+    let users: Vec<_> = (0..2000)
+        .map(|i| rustible::json!({ "name": format!("u{i}"), "a": 1, "b": 2, "c": 3, "d": 4 }))
+        .collect();
+    let started = std::time::Instant::now();
+    let out = template!(
+        "{% for u in users %}{{ users | length }}{% if u == users | last %}!{% endif %}{% endfor %}",
+        users = &users,
+    )
+    .unwrap();
+    assert!(out.ends_with("2000!"));
+    // Quadratic in the number of users before the check stopped looking
+    // inside maps: seconds even in a release build.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
