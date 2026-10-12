@@ -384,10 +384,7 @@ fn refuse_undefined(
             if items && arg.try_iter()?.any(|item| item.is_undefined()) {
                 return Err(minijinja::Error::new(
                     minijinja::ErrorKind::UndefinedError,
-                    format!(
-                        "{kind} `{name}` was given a list holding an undefined item (a \
-                         `map(attribute=..)` of an attribute some items lack?)"
-                    ),
+                    format!("{kind} `{name}` was given a list holding an undefined item"),
                 ));
             }
         } else {
@@ -399,7 +396,7 @@ fn refuse_undefined(
 
 /// Whether a built-in's list arguments are looked into for undefined items.
 /// Not by one that only hands items on or counts them (`length`, `first`,
-/// `reverse`, `chain`, `default`'s fallback, …), so it stays constant time
+/// `list`, `reverse`, `chain`, `default`'s fallback, …), so it stays constant time
 /// in a loop over large data and an item it hands on fails when printed;
 /// not by a test that asks what a value is (`sequence`, `string`, …); and
 /// not by `select("defined")`, `reject("undefined")` or `map("default", ..)`,
@@ -417,8 +414,8 @@ fn walks_items(kind: &str, name: &str, args: &[Value]) -> bool {
         ("test", _) => false,
         (
             "filter",
-            "length" | "count" | "first" | "last" | "bool" | "reverse" | "chain" | "zip" | "batch"
-            | "slice" | "attr" | "default" | "d",
+            "length" | "count" | "first" | "last" | "bool" | "list" | "reverse" | "chain" | "zip"
+            | "batch" | "slice" | "attr" | "default" | "d",
         ) => false,
         ("filter", "select" | "reject") => !matches!(second, Some("defined" | "undefined")),
         ("filter", "map") => !matches!(second, Some("default" | "d")),
@@ -947,6 +944,28 @@ mod tests {
                 err.kind(),
                 ErrorKind::UndefinedError,
                 "function {name}: {err}"
+            );
+        }
+        // Every name is a real built-in: one misspelt here would be refused
+        // above all the same, and leave the real one unchecked.
+        for &name in FILTERS {
+            let err = builtins()
+                .empty_state()
+                .apply_filter(name, &[Value::from(1)])
+                .err();
+            assert!(
+                err.is_none_or(|e| e.kind() != ErrorKind::UnknownFilter),
+                "filter {name} is not a minijinja built-in"
+            );
+        }
+        for &name in TESTS {
+            let err = builtins()
+                .empty_state()
+                .perform_test(name, &[Value::from(1)])
+                .err();
+            assert!(
+                err.is_none_or(|e| e.kind() != ErrorKind::UnknownTest),
+                "test {name} is not a minijinja built-in"
             );
         }
         // And the ones that exist to take it, do.

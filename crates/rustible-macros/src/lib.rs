@@ -657,10 +657,11 @@ fn integration_test_impl(
 /// looks up itself (`selectattr("admn")` keeps nobody, `sort(attribute=
 /// "nmae")` leaves the order, `unique(attribute=..)`, `rejectattr`), a
 /// macro's keyword argument (`f(a=v.nope)` takes `a`'s default), a list
-/// printed whole (`{{ [v.nope] }}`, or `map(attribute=..)`'s result, prints
-/// `[undefined]`) or compared with the `in` and `==` operators (`"x" in
-/// xs | map(attribute="nmae")` is false; the tests `is in` and `is eq`
-/// refuse), and an undefined value deeper than a list's own items.
+/// or map printed whole (`{{ [v.nope] }}`, or `map(attribute=..)`'s result,
+/// prints `[undefined]`; `{{ {"port": v.nope} | tojson }}` writes `null`) or
+/// compared with the `in` and `==` operators (`"x" in xs |
+/// map(attribute="nmae")` is false; the tests `is in` and `is eq` refuse),
+/// and an undefined value inside a map or deeper than a list's own items.
 /// A template that handles missing items says so, and renders:
 /// `select("defined")`, `reject("undefined")`, `map("default", ..)`.
 /// A literal or `include_str!` template must be passed every
@@ -762,8 +763,8 @@ fn integration_test_impl(
 /// - **Tags**: `for` (with `loop`, `loop.previtem`, `loop.nextitem`, and
 ///   `break` and `continue`), `if`, `set`, `with`, `filter`, `macro`,
 ///   `call`, `do`, `autoescape` (which escapes what is printed; a filter
-///   inside it does not escape for it), `raw`, `block`, and the loads
-///   above.
+///   inside it neither escapes for it nor keeps a `safe` mark), `raw`,
+///   `block`, and the loads above.
 ///
 /// minijinja's documentation describes each:
 /// <https://docs.rs/minijinja/3.0.0/minijinja/filters/index.html>,

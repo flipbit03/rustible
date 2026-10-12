@@ -231,11 +231,17 @@ fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
                    {{ users | map(attribute='email') | select('defined') | list }} \
                    {{ users | map(attribute='email') | map('default', 'z') | join(',') }} \
                    {{ users | map(attribute='email') | map('d', 'y') | join(',') }} \
-                   {{ users | map(attribute='email') | length }}"
+                   {{ users | map(attribute='email') | length }} \
+                   {{ users | map(attribute='email') | select('undefined') | list | length }} \
+                   {{ users | map(attribute='email') | batch(2) | length }}\
+                   {{ users | map(attribute='email') | slice(2) | length }}\
+                   {{ users | map(attribute='email') | chain([1]) | list | length }}\
+                   {{ users | map(attribute='email') | zip([1]) | list | length }} \
+                   {{ (users | map(attribute='email') | list | default([]) | first) }}"
         .to_string();
     assert_eq!(
         template!(&handled, users = &users).unwrap(),
-        "['b@x'] ['b@x'] b@x,z,z b@x,y,y 3"
+        "['b@x'] ['b@x'] b@x,z,z b@x,y,y 3 2 2241 b@x"
     );
     // But a truth test or a comparison does not handle them: it gets them
     // wrong, so it refuses them.
@@ -243,6 +249,8 @@ fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
         "{{ users | map(attribute='emial') | select | join(',') }}",
         "{% if 'b@x' is in(users | map(attribute='emial')) %}{% endif %}",
         "{% if [users[0].emial] is eq(['b@x']) %}{% endif %}",
+        "{% if [users[0].emial] is sameas(none) %}{% endif %}",
+        "{% if [users[0].emial] is lt([1]) %}{% endif %}",
     ] {
         let dynamic = text.to_string();
         let err = template!(&dynamic, users = &users).unwrap_err().chain();
