@@ -599,8 +599,8 @@ fn integration_test_impl(
 /// # fn main() {}
 /// ```
 ///
-/// A [`Secret`](../rustible/sdk/secret/struct.Secret.html) passed in
-/// renders as its plaintext, and the run masks it in every event, diffs
+/// A `Secret` (`rustible::prelude::Secret`) passed in renders as its
+/// plaintext, and the run masks it in every event, diffs
 /// included, as it masks a secret anywhere. A filter that rewrites it
 /// (`upper`, `replace`) produces text the masker does not know.
 ///
@@ -638,7 +638,8 @@ fn integration_test_impl(
 /// `inline template at <file>:<line>`, or `dynamic template at
 /// <file>:<line>`) and the line, the undefined expression (except inside a
 /// macro, where minijinja gives only the line), and for an error inside an
-/// included file, the include sites it was reached through.
+/// included file or a parent's block (`{{ super() }}`), the sites it was
+/// reached through.
 ///
 /// **Strict undefined**: a missing name or attribute is an error, never
 /// empty text. A literal or `include_str!` template must be passed every
@@ -686,8 +687,10 @@ fn integration_test_impl(
 ///   says `ignore missing`;
 /// - every target is embedded, including both branches of a conditional
 ///   `extends` and a statement in a branch that never runs;
-/// - a template may include itself (a tree rendered by its data); an
-///   infinite recursion fails the render at minijinja's recursion limit.
+/// - a template may include or import itself, or another that comes back
+///   to it (a tree rendered by its data); an infinite recursion fails the
+///   render at minijinja's recursion limit. A chain of `extends` that comes
+///   back to a template it started from is a compile error.
 ///
 /// What they do, as minijinja implements Jinja:
 ///

@@ -116,10 +116,20 @@ fn an_included_file_keeps_its_final_newline_so_one_include_per_line_works() {
 }
 
 #[test]
-fn nothing_is_autoescaped() {
+fn nothing_is_autoescaped_whatever_the_file_is_called() {
     assert_eq!(
         template!("{{ v }}", v = "<a href=\"x\">&amp;</a>").unwrap(),
         "<a href=\"x\">&amp;</a>"
+    );
+    // minijinja's default would JSON-escape a `.yaml` name and HTML-escape
+    // an `.html` one.
+    assert_eq!(
+        template!(include_str!("templates/escape/app.yaml.j2"), v = "a\"b").unwrap(),
+        "k: a\"b\n"
+    );
+    assert_eq!(
+        template!(include_str!("templates/escape/page.html.j2"), v = "<b>&").unwrap(),
+        "<p><b>&</p>\n"
     );
 }
 
@@ -293,7 +303,7 @@ fn an_error_in_an_included_file_names_that_file_its_line_and_the_include_sites()
     assert_eq!(
         err,
         "template `tests/templates/nest_err/two/three/three.j2` line 2: undefined value: \
-         `whom` is undefined (included from template `tests/templates/nest_err/two/two.j2` \
+         `whom` is undefined (reached from template `tests/templates/nest_err/two/two.j2` \
          line 2, from template `tests/templates/nest_err/one.j2` line 2)"
     );
 }
@@ -396,6 +406,18 @@ fn strict_undefined_holds_inside_an_included_file() {
     assert!(err.contains("`who` is undefined"), "{err}");
 }
 
+#[test]
+fn an_error_inside_a_super_block_names_the_parent_s_file_and_line() {
+    let err = template!(include_str!("templates/superr/child.j2"))
+        .unwrap_err()
+        .chain();
+    assert_eq!(
+        err,
+        "template `tests/templates/superr/base.j2` line 1: undefined value: `missing` is \
+         undefined (reached from template `tests/templates/superr/child.j2` line 1)"
+    );
+}
+
 // ---- recursion ----
 
 #[test]
@@ -447,6 +469,22 @@ fn infinite_recursion_fails_at_the_limit_and_does_not_hang() {
         "the include sites are counted, not listed: {err}"
     );
     assert!(err.len() < 1000, "{err}");
+}
+
+#[test]
+fn an_import_cycle_fails_at_the_recursion_limit_and_does_not_hang() {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .spawn(move || {
+            tx.send(template!(include_str!("templates/importcycle/a.j2")).map_err(|e| e.chain()))
+                .unwrap();
+        })
+        .unwrap();
+    let err = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("an import cycle must end, not hang")
+        .unwrap_err();
+    assert!(err.contains("recursion limit exceeded"), "{err}");
 }
 
 // ---- dynamic templates read nothing ----

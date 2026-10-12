@@ -63,7 +63,7 @@ The concepts carry over. The syntax does not.
 | `when: condition` | `if condition { ... }` |
 | `loop:` / `with_items:` | `for x in ... { ... }` |
 | `register:` then `{{ result.x }}` | the value the step returns |
-| `template:` with a `.j2` file | `template!(include_str!("x.j2"), name = value)` into `file::Copy` — see §13 |
+| `template:` with a `.j2` file | `template!(include_str!("x.j2"), name = value)?` into `file::Copy` — see §13 |
 | handlers and `notify:` | `if step.changed { ... }` |
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
@@ -1169,13 +1169,13 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
 - ⚠️ **`true` renders as `True`**, `None` as `None`, a list as `['a', 'b']`:
   Jinja's Python spellings. Use `| lower` or `| tojson` where a config file
   wants `true` or JSON.
-- **Whitespace**: `trim_blocks` is on, as in Ansible (the newline after a
-  `{% %}` tag goes); a template's and an included file's final newline
+- **Whitespace**: `trim_blocks` is on (the newline after a `{% %}` tag
+  goes), `lstrip_blocks` off (indentation before a tag stays); a template's and an included file's final newline
   stays, so `{% include "x.j2" %}` on its own line renders the file's lines;
   `{%-`/`-%}` strip by hand; nothing is autoescaped.
 - **Includes** (`include`, `extends`, `import`, `from … import`) resolve
   relative to the file that contains them; a literal's, relative to the
-  playbook. The target must be a string literal. Every reached file is
+  playbook. The target must be a string literal (or a list of them, or `"a" if x else "b"`). Every reached file is
   embedded in the binary, and editing one rebuilds the playbook. A dynamic
   template can include nothing: read target-side files in Rust
   (`ctx.sys().read_to_string`) and pass them in.

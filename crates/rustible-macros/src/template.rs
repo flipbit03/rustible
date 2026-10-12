@@ -269,8 +269,9 @@ struct Tree {
     files: Vec<File>,
     /// `(from, as written, to)`, by index into `files`.
     links: Vec<(usize, String, usize)>,
-    /// `(from, to)` for every `extends` target, by index into `files`.
-    extends: Vec<(usize, usize)>,
+    /// `(from, to, line)` for every `extends` target, by index into
+    /// `files`, with the line of the statement.
+    extends: Vec<(usize, usize, usize)>,
 }
 
 struct File {
@@ -394,8 +395,10 @@ impl Tree {
                     {
                         tree.links.push((index, target.clone(), to));
                     }
-                    if load.statement == "extends" && !tree.extends.contains(&(index, to)) {
-                        tree.extends.push((index, to));
+                    if load.statement == "extends"
+                        && !tree.extends.iter().any(|&(f, t, _)| (f, t) == (index, to))
+                    {
+                        tree.extends.push((index, to, load.line));
                     }
                 }
                 let fails = if load.list {
@@ -422,7 +425,53 @@ impl Tree {
                 }
             }
         }
+        tree.reject_extends_cycle()?;
         Ok(tree)
+    }
+
+    /// Refuse a template that is its own ancestor. minijinja catches an
+    /// inheritance cycle by the names as written, which the target's
+    /// path-join renames, so on the target it would render forever; and a
+    /// chain of `extends` that comes back to where it started never has a
+    /// last parent to render, whatever its conditions, so there is nothing
+    /// to lose by refusing it here.
+    fn reject_extends_cycle(&self) -> Result<(), String> {
+        // Depth-first from every template, along `extends` only.
+        fn visit(tree: &Tree, at: usize, path: &mut Vec<usize>) -> Result<(), String> {
+            if let Some(start) = path.iter().position(|&p| p == at) {
+                let cycle: Vec<&str> = path[start..]
+                    .iter()
+                    .chain(std::iter::once(&at))
+                    .map(|&i| tree.files[i].name.as_str())
+                    .collect();
+                let from = path[path.len() - 1];
+                let line = tree
+                    .extends
+                    .iter()
+                    .find(|&&(f, t, _)| (f, t) == (from, at))
+                    .map_or(0, |&(_, _, l)| l);
+                return Err(tree.at(
+                    from,
+                    line,
+                    &format!(
+                        "`{{% extends %}}` makes a template its own ancestor: {}",
+                        cycle.join(" -> ")
+                    ),
+                ));
+            }
+            path.push(at);
+            for &(from, to, _) in &tree.extends {
+                if from == at {
+                    visit(tree, to, path)?;
+                }
+            }
+            path.pop();
+            Ok(())
+        }
+        for start in 0..self.files.len() {
+            visit(self, start, &mut Vec::new())?;
+        }
+        Ok(())
     }
 
     /// A message about line `line` of template `index`, with the chain of
@@ -445,7 +494,7 @@ impl Tree {
         )
     }
 
-    /// ` (included from `a` line 3, from `b` line 1)`, or nothing for the
+    /// ` (reached from `a` line 3, from `b` line 1)`, or nothing for the
     /// top-level template.
     fn reached(&self, mut index: usize) -> String {
         let mut sites = Vec::new();
@@ -488,7 +537,7 @@ impl Tree {
         let mut parents = vec![0];
         let mut reached = HashSet::from([0]);
         while let Some(child) = parents.pop() {
-            for &(from, to) in &self.extends {
+            for &(from, to, _) in &self.extends {
                 if from == child && reached.insert(to) {
                     parents.push(to);
                 }
@@ -506,7 +555,7 @@ impl Tree {
             let missing: BTreeSet<&str> = root
                 .undeclared
                 .iter()
-                .chain(&root.walked.target_vars)
+                .chain(&root.walked.reads.unseen)
                 .map(String::as_str)
                 .filter(|n| !passed.contains(n) && !globals.contains(*n) && !assigned.contains(n))
                 .collect();
@@ -531,7 +580,7 @@ impl Tree {
         let used: HashSet<&str> = self
             .files
             .iter()
-            .flat_map(|f| f.walked.vars.iter().map(String::as_str))
+            .flat_map(|f| f.walked.reads.all.iter().map(String::as_str))
             .collect();
         for (name, ident, _) in named {
             if !used.contains(name.as_str()) {
@@ -631,6 +680,17 @@ fn syntax() -> SyntaxConfig {
 /// A walk's failure: the line, and why.
 type WalkResult = Result<(), (usize, String)>;
 
+/// The variables a template reads.
+#[derive(Default)]
+struct Reads {
+    /// Every one, wherever it is read: a name in here is used.
+    all: HashSet<String>,
+    /// The ones minijinja's own name analysis does not see: a load target's
+    /// condition (`{% include "a.j2" if flag else "b.j2" %}`) and the value
+    /// a slice is taken of (`{{ xs[1:] }}`).
+    unseen: HashSet<String>,
+}
+
 /// What a walk over one template collects.
 #[derive(Default)]
 struct Walk {
@@ -638,13 +698,8 @@ struct Walk {
     /// Names the template assigns: `set`, `for`, `with`, macro and import
     /// names.
     assigned: HashSet<String>,
-    /// Every variable the template reads anywhere, a load target's
-    /// condition included: a name in here is used.
-    vars: HashSet<String>,
-    /// The variables a load target's condition reads (`{% include "a.j2"
-    /// if flag else "b.j2" %}`), which minijinja's own name analysis does
-    /// not look at.
-    target_vars: HashSet<String>,
+    /// Every variable the template reads, anywhere.
+    reads: Reads,
 }
 
 /// Collect the loads, assigned names and read variables of a statement and
@@ -657,65 +712,65 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
     match stmt {
         Stmt::Template(t) => body(&t.children, w),
         Stmt::EmitExpr(e) => {
-            vars(&e.expr, &mut w.vars);
+            vars(&e.expr, &mut w.reads);
             Ok(())
         }
         Stmt::EmitRaw(_) | Stmt::Continue(_) | Stmt::Break(_) => Ok(()),
         Stmt::Do(d) => {
-            call_vars(&d.call, &mut w.vars);
+            call_vars(&d.call, &mut w.reads);
             Ok(())
         }
         Stmt::ForLoop(f) => {
             assign(&f.target, &mut w.assigned);
             w.assigned.insert("loop".to_string());
-            vars(&f.iter, &mut w.vars);
+            vars(&f.iter, &mut w.reads);
             if let Some(e) = &f.filter_expr {
-                vars(e, &mut w.vars);
+                vars(e, &mut w.reads);
             }
             body(&f.body, w)?;
             body(&f.else_body, w)
         }
         Stmt::IfCond(i) => {
-            vars(&i.expr, &mut w.vars);
+            vars(&i.expr, &mut w.reads);
             body(&i.true_body, w)?;
             body(&i.false_body, w)
         }
         Stmt::WithBlock(b) => {
             for (target, value) in &b.assignments {
                 assign(target, &mut w.assigned);
-                vars(value, &mut w.vars);
+                vars(value, &mut w.reads);
             }
             body(&b.body, w)
         }
         Stmt::Set(s) => {
             assign(&s.target, &mut w.assigned);
-            vars(&s.expr, &mut w.vars);
+            vars(&s.expr, &mut w.reads);
             Ok(())
         }
         Stmt::SetBlock(s) => {
             assign(&s.target, &mut w.assigned);
             if let Some(f) = &s.filter {
-                vars(f, &mut w.vars);
+                vars(f, &mut w.reads);
             }
             body(&s.body, w)
         }
         Stmt::AutoEscape(a) => {
-            vars(&a.enabled, &mut w.vars);
+            vars(&a.enabled, &mut w.reads);
             body(&a.body, w)
         }
         Stmt::FilterBlock(f) => {
-            vars(&f.filter, &mut w.vars);
+            vars(&f.filter, &mut w.reads);
             body(&f.body, w)
         }
         Stmt::Block(b) => body(&b.body, w),
         Stmt::Macro(m) => {
             w.assigned.insert(m.name.to_string());
             m.args.iter().for_each(|a| assign(a, &mut w.assigned));
-            m.defaults.iter().for_each(|d| vars(d, &mut w.vars));
+            m.defaults.iter().for_each(|d| vars(d, &mut w.reads));
             body(&m.body, w)
         }
         Stmt::CallBlock(c) => {
-            call_vars(&c.call, &mut w.vars);
+            call_vars(&c.call, &mut w.reads);
             w.assigned.insert("caller".to_string());
             c.macro_decl
                 .args
@@ -724,7 +779,7 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
             c.macro_decl
                 .defaults
                 .iter()
-                .for_each(|d| vars(d, &mut w.vars));
+                .for_each(|d| vars(d, &mut w.reads));
             body(&c.macro_decl.body, w)
         }
         Stmt::Extends(e) => load("extends", &e.name, false, false, line_of(e.span()), w),
@@ -780,10 +835,10 @@ fn load(
             ),
         ));
     }
-    let mut condition = HashSet::new();
+    let mut condition = Reads::default();
     vars(target, &mut condition);
-    w.vars.extend(condition.iter().cloned());
-    w.target_vars.extend(condition);
+    w.reads.all.extend(condition.all.iter().cloned());
+    w.reads.unseen.extend(condition.all);
     w.loads.push(Load {
         statement,
         targets,
@@ -832,14 +887,18 @@ fn assign(target: &Expr, assigned: &mut HashSet<String>) {
 }
 
 /// Every variable an expression reads. Exhaustive, like [`walk`].
-fn vars(expr: &Expr, out: &mut HashSet<String>) {
+fn vars(expr: &Expr, out: &mut Reads) {
     match expr {
         Expr::Var(v) => {
-            out.insert(v.id.to_string());
+            out.all.insert(v.id.to_string());
         }
         Expr::Const(_) => {}
         Expr::Slice(s) => {
-            vars(&s.expr, out);
+            let mut sliced = Reads::default();
+            vars(&s.expr, &mut sliced);
+            out.all.extend(sliced.all.iter().cloned());
+            out.unseen.extend(sliced.all);
+            out.unseen.extend(sliced.unseen);
             for e in [&s.start, &s.stop, &s.step].into_iter().flatten() {
                 vars(e, out);
             }
@@ -885,12 +944,12 @@ fn vars(expr: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-fn call_vars(call: &minijinja::machinery::ast::Call, out: &mut HashSet<String>) {
+fn call_vars(call: &minijinja::machinery::ast::Call, out: &mut Reads) {
     vars(&call.expr, out);
     call.args.iter().for_each(|a| arg_vars(a, out));
 }
 
-fn arg_vars(arg: &minijinja::machinery::ast::CallArg, out: &mut HashSet<String>) {
+fn arg_vars(arg: &minijinja::machinery::ast::CallArg, out: &mut Reads) {
     use minijinja::machinery::ast::CallArg;
     match arg {
         CallArg::Pos(e) | CallArg::Kwarg(_, e) | CallArg::PosSplat(e) | CallArg::KwargSplat(e) => {
@@ -1339,6 +1398,93 @@ mod tests {
             "t.j2",
         );
         assert_eq!(check(&tree.unwrap(), false, &["items"]), Ok(()));
+    }
+
+    #[test]
+    fn a_template_that_is_its_own_ancestor_is_refused() {
+        let (_d, tree) = resolve(&[("self.j2", "\n{% extends \"self.j2\" %}")], "self.j2");
+        assert_eq!(
+            tree.err().unwrap(),
+            "template `self.j2` line 2: `{% extends %}` makes a template its own ancestor: \
+             self.j2 -> self.j2"
+        );
+        let (_d, tree) = resolve(
+            &[
+                ("top.j2", "{% extends \"a.j2\" %}"),
+                ("a.j2", "{% if x %}{% extends \"b.j2\" %}{% endif %}"),
+                ("b.j2", "{% extends \"a.j2\" %}"),
+            ],
+            "top.j2",
+        );
+        let err = tree.err().unwrap();
+        assert!(
+            err.contains("its own ancestor: a.j2 -> b.j2 -> a.j2"),
+            "{err}"
+        );
+        // An include cycle is a recursion, which the render bounds: allowed.
+        let (_d, tree) = resolve(
+            &[
+                ("a.j2", "{% include \"b.j2\" %}"),
+                (
+                    "b.j2",
+                    "{% extends \"c.j2\" %}{% block x %}{% include \"a.j2\" %}{% endblock %}",
+                ),
+                ("c.j2", ""),
+            ],
+            "a.j2",
+        );
+        assert!(tree.is_ok());
+    }
+
+    #[test]
+    fn a_slice_s_value_is_a_name_the_template_uses() {
+        let (_d, tree) = resolve(&[("t.j2", "{{ xs[1:] }}{{ ys[n:] }}")], "t.j2");
+        let tree = tree.unwrap();
+        assert_eq!(check(&tree, false, &["xs", "ys", "n"]), Ok(()));
+        let err = check(&tree, false, &[]).unwrap_err();
+        assert!(err.contains("uses `n`, `xs`, `ys`"), "{err}");
+    }
+
+    #[test]
+    fn a_load_inside_every_kind_of_body_is_embedded() {
+        let bodies = [
+            "{% for x in [1] %}{% include \"for.j2\" %}{% else %}{% include \"else.j2\" %}{% endfor %}",
+            "{% if x %}{% include \"if.j2\" %}{% else %}{% include \"ifelse.j2\" %}{% endif %}",
+            "{% with y = 1 %}{% include \"with.j2\" %}{% endwith %}",
+            "{% set s %}{% include \"setblock.j2\" %}{% endset %}",
+            "{% autoescape false %}{% include \"autoescape.j2\" %}{% endautoescape %}",
+            "{% filter upper %}{% include \"filter.j2\" %}{% endfilter %}",
+            "{% block b %}{% include \"block.j2\" %}{% endblock %}",
+            "{% macro m() %}{% include \"macro.j2\" %}{% endmacro %}",
+            "{% call m() %}{% include \"call.j2\" %}{% endcall %}",
+        ];
+        let targets = [
+            "for",
+            "else",
+            "if",
+            "ifelse",
+            "with",
+            "setblock",
+            "autoescape",
+            "filter",
+            "block",
+            "macro",
+            "call",
+        ];
+        let mut files: Vec<(String, String)> = vec![("t.j2".into(), bodies.concat())];
+        files.extend(targets.iter().map(|t| (format!("{t}.j2"), String::new())));
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (_d, tree) = resolve(&files, "t.j2");
+        let tree = tree.unwrap();
+        let mut embedded = names(&tree);
+        embedded.sort_unstable();
+        let mut want: Vec<String> = targets.iter().map(|t| format!("{t}.j2")).collect();
+        want.push("t.j2".into());
+        want.sort_unstable();
+        assert_eq!(embedded, want);
     }
 
     #[test]

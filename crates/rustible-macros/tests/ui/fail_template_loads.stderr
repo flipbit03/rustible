@@ -10,14 +10,20 @@ error: template `$DIR/tests/ui/templates/missing_include.j2` line 1: `{% include
 5 |     let _ = rustible::template!(include_str!("templates/missing_include.j2"));
   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: `template!` cannot read `$DIR/tests/ui/templates/not_there.j2`: No such file or directory (os error 2)
- --> tests/ui/fail_template_loads.rs:7:46
+error: template `$DIR/tests/ui/templates/self_extends.j2` line 1: `{% extends %}` makes a template its own ancestor: $DIR/tests/ui/templates/self_extends.j2 -> $DIR/tests/ui/templates/self_extends.j2
+ --> tests/ui/fail_template_loads.rs:7:33
   |
-7 |     let _ = rustible::template!(include_str!("templates/not_there.j2"));
+7 |     let _ = rustible::template!(include_str!("templates/self_extends.j2"));
+  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `template!` cannot read `$DIR/tests/ui/templates/not_there.j2`: No such file or directory (os error 2)
+ --> tests/ui/fail_template_loads.rs:9:46
+  |
+9 |     let _ = rustible::template!(include_str!("templates/not_there.j2"));
   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^
 
 error: `template!` reads an `include_str!` template itself, to check it and to embed the files it includes, so the path must be one string literal: `include_str!("files/app.conf.j2")`
- --> tests/ui/fail_template_loads.rs:9:33
-  |
-9 |     let _ = rustible::template!(include_str!(concat!("templates/", "app.conf.j2")), listen = 1);
-  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  --> tests/ui/fail_template_loads.rs:11:33
+   |
+11 |     let _ = rustible::template!(include_str!(concat!("templates/", "app.conf.j2")), listen = 1);
+   |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

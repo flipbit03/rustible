@@ -34,7 +34,7 @@ use std::borrow::Cow;
 use minijinja::machinery::{Token, tokenize};
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Serde, ValueKind};
-use minijinja::{AutoEscape, Environment, ErrorKind, UndefinedBehavior, Value};
+use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
@@ -297,18 +297,18 @@ fn first_load(source: &str) -> Option<(&'static str, usize)> {
 }
 
 /// A render error as one line: what failed, in which template and line,
-/// and the include sites it was reached through, innermost first.
+/// and the sites it was reached through (an include, a `super()`), innermost
+/// first.
 fn render_error(err: &minijinja::Error) -> Error {
-    // minijinja wraps an error raised inside an included template in one
-    // `BadInclude` per include level; the innermost error is the cause.
+    // minijinja wraps an error raised in another template, or in another
+    // template's block, in one error per level (an `include`, a `{{ super()
+    // }}`, a recursive loop), each with the error inside as its source; the
+    // innermost is the cause, and each wrapper is where it was reached from.
     let mut sites = Vec::new();
     let mut cause = err;
-    while cause.kind() == ErrorKind::BadInclude {
-        let Some(inner) =
-            std::error::Error::source(cause).and_then(|s| s.downcast_ref::<minijinja::Error>())
-        else {
-            break;
-        };
+    while let Some(inner) =
+        std::error::Error::source(cause).and_then(|s| s.downcast_ref::<minijinja::Error>())
+    {
         sites.push(location(cause));
         cause = inner;
     }
@@ -324,7 +324,7 @@ fn render_error(err: &minijinja::Error) -> Error {
             .take(SHOWN_INCLUDE_SITES)
             .cloned()
             .collect();
-        out.push_str(&format!(" (included from {}", shown.join(", from ")));
+        out.push_str(&format!(" (reached from {}", shown.join(", from ")));
         if sites.len() > SHOWN_INCLUDE_SITES {
             out.push_str(&format!(", and {} more", sites.len() - SHOWN_INCLUDE_SITES));
         }
@@ -364,6 +364,8 @@ fn is_call_site(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use minijinja::ErrorKind;
+
     use super::*;
 
     fn vars() -> __Vars {
@@ -464,7 +466,7 @@ mod tests {
         let err = __render_embedded(&RESOLVED, vars()).unwrap_err().chain();
         assert_eq!(
             err,
-            "template `dir/x.j2` line 1: undefined value: `who` is undefined (included from \
+            "template `dir/x.j2` line 1: undefined value: `who` is undefined (reached from \
              template `top.j2` line 1)"
         );
     }
@@ -486,7 +488,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .unwrap()
             .unwrap_err();
-        assert!(err.starts_with("template `f.j2` line 1: invalid operation: recursion limit exceeded (included from template `f.j2` line 1, from "), "{err}");
+        assert!(err.starts_with("template `f.j2` line 1: invalid operation: recursion limit exceeded (reached from template `f.j2` line 1, from "), "{err}");
         assert_eq!(
             err.matches("from template").count(),
             SHOWN_INCLUDE_SITES,
