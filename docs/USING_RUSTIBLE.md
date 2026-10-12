@@ -1145,6 +1145,18 @@ let conf = template!(
     vhosts = &vhosts,                      // anything `Serialize`, borrowed
 )?;
 ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
+
+// Ad hoc nested data, no struct needed
+let ops = [
+    rustible::json!({ "name": "alice", "level": 4 }),
+    rustible::json!({ "name": "bob",   "level": 2 }),
+];
+let ops_txt = template!(
+    "{% for op in ops %}{{ op.name }} (level {{ op.level }})\n{% endfor %}",
+    ops = &ops,
+)?;
+// alice (level 4)
+// bob (level 2)
 ```
 
 - **The template** is a string literal, `include_str!("x.j2")`, or any
