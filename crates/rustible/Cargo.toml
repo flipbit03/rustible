@@ -22,3 +22,8 @@ all-features = true
 rustible-sdk.workspace = true
 rustible-macros.workspace = true
 rustible-std.workspace = true
+
+[dev-dependencies]
+# The `Fake` and `testing::ctx`, for the masking tests in `tests/template.rs`.
+rustible-sdk = { workspace = true, features = ["testing"] }
+tempfile.workspace = true

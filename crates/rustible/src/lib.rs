@@ -15,7 +15,17 @@ pub use rustible_sdk as sdk;
 /// The standard operations, also available as the `rustible_std` crate.
 pub use rustible_std as std_ops;
 
-pub use rustible_macros::{playbook, vars};
+pub use rustible_macros::{playbook, template, vars};
+
+/// Serde, for data a template renders: `#[derive(rustible::serde::Serialize)]`
+/// with `#[serde(crate = "rustible::serde")]`, so a workspace needs no serde
+/// dependency of its own. See [`template!`].
+pub use rustible_sdk::__private::serde;
+
+/// `serde_json`'s `json!`: ad hoc nested data for a template, without
+/// declaring a type. `rustible::json!({ "name": "alice", "level": 4 })`. See
+/// [`template!`].
+pub use rustible_sdk::__private::serde_json::json;
 
 // Test API: gated on the attribute itself, so a test crate without the
 // `testing` feature fails at the line that names it rather than inside the
@@ -30,15 +40,16 @@ pub use rustible_sdk::{registry, runtime};
 /// [`Result`](sdk::error::Result) and its `Context` extension, [`Facts`] and
 /// the enums a distro branch matches on, [`Diff`], [`Secret`], [`System`],
 /// and the `bail!` and `ensure!` macros, plus the `#[playbook]` and
-/// `#[vars]` attributes themselves. Ops come from `rustible_std` and are
-/// deliberately not here: a playbook names the modules it uses, so
-/// `file::Copy` and `systemd::Enabled` stay distinguishable at the call site.
+/// `#[vars]` attributes themselves and [`template!`]. Ops come from
+/// `rustible_std` and are deliberately not here: a playbook names the
+/// modules it uses, so `file::Copy` and `systemd::Enabled` stay
+/// distinguishable at the call site.
 ///
 /// [`Facts`]: sdk::facts::Facts
 /// [`Diff`]: sdk::diff::Diff
 /// [`Secret`]: sdk::secret::Secret
 /// [`System`]: sdk::system::System
 pub mod prelude {
-    pub use rustible_macros::{playbook, vars};
+    pub use rustible_macros::{playbook, template, vars};
     pub use rustible_sdk::prelude::*;
 }

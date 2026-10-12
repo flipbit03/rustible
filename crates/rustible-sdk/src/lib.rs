@@ -38,6 +38,7 @@ pub mod runtime;
 pub mod secret;
 pub mod stream;
 pub mod system;
+pub mod template;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod vars;

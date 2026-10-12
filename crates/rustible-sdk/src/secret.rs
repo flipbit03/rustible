@@ -28,8 +28,9 @@ use zeroize::{Zeroize, Zeroizing};
 /// - Making one registers it with the run's [masker](crate::mask): `new`,
 ///   `From<String>`, `Deserialize` (the escalation password) and
 ///   `ctx.local_secret`. From then on every string of every event the
-///   binary emits shows `<secret>` where the value appears, raw,
-///   JSON-escaped or form-encoded, whoever wrote the text: a command's
+///   binary emits shows `<secret>` where the value appears, raw or in one
+///   of the spellings [`mask`](crate::mask) lists (JSON-escaped, form- or
+///   percent-encoded, HTML-escaped), whoever wrote the text: a command's
 ///   stderr echoing it, an error, a warning, a diff. Masked on the target,
 ///   before the event is sent. A panic's message, which goes to the
 ///   binary's stderr, is masked the same way by the panic hook the runtime
@@ -49,7 +50,8 @@ use zeroize::{Zeroize, Zeroizing};
 ///   playbook writes to stdout or stderr itself, and in any text cut or
 ///   rewritten before it reaches an event without
 ///   [`mask::apply_prefix`](crate::mask::apply_prefix), which masking may
-///   no longer recognise.
+///   no longer recognise: upper-cased, indented, or encoded in a spelling
+///   `mask` does not list, in Rust or by a template's filter.
 /// - [`Secret::as_bytes`] and [`Secret::as_str`] hand back the plaintext.
 ///   Whatever the caller then writes to a file, sends, or passes as a
 ///   command argument is outside this type.

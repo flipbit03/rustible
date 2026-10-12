@@ -1,6 +1,6 @@
 [package]
 name = "rustible-macros"
-description = "Proc macros for Rustible playbooks (#[rustible::playbook], #[rustible::vars]). Use through the `rustible` crate."
+description = "Proc macros for Rustible playbooks (#[rustible::playbook], #[rustible::vars], rustible::template!). Use through the `rustible` crate."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -17,9 +17,14 @@ proc-macro = true
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
+# `template!` parses templates at compile time with the parser the target
+# renders with; pinned in the workspace manifest.
+minijinja.workspace = true
 
 [dev-dependencies]
 trybuild = "1"
+# Template trees laid out on disk for `template`'s unit tests.
+tempfile.workspace = true
 # `testing` for the `#[integration_test]` cases, which the facade re-exports
 # only with it.
 rustible = { path = "../rustible", features = ["testing"] }

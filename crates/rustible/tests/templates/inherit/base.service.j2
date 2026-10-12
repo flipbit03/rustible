@@ -1,0 +1,8 @@
+[Unit]
+Description={{ description }}
+[Service]
+{% block service %}
+Type=simple
+{% endblock %}
+[Install]
+WantedBy=default.target

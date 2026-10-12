@@ -1,0 +1,6 @@
+{{ v.host }} {
+    reverse_proxy {{ v.upstream }}
+{% if v.websocket %}
+    header_up Connection {>Connection}
+{% endif %}
+}

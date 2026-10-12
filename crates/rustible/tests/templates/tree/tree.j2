@@ -1,0 +1,1 @@
+{{ node.name }}{% if node.children %}({% for child in node.children %}{% with node = child %}{% include "tree.j2" %}{% endwith %}{% if not loop.last %},{% endif %}{% endfor %}){% endif %}

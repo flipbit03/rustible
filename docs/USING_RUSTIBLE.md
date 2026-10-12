@@ -63,6 +63,7 @@ The concepts carry over. The syntax does not.
 | `when: condition` | `if condition { ... }` |
 | `loop:` / `with_items:` | `for x in ... { ... }` |
 | `register:` then `{{ result.x }}` | the value the step returns |
+| `template:` with a `.j2` file | `template!(include_str!("x.j2"), name = value)?` into `file::Copy` — see §13 |
 | handlers and `notify:` | `if step.changed { ... }` |
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
@@ -377,7 +378,8 @@ time with `ctx.local_secret(path)` (§8).
 Every `Secret` and the escalation password are masked in what a run reports,
 on the target before it is sent: wherever one appears in an event's text (a
 command's stderr, an error, a warning, a diff) or in a panic's message, raw,
-JSON-escaped or form-encoded, it shows as `<secret>`. A secret you hold as a
+JSON-escaped, form- or percent-encoded, or HTML-escaped, it shows as
+`<secret>`. A secret you hold as a
 plain string is masked once you pass it to `rustible::sdk::mask::register(&s)`.
 Text that may hold a secret and that you cut or reshape before it reaches an
 event goes through `rustible::sdk::mask::apply_prefix` first, or a secret the
@@ -1121,37 +1123,93 @@ let mut root = ctx.as_root();           // also fine
 let root = ctx.as_root(); root.step(..) // E0596: cannot borrow as mutable
 ```
 
-### Putting a variable into a config file
+### Templates: `template!`
 
-There is no template operation and no Jinja. A playbook is Rust, so build the
-string in Rust and copy it:
+`template!` renders Jinja2 (minijinja) to a `String`, on the target. It is a
+value, not an operation: the text goes into any op — `file::Copy`,
+`file::Line`, `file::Block`, a command's stdin, a request body — which diffs
+and dry-runs it as usual. It is in the prelude.
 
 ```rust
-#[rustible::vars]
-struct Vars {
-    #[default = 4]
-    nginx_workers: u32,
-}
+#[derive(rustible::serde::Serialize)]
+#[serde(crate = "rustible::serde")] // or `serde::Serialize` with serde in your workspace
+struct Vhost { host: String, upstream: String }
 
-const NGINX_CONF: &str = "\
-user www-data;
-worker_processes {workers};
-events { worker_connections 768; }
-";
+let vhosts = vec![
+    Vhost { host: "a.example.com".into(), upstream: "127.0.0.1:8080".into() },
+    Vhost { host: "b.example.com".into(), upstream: "127.0.0.1:9000".into() },
+];
+let conf = template!(
+    include_str!("../files/Caddyfile.j2"),   // relative to this file
+    email = "admin@example.com",
+    vhosts = &vhosts,                      // anything `Serialize`, borrowed
+)?;
+ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
 
-#[rustible::playbook(hosts = "web", vars = Vars, escalate = true)]
-fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
-    let conf = NGINX_CONF.replace("{workers}", &vars.nginx_workers.to_string());
-    ctx.step("nginx.conf", file::Copy::from_str(&conf).to("/etc/nginx/nginx.conf"))?;
-    Ok(())
-}
+// Ad hoc nested data, no struct needed
+let ops = [
+    rustible::json!({ "name": "alice", "level": 4 }),
+    rustible::json!({ "name": "bob",   "level": 2 }),
+];
+let ops_txt = template!(
+    "{% for op in ops %}{{ op.name }} (level {{ op.level }})\n{% endfor %}",
+    ops = &ops,
+)?;
+// alice (level 4)
+// bob (level 2)
 ```
 
-`format!` works too, and for anything bigger, add a real template crate to
-your workspace with `cargo add` — it is an ordinary Cargo package, and the
-rendering happens on the target inside your playbook binary.
-
-⚠️ `from_str` takes `&str`, so a `String` you built is passed as `&conf`.
+- **The template** is a string literal, `include_str!("x.j2")`, or any
+  `&str` known only at run time (a *dynamic* template). Name a templated file
+  for what it renders plus `.j2` (`Caddyfile.j2`, `script.sh.j2`); a plain
+  file copied with `file::Copy::from_str(include_str!(..))` is never
+  templated, `{{ }}` and all.
+- **Variables**: `name = value`, any name (`type = ..` too), and at most one
+  `..map` (a struct, a map, a `rustible::json!({..})`) for names known only at
+  run time; a named argument wins over the map's key. `rustible::json!` builds
+  nested data without a type.
+- **Checked when the playbook compiles** (literal and `include_str!`): the
+  syntax of every file in the tree, every target of `include`/`extends`/
+  `import` exists, every name the top-level template reads is passed
+  (unless there is a `..map`; a name it `set`s itself is not required), and
+  every name passed is read somewhere. **Checked when it renders**, on the
+  target, where the macro is called: names in included files, nested fields
+  (`{{ v.upstrem }}`), and all of a dynamic template. The error names the
+  file and line; `?` returns it before the step that would write runs.
+  `--check` renders every template it reaches (not one fed from a
+  would-change step's output: §9).
+- **Strict undefined**: a missing name or field that is printed, looped
+  over, compared or tested for truth (`{% if %}`) is an error, never empty
+  text. ⚠️ Handed to a filter or an `is` test first, it passes silently:
+  `v.itmes | join(",")` renders `""`, `selectattr("admn")` keeps nobody,
+  `v.nope is none` is false. Every top-level name is passed, so an optional value is an `Option`: `None` renders `None`,
+  `{% if x %}` is false for it, and `x | default("off", true)` replaces it.
+  `is defined` and `default(..)` are for names that may be absent: a
+  spread's, an included file's.
+- ⚠️ **`true` renders as `True`**, `None` as `None`, a list as `['a', 'b']`:
+  Jinja's Python spellings. Use `| lower` or `| tojson` where a config file
+  wants `true` or JSON.
+- **Whitespace**: `trim_blocks` is on (the newline after a `{% %}` tag
+  goes), `lstrip_blocks` off (indentation before a tag stays); a template's
+  and an included file's final newline stays, so `{% include "x.j2" %}` on
+  its own line renders the file's lines; `{%-`/`-%}` strip by hand; nothing
+  is autoescaped.
+- **Includes** (`include`, `extends`, `import`, `from … import`) resolve
+  relative to the file that contains them; a literal's, relative to the
+  playbook. The target must be a string literal (or a list of them, or
+  `"a" if x else "b"`). Every reached file is embedded in the binary, and
+  editing one rebuilds the playbook. A dynamic
+  template can include nothing: read target-side files in Rust
+  (`ctx.sys().read_to_string`) and pass them in.
+- In a child that `extends`, only `{% block %}` contents are output. An
+  included file's `{% set %}` outside a loop changes the includer's
+  variable (Jinja2's does not).
+- A `Secret` renders as its plaintext; the run masks it in what it reports
+  as it masks any secret (§6), through `tojson`, `urlencode` and `escape`
+  too, but not reshaped otherwise (`indent`, `upper`).
+- **Filters, tests, functions**: every minijinja built-in (listed in
+  `template!`'s rustdoc). Ansible's own (`to_nice_json`, `regex_replace`, …)
+  are not there: compute in Rust, render in the template.
 
 ### Calling an HTTP API
 

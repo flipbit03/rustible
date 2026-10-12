@@ -369,12 +369,8 @@ vars pre-check of 5.2, and the escalation helper of 11.3.
 Ansible's `copy` and `template` ship controller-side files to the target. Rustible
 supports two mechanisms, each for a different need:
 
-1. **Embed at compile time**, with `include_bytes!` / `include_str!` or a
-   compile-time template engine (askama-style), for small, fixed files and
-   templates. The binary stays self-contained, and a misspelt field in a
-   template is a compile error. `file::Template` is wave two (6.9) and not
-   built; today a playbook builds the text in Rust
-   (`docs/USING_RUSTIBLE.md`, "Putting a variable into a config file").
+1. **Embed at compile time**, with `include_bytes!` / `include_str!`, for
+   small, fixed files and templates. The binary stays self-contained.
 
 2. **Stream over the channel at run time.** `ctx.local_file` brings a
    workspace file to a temp path on the target, removed when the run ends,
@@ -394,6 +390,31 @@ whole or not at all, with its mode and owner already set.
 The reverse (Ansible's `fetch`) uses the same channel upward, and lands the
 same way. Cross-host copy (Ansible's `synchronize` with `delegate_to`) is
 deferred; it is a coordination feature, not a backend concern.
+
+### 5.7 Templates
+
+A template turns data into text. Rustible holds five things true of
+templates, whatever renders them:
+
+- **A template is a value, not an operation.** Rendering produces text, and
+  that text goes wherever text can go: a file, a line, a command's input, a
+  request body. One abstraction serves every op, rather than one op per
+  destination.
+- **Compute in Rust, render in the template.** The playbook prepares the
+  data, typed and testable. The template only lays it out. Logic that grows
+  inside a template belongs in the playbook.
+- **One language everywhere,** whether the template is inline in the
+  playbook, a file beside it, or text that only exists at run time. The
+  language is one operators already know, so existing templates carry over.
+- **Mistakes surface as early as the information allows.** What is known
+  when the playbook compiles is checked when it compiles. What is only known
+  at run time fails before anything is written. A missing value a template
+  prints, loops over, compares or tests for truth fails the render; it is
+  never written as empty text.
+- **Rendering happens on the target,** inside the playbook binary, like
+  every other part of a run. The target installs nothing for it, and a dry
+  run renders every template, so `--check` finds template errors without
+  touching the machine.
 
 ## 6. Playbook programming model
 
@@ -673,7 +694,8 @@ usage:
 | `get_url`, `unarchive` | 3 + 2 | `http::Download`, `archive::Extracted` |
 | `sysctl` | 3 | `sysctl::Present` |
 | `group` | 2 | `group::Present` |
-| `stat`, `acl`, `mount`, `iptables`, `replace`, `template`, `command`, `shell` | 1 or 2 each | tail |
+| `stat`, `acl`, `mount`, `iptables`, `replace`, `command`, `shell` | 1 or 2 each | tail |
+| `template` | 1 or 2 | not an op: a template is a value (5.7) |
 
 **Wave one of `rustible-std`**, covering about 95 percent of that repository
 with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,
@@ -681,8 +703,8 @@ with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,
 `apt::{Present, Absent, Latest}`, `systemd::{Enabled, Disabled, Running,
 Stopped, Restart, Reload, DaemonReload}`, `ssh::authorized_keys::{Present, Absent}`,
 `hostname::Is`, `sysctl::Present`, `http::Download`, `archive::Extracted`,
-`shell::Command`. **Wave two**, the tail: `file::Template` (used once, but
-generally important), `file::Replace`, `acl`, `mount`, `iptables`.
+`shell::Command`. **Wave two**, the tail: `file::Replace`, `acl`, `mount`,
+`iptables`.
 
 **`rustible-github`, the first collection.** The GitHub-keys pattern (a
 `url` lookup of `https://github.com/<user>.keys`, combined into a list and

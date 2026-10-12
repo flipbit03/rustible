@@ -1,0 +1,8 @@
+# Rendered on {{ hostname }} by rustible's template! (vagrant.rs).
+{
+    email {{ email }}
+}
+{% for v in vhosts %}
+
+{% include "caddy/vhost.j2" %}
+{% endfor %}

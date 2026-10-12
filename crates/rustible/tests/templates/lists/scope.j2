@@ -1,0 +1,3 @@
+{% set leaked = "yes" %}{% for v in [1] %}{% include "setter.j2" %}{% endfor %}[{{ leaked }}]{% if true %}
+after-if
+{% endif %}

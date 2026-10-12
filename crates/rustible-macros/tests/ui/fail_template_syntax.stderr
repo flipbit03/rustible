@@ -1,0 +1,5 @@
+error: inline template at $DIR/tests/ui/fail_template_syntax.rs:2, line 2: syntax error: unexpected end of input, expected end of block
+ --> tests/ui/fail_template_syntax.rs:2:33
+  |
+2 |     let _ = rustible::template!("line one\n{% if x %}never closed", x = true);
+  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -159,9 +159,9 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
 |---|---|
 | `rustible-cli` | the `rustible` binary: workspace, inventory, the run pipeline, rendering |
 | `rustible` | the facade a playbook imports (`use rustible::prelude::*`) |
-| `rustible-sdk` | `Op`, `Ctx`, `System`, `Backend`, facts, protocol, events, testing harness |
+| `rustible-sdk` | `Op`, `Ctx`, `System`, `Backend`, facts, protocol, events, template rendering, testing harness |
 | `rustible-std` | the standard operations |
-| `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]` |
+| `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]`, `template!` |
 | `rustible-build` | playbook discovery for the generated `build.rs` |
 | `rustible-github` | the first collection, and the worked example of one |
 
@@ -364,7 +364,8 @@ never the op's internals; do not edit `docs/01_VISION.md` yourself.
   reaching for `std::fs` or `std::process::Command` fails the lint job, with
   the `sys` method to use instead in the message. The crates that legitimately
   own real I/O — `rustible-sdk`, which implements the `Local` backend,
-  `rustible-cli`, which runs on the operator's own machine, and build scripts
+  `rustible-cli`, which runs on the operator's own machine, `rustible-macros`,
+  whose `template!` reads template files at compile time, and build scripts
   and CLI test harnesses — opt out at the crate level with a reason. Op crates
   do not, and are already clean.
 
