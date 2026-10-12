@@ -10,7 +10,9 @@
 //! The environment, the same for every template:
 //!
 //! - **Strict undefined.** A missing name or attribute fails the render; it
-//!   never renders as empty text.
+//!   never renders as empty text. Given to a built-in filter, test or
+//!   function, where minijinja's strict mode lets it through, it fails too
+//!   (`environment` puts every built-in behind that check).
 //! - **`trim_blocks`**, as Ansible's `template` module renders: the newline
 //!   after a `{% … %}` tag is removed. **`keep_trailing_newline`**: a
 //!   template, and an included one, keeps its final newline, so an include
@@ -33,7 +35,7 @@ use std::borrow::Cow;
 
 use minijinja::machinery::{Token, tokenize};
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Serde, ValueKind};
+use minijinja::value::{Kwargs, Rest, Serde, ValueKind};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 use serde::Serialize;
 
@@ -184,8 +186,242 @@ fn describe(value: &Value) -> String {
     format!("a {}", value.kind())
 }
 
-/// The environment every template renders in; see the [module docs](self).
+/// The built-in filters, tests and functions that are given an undefined
+/// value without minijinja's strict mode noticing: it fails only where an
+/// undefined value is printed, iterated, compared or tested for truth, so
+/// `{{ v.itmes | join(",") }}` rendered `""` and `join(v.seperator)` joined
+/// with nothing. [`environment`] puts each behind a check. Every built-in of
+/// minijinja 3.0.0 (`template_builtins.rs` tests each), but `debug`, which
+/// shows the context, and the tests that ask about undefined itself.
+const FILTERS: &[&str] = &[
+    "abs",
+    "attr",
+    "batch",
+    "bool",
+    "capitalize",
+    "chain",
+    "count",
+    "d",
+    "default",
+    "dictsort",
+    "e",
+    "escape",
+    "first",
+    "float",
+    "format",
+    "groupby",
+    "indent",
+    "int",
+    "items",
+    "join",
+    "last",
+    "length",
+    "lines",
+    "list",
+    "lower",
+    "map",
+    "max",
+    "min",
+    "pprint",
+    "reject",
+    "rejectattr",
+    "replace",
+    "reverse",
+    "round",
+    "safe",
+    "select",
+    "selectattr",
+    "slice",
+    "sort",
+    "split",
+    "string",
+    "sum",
+    "title",
+    "tojson",
+    "trim",
+    "unique",
+    "upper",
+    "urlencode",
+    "zip",
+];
+const TESTS: &[&str] = &[
+    "!=",
+    "<",
+    "<=",
+    "==",
+    ">",
+    ">=",
+    "boolean",
+    "divisibleby",
+    "endingwith",
+    "eq",
+    "equalto",
+    "escaped",
+    "even",
+    "false",
+    "filter",
+    "float",
+    "ge",
+    "greaterthan",
+    "gt",
+    "in",
+    "int",
+    "integer",
+    "iterable",
+    "le",
+    "lessthan",
+    "lower",
+    "lt",
+    "mapping",
+    "ne",
+    "none",
+    "number",
+    "odd",
+    "safe",
+    "sameas",
+    "sequence",
+    "startingwith",
+    "string",
+    "test",
+    "true",
+    "upper",
+];
+const FUNCTIONS: &[&str] = &["range", "dict", "namespace"];
+
+/// The environment every template renders in; see the [module docs](self):
+/// [`base_environment`], with each built-in in [`FILTERS`], [`TESTS`] and
+/// [`FUNCTIONS`] refusing an undefined value and then running as itself.
 fn environment<'source>() -> Environment<'source> {
+    let mut env = base_environment();
+    for &name in FILTERS {
+        // `default` exists to be given an undefined value; its fallback
+        // must not be one.
+        let input_may_be_undefined = matches!(name, "default" | "d");
+        env.add_filter(
+            name,
+            move |args: Rest<Value>,
+                  kwargs: Kwargs|
+                  -> std::result::Result<Value, minijinja::Error> {
+                let args = with_kwargs(args, kwargs);
+                refuse_undefined("filter", name, &args, input_may_be_undefined)?;
+                builtins().empty_state().apply_filter(name, &args)
+            },
+        );
+    }
+    for &name in TESTS {
+        env.add_test(
+            name,
+            move |args: Rest<Value>,
+                  kwargs: Kwargs|
+                  -> std::result::Result<bool, minijinja::Error> {
+                let args = with_kwargs(args, kwargs);
+                refuse_undefined("test", name, &args, false)?;
+                builtins().empty_state().perform_test(name, &args)
+            },
+        );
+    }
+    for &name in FUNCTIONS {
+        let function = builtins()
+            .globals()
+            .find(|(global, _)| *global == name)
+            .map(|(_, f)| f)
+            .expect("a minijinja built-in function");
+        env.add_function(
+            name,
+            move |args: Rest<Value>,
+                  kwargs: Kwargs|
+                  -> std::result::Result<Value, minijinja::Error> {
+                let args = with_kwargs(args, kwargs);
+                refuse_undefined("function", name, &args, false)?;
+                function.call(&mut builtins().empty_state(), &args)
+            },
+        );
+    }
+    env
+}
+
+/// The arguments as the built-in is called with them: the positional ones,
+/// then the keyword ones as minijinja passes them, when there are any.
+fn with_kwargs(args: Rest<Value>, kwargs: Kwargs) -> Vec<Value> {
+    let mut args = args.0;
+    if kwargs.args().next().is_some() {
+        args.push(Value::from(kwargs));
+    }
+    args
+}
+
+/// The built-ins as minijinja ships them (and Rustible's `tojson`), which
+/// the checked ones in [`environment`] call.
+fn builtins() -> &'static Environment<'static> {
+    static BUILTINS: std::sync::OnceLock<Environment<'static>> = std::sync::OnceLock::new();
+    BUILTINS.get_or_init(base_environment)
+}
+
+/// Fail when a built-in is given an undefined value: directly, as a
+/// keyword argument, or inside a list or map it is given (what `map(attribute
+/// = ..)` makes of a missing attribute). minijinja's own strict mode lets
+/// one through here: a filter takes it as an argument left out.
+fn refuse_undefined(
+    kind: &str,
+    name: &str,
+    args: &[Value],
+    input_may_be_undefined: bool,
+) -> std::result::Result<(), minijinja::Error> {
+    let undefined = |what: &str| {
+        Err(minijinja::Error::new(
+            minijinja::ErrorKind::UndefinedError,
+            format!("{kind} `{name}` was given {what}"),
+        ))
+    };
+    for (i, arg) in args.iter().enumerate() {
+        if i == 0 && input_may_be_undefined {
+            continue;
+        }
+        if arg.is_kwargs() {
+            for key in arg.try_iter()? {
+                if holds_undefined(&arg.get_item(&key)?) {
+                    return undefined(&format!("an undefined value for `{key}`"));
+                }
+            }
+        } else if arg.is_undefined() {
+            return undefined(if i == 0 && kind != "function" {
+                "an undefined value"
+            } else {
+                "an undefined argument"
+            });
+        } else if holds_undefined(arg) {
+            return undefined("a list or map holding an undefined value");
+        }
+    }
+    Ok(())
+}
+
+/// An undefined value, or a list or map with one inside, at any depth.
+fn holds_undefined(value: &Value) -> bool {
+    match value.kind() {
+        ValueKind::Undefined => true,
+        ValueKind::Seq | ValueKind::Map => {
+            let Ok(items) = value.try_iter() else {
+                return false;
+            };
+            for item in items {
+                if holds_undefined(&item) {
+                    return true;
+                }
+                if value.kind() == ValueKind::Map
+                    && value.get_item(&item).is_ok_and(|v| holds_undefined(&v))
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Strict undefined, no autoescape, the syntax, and Rustible's `tojson`.
+fn base_environment<'source>() -> Environment<'source> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_auto_escape_callback(|_| AutoEscape::None);
@@ -367,19 +603,30 @@ fn render_error(err: &minijinja::Error) -> Error {
     // template's block, in one error per level (an `include`, a `{{ super()
     // }}`, a recursive loop), each with the error inside as its source; the
     // innermost is the cause, and each wrapper is where it was reached from.
+    // A wrapper whose cause names no template (a filter's own error
+    // wrapped) is not a site: the error is reported where the wrapper is,
+    // with the cause's words when the wrapper has none of its own.
     let mut sites = Vec::new();
     let mut cause = err;
+    let mut at = location(err);
     while let Some(inner) =
         std::error::Error::source(cause).and_then(|s| s.downcast_ref::<minijinja::Error>())
     {
-        sites.push(location(cause));
+        if inner.name().is_none() {
+            if cause.detail().is_none() {
+                cause = inner;
+            }
+            break;
+        }
+        sites.push(at);
         cause = inner;
+        at = location(cause);
     }
     let message = match cause.detail() {
         Some(detail) => format!("{}: {detail}", cause.kind()),
         None => cause.kind().to_string(),
     };
-    let mut out = format!("{}: {message}", location(cause));
+    let mut out = format!("{at}: {message}");
     if !sites.is_empty() {
         let shown: Vec<String> = sites
             .iter()

@@ -179,6 +179,63 @@ fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
 }
 
 #[test]
+fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
+    let v = rustible::json!({ "names": ["a", "b"], "items": [{ "a": 1 }], "sep": "," });
+    for (text, said) in [
+        // An argument, the input, a keyword argument.
+        (
+            "{{ v.names | join(v.seperator) }}",
+            "filter `join` was given an undefined argument",
+        ),
+        (
+            "{{ v.itmes | join(',') }}",
+            "filter `join` was given an undefined value",
+        ),
+        (
+            "{{ v.itmes | tojson }}",
+            "filter `tojson` was given an undefined value",
+        ),
+        (
+            "{{ 'ab' | indent(v.indnet) }}",
+            "filter `indent` was given an undefined argument",
+        ),
+        (
+            "{{ v.names | sort(reverse=v.rev) }}",
+            "filter `sort` was given an undefined value for `reverse`",
+        ),
+        // Inside a list a built-in is given: a missing attribute `map` made.
+        (
+            "{{ v.items | map(attribute='b') | join(',') }}",
+            "filter `join` was given a list or map holding an undefined value",
+        ),
+        (
+            "{{ v.nope | default(v.nope2) }}",
+            "filter `default` was given an undefined argument",
+        ),
+        (
+            "{{ dict(a=v.nope) }}",
+            "function `dict` was given an undefined value for `a`",
+        ),
+        (
+            "{{ range(v.nope) }}",
+            "function `range` was given an undefined argument",
+        ),
+        (
+            "{{ v.nope is string }}",
+            "test `string` was given an undefined value",
+        ),
+    ] {
+        let dynamic = text.to_string();
+        let err = template!(&dynamic, v = &v).unwrap_err().chain();
+        assert!(err.contains(said), "{text}: {err}");
+        assert!(err.contains(", line 1: undefined value: "), "{text}: {err}");
+    }
+    // What exists to take an undefined value still does.
+    let fine = "{{ v.nope | default('d') }} {{ v.nope is defined }} {{ v.nope is undefined }} {{ v.names | join(v.sep) }}".to_string();
+    assert_eq!(template!(&fine, v = &v).unwrap(), "d False True a,b");
+}
+
+#[test]
 fn named_arguments_win_over_the_spread_wherever_they_are_written() {
     let settings = rustible::json!({ "listen": "0.0.0.0:80", "env": "dev", "workers": 4 });
     let out = template!(

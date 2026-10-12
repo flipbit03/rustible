@@ -650,7 +650,13 @@ fn integration_test_impl(
 /// `rendered at`, since one file may be rendered from several calls.
 ///
 /// **Strict undefined**: a missing name or attribute is an error, never
-/// empty text. A literal or `include_str!` template must be passed every
+/// empty text: printed, iterated, compared, tested, or given to a built-in
+/// filter, test or function (`join(v.seperator)`, `v.itmes | join(",")`),
+/// as an argument or inside a list (what `map(attribute="x")` makes of a
+/// missing `x`). Two places minijinja offers no hook, which stay silent: a
+/// macro's keyword argument (`f(a=v.nope)` takes `a`'s default) and a list
+/// or map literal printed whole (`{{ [v.nope] }}` prints `[undefined]`).
+/// A literal or `include_str!` template must be passed every
 /// name it reads, so an optional value is an `Option`: `None` is `none`,
 /// `{% if x %}` is false for it, and `{{ x | default("off", true) }}`
 /// replaces it (`default("off")` alone keeps the `none`). `is defined` and

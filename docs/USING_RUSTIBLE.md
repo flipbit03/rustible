@@ -1162,10 +1162,12 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   `--check` renders every template it reaches (not one fed from a
   would-change step's output: §9).
 - **Strict undefined**: a missing name or field is an error, never empty
-  text. Every top-level name is passed, so an optional value is an
-  `Option`: `None` renders `None`, `{% if x %}` is false for it, and
-  `x | default("off", true)` replaces it. `is defined` and `default(..)`
-  are for names that may be absent: a spread's, an included file's.
+  text, given to a filter too (`join(v.seperator)`); not as a macro's
+  keyword argument, which then takes its default. Every top-level name is
+  passed, so an optional value is an `Option`: `None` renders `None`,
+  `{% if x %}` is false for it, and `x | default("off", true)` replaces it.
+  `is defined` and `default(..)` are for names that may be absent: a
+  spread's, an included file's.
 - ⚠️ **`true` renders as `True`**, `None` as `None`, a list as `['a', 'b']`:
   Jinja's Python spellings. Use `| lower` or `| tojson` where a config file
   wants `true` or JSON.

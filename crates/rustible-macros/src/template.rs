@@ -711,8 +711,9 @@ struct Reads {
     /// Every one, wherever it is read: a name in here is used.
     all: HashSet<String>,
     /// The ones minijinja's own name analysis does not see: a load target's
-    /// condition (`{% include "a.j2" if flag else "b.j2" %}`) and the value
-    /// a slice is taken of (`{{ xs[1:] }}`).
+    /// condition (`{% include "a.j2" if flag else "b.j2" %}`), the value a
+    /// slice is taken of (`{{ xs[1:] }}`), a filter block's or set block's
+    /// filter, and an `{% autoescape %}` expression.
     unseen: HashSet<String>,
 }
 
@@ -781,16 +782,16 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
             assign(&s.target, &mut w.assigned);
             assign(&s.target, &mut w.set);
             if let Some(f) = &s.filter {
-                vars(f, &mut w.reads);
+                unseen(f, w);
             }
             body(&s.body, w)
         }
         Stmt::AutoEscape(a) => {
-            vars(&a.enabled, &mut w.reads);
+            unseen(&a.enabled, w);
             body(&a.body, w)
         }
         Stmt::FilterBlock(f) => {
-            vars(&f.filter, &mut w.reads);
+            unseen(&f.filter, w);
             body(&f.body, w)
         }
         Stmt::Block(b) => {
@@ -876,10 +877,7 @@ fn load(
             ),
         ));
     }
-    let mut condition = Reads::default();
-    vars(target, &mut condition);
-    w.reads.all.extend(condition.all.iter().cloned());
-    w.reads.unseen.extend(condition.all);
+    unseen(target, w);
     w.loads.push(Load {
         statement,
         targets,
@@ -913,6 +911,16 @@ fn literals(expr: &Expr, list_allowed: bool, out: &mut Vec<String>) -> bool {
         },
         _ => false,
     }
+}
+
+/// Collect an expression's reads as ones minijinja's name analysis does not
+/// see: it never visits a load target, a `{% filter %}` block's or a set
+/// block's filter, or an `{% autoescape %}` expression.
+fn unseen(expr: &Expr, w: &mut Walk) {
+    let mut reads = Reads::default();
+    vars(expr, &mut reads);
+    w.reads.all.extend(reads.all.iter().cloned());
+    w.reads.unseen.extend(reads.all);
 }
 
 /// The names an assignment target binds: `x`, `(a, b)`, `[a, b]`.
@@ -1568,6 +1576,55 @@ mod tests {
             "t.j2",
         );
         assert_eq!(names(&tree.unwrap()), ["t.j2", "x.j2"]);
+    }
+
+    #[test]
+    fn a_grandparent_s_names_reach_the_top_level_block_too() {
+        let (_d, tree) = resolve(
+            &[
+                (
+                    "t.j2",
+                    "{% extends 'p.j2' %}{% block b %}{{ item }}{% endblock %}",
+                ),
+                ("p.j2", "{% extends 'gp.j2' %}"),
+                (
+                    "gp.j2",
+                    "{% for item in items %}{% block b %}{% endblock %}{% endfor %}",
+                ),
+            ],
+            "t.j2",
+        );
+        assert_eq!(check(&tree.unwrap(), false, &["items"]), Ok(()));
+    }
+
+    #[test]
+    fn a_set_block_in_both_branches_binds_the_name_after_them() {
+        let (_d, tree) = resolve(
+            &[(
+                "t.j2",
+                "{% if c %}{% set x %}a{% endset %}{% else %}{% set x %}b{% endset %}{% endif %}{{ x }}",
+            )],
+            "t.j2",
+        );
+        assert_eq!(check(&tree.unwrap(), false, &["c"]), Ok(()));
+    }
+
+    #[test]
+    fn a_name_read_by_a_filter_block_or_autoescape_must_be_passed() {
+        for (text, name) in [
+            ("{% filter indent(width) %}a\nb{% endfilter %}", "width"),
+            (
+                "{% set x | indent(width) %}a\nb{% endset %}{{ x }}",
+                "width",
+            ),
+            ("{% autoescape flag %}a{% endautoescape %}", "flag"),
+        ] {
+            let (_d, tree) = resolve(&[("t.j2", text)], "t.j2");
+            let tree = tree.unwrap();
+            let err = check(&tree, false, &[]).unwrap_err();
+            assert!(err.contains(&format!("uses `{name}`")), "{text}: {err}");
+            assert_eq!(check(&tree, false, &[name]), Ok(()), "{text}");
+        }
     }
 
     #[test]
