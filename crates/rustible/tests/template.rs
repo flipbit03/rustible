@@ -158,6 +158,8 @@ fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
         err.starts_with("inline template at tests/template.rs:"),
         "{err}"
     );
+    // Named by its call already, so no `(rendered at ..)` as a file's has.
+    assert!(!err.contains("rendered at"), "{err}");
 
     // Optional values are said so.
     assert_eq!(

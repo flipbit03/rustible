@@ -1182,6 +1182,10 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
 - In a child that `extends`, only `{% block %}` contents are output. An
   included file's `{% set %}` outside a loop changes the includer's
   variable (Jinja2's does not).
+- ⚠️ **A secret is masked as passed, or through `tojson`, and not once a
+  filter reshapes it** (`indent`, `urlencode`, `escape`, …) or a list
+  holding it prints whole: reshape it in Rust and pass the result as its own
+  `Secret`.
 - **Filters, tests, functions**: every minijinja built-in (listed in
   `template!`'s rustdoc). Ansible's own (`to_nice_json`, `regex_replace`, …)
   are not there: compute in Rust, render in the template.

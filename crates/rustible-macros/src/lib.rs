@@ -600,11 +600,15 @@ fn integration_test_impl(
 /// ```
 ///
 /// A `Secret` (`rustible::prelude::Secret`) passed in renders as its
-/// plaintext, and the run masks it in every event, diffs
-/// included, as it masks a secret anywhere. A filter that rewrites it
-/// (`upper`, `replace`) produces text the masker does not know. `tojson`
-/// writes JSON as the masker knows it: Rustible's `tojson` leaves out the
-/// escapes minijinja's adds for HTML (`\u003c` for `<`, and `>`, `&`, `'`).
+/// plaintext, and the run masks it in every event, diffs included, as it
+/// masks a secret anywhere, and through `tojson` (Rustible's leaves out the
+/// escapes minijinja's adds for HTML, `\u003c` for `<` and the like, so its
+/// JSON is the form the masker knows). **Anything else that reshapes it
+/// goes out unmasked**: a filter that rewrites it (`indent` on a multi-line
+/// key, `urlencode`, `escape`, `upper`, `replace`) and a list or struct
+/// holding it printed whole, which prints it Python-style. Reshape a secret
+/// in Rust instead, and pass the result as a `Secret` of its own
+/// (`Secret::new(indented)`), which registers that form too.
 ///
 /// # When a template is checked
 ///

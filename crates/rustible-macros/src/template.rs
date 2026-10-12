@@ -438,8 +438,17 @@ impl Tree {
     /// last parent to render, whatever its conditions, so there is nothing
     /// to lose by refusing it here.
     fn reject_extends_cycle(&self) -> Result<(), String> {
-        // Depth-first from every template, along `extends` only.
-        fn visit(tree: &Tree, at: usize, path: &mut Vec<usize>) -> Result<(), String> {
+        // Depth-first along `extends` only, from every template (one reached
+        // by `include` can still start a cycle), each finished once.
+        fn visit(
+            tree: &Tree,
+            at: usize,
+            path: &mut Vec<usize>,
+            done: &mut HashSet<usize>,
+        ) -> Result<(), String> {
+            if done.contains(&at) {
+                return Ok(());
+            }
             if let Some(start) = path.iter().position(|&p| p == at) {
                 let cycle: Vec<&str> = path[start..]
                     .iter()
@@ -464,14 +473,16 @@ impl Tree {
             path.push(at);
             for &(from, to, _) in &tree.extends {
                 if from == at {
-                    visit(tree, to, path)?;
+                    visit(tree, to, path, done)?;
                 }
             }
             path.pop();
+            done.insert(at);
             Ok(())
         }
+        let mut done = HashSet::new();
         for start in 0..self.files.len() {
-            visit(self, start, &mut Vec::new())?;
+            visit(self, start, &mut Vec::new(), &mut done)?;
         }
         Ok(())
     }
@@ -712,7 +723,9 @@ struct Walk {
     /// Names the template assigns: `set`, `for`, `with`, macro and import
     /// names.
     assigned: HashSet<String>,
-    /// The names a `set` (or a set block) assigns, a subset of `assigned`.
+    /// The names bound for the rest of the template wherever they are
+    /// bound: a `set` (or a set block), a macro, an import. A subset of
+    /// `assigned`.
     set: HashSet<String>,
     /// Every variable the template reads, anywhere.
     reads: Reads,
@@ -780,9 +793,17 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
             vars(&f.filter, &mut w.reads);
             body(&f.body, w)
         }
-        Stmt::Block(b) => body(&b.body, w),
+        Stmt::Block(b) => {
+            w.assigned.insert("super".to_string());
+            body(&b.body, w)
+        }
         Stmt::Macro(m) => {
+            // A macro, like an import, is bound for the rest of the
+            // template wherever it is defined (an `if` branch too), as a
+            // `set` is.
             w.assigned.insert(m.name.to_string());
+            w.set.insert(m.name.to_string());
+            w.assigned.insert("caller".to_string());
             m.args.iter().for_each(|a| assign(a, &mut w.assigned));
             m.defaults.iter().for_each(|d| vars(d, &mut w.reads));
             body(&m.body, w)
@@ -811,11 +832,13 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
         ),
         Stmt::Import(i) => {
             assign(&i.name, &mut w.assigned);
+            assign(&i.name, &mut w.set);
             load("import", &i.expr, false, false, line_of(i.span()), w)
         }
         Stmt::FromImport(f) => {
             for (name, alias) in &f.names {
                 assign(alias.as_ref().unwrap_or(name), &mut w.assigned);
+                assign(alias.as_ref().unwrap_or(name), &mut w.set);
             }
             load("from", &f.expr, false, false, line_of(f.span()), w)
         }
@@ -1442,6 +1465,69 @@ mod tests {
     }
 
     #[test]
+    fn a_name_bound_in_any_way_is_not_required_where_only_the_walk_sees_it() {
+        // Each bound name is read only in a slice or a load condition, which
+        // minijinja's analysis does not see, so only the walk's bindings
+        // keep it from being required.
+        for (text, passed) in [
+            (
+                "{% macro m(xs) %}{{ xs[1:] }}{% endmacro %}{{ m([1, 2]) }}",
+                &[][..],
+            ),
+            (
+                "{% macro m() %}{{ caller()[1:] }}{% endmacro %}{% call m() %}ab{% endcall %}",
+                &[][..],
+            ),
+            (
+                "{% macro m() %}{% endmacro %}{% call(c) m() %}{{ c[1:] }}{% endcall %}",
+                &[][..],
+            ),
+            ("{% with b = a %}{{ b[1:] }}{% endwith %}", &["a"][..]),
+            (
+                "{% for i in xs %}{{ i[1:] }}{{ loop.cycle[1:] }}{% endfor %}",
+                &["xs"][..],
+            ),
+            ("{% set s %}abc{% endset %}{{ s[1:] }}", &[][..]),
+            ("{% import 'a.j2' as m %}{{ m[1:] }}", &[][..]),
+            ("{% from 'a.j2' import f as g %}{{ g[1:] }}", &[][..]),
+            (
+                "{% from 'a.j2' import f %}{% include 'a.j2' if f else 'a.j2' %}",
+                &[][..],
+            ),
+            // Bound in both branches of an `if`, used after it.
+            (
+                "{% if fancy %}{% macro row(x) %}<b>{{ x }}</b>{% endmacro %}{% else %}\
+                 {% macro row(x) %}{{ x }}{% endmacro %}{% endif %}{{ row(1) }}",
+                &["fancy"][..],
+            ),
+            (
+                "{% if f %}{% import 'a.j2' as m %}{% else %}{% import 'a.j2' as m %}{% endif %}\
+                 {{ m.x is defined }}",
+                &["f"][..],
+            ),
+        ] {
+            let (_d, tree) = resolve(
+                &[("t.j2", text), ("a.j2", "{% macro f() %}{% endmacro %}")],
+                "t.j2",
+            );
+            let tree = tree.unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(check(&tree, false, passed), Ok(()), "{text}");
+        }
+        // `super` inside a block, read in a slice.
+        let (_d, tree) = resolve(
+            &[
+                (
+                    "child.j2",
+                    "{% extends 'base.j2' %}{% block b %}{{ super()[1:] }}{% endblock %}",
+                ),
+                ("base.j2", "{% block b %}[base]{% endblock %}"),
+            ],
+            "child.j2",
+        );
+        assert_eq!(check(&tree.unwrap(), false, &[]), Ok(()));
+    }
+
+    #[test]
     fn a_load_target_s_condition_is_a_name_the_template_uses() {
         let files = [
             ("t.j2", "{% include \"a.j2\" if flag else \"b.j2\" %}"),
@@ -1526,6 +1612,46 @@ mod tests {
             err.contains("its own ancestor: a.j2 -> b.j2 -> a.j2"),
             "{err}"
         );
+        // A cycle among templates the root only includes is refused too: it
+        // would hang the render just the same.
+        let (_d, tree) = resolve(
+            &[
+                ("root.j2", "[{% include 'ca.j2' %}]"),
+                ("ca.j2", "{% extends 'cb.j2' %}"),
+                ("cb.j2", "{% extends 'ca.j2' %}"),
+            ],
+            "root.j2",
+        );
+        let err = tree.err().unwrap();
+        assert!(
+            err.contains("its own ancestor: ca.j2 -> cb.j2 -> ca.j2"),
+            "{err}"
+        );
+        // A long chain of conditional parents is checked in linear time.
+        let mut chain: Vec<(String, String)> = (0..40)
+            .map(|n| {
+                (
+                    format!("a{n}.j2"),
+                    format!("{{% extends 'a{}.j2' if x else 'b{}.j2' %}}", n + 1, n + 1),
+                )
+            })
+            .collect();
+        chain.extend((0..40).map(|n| {
+            (
+                format!("b{n}.j2"),
+                format!("{{% extends 'a{}.j2' if x else 'b{}.j2' %}}", n + 1, n + 1),
+            )
+        }));
+        chain.push(("a40.j2".into(), String::new()));
+        chain.push(("b40.j2".into(), String::new()));
+        let files: Vec<(&str, &str)> = chain
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let started = std::time::Instant::now();
+        let (_d, tree) = resolve(&files, "a0.j2");
+        assert!(tree.is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         // An include cycle is a recursion, which the render bounds: allowed.
         let (_d, tree) = resolve(
             &[
