@@ -378,7 +378,8 @@ time with `ctx.local_secret(path)` (§8).
 Every `Secret` and the escalation password are masked in what a run reports,
 on the target before it is sent: wherever one appears in an event's text (a
 command's stderr, an error, a warning, a diff) or in a panic's message, raw,
-JSON-escaped or form-encoded, it shows as `<secret>`. A secret you hold as a
+JSON-escaped, form- or percent-encoded, or HTML-escaped, it shows as
+`<secret>`. A secret you hold as a
 plain string is masked once you pass it to `rustible::sdk::mask::register(&s)`.
 Text that may hold a secret and that you cut or reshape before it reaches an
 event goes through `rustible::sdk::mask::apply_prefix` first, or a secret the
@@ -1134,6 +1135,10 @@ and dry-runs it as usual. It is in the prelude.
 #[serde(crate = "rustible::serde")] // or `serde::Serialize` with serde in your workspace
 struct Vhost { host: String, upstream: String }
 
+let vhosts = vec![
+    Vhost { host: "a.example.com".into(), upstream: "127.0.0.1:8080".into() },
+    Vhost { host: "b.example.com".into(), upstream: "127.0.0.1:9000".into() },
+];
 let conf = template!(
     include_str!("../files/Caddyfile.j2"),   // relative to this file
     email = "admin@example.com",
@@ -1161,12 +1166,10 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   file and line; `?` returns it before the step that would write runs.
   `--check` renders every template it reaches (not one fed from a
   would-change step's output: §9).
-- **Strict undefined**: a missing name or field is an error, never empty
-  text, given to a filter too (`join(v.seperator)`); not an attribute a
-  filter looks up itself (`selectattr("admn")` keeps nobody), a value
-  inside a map (`{"port": v.nope} | tojson` writes `null`), or a macro's
-  keyword argument, which then takes its default. Every top-level name is
-  passed, so an optional value is an `Option`: `None` renders `None`,
+- **Strict undefined**: a missing name or field that is printed, looped
+  over or tested is an error, never empty text. ⚠️ Handed to a filter first,
+  it passes silently: `v.itmes | join(",")` renders `""`,
+  `selectattr("admn")` keeps nobody. Every top-level name is passed, so an optional value is an `Option`: `None` renders `None`,
   `{% if x %}` is false for it, and `x | default("off", true)` replaces it.
   `is defined` and `default(..)` are for names that may be absent: a
   spread's, an included file's.
@@ -1174,22 +1177,23 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   Jinja's Python spellings. Use `| lower` or `| tojson` where a config file
   wants `true` or JSON.
 - **Whitespace**: `trim_blocks` is on (the newline after a `{% %}` tag
-  goes), `lstrip_blocks` off (indentation before a tag stays); a template's and an included file's final newline
-  stays, so `{% include "x.j2" %}` on its own line renders the file's lines;
-  `{%-`/`-%}` strip by hand; nothing is autoescaped.
+  goes), `lstrip_blocks` off (indentation before a tag stays); a template's
+  and an included file's final newline stays, so `{% include "x.j2" %}` on
+  its own line renders the file's lines; `{%-`/`-%}` strip by hand; nothing
+  is autoescaped.
 - **Includes** (`include`, `extends`, `import`, `from … import`) resolve
   relative to the file that contains them; a literal's, relative to the
-  playbook. The target must be a string literal (or a list of them, or `"a" if x else "b"`). Every reached file is
-  embedded in the binary, and editing one rebuilds the playbook. A dynamic
+  playbook. The target must be a string literal (or a list of them, or
+  `"a" if x else "b"`). Every reached file is embedded in the binary, and
+  editing one rebuilds the playbook. A dynamic
   template can include nothing: read target-side files in Rust
   (`ctx.sys().read_to_string`) and pass them in.
 - In a child that `extends`, only `{% block %}` contents are output. An
   included file's `{% set %}` outside a loop changes the includer's
   variable (Jinja2's does not).
-- ⚠️ **A secret is masked as passed, or through `tojson`, and not once a
-  filter reshapes it** (`indent`, `urlencode`, `escape`, …) or a list
-  holding it prints whole: reshape it in Rust and pass the result as its own
-  `Secret`.
+- A `Secret` renders as its plaintext; the run masks it in what it reports
+  as it masks any secret (§6), through `tojson`, `urlencode` and `escape`
+  too, but not reshaped otherwise (`indent`, `upper`).
 - **Filters, tests, functions**: every minijinja built-in (listed in
   `template!`'s rustdoc). Ansible's own (`to_nice_json`, `regex_replace`, …)
   are not there: compute in Rust, render in the template.

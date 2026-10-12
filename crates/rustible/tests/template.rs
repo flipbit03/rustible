@@ -179,113 +179,6 @@ fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
 }
 
 #[test]
-fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
-    let v = rustible::json!({ "names": ["a", "b"], "items": [{ "a": 1 }], "sep": "," });
-    for (text, said) in [
-        // An argument, the input, a keyword argument: each named.
-        (
-            "{{ v.names | join(v.seperator) }}",
-            "`v.seperator` is undefined",
-        ),
-        ("{{ v.itmes | join(',') }}", "`v.itmes` is undefined"),
-        ("{{ v.itmes | tojson }}", "`v.itmes` is undefined"),
-        ("{{ 'ab' | indent(v.indnet) }}", "`v.indnet` is undefined"),
-        (
-            "{{ v.names | sort(reverse=v.rev) }}",
-            "`v.rev` is undefined",
-        ),
-        ("{{ v.nope | default(v.nope2) }}", "`v.nope2` is undefined"),
-        ("{{ dict(a=v.nope) }}", "`v.nope` is undefined"),
-        ("{{ range(v.nope) }}", "`v.nope` is undefined"),
-        ("{{ v.nope is string }}", "`v.nope` is undefined"),
-        // An item of a list: what `map` makes of a missing attribute.
-        (
-            "{{ v.items | map(attribute='b') | join(',') }}",
-            "undefined value",
-        ),
-        (
-            "{{ [v.nope] | join(',') }}",
-            "filter `join` was given a list holding an undefined item",
-        ),
-    ] {
-        let dynamic = text.to_string();
-        let err = template!(&dynamic, v = &v).unwrap_err().chain();
-        assert!(err.contains(said), "{text}: {err}");
-        assert!(err.contains(", line 1: undefined value"), "{text}: {err}");
-    }
-    // What exists to take an undefined value still does, and a defined
-    // value that holds one (a `loop` at its edges) or holds itself (a
-    // `namespace`) is given to a built-in as before.
-    let fine = "{{ v.nope | default('d') }} {{ v.nope is defined }} {{ v.nope is undefined }} \
-                {{ v.names | join(v.sep) }}\
-                {% for n in v.names %} {{ loop | length }}{% endfor %}\
-                {% set ns = namespace(a=1) %}{% set ns.me = ns %} {{ ns | length }}"
-        .to_string();
-    assert_eq!(
-        template!(&fine, v = &v).unwrap(),
-        "d False True a,b 11 11 2"
-    );
-    // A template that handles the missing items itself still renders.
-    let users = rustible::json!([{ "email": "b@x" }, {}, {}]);
-    let handled = "{{ users | map(attribute='email') | reject('undefined') | list }} \
-                   {{ users | map(attribute='email') | select('defined') | list }} \
-                   {{ users | map(attribute='email') | map('default', 'z') | join(',') }} \
-                   {{ users | map(attribute='email') | map('d', 'y') | join(',') }} \
-                   {{ users | map(attribute='email') | length }} \
-                   {{ users | map(attribute='email') | select('undefined') | list | length }} \
-                   {{ users | map(attribute='email') | batch(2) | length }}\
-                   {{ users | map(attribute='email') | slice(2) | length }}\
-                   {{ users | map(attribute='email') | chain([1]) | list | length }}\
-                   {{ users | map(attribute='email') | zip([1]) | list | length }} \
-                   {{ (users | map(attribute='email') | list | default([]) | first) }}"
-        .to_string();
-    assert_eq!(
-        template!(&handled, users = &users).unwrap(),
-        "['b@x'] ['b@x'] b@x,z,z b@x,y,y 3 2 2241 b@x"
-    );
-    // But a truth test or a comparison does not handle them: it gets them
-    // wrong, so it refuses them.
-    for text in [
-        "{{ users | map(attribute='emial') | select | join(',') }}",
-        "{% if 'b@x' is in(users | map(attribute='emial')) %}{% endif %}",
-        "{% if [users[0].emial] is eq(['b@x']) %}{% endif %}",
-        "{% if [users[0].emial] is sameas(none) %}{% endif %}",
-        "{% if [users[0].emial] is lt([1]) %}{% endif %}",
-    ] {
-        let dynamic = text.to_string();
-        let err = template!(&dynamic, users = &users).unwrap_err().chain();
-        assert!(
-            err.contains("a list holding an undefined item"),
-            "{text}: {err}"
-        );
-    }
-}
-
-#[test]
-fn the_check_stays_linear_in_a_loop_over_large_data() {
-    let users: Vec<_> = (0..20_000)
-        .map(|i| rustible::json!({ "name": format!("u{i}"), "a": 1, "b": 2, "c": 3, "d": 4 }))
-        .collect();
-    let started = std::time::Instant::now();
-    let out = template!(
-        "{% for u in users %}{{ users | length }}{{ users | count }}{{ users | bool }}\
-         {{ (users | first).a }}{{ (users | reverse | first).a }}{{ users is sequence }}\
-         {% if u == users | last %}!{% endif %}{% endfor %}",
-        users = &users,
-    )
-    .unwrap();
-    assert!(out.starts_with("2000020000True11True"), "{}", &out[..40]);
-    assert!(out.ends_with("2000020000True11True!"));
-    // These take no look at the items, so this is linear; a check that
-    // walked them on every call is quadratic, minutes here.
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "{:?}",
-        started.elapsed()
-    );
-}
-
-#[test]
 fn named_arguments_win_over_the_spread_wherever_they_are_written() {
     let settings = rustible::json!({ "listen": "0.0.0.0:80", "env": "dev", "workers": 4 });
     let out = template!(
@@ -752,18 +645,26 @@ fn a_secret_rendered_through_a_template_or_an_include_is_masked_in_events() {
     // What lands on disk is the plaintext: masking is for what is reported.
     assert_eq!(fake.content("/etc/direct.conf").unwrap(), direct);
 
-    // Through `tojson`, whose escapes for HTML the masker would not know.
-    let html = Secret::new("pa'ss<wo>rd&xyz");
-    let json = template!("{\"password\": {{ p | tojson }}}\n", p = &html).unwrap();
-    assert_eq!(json, "{\"password\": \"pa'ss<wo>rd&xyz\"}\n");
-    ctx.step("json", file::Copy::from_str(&json).to("/etc/secret.json"))
-        .unwrap();
+    // Through the filters that write it in a spelling of their own, which
+    // the masker registers too: JSON safe for HTML, percent-encoded,
+    // HTML-escaped.
+    let html = Secret::new("pa'ss<wo>rd&xyz/1 2");
+    let encoded = template!(
+        "{\"password\": {{ p | tojson }}}\nurl=x://u:{{ p | urlencode }}@h\nhtml={{ p | escape }}\n",
+        p = &html,
+    )
+    .unwrap();
+    assert!(encoded.contains("\\u0026") && encoded.contains("%20") && encoded.contains("&amp;"));
+    ctx.step(
+        "encoded",
+        file::Copy::from_str(&encoded).to("/etc/secret.conf"),
+    )
+    .unwrap();
 
     let events = rustible::sdk::__private::serde_json::to_string(&sink.events()).unwrap();
     assert!(!events.contains("s3cr3t-t0ken-value"), "{events}");
-    assert!(
-        !events.contains("rd&xyz") && !events.contains("u0026xyz"),
-        "{events}"
-    );
+    for spelling in ["rd&xyz", "u0026xyz", "%26xyz", "&amp;xyz"] {
+        assert!(!events.contains(spelling), "{spelling} in {events}");
+    }
     assert_eq!(events.matches("token=<secret>").count(), 2, "{events}");
 }

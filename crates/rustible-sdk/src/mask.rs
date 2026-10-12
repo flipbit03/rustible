@@ -32,9 +32,13 @@
 //!
 //! Lengths count characters, not bytes. Besides the value itself, each
 //! secret is registered in the forms that carry it in the run's output:
-//! JSON-escaped, both as Rustible writes JSON (UTF-8) and as an
-//! ASCII-only encoder writes it (`\u00fc`); and form-encoded as
-//! `http::Request::form` writes it (`p@ss` as `p%40ss`).
+//! JSON-escaped, as Rustible writes JSON (UTF-8), as an ASCII-only encoder
+//! writes it (`\u00fc`), and as an encoder safe to embed in HTML writes it
+//! (`\u003c` for `<`, as a template's `tojson` does); form-encoded as
+//! `http::Request::form` writes it (`p@ss` as `p%40ss`); percent-encoded as
+//! a URL path or a template's `urlencode` writes it (`a/b c` as `a/b%20c`);
+//! and HTML-escaped as a template's `escape` writes it (`&` as `&amp;`).
+//! Any other reshaping (upper-cased, indented, cut) is not recognised.
 //!
 //! The runtime also installs a panic hook that masks a panic's message the
 //! same way before it is printed to stderr, which `rustible` shows.
@@ -212,7 +216,10 @@ impl Registry {
             Zeroizing::new(capped.to_owned()),
             json_escaped(capped, false),
             json_escaped(capped, true),
+            json_html_safe(capped),
             form_encoded(capped),
+            percent_encoded(capped),
+            html_escaped(capped),
         ] {
             if !reg.forms.contains(&form) {
                 reg.forms.push(form);
@@ -431,6 +438,61 @@ fn json_escaped(s: &str, ascii: bool) -> Zeroizing<String> {
                     push_hex(&mut out, *unit);
                 }
             }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `s` inside a JSON string as an encoder that makes JSON safe to embed in
+/// HTML writes it (minijinja's and Jinja2's `tojson`): [`json_escaped`],
+/// and `<`, `>`, `&` and `'` as `\u003c`, `\u003e`, `\u0026` and `\u0027`.
+fn json_html_safe(s: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(s.len() * 6));
+    for c in json_escaped(s, false).chars() {
+        match c {
+            '<' | '>' | '&' | '\'' => push_hex(&mut out, c as u16),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `s` percent-encoded as a URL's path or a DSN's password is usually
+/// written (minijinja's `urlencode`): letters, digits, `/`, `.`, `-` and
+/// `_` as they are, a space as `%20`, every other byte `%XX`. It differs
+/// from [`form_encoded`] in `/`, `*`, `~` and the space.
+fn percent_encoded(s: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(s.len() * 3));
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' => {
+                out.push(b as char)
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[usize::from(b >> 4)] as char);
+                out.push(HEX[usize::from(b & 0xf)] as char);
+            }
+        }
+    }
+    out
+}
+
+/// `s` HTML-escaped as minijinja's `escape` writes it: `&`, `<`, `>`, `"`,
+/// `'` and `/` as `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#x27;` and `&#x2f;`.
+fn html_escaped(s: &str) -> Zeroizing<String> {
+    // No byte becomes more than six (`&quot;`, `&#x27;`, `&#x2f;`).
+    let mut out = Zeroizing::new(String::with_capacity(s.len() * 6));
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            '/' => out.push_str("&#x2f;"),
             c => out.push(c),
         }
     }
@@ -840,6 +902,38 @@ mod tests {
             format!("password={S}&x=1")
         );
         assert_eq!(*form_encoded("a b&c=d~"), "a+b%26c%3Dd%7E");
+    }
+
+    #[test]
+    fn the_html_safe_json_percent_and_html_forms_are_masked() {
+        let secret = "pa'ss<w o>rd&x/y\"z";
+        // Each form is exactly what minijinja writes, which is how a
+        // template's `tojson`, `urlencode` and `escape` emit it.
+        let env = minijinja::Environment::new();
+        let render = |filter: &str| {
+            env.render_str(
+                &format!("{{{{ s | {filter} }}}}"),
+                minijinja::context! { s => secret },
+            )
+            .unwrap()
+        };
+        let tojson = render("tojson");
+        assert_eq!(*json_html_safe(secret), tojson[1..tojson.len() - 1]);
+        assert_eq!(*percent_encoded(secret), render("urlencode"));
+        assert_eq!(*html_escaped(secret), render("escape"));
+        for (form, shown) in [
+            (tojson, format!("\"{S}\"")),
+            (render("urlencode"), S.to_string()),
+            (render("escape"), S.to_string()),
+        ] {
+            assert_eq!(
+                masked(&[secret], &format!("x {form} y")),
+                format!("x {shown} y"),
+                "{form}"
+            );
+        }
+        assert_eq!(*percent_encoded("a/b c~*"), "a/b%20c%7E%2A");
+        assert_eq!(*html_escaped("a&b"), "a&amp;b");
     }
 
     #[test]

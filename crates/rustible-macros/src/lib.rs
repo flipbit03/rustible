@@ -599,16 +599,12 @@ fn integration_test_impl(
 /// # fn main() {}
 /// ```
 ///
-/// A `Secret` (`rustible::prelude::Secret`) passed in renders as its
-/// plaintext, and the run masks it in every event, diffs included, as it
-/// masks a secret anywhere, and through `tojson` (Rustible's leaves out the
-/// escapes minijinja's adds for HTML, `\u003c` for `<` and the like, so its
-/// JSON is the form the masker knows). **Anything else that reshapes it
-/// goes out unmasked**: a filter that rewrites it (`indent` on a multi-line
-/// key, `urlencode`, `escape`, `upper`, `replace`) and a list or struct
-/// holding it printed whole, which prints it Python-style. Reshape a secret
-/// in Rust instead, and pass the result as a `Secret` of its own
-/// (`Secret::new(indented)`), which registers that form too.
+/// A `Secret` passed in renders as its plaintext. Masking is the run's,
+/// not the template's: the run masks a secret in every event, a step's diff
+/// included, in the spellings `rustible_sdk::mask` lists, which include
+/// what `tojson`, `urlencode` and `escape` write; a secret reshaped any
+/// other way (`indent`, `upper`, printed inside a list) is not recognised,
+/// as with text reshaped in Rust.
 ///
 /// # When a template is checked
 ///
@@ -649,21 +645,15 @@ fn integration_test_impl(
 /// reached through. A file template's error ends with the call it was
 /// `rendered at`, since one file may be rendered from several calls.
 ///
-/// **Strict undefined**: a missing name or attribute is an error: printed,
-/// iterated, compared, tested, or given to a built-in filter, test or
-/// function (`join(v.seperator)`, `v.itmes | join(",")`), as an argument or
-/// as an item of a list (what `map(attribute="x")` makes of a missing `x`).
-/// What stays silent, where minijinja gives no hook: an attribute a filter
-/// looks up itself (`selectattr("admn")` keeps nobody, `sort(attribute=
-/// "nmae")` leaves the order, `unique(attribute=..)`, `rejectattr`), a
-/// macro's keyword argument (`f(a=v.nope)` takes `a`'s default), a list
-/// or map printed whole (`{{ [v.nope] }}`, or `map(attribute=..)`'s result,
-/// prints `[undefined]`; `{{ {"port": v.nope} | tojson }}` writes `null`) or
-/// compared with the `in` and `==` operators (`"x" in xs |
-/// map(attribute="nmae")` is false; the tests `is in` and `is eq` refuse),
-/// and an undefined value inside a map or deeper than a list's own items.
-/// A template that handles missing items says so, and renders:
-/// `select("defined")`, `reject("undefined")`, `map("default", ..)`.
+/// **Strict undefined**, minijinja's: a missing name or attribute that is
+/// printed, iterated, compared or tested for truth is an error, never empty
+/// text. Handed on before that, minijinja lets it pass as a value left out,
+/// and the template renders: given to a filter (`v.itmes | join(",")`
+/// renders `""`, `join(v.seperator)` joins with nothing), an attribute a
+/// filter looks up itself (`selectattr("admn")` keeps nobody), a value
+/// inside a list or map printed whole (`{{ [v.nope] }}` prints
+/// `[undefined]`, `{"port": v.nope} | tojson` writes `null`), or a macro's
+/// keyword argument (`f(a=v.nope)` takes `a`'s default).
 /// A literal or `include_str!` template must be passed every
 /// name it reads, so an optional value is an `Option`: `None` is `none`,
 /// `{% if x %}` is false for it, and `{{ x | default("off", true) }}`
@@ -762,9 +752,7 @@ fn integration_test_impl(
 /// - **Functions**: `range`, `dict`, `namespace`, `debug`.
 /// - **Tags**: `for` (with `loop`, `loop.previtem`, `loop.nextitem`, and
 ///   `break` and `continue`), `if`, `set`, `with`, `filter`, `macro`,
-///   `call`, `do`, `autoescape` (which escapes what is printed; a filter
-///   inside it neither escapes for it nor keeps a `safe` mark), `raw`,
-///   `block`, and the loads above.
+///   `call`, `do`, `autoescape`, `raw`, `block`, and the loads above.
 ///
 /// minijinja's documentation describes each:
 /// <https://docs.rs/minijinja/3.0.0/minijinja/filters/index.html>,

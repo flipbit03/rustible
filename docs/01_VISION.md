@@ -408,8 +408,9 @@ templates, whatever renders them:
   language is one operators already know, so existing templates carry over.
 - **Mistakes surface as early as the information allows.** What is known
   when the playbook compiles is checked when it compiles. What is only known
-  at run time fails before anything is written. A template never silently
-  renders a missing value as empty text.
+  at run time fails before anything is written. A missing value a template
+  prints, loops over or tests fails the render; it is never written as
+  empty text.
 - **Rendering happens on the target,** inside the playbook binary, like
   every other part of a run. The target installs nothing for it, and a dry
   run renders every template, so `--check` finds template errors without
@@ -693,7 +694,8 @@ usage:
 | `get_url`, `unarchive` | 3 + 2 | `http::Download`, `archive::Extracted` |
 | `sysctl` | 3 | `sysctl::Present` |
 | `group` | 2 | `group::Present` |
-| `stat`, `acl`, `mount`, `iptables`, `replace`, `template`, `command`, `shell` | 1 or 2 each | tail |
+| `stat`, `acl`, `mount`, `iptables`, `replace`, `command`, `shell` | 1 or 2 each | tail |
+| `template` | 1 or 2 | not an op: a template is a value (5.7) |
 
 **Wave one of `rustible-std`**, covering about 95 percent of that repository
 with roughly twenty ops: `user::{Present, Absent}`, `group::Present`,

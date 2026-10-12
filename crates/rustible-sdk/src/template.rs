@@ -9,10 +9,10 @@
 //!
 //! The environment, the same for every template:
 //!
-//! - **Strict undefined.** A missing name or attribute fails the render; it
-//!   never renders as empty text. Given to a built-in filter, test or
-//!   function, where minijinja's strict mode lets it through, it fails too
-//!   (`environment` puts every built-in behind that check).
+//! - **Strict undefined**, minijinja's: a missing name or attribute that is
+//!   printed, iterated, compared or tested fails the render. Handed to a
+//!   filter or a macro argument it passes as an argument left out (the
+//!   `template!` rustdoc lists the cases).
 //! - **`trim_blocks`**, as Ansible's `template` module renders: the newline
 //!   after a `{% … %}` tag is removed. **`keep_trailing_newline`**: a
 //!   template, and an included one, keeps its final newline, so an include
@@ -35,7 +35,7 @@ use std::borrow::Cow;
 
 use minijinja::machinery::{Token, tokenize};
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Kwargs, Rest, Serde, ValueKind};
+use minijinja::value::{Serde, ValueKind};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, Value};
 use serde::Serialize;
 
@@ -186,256 +186,8 @@ fn describe(value: &Value) -> String {
     format!("a {}", value.kind())
 }
 
-/// The built-in filters, tests and functions that are given an undefined
-/// value without minijinja's strict mode noticing: it fails only where an
-/// undefined value is printed, iterated, compared or tested for truth, so
-/// `{{ v.itmes | join(",") }}` rendered `""` and `join(v.seperator)` joined
-/// with nothing. [`environment`] puts each behind a check. Every built-in of
-/// minijinja 3.0.0 (`template_builtins.rs` tests each), but `debug`, which
-/// shows the context, and the tests that ask about undefined itself.
-const FILTERS: &[&str] = &[
-    "abs",
-    "attr",
-    "batch",
-    "bool",
-    "capitalize",
-    "chain",
-    "count",
-    "d",
-    "default",
-    "dictsort",
-    "e",
-    "escape",
-    "first",
-    "float",
-    "format",
-    "groupby",
-    "indent",
-    "int",
-    "items",
-    "join",
-    "last",
-    "length",
-    "lines",
-    "list",
-    "lower",
-    "map",
-    "max",
-    "min",
-    "pprint",
-    "reject",
-    "rejectattr",
-    "replace",
-    "reverse",
-    "round",
-    "safe",
-    "select",
-    "selectattr",
-    "slice",
-    "sort",
-    "split",
-    "string",
-    "sum",
-    "title",
-    "tojson",
-    "trim",
-    "unique",
-    "upper",
-    "urlencode",
-    "zip",
-];
-const TESTS: &[&str] = &[
-    "!=",
-    "<",
-    "<=",
-    "==",
-    ">",
-    ">=",
-    "boolean",
-    "divisibleby",
-    "endingwith",
-    "eq",
-    "equalto",
-    "escaped",
-    "even",
-    "false",
-    "filter",
-    "float",
-    "ge",
-    "greaterthan",
-    "gt",
-    "in",
-    "int",
-    "integer",
-    "iterable",
-    "le",
-    "lessthan",
-    "lower",
-    "lt",
-    "mapping",
-    "ne",
-    "none",
-    "number",
-    "odd",
-    "safe",
-    "sameas",
-    "sequence",
-    "startingwith",
-    "string",
-    "test",
-    "true",
-    "upper",
-];
-const FUNCTIONS: &[&str] = &["range", "dict", "namespace"];
-
-/// The environment every template renders in; see the [module docs](self):
-/// [`base_environment`], with each built-in in [`FILTERS`], [`TESTS`] and
-/// [`FUNCTIONS`] refusing an undefined value and then running as itself.
+/// The environment every template renders in; see the [module docs](self).
 fn environment<'source>() -> Environment<'source> {
-    let mut env = base_environment();
-    for &name in FILTERS {
-        // `default` exists to be given an undefined value; its fallback
-        // must not be one.
-        let input_may_be_undefined = matches!(name, "default" | "d");
-        env.add_filter(
-            name,
-            move |args: Rest<Value>,
-                  kwargs: Kwargs|
-                  -> std::result::Result<Value, minijinja::Error> {
-                let args = with_kwargs(args, kwargs);
-                refuse_undefined("filter", name, &args, input_may_be_undefined)?;
-                builtins().empty_state().apply_filter(name, &args)
-            },
-        );
-    }
-    for &name in TESTS {
-        env.add_test(
-            name,
-            move |args: Rest<Value>,
-                  kwargs: Kwargs|
-                  -> std::result::Result<bool, minijinja::Error> {
-                let args = with_kwargs(args, kwargs);
-                refuse_undefined("test", name, &args, false)?;
-                builtins().empty_state().perform_test(name, &args)
-            },
-        );
-    }
-    for &name in FUNCTIONS {
-        let function = builtins()
-            .globals()
-            .find(|(global, _)| *global == name)
-            .map(|(_, f)| f)
-            .expect("a minijinja built-in function");
-        env.add_function(
-            name,
-            move |args: Rest<Value>,
-                  kwargs: Kwargs|
-                  -> std::result::Result<Value, minijinja::Error> {
-                let args = with_kwargs(args, kwargs);
-                refuse_undefined("function", name, &args, false)?;
-                function.call(&mut builtins().empty_state(), &args)
-            },
-        );
-    }
-    env
-}
-
-/// The arguments as the built-in is called with them: the positional ones,
-/// then the keyword ones as minijinja passes them, when there are any.
-fn with_kwargs(args: Rest<Value>, kwargs: Kwargs) -> Vec<Value> {
-    let mut args = args.0;
-    if kwargs.args().next().is_some() {
-        args.push(Value::from(kwargs));
-    }
-    args
-}
-
-/// The built-ins as minijinja ships them (and Rustible's `tojson`), which
-/// the checked ones in [`environment`] call.
-fn builtins() -> &'static Environment<'static> {
-    static BUILTINS: std::sync::OnceLock<Environment<'static>> = std::sync::OnceLock::new();
-    BUILTINS.get_or_init(base_environment)
-}
-
-/// Fail when a built-in is given an undefined value: as the input (but
-/// `default`'s), as an argument or a keyword argument, or as an item of a
-/// list it is given (what `map(attribute=..)` makes of a missing attribute),
-/// where [`walks_items`] says the items matter. minijinja's own strict mode
-/// lets one through here: a filter takes it as an argument left out. Only a
-/// list's own items are looked at, not deeper and not inside a map or an
-/// object (a `loop`, a `namespace`), so the check never follows a value
-/// that contains itself.
-fn refuse_undefined(
-    kind: &str,
-    name: &str,
-    args: &[Value],
-    input_may_be_undefined: bool,
-) -> std::result::Result<(), minijinja::Error> {
-    let items = walks_items(kind, name, args);
-    for (i, arg) in args.iter().enumerate() {
-        if i == 0 && input_may_be_undefined {
-            continue;
-        }
-        if arg.is_kwargs() {
-            for key in arg.try_iter()? {
-                undefined_fails(&arg.get_item(&key)?)?;
-            }
-        } else if arg.kind() == ValueKind::Seq {
-            if items && arg.try_iter()?.any(|item| item.is_undefined()) {
-                return Err(minijinja::Error::new(
-                    minijinja::ErrorKind::UndefinedError,
-                    format!("{kind} `{name}` was given a list holding an undefined item"),
-                ));
-            }
-        } else {
-            undefined_fails(arg)?;
-        }
-    }
-    Ok(())
-}
-
-/// Whether a built-in's list arguments are looked into for undefined items.
-/// Not by one that only hands items on or counts them (`length`, `first`,
-/// `list`, `reverse`, `chain`, `default`'s fallback, …), so it stays constant time
-/// in a loop over large data and an item it hands on fails when printed;
-/// not by a test that asks what a value is (`sequence`, `string`, …); and
-/// not by `select("defined")`, `reject("undefined")` or `map("default", ..)`,
-/// which handle the missing items on purpose. A test that compares or looks
-/// for membership (`in`, `eq`, `lt`, …) and every other filter, `select` by
-/// truth included, does look: what it does with an undefined item is wrong.
-fn walks_items(kind: &str, name: &str, args: &[Value]) -> bool {
-    let second = args.get(1).and_then(Value::as_str);
-    match (kind, name) {
-        (
-            "test",
-            "in" | "eq" | "equalto" | "==" | "ne" | "!=" | "sameas" | "lt" | "lessthan" | "<"
-            | "le" | "<=" | "gt" | "greaterthan" | ">" | "ge" | ">=",
-        ) => true,
-        ("test", _) => false,
-        (
-            "filter",
-            "length" | "count" | "first" | "last" | "bool" | "list" | "reverse" | "chain" | "zip"
-            | "batch" | "slice" | "attr" | "default" | "d",
-        ) => false,
-        ("filter", "select" | "reject") => !matches!(second, Some("defined" | "undefined")),
-        ("filter", "map") => !matches!(second, Some("default" | "d")),
-        _ => true,
-    }
-}
-
-/// The error strict mode raises for this undefined value, which names the
-/// expression it came from (`` `v.itmes` is undefined ``): looking anything
-/// up on it is an error in strict mode, and minijinja attaches the origin.
-fn undefined_fails(value: &Value) -> std::result::Result<(), minijinja::Error> {
-    if value.is_undefined() {
-        value.get_attr("undefined")?;
-        return Err(minijinja::Error::from(minijinja::ErrorKind::UndefinedError));
-    }
-    Ok(())
-}
-
-/// Strict undefined, no autoescape, the syntax, and Rustible's `tojson`.
-fn base_environment<'source>() -> Environment<'source> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_auto_escape_callback(|_| AutoEscape::None);
@@ -445,58 +197,7 @@ fn base_environment<'source>() -> Environment<'source> {
     // minijinja gives the line only). It also copies the variables in scope
     // into the error's debug info, which `render_error` never shows.
     env.set_debug(true);
-    env.add_filter("tojson", tojson);
     env
-}
-
-/// minijinja's `tojson`, without its HTML escaping: it writes `<`, `>`,
-/// `&` and `'` as `\u003c`, `\u003e`, `\u0026` and `\u0027`, which a config
-/// file does not need and the run's masker does not know, so a secret
-/// holding one of them would go out unmasked. What is left is JSON as
-/// `serde_json` escapes it, the form the masker registers.
-fn tojson(
-    value: &Value,
-    indent: Option<Value>,
-    kwargs: minijinja::value::Kwargs,
-) -> std::result::Result<Value, minijinja::Error> {
-    let html_safe = minijinja::filters::tojson(value, indent, kwargs)?;
-    Ok(Value::from_safe_string(without_html_escapes(
-        html_safe.as_str().unwrap_or_default(),
-    )))
-}
-
-/// Undo the four `\u00XX` escapes `tojson` adds for HTML. Every backslash in
-/// JSON starts an escape, so stepping over each one whole is what keeps an
-/// escaped backslash followed by `u003c` (`\\u003c`) as it is.
-fn without_html_escapes(json: &str) -> String {
-    let mut out = String::with_capacity(json.len());
-    let mut rest = json;
-    while let Some(at) = rest.find('\\') {
-        out.push_str(&rest[..at]);
-        let escape = &rest[at..];
-        let plain = match escape.get(..6) {
-            Some("\\u003c") => Some('<'),
-            Some("\\u003e") => Some('>'),
-            Some("\\u0026") => Some('&'),
-            Some("\\u0027") => Some('\''),
-            _ => None,
-        };
-        match plain {
-            Some(c) => {
-                out.push(c);
-                rest = &escape[6..];
-            }
-            None => {
-                // Any other escape is two characters, or six for `\uXXXX`,
-                // whose four hex digits hold no backslash: copy the two.
-                let len = escape.chars().take(2).map(char::len_utf8).sum();
-                out.push_str(&escape[..len]);
-                rest = &escape[len..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// `trim_blocks` and `keep_trailing_newline`, minijinja's delimiters.
@@ -713,30 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn without_html_escapes_undoes_only_tojson_s_html_escapes() {
-        assert_eq!(
-            without_html_escapes(r#""a\u003cb\u003e\u0026\u0027c""#),
-            r#""a<b>&'c""#
-        );
-        // An escaped backslash followed by the text `u003c` stays, as do
-        // the escapes JSON needs.
-        assert_eq!(
-            without_html_escapes(r#""\\u003c \" \n \u0001 ü""#),
-            r#""\\u003c \" \n \u0001 ü""#
-        );
-    }
-
-    #[test]
-    fn tojson_writes_json_as_serde_json_escapes_it() {
-        let out =
-            __render_dynamic("d", "{{ v | tojson }}", vars().named("v", "<a&'b\"\n>")).unwrap();
-        assert_eq!(out, serde_json::to_string("<a&'b\"\n>").unwrap());
-        let pretty =
-            __render_dynamic("d", "{{ v | tojson(indent=2) }}", vars().named("v", &[1])).unwrap();
-        assert_eq!(pretty, "[\n  1\n]");
-    }
-
-    #[test]
     fn first_load_ignores_raw_text_strings_and_names() {
         for text in [
             "{% raw %}{% include 'x' %}{% endraw %}",
@@ -903,83 +580,6 @@ mod tests {
             );
             assert!(err.contains("secret is not utf-8"), "{err}");
         }
-    }
-
-    #[test]
-    fn every_built_in_refuses_an_undefined_value() {
-        // minijinja 3.0.0 ships 49 filters, 42 tests and 4 functions
-        // (`defaults.rs`; `template_builtins.rs` renders each): all but
-        // `defined`, `undefined` and `debug` are checked. Re-count on an
-        // upgrade, so a new built-in is not left unchecked.
-        assert_eq!((FILTERS.len(), TESTS.len(), FUNCTIONS.len()), (49, 40, 3));
-        let env = environment();
-        let undefined = Value::UNDEFINED;
-        for &name in FILTERS {
-            let mut state = env.empty_state();
-            let args = if matches!(name, "default" | "d") {
-                vec![Value::from(1), undefined.clone()]
-            } else {
-                vec![undefined.clone()]
-            };
-            let err = state.apply_filter(name, &args).expect_err(name);
-            assert_eq!(
-                err.kind(),
-                ErrorKind::UndefinedError,
-                "filter {name}: {err}"
-            );
-        }
-        for &name in TESTS {
-            let err = env
-                .empty_state()
-                .perform_test(name, std::slice::from_ref(&undefined))
-                .expect_err(name);
-            assert_eq!(err.kind(), ErrorKind::UndefinedError, "test {name}: {err}");
-        }
-        for &name in FUNCTIONS {
-            let (_, function) = env.globals().find(|(g, _)| *g == name).unwrap();
-            let err = function
-                .call(&mut env.empty_state(), std::slice::from_ref(&undefined))
-                .expect_err(name);
-            assert_eq!(
-                err.kind(),
-                ErrorKind::UndefinedError,
-                "function {name}: {err}"
-            );
-        }
-        // Every name is a real built-in: one misspelt here would be refused
-        // above all the same, and leave the real one unchecked.
-        for &name in FILTERS {
-            let err = builtins()
-                .empty_state()
-                .apply_filter(name, &[Value::from(1)])
-                .err();
-            assert!(
-                err.is_none_or(|e| e.kind() != ErrorKind::UnknownFilter),
-                "filter {name} is not a minijinja built-in"
-            );
-        }
-        for &name in TESTS {
-            let err = builtins()
-                .empty_state()
-                .perform_test(name, &[Value::from(1)])
-                .err();
-            assert!(
-                err.is_none_or(|e| e.kind() != ErrorKind::UnknownTest),
-                "test {name} is not a minijinja built-in"
-            );
-        }
-        // And the ones that exist to take it, do.
-        let mut state = env.empty_state();
-        assert!(
-            state
-                .perform_test("defined", std::slice::from_ref(&undefined))
-                .is_ok()
-        );
-        assert!(
-            state
-                .apply_filter("default", &[undefined, Value::from(1)])
-                .is_ok()
-        );
     }
 
     #[test]
