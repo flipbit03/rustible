@@ -27,10 +27,10 @@
 //! one is over 48 MiB too, so its reads cross the helper in chunks, and in
 //! both the member's writes do, alternating with them.
 //!
-//! And it renders a template on the guest, `files/Caddyfile.j2`, which
-//! includes `files/caddy/vhost.j2` once per entry of a `Vec` of structs, and
-//! writes it with `file::Copy`: the second run renders the same text and
-//! reports `ok`.
+//! And it renders a template on the guest, `../files/Caddyfile.j2`, which
+//! includes `caddy/vhost.j2` beside it once per entry of a `Vec` of
+//! structs, and writes it with `file::Copy`: the second run renders the same
+//! text and reports `ok`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -121,7 +121,7 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         Vhost { host: format!("app.{hostname}.example"), upstream: "127.0.0.1:8080".into(), websocket: true },
         Vhost { host: format!("api.{hostname}.example"), upstream: "127.0.0.1:9000".into(), websocket: false },
     ];
-    let caddyfile = template!(include_str!("files/Caddyfile.j2"), hostname = &hostname, email = "admin@example.com", vhosts = &vhosts)?;
+    let caddyfile = template!(include_str!("../files/Caddyfile.j2"), hostname = &hostname, email = "admin@example.com", vhosts = &vhosts)?;
     ctx.step("Caddyfile from a template", file::Copy::from_str(&caddyfile).to("/etc/rustible-Caddyfile").mode(0o644))?;
 
     // A full init system, queried through systemctl.

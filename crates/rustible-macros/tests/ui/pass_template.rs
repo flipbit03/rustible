@@ -20,7 +20,15 @@ fn render(motd: &str) -> Result<String> {
     let e = template!("{{ type }}{{ fn }}", type = 1, r#fn = 2,)?;
     let items = vec![Item { name: "n".into() }];
     let f = template!("{% for i in items %}{{ i.name }}{% endfor %}", items = &items)?;
-    Ok([a, b, c, d, e, f].concat())
+    // A name the template assigns itself is optional; an include's
+    // condition is a name the template reads.
+    let g = template!("{% set port = port | default(80) %}{{ port }}")?;
+    let h = template!(
+        "{% include \"templates/app.conf.j2\" if full else \"templates/deep/b/c/leaf.j2\" %}",
+        full = false,
+        listen = "l",
+    )?;
+    Ok([a, b, c, d, e, f, g, h].concat())
 }
 
 fn main() {

@@ -227,14 +227,16 @@ fn manifest_dir() -> Option<PathBuf> {
     std::env::var_os("CARGO_MANIFEST_DIR").and_then(|d| PathBuf::from(d).canonicalize().ok())
 }
 
-/// The file a span is in, canonical, when the compiler knows it.
+/// The file a span is in, as the compiler names it (possibly relative to
+/// its working directory), when it knows. Not canonical: a playbook that is a
+/// symlink resolves `include_str!` next to the link, so its targets do too.
 fn local_file(span: Span) -> Option<PathBuf> {
-    span.unwrap().local_file()?.canonicalize().ok()
+    span.unwrap().local_file()
 }
 
 /// `<file>:<line>` of a span, the file relative to the crate.
 fn call_location(span: Span, base: Option<&Path>) -> Option<String> {
-    let file = local_file(span)?;
+    let file = local_file(span)?.canonicalize().ok()?;
     Some(format!(
         "{}:{}",
         display(&file, base),
@@ -267,6 +269,8 @@ struct Tree {
     files: Vec<File>,
     /// `(from, as written, to)`, by index into `files`.
     links: Vec<(usize, String, usize)>,
+    /// `(from, to)` for every `extends` target, by index into `files`.
+    extends: Vec<(usize, usize)>,
 }
 
 struct File {
@@ -278,13 +282,11 @@ struct File {
     /// The template that first reached this one, and the line of the
     /// statement that did.
     reached_from: Option<(usize, usize)>,
-    /// Followed only through `extends`, from the top-level template.
-    via_extends: bool,
-    /// Names the template looks up without assigning them itself.
+    /// What [`walk`] collected: the names it assigns and reads.
+    walked: Walk,
+    /// Names the template looks up without assigning them first, by
+    /// minijinja's own analysis.
     undeclared: HashSet<String>,
-    /// Names the template assigns: `set`, `for`, `with`, macro and import
-    /// names.
-    assigned: HashSet<String>,
 }
 
 /// One `include`, `extends`, `import` or `from … import`.
@@ -310,11 +312,11 @@ impl Tree {
                 path: root.path,
                 dir: root.dir,
                 reached_from: None,
-                via_extends: false,
+                walked: Walk::default(),
                 undeclared: HashSet::new(),
-                assigned: HashSet::new(),
             }],
             links: Vec::new(),
+            extends: Vec::new(),
         };
         let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
         if let Some(p) = &tree.files[0].path {
@@ -325,21 +327,20 @@ impl Tree {
         while next < tree.files.len() {
             let index = next;
             next += 1;
-            let (loads, assigned, undeclared) = {
+            let (mut walked, undeclared) = {
                 let file = &tree.files[index];
                 let ast = minijinja::machinery::parse(&file.source, &file.name, syntax())
                     .map_err(|e| tree.syntax_error(index, &e))?;
-                let mut loads = Vec::new();
-                let mut assigned = HashSet::new();
-                walk(&ast, &mut loads, &mut assigned)
-                    .map_err(|(line, why)| tree.at(index, line, &why))?;
+                let mut walked = Walk::default();
+                walk(&ast, &mut walked).map_err(|(line, why)| tree.at(index, line, &why))?;
                 let env = environment();
                 let template = env
                     .template_from_named_str(&file.name, &file.source)
                     .map_err(|e| tree.syntax_error(index, &e))?;
-                (loads, assigned, template.undeclared_variables(false))
+                (walked, template.undeclared_variables(false))
             };
-            tree.files[index].assigned = assigned;
+            let loads = std::mem::take(&mut walked.loads);
+            tree.files[index].walked = walked;
             tree.files[index].undeclared = undeclared;
 
             for load in loads {
@@ -379,10 +380,8 @@ impl Tree {
                                 dir: canon.parent().map(Path::to_path_buf),
                                 path: Some(canon.clone()),
                                 reached_from: Some((index, load.line)),
-                                via_extends: load.statement == "extends"
-                                    && (index == 0 || tree.files[index].via_extends),
+                                walked: Walk::default(),
                                 undeclared: HashSet::new(),
-                                assigned: HashSet::new(),
                             });
                             by_path.insert(canon, tree.files.len() - 1);
                             tree.files.len() - 1
@@ -395,9 +394,8 @@ impl Tree {
                     {
                         tree.links.push((index, target.clone(), to));
                     }
-                    if load.statement == "extends" && (index == 0 || tree.files[index].via_extends)
-                    {
-                        tree.files[to].via_extends = true;
+                    if load.statement == "extends" && !tree.extends.contains(&(index, to)) {
+                        tree.extends.push((index, to));
                     }
                 }
                 let fails = if load.list {
@@ -477,22 +475,40 @@ impl Tree {
             .map(|(n, _)| n.to_string())
             .collect();
 
-        // A name a parent template assigns can reach a child's blocks
-        // (minijinja runs a block in the scope it is called from), so it is
-        // left to the render.
-        let inherited: HashSet<&str> = self
-            .files
+        // Names left to the render rather than required of the call:
+        // - one the top-level template assigns anywhere (`set`, `for`,
+        //   `with`, a macro or an import): minijinja's analysis takes a name
+        //   assigned in one branch for undeclared in the next, and the
+        //   `{% set port = port | default(80) %}` idiom reads a name it also
+        //   assigns;
+        // - one a parent assigns (any file reached through `extends`,
+        //   transitively): minijinja runs a child's block in the scope it is
+        //   called from, so the block can use the parent's loop variable.
+        let root = &self.files[0];
+        let mut parents = vec![0];
+        let mut reached = HashSet::from([0]);
+        while let Some(child) = parents.pop() {
+            for &(from, to) in &self.extends {
+                if from == child && reached.insert(to) {
+                    parents.push(to);
+                }
+            }
+        }
+        let assigned: HashSet<&str> = reached
             .iter()
-            .filter(|f| f.via_extends)
-            .flat_map(|f| f.assigned.iter().map(String::as_str))
+            .flat_map(|&i| self.files[i].walked.assigned.iter().map(String::as_str))
             .collect();
 
         if !has_spread {
-            let missing: BTreeSet<&str> = self.files[0]
+            // minijinja's analysis plus the condition of a load target
+            // (`{% include "a.j2" if flag else "b.j2" %}`), which it does not
+            // look at.
+            let missing: BTreeSet<&str> = root
                 .undeclared
                 .iter()
+                .chain(&root.walked.target_vars)
                 .map(String::as_str)
-                .filter(|n| !passed.contains(n) && !globals.contains(*n) && !inherited.contains(n))
+                .filter(|n| !passed.contains(n) && !globals.contains(*n) && !assigned.contains(n))
                 .collect();
             if !missing.is_empty() {
                 let list: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
@@ -502,7 +518,7 @@ impl Tree {
                     format!(
                         "{} uses {}, not passed to `template!`: add `{first} = <value>`, \
                          or a `..` spread that holds {}",
-                        shown(&self.files[0].name),
+                        shown(&root.name),
                         list.join(", "),
                         if missing.len() == 1 { "it" } else { "them" }
                     ),
@@ -510,10 +526,12 @@ impl Tree {
             }
         }
 
+        // Every variable any file of the tree reads, wherever: a name in
+        // here may be the argument's, so the argument is used.
         let used: HashSet<&str> = self
             .files
             .iter()
-            .flat_map(|f| f.undeclared.iter().map(String::as_str))
+            .flat_map(|f| f.walked.vars.iter().map(String::as_str))
             .collect();
         for (name, ident, _) in named {
             if !used.contains(name.as_str()) {
@@ -613,85 +631,125 @@ fn syntax() -> SyntaxConfig {
 /// A walk's failure: the line, and why.
 type WalkResult = Result<(), (usize, String)>;
 
-/// Collect the loads and the assigned names of a statement and everything
-/// inside it. Every statement that holds a body is walked, so a load in an
-/// untaken branch, a macro or a block is found too: all of them are
-/// embedded.
-fn walk(stmt: &Stmt, loads: &mut Vec<Load>, assigned: &mut HashSet<String>) -> WalkResult {
-    let body = |stmts: &[Stmt], loads: &mut Vec<Load>, assigned: &mut HashSet<String>| {
-        stmts.iter().try_for_each(|s| walk(s, loads, assigned))
-    };
+/// What a walk over one template collects.
+#[derive(Default)]
+struct Walk {
+    loads: Vec<Load>,
+    /// Names the template assigns: `set`, `for`, `with`, macro and import
+    /// names.
+    assigned: HashSet<String>,
+    /// Every variable the template reads anywhere, a load target's
+    /// condition included: a name in here is used.
+    vars: HashSet<String>,
+    /// The variables a load target's condition reads (`{% include "a.j2"
+    /// if flag else "b.j2" %}`), which minijinja's own name analysis does
+    /// not look at.
+    target_vars: HashSet<String>,
+}
+
+/// Collect the loads, assigned names and read variables of a statement and
+/// everything inside it. Every statement that holds a body is walked, so a
+/// load in an untaken branch, a macro or a block is found too: all of them
+/// are embedded. The match is exhaustive on purpose: a statement kind a
+/// minijinja upgrade adds fails to compile here until it is walked.
+fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
+    let body = |stmts: &[Stmt], w: &mut Walk| stmts.iter().try_for_each(|s| walk(s, w));
     match stmt {
-        Stmt::Template(t) => body(&t.children, loads, assigned),
-        Stmt::EmitExpr(_) | Stmt::EmitRaw(_) | Stmt::Do(_) => Ok(()),
-        Stmt::Continue(_) | Stmt::Break(_) => Ok(()),
+        Stmt::Template(t) => body(&t.children, w),
+        Stmt::EmitExpr(e) => {
+            vars(&e.expr, &mut w.vars);
+            Ok(())
+        }
+        Stmt::EmitRaw(_) | Stmt::Continue(_) | Stmt::Break(_) => Ok(()),
+        Stmt::Do(d) => {
+            call_vars(&d.call, &mut w.vars);
+            Ok(())
+        }
         Stmt::ForLoop(f) => {
-            assign(&f.target, assigned);
-            assigned.insert("loop".to_string());
-            body(&f.body, loads, assigned)?;
-            body(&f.else_body, loads, assigned)
+            assign(&f.target, &mut w.assigned);
+            w.assigned.insert("loop".to_string());
+            vars(&f.iter, &mut w.vars);
+            if let Some(e) = &f.filter_expr {
+                vars(e, &mut w.vars);
+            }
+            body(&f.body, w)?;
+            body(&f.else_body, w)
         }
         Stmt::IfCond(i) => {
-            body(&i.true_body, loads, assigned)?;
-            body(&i.false_body, loads, assigned)
+            vars(&i.expr, &mut w.vars);
+            body(&i.true_body, w)?;
+            body(&i.false_body, w)
         }
-        Stmt::WithBlock(w) => {
-            for (target, _) in &w.assignments {
-                assign(target, assigned);
+        Stmt::WithBlock(b) => {
+            for (target, value) in &b.assignments {
+                assign(target, &mut w.assigned);
+                vars(value, &mut w.vars);
             }
-            body(&w.body, loads, assigned)
+            body(&b.body, w)
         }
         Stmt::Set(s) => {
-            assign(&s.target, assigned);
+            assign(&s.target, &mut w.assigned);
+            vars(&s.expr, &mut w.vars);
             Ok(())
         }
         Stmt::SetBlock(s) => {
-            assign(&s.target, assigned);
-            body(&s.body, loads, assigned)
+            assign(&s.target, &mut w.assigned);
+            if let Some(f) = &s.filter {
+                vars(f, &mut w.vars);
+            }
+            body(&s.body, w)
         }
-        Stmt::AutoEscape(a) => body(&a.body, loads, assigned),
-        Stmt::FilterBlock(f) => body(&f.body, loads, assigned),
-        Stmt::Block(b) => body(&b.body, loads, assigned),
+        Stmt::AutoEscape(a) => {
+            vars(&a.enabled, &mut w.vars);
+            body(&a.body, w)
+        }
+        Stmt::FilterBlock(f) => {
+            vars(&f.filter, &mut w.vars);
+            body(&f.body, w)
+        }
+        Stmt::Block(b) => body(&b.body, w),
         Stmt::Macro(m) => {
-            assigned.insert(m.name.to_string());
-            m.args.iter().for_each(|a| assign(a, assigned));
-            body(&m.body, loads, assigned)
+            w.assigned.insert(m.name.to_string());
+            m.args.iter().for_each(|a| assign(a, &mut w.assigned));
+            m.defaults.iter().for_each(|d| vars(d, &mut w.vars));
+            body(&m.body, w)
         }
         Stmt::CallBlock(c) => {
-            assigned.insert("caller".to_string());
-            c.macro_decl.args.iter().for_each(|a| assign(a, assigned));
-            body(&c.macro_decl.body, loads, assigned)
+            call_vars(&c.call, &mut w.vars);
+            w.assigned.insert("caller".to_string());
+            c.macro_decl
+                .args
+                .iter()
+                .for_each(|a| assign(a, &mut w.assigned));
+            c.macro_decl
+                .defaults
+                .iter()
+                .for_each(|d| vars(d, &mut w.vars));
+            body(&c.macro_decl.body, w)
         }
-        Stmt::Extends(e) => load("extends", &e.name, false, false, stmt_line(stmt), loads),
+        Stmt::Extends(e) => load("extends", &e.name, false, false, line_of(e.span()), w),
         Stmt::Include(i) => load(
             "include",
             &i.name,
             i.ignore_missing,
             true,
-            stmt_line(stmt),
-            loads,
+            line_of(i.span()),
+            w,
         ),
         Stmt::Import(i) => {
-            assign(&i.name, assigned);
-            load("import", &i.expr, false, false, stmt_line(stmt), loads)
+            assign(&i.name, &mut w.assigned);
+            load("import", &i.expr, false, false, line_of(i.span()), w)
         }
         Stmt::FromImport(f) => {
             for (name, alias) in &f.names {
-                assign(alias.as_ref().unwrap_or(name), assigned);
+                assign(alias.as_ref().unwrap_or(name), &mut w.assigned);
             }
-            load("from", &f.expr, false, false, stmt_line(stmt), loads)
+            load("from", &f.expr, false, false, line_of(f.span()), w)
         }
     }
 }
 
-fn stmt_line(stmt: &Stmt) -> usize {
-    let span = match stmt {
-        Stmt::Extends(s) => s.span(),
-        Stmt::Include(s) => s.span(),
-        Stmt::Import(s) => s.span(),
-        Stmt::FromImport(s) => s.span(),
-        _ => return 0,
-    };
+fn line_of(span: minijinja::machinery::Span) -> usize {
     usize::from(span.start_line)
 }
 
@@ -703,15 +761,15 @@ fn load(
     ignore_missing: bool,
     list_allowed: bool,
     line: usize,
-    loads: &mut Vec<Load>,
+    w: &mut Walk,
 ) -> WalkResult {
     let mut targets = Vec::new();
-    let list = matches!(target, Expr::List(_));
+    let list = matches!(target, Expr::List(_) | Expr::Tuple(_));
     if !literals(target, list_allowed, &mut targets) {
         let what = if list_allowed {
-            "a string literal, or a list of them"
+            "a string literal, a list of them, or `\"a\" if <test> else \"b\"`"
         } else {
-            "a string literal"
+            "a string literal, or `\"a\" if <test> else \"b\"`"
         };
         return Err((
             line,
@@ -722,7 +780,11 @@ fn load(
             ),
         ));
     }
-    loads.push(Load {
+    let mut condition = HashSet::new();
+    vars(target, &mut condition);
+    w.vars.extend(condition.iter().cloned());
+    w.target_vars.extend(condition);
+    w.loads.push(Load {
         statement,
         targets,
         may_miss: ignore_missing,
@@ -733,7 +795,9 @@ fn load(
 }
 
 /// Collect the string literals an expression can evaluate to: a literal,
-/// a list of them (an include list), or either branch of an inline `if`.
+/// a list of them (an include list), or both branches of an inline `if`,
+/// which must have an `else`: without one a false test yields no name,
+/// which fails the render even under `ignore missing`.
 fn literals(expr: &Expr, list_allowed: bool, out: &mut Vec<String>) -> bool {
     match expr {
         Expr::Const(c) => match c.value.as_str() {
@@ -744,12 +808,13 @@ fn literals(expr: &Expr, list_allowed: bool, out: &mut Vec<String>) -> bool {
             None => false,
         },
         Expr::List(l) if list_allowed => l.items.iter().all(|i| literals(i, false, out)),
-        Expr::IfExpr(i) => {
-            literals(&i.true_expr, list_allowed, out)
-                && i.false_expr
-                    .as_ref()
-                    .is_none_or(|e| literals(e, list_allowed, out))
-        }
+        Expr::Tuple(t) if list_allowed => t.items.iter().all(|i| literals(i, false, out)),
+        Expr::IfExpr(i) => match &i.false_expr {
+            Some(otherwise) => {
+                literals(&i.true_expr, list_allowed, out) && literals(otherwise, list_allowed, out)
+            }
+            None => false,
+        },
         _ => false,
     }
 }
@@ -763,6 +828,74 @@ fn assign(target: &Expr, assigned: &mut HashSet<String>) {
         Expr::List(l) => l.items.iter().for_each(|i| assign(i, assigned)),
         Expr::Tuple(t) => t.items.iter().for_each(|i| assign(i, assigned)),
         _ => {}
+    }
+}
+
+/// Every variable an expression reads. Exhaustive, like [`walk`].
+fn vars(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Var(v) => {
+            out.insert(v.id.to_string());
+        }
+        Expr::Const(_) => {}
+        Expr::Slice(s) => {
+            vars(&s.expr, out);
+            for e in [&s.start, &s.stop, &s.step].into_iter().flatten() {
+                vars(e, out);
+            }
+        }
+        Expr::UnaryOp(u) => vars(&u.expr, out),
+        Expr::BinOp(b) => {
+            vars(&b.left, out);
+            vars(&b.right, out);
+        }
+        Expr::Compare(c) => {
+            vars(&c.expr, out);
+            c.ops.iter().for_each(|op| vars(&op.expr, out));
+        }
+        Expr::IfExpr(i) => {
+            vars(&i.test_expr, out);
+            vars(&i.true_expr, out);
+            if let Some(e) = &i.false_expr {
+                vars(e, out);
+            }
+        }
+        Expr::Filter(f) => {
+            if let Some(e) = &f.expr {
+                vars(e, out);
+            }
+            f.args.iter().for_each(|a| arg_vars(a, out));
+        }
+        Expr::Test(t) => {
+            vars(&t.expr, out);
+            t.args.iter().for_each(|a| arg_vars(a, out));
+        }
+        Expr::GetAttr(g) => vars(&g.expr, out),
+        Expr::GetItem(g) => {
+            vars(&g.expr, out);
+            vars(&g.subscript_expr, out);
+        }
+        Expr::Call(c) => call_vars(c, out),
+        Expr::List(l) => l.items.iter().for_each(|i| vars(i, out)),
+        Expr::Tuple(t) => t.items.iter().for_each(|i| vars(i, out)),
+        Expr::Map(m) => {
+            m.keys.iter().for_each(|k| vars(k, out));
+            m.values.iter().for_each(|v| vars(v, out));
+        }
+    }
+}
+
+fn call_vars(call: &minijinja::machinery::ast::Call, out: &mut HashSet<String>) {
+    vars(&call.expr, out);
+    call.args.iter().for_each(|a| arg_vars(a, out));
+}
+
+fn arg_vars(arg: &minijinja::machinery::ast::CallArg, out: &mut HashSet<String>) {
+    use minijinja::machinery::ast::CallArg;
+    match arg {
+        CallArg::Pos(e) | CallArg::Kwarg(_, e) | CallArg::PosSplat(e) | CallArg::KwargSplat(e) => {
+            vars(e, out)
+        }
     }
 }
 
@@ -1112,6 +1245,100 @@ mod tests {
             "t.j2",
         );
         assert_eq!(check(&tree.unwrap(), false, &[]), Ok(()));
+    }
+
+    #[test]
+    fn a_name_the_template_assigns_itself_is_never_required_and_never_unused() {
+        for (text, passed) in [
+            // The default idiom: reads the name it assigns.
+            (
+                "{% set port = port | default(80) %}{{ port }}",
+                &["port"][..],
+            ),
+            ("{% set port = port | default(80) %}{{ port }}", &[][..]),
+            // A macro's default and a `with` read the outer name.
+            (
+                "{% macro m(x=x) %}{{ x }}{% endmacro %}{{ m() }}",
+                &["x"][..],
+            ),
+            ("{% with x = x + 1 %}{{ x }}{% endwith %}", &["x"][..]),
+            // Assigned in both branches, read after.
+            (
+                "{% if c %}{% set y = 1 %}{% else %}{% set y = 2 %}{% endif %}{{ y }}",
+                &["c"][..],
+            ),
+        ] {
+            let (_d, tree) = resolve(&[("t.j2", text)], "t.j2");
+            assert_eq!(
+                check(&tree.unwrap(), false, passed),
+                Ok(()),
+                "{text} with {passed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_load_target_s_condition_is_a_name_the_template_uses() {
+        let files = [
+            ("t.j2", "{% include \"a.j2\" if flag else \"b.j2\" %}"),
+            ("a.j2", "a"),
+            ("b.j2", "b"),
+        ];
+        let (_d, tree) = resolve(&files, "t.j2");
+        let tree = tree.unwrap();
+        assert_eq!(names(&tree), ["t.j2", "a.j2", "b.j2"]);
+        assert_eq!(check(&tree, false, &["flag"]), Ok(()));
+        assert!(
+            check(&tree, false, &[])
+                .unwrap_err()
+                .contains("uses `flag`")
+        );
+
+        // Without an `else`, a false test names no template at all.
+        let (_d, tree) = resolve(
+            &[("t.j2", "{% include \"a.j2\" if flag %}"), ("a.j2", "")],
+            "t.j2",
+        );
+        let err = tree.err().unwrap();
+        assert!(
+            err.contains(
+                "must be a string literal, a list of them, or `\"a\" if <test> else \"b\"`"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_include_tuple_is_a_list() {
+        let (_d, tree) = resolve(
+            &[
+                ("t.j2", "{% include (\"gone.j2\", \"x.j2\") %}"),
+                ("x.j2", "x"),
+            ],
+            "t.j2",
+        );
+        assert_eq!(names(&tree.unwrap()), ["t.j2", "x.j2"]);
+    }
+
+    #[test]
+    fn a_parent_reached_by_include_first_still_lends_its_names() {
+        // `gp.j2` is included before `p.j2` extends it, and its loop
+        // variable still reaches the top-level template's block.
+        let (_d, tree) = resolve(
+            &[
+                (
+                    "t.j2",
+                    "{% include \"gp.j2\" %}{% extends \"p.j2\" %}{% block b %}{{ item }}{% endblock %}",
+                ),
+                ("p.j2", "{% extends \"gp.j2\" %}"),
+                (
+                    "gp.j2",
+                    "{% for item in items %}{% block b %}{% endblock %}{% endfor %}",
+                ),
+            ],
+            "t.j2",
+        );
+        assert_eq!(check(&tree.unwrap(), false, &["items"]), Ok(()));
     }
 
     #[test]

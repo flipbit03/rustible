@@ -63,7 +63,7 @@ The concepts carry over. The syntax does not.
 | `when: condition` | `if condition { ... }` |
 | `loop:` / `with_items:` | `for x in ... { ... }` |
 | `register:` then `{{ result.x }}` | the value the step returns |
-| `template:` with a `.j2` file | `template!(include_str!("x.j2"), ..)` into `file::Copy` — see §13 |
+| `template:` with a `.j2` file | `template!(include_str!("x.j2"), name = value)` into `file::Copy` — see §13 |
 | handlers and `notify:` | `if step.changed { ... }` |
 | `become: true` | `escalate = true`, or `ctx.as_root()` |
 | `hosts: all` | ⚠️ **there is no `all`** — see §6 |
@@ -1135,7 +1135,7 @@ and dry-runs it as usual. It is in the prelude.
 struct Vhost { host: String, upstream: String }
 
 let conf = template!(
-    include_str!("files/Caddyfile.j2"),   // relative to this file
+    include_str!("../files/Caddyfile.j2"),   // relative to this file
     email = "admin@example.com",
     vhosts = &vhosts,                      // anything `Serialize`, borrowed
 )?;
@@ -1153,15 +1153,19 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   nested data without a type.
 - **Checked when the playbook compiles** (literal and `include_str!`): the
   syntax of every file in the tree, every target of `include`/`extends`/
-  `import` exists, every name the top-level template uses is passed (unless
-  there is a `..map`), and every name passed is used. **Checked when it
-  renders**, on the target, where the macro is called: names in included
-  files, nested fields (`{{ v.upstrem }}`), and all of a dynamic template. The
-  error names the file and line; `?` returns it before the step that would
-  write runs, and `--check` renders every template.
+  `import` exists, every name the top-level template reads is passed
+  (unless there is a `..map`; a name it `set`s itself is not required), and
+  every name passed is read somewhere. **Checked when it renders**, on the
+  target, where the macro is called: names in included files, nested fields
+  (`{{ v.upstrem }}`), and all of a dynamic template. The error names the
+  file and line; `?` returns it before the step that would write runs.
+  `--check` renders every template it reaches (not one fed from a
+  would-change step's output: §9).
 - **Strict undefined**: a missing name or field is an error, never empty
-  text. Optional names say so: `{% if x is defined %}`, `| default(..)`; a
-  `None` is `none`, not undefined.
+  text. Every top-level name is passed, so an optional value is an
+  `Option`: `None` renders `None`, `{% if x %}` is false for it, and
+  `x | default("off", true)` replaces it. `is defined` and `default(..)`
+  are for names that may be absent: a spread's, an included file's.
 - ⚠️ **`true` renders as `True`**, `None` as `None`, a list as `['a', 'b']`:
   Jinja's Python spellings. Use `| lower` or `| tojson` where a config file
   wants `true` or JSON.
@@ -1175,7 +1179,9 @@ ctx.step("Caddyfile", file::Copy::from_str(&conf).to("/etc/caddy/Caddyfile"))?;
   embedded in the binary, and editing one rebuilds the playbook. A dynamic
   template can include nothing: read target-side files in Rust
   (`ctx.sys().read_to_string`) and pass them in.
-- In a child that `extends`, only `{% block %}` contents are output.
+- In a child that `extends`, only `{% block %}` contents are output. An
+  included file's `{% set %}` outside a loop changes the includer's
+  variable (Jinja2's does not).
 - **Filters, tests, functions**: every minijinja built-in (listed in
   `template!`'s rustdoc). Ansible's own (`to_nice_json`, `regex_replace`, …)
   are not there: compute in Rust, render in the template.

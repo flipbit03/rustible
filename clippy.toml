@@ -5,8 +5,9 @@
 # This is a lint, not a wall. The crates that legitimately touch the real
 # filesystem -- `rustible-sdk`, which implements the `Local` backend the rest
 # of the world goes through, `rustible-cli`, which manages workspaces on the
-# operator's own machine, and `rustible-build`, a build-script helper -- opt
-# out at the crate level with a reason. The op crates do not, so an operation
+# operator's own machine, `rustible-build`, a build-script helper, and
+# `rustible-macros`, whose `template!` reads template files at compile time
+# as `include_str!` does -- opt out at the crate level with a reason. The op crates do not, so an operation
 # reaching for `std::fs` or spawning a process itself fails the lint job.
 
 disallowed-types = [

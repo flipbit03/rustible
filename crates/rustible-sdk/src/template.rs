@@ -131,25 +131,53 @@ impl __Vars {
     }
 }
 
-/// Fail on a value that did not serialize: minijinja keeps the error inside
-/// the value and would raise it only where the template touched it.
+/// Fail on a value that did not serialize, at any depth: minijinja keeps
+/// the error inside the value, raises it only where the template touches
+/// it, and prints it as text where the template prints the container.
 fn invalid(value: &Value, template: &str, what: &str) -> Result<()> {
-    if value.kind() == ValueKind::Invalid {
-        return Err(Error::msg(format!(
-            "{template}: {what} cannot be given to a template: {value}"
-        )));
+    match first_invalid(value) {
+        Some(why) => Err(Error::msg(format!(
+            "{template}: {what} cannot be given to a template: {why}"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// A value's kind, and the value when it is short, for an error message.
-fn describe(value: &Value) -> String {
-    let shown = value.to_string();
-    if shown.chars().count() <= 40 {
-        format!("{} `{shown}`", value.kind())
-    } else {
-        format!("a {}", value.kind())
+/// The first value inside `value` that did not serialize, as minijinja
+/// describes it.
+fn first_invalid(value: &Value) -> Option<String> {
+    match value.kind() {
+        ValueKind::Invalid => Some(value.to_string()),
+        ValueKind::Seq | ValueKind::Map => {
+            let items = match value.try_iter() {
+                Ok(items) => items,
+                Err(e) => return Some(e.to_string()),
+            };
+            for item in items {
+                if let Some(why) = first_invalid(&item) {
+                    return Some(why);
+                }
+                if value.kind() == ValueKind::Map {
+                    match value.get_item(&item) {
+                        Ok(entry) => {
+                            if let Some(why) = first_invalid(&entry) {
+                                return Some(why);
+                            }
+                        }
+                        Err(e) => return Some(e.to_string()),
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
     }
+}
+
+/// A value's kind, for an error message. Never the value: it may hold a
+/// secret, which minijinja's printing would reshape past the masker.
+fn describe(value: &Value) -> String {
+    format!("a {}", value.kind())
 }
 
 /// The environment every template renders in; see the [module docs](self).
@@ -159,8 +187,9 @@ fn environment<'source>() -> Environment<'source> {
     env.set_auto_escape_callback(|_| AutoEscape::None);
     env.set_syntax(syntax());
     // Debug mode is what names the undefined expression in an error
-    // (`` `v.upstrem` is undefined ``). It also copies the variables in
-    // scope into the error's debug info, which `render_error` never shows.
+    // (`` `v.upstrem` is undefined ``), outside a macro (inside one,
+    // minijinja gives the line only). It also copies the variables in scope
+    // into the error's debug info, which `render_error` never shows.
     env.set_debug(true);
     env
 }
@@ -216,12 +245,20 @@ fn embedded_environment(template: &'static __Embedded) -> Environment<'static> {
     env
 }
 
+/// The environment a dynamic template renders in: [`environment`], with no
+/// loader and no path-join callback, ever. `first_load` refuses a load
+/// before rendering; this is the second wall, so that a load it missed
+/// would find no template rather than a file.
+fn dynamic_environment<'source>() -> Environment<'source> {
+    environment()
+}
+
 /// Render a dynamic template: `template!` with a `&str` known only at run
 /// time. `name` says where the call is.
 #[doc(hidden)]
 pub fn __render_dynamic(name: &str, source: &str, vars: __Vars) -> Result<String> {
     let context = vars.into_context(name)?;
-    let env = environment();
+    let env = dynamic_environment();
     let template = env
         .template_from_named_str(name, source)
         .map_err(|e| render_error(&e))?;
@@ -275,13 +312,10 @@ fn render_error(err: &minijinja::Error) -> Error {
         sites.push(location(cause));
         cause = inner;
     }
-    let mut message = match cause.detail() {
+    let message = match cause.detail() {
         Some(detail) => format!("{}: {detail}", cause.kind()),
         None => cause.kind().to_string(),
     };
-    if cause.kind() == ErrorKind::TemplateNotFound && cause.detail().is_none() {
-        message.push_str(" (an `include`, `extends` or `import` target)");
-    }
     let mut out = format!("{}: {message}", location(cause));
     if !sites.is_empty() {
         let shown: Vec<String> = sites
@@ -374,7 +408,7 @@ mod tests {
         std::fs::write(&path, "PLANTED-MARKER").unwrap();
         let name = path.to_string_lossy().into_owned();
 
-        let env = environment();
+        let env = dynamic_environment();
         let err = env.get_template(&name).expect_err("no loader, no template");
         assert_eq!(err.kind(), ErrorKind::TemplateNotFound);
         assert!(!err.to_string().contains("PLANTED-MARKER"));
@@ -469,7 +503,7 @@ mod tests {
         assert_eq!(
             err,
             "dynamic template: the `..` spread must serialize to a map (a struct, a `HashMap`, a \
-             `json!({..})` object), but it is number `5`"
+             `json!({..})` object), but it is a number"
         );
         let mut by_number = std::collections::BTreeMap::new();
         by_number.insert(1, "a");
@@ -477,7 +511,7 @@ mod tests {
             .unwrap_err()
             .chain();
         assert!(
-            err.contains("keys are variable names, so they must be strings, but one is number `1`"),
+            err.contains("keys are variable names, so they must be strings, but one is a number"),
             "{err}"
         );
     }
@@ -493,6 +527,37 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("secret is not utf-8"), "{err}");
+    }
+
+    #[test]
+    fn a_value_that_does_not_serialize_fails_at_any_depth() {
+        let bad = crate::Secret::new(vec![0xff, 0xfe]);
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("k", vec![&bad]);
+        for (vars, what) in [
+            (vars().named("v", &vec![&bad]), "argument `v`"),
+            (vars().named("m", &map), "argument `m`"),
+            (vars().spread(&map), "the `..` spread"),
+        ] {
+            let err = __render_dynamic("dynamic template", "{{ v }}", vars)
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.starts_with(&format!(
+                    "dynamic template: {what} cannot be given to a template: "
+                )),
+                "{err}"
+            );
+            assert!(err.contains("secret is not utf-8"), "{err}");
+        }
+    }
+
+    #[test]
+    fn lstrip_blocks_is_off_as_in_ansible() {
+        assert_eq!(
+            __render_dynamic("d", "  {% if true %}x{% endif %}", vars()).unwrap(),
+            "  x"
+        );
     }
 
     #[test]

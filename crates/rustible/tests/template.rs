@@ -158,6 +158,10 @@ fn a_missing_name_or_attribute_is_an_error_never_empty_text() {
         .unwrap(),
         "None|unset"
     );
+    assert_eq!(
+        template!("{{ x | default('off', true) }}", x = &None::<u8>).unwrap(),
+        "off"
+    );
     let missing = "{{ y | default('d') }}|{% if y is defined %}{{ y }}{% endif %}".to_string();
     assert_eq!(template!(&missing).unwrap(), "d|");
 }
@@ -338,10 +342,42 @@ fn import_and_from_import_bring_macros() {
 }
 
 #[test]
-fn set_in_an_included_file_does_not_leak_back_and_trim_blocks_applies_inside() {
+fn set_in_an_included_file_inside_a_loop_does_not_leak_back_and_trim_blocks_applies_inside() {
     assert_eq!(
         template!(include_str!("templates/lists/scope.j2")).unwrap(),
         "inner1[yes]after-if\n"
+    );
+}
+
+#[test]
+fn set_in_an_included_file_outside_a_loop_replaces_the_includer_s_variable() {
+    // minijinja, unlike Jinja2: documented on `template!`.
+    assert_eq!(
+        template!(include_str!("templates/lists/leak.j2")).unwrap(),
+        "[inc]"
+    );
+    assert_eq!(
+        template!(
+            "{% include \"templates/lists/setx.j2\" %}[{{ x }}]",
+            x = "passed"
+        )
+        .unwrap(),
+        "[inc]"
+    );
+}
+
+#[test]
+fn the_same_target_written_in_two_files_resolves_from_each() {
+    // `leaf.j2` is a different file beside each template that names it:
+    // blocks run from the child and from the parent, `super()`, a macro
+    // defined in another directory, and a `call` body.
+    assert_eq!(
+        template!(include_str!("templates/rel/child/child.j2")).unwrap(),
+        "[CHILD|BASE|BASE+CHILD]"
+    );
+    assert_eq!(
+        template!(include_str!("templates/rel/use/use.j2")).unwrap(),
+        "LIB/USE/<USE>"
     );
 }
 

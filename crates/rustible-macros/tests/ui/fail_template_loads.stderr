@@ -1,4 +1,4 @@
-error: inline template at $DIR/tests/ui/fail_template_loads.rs:3, line 1: the target of `{% include %}` must be a string literal, or a list of them: `template!` embeds the files a template reaches when the playbook compiles, so it must know their names then
+error: inline template at $DIR/tests/ui/fail_template_loads.rs:3, line 1: the target of `{% include %}` must be a string literal, a list of them, or `"a" if <test> else "b"`: `template!` embeds the files a template reaches when the playbook compiles, so it must know their names then
  --> tests/ui/fail_template_loads.rs:3:33
   |
 3 |     let _ = rustible::template!("{% include name %}", name = "x.j2");

@@ -533,7 +533,9 @@ fn integration_test_impl(
 /// - **`include_str!("files/Caddyfile.j2")`**, a file, with the path
 ///   relative to the file the call is in, as `include_str!` resolves it. The
 ///   macro recognises `include_str!` and reads the file itself, so the path
-///   must be a single string literal.
+///   must be a single string literal. (One difference: inside a
+///   `macro_rules!` defined in another file, the path resolves from the file
+///   that defines the macro, where `include_str!` would use the caller's.)
 /// - **Any other expression**: a `&str` (or anything `AsRef<str>`) known only
 ///   at run time, such as a var or a fetched file. This is a *dynamic*
 ///   template.
@@ -547,9 +549,10 @@ fn integration_test_impl(
 /// `name = <value>` passes one variable; the value is anything that
 /// implements `serde::Serialize`, borrowed, and the template sees what it
 /// serializes to: a struct is a map of its fields, in declaration order, a
-/// `Vec` or a slice is a list, an `Option` is the value or `none`. Any name
-/// can be passed, a Rust keyword too (`type = "x"`): no argument name is
-/// reserved.
+/// `Vec` or a slice is a list, an array a tuple (both iterate the same), an
+/// `Option` is the value or `none`. Any name can be passed, a Rust keyword
+/// too (`type = "x"`): no argument name is reserved. A value that fails to
+/// serialize, at any depth, fails the render naming the argument.
 ///
 /// `..<value>` spreads a map (a struct, a `HashMap`, a `json!` object) into
 /// the variables, for names known only at run time. A named argument wins
@@ -608,14 +611,18 @@ fn integration_test_impl(
 ///
 /// - the syntax of the template and of every file it includes, extends or
 ///   imports, at any depth;
-/// - that every name the top-level template uses is passed (unless there is
-///   a spread, which may hold it), and that every name passed is used by
-///   the top-level template or by a file it reaches. Names in an included,
+/// - that every name the top-level template reads is passed (unless there
+///   is a spread, which may hold it), a name in an `include`'s inline `if`
+///   included. A name the template assigns itself (`set`, `for`, `with`, a
+///   macro, an import) is not required, so `{% set port = port |
+///   default(80) %}` works with `port` passed or not. Names in an included,
 ///   extended or imported file are not checked against the arguments: they
 ///   can come from the scope at the include site (a `for` loop's variable,
 ///   a `set`, a macro's arguments), which only the render knows. A name a
 ///   parent template (`extends`) assigns is not required of the child
 ///   either, since minijinja runs a block in the scope it is called from;
+/// - that every name passed is read somewhere: by the top-level template or
+///   by a file it reaches;
 /// - that every `include`, `extends` and `import` target exists.
 ///
 /// **When it renders**, on the target, where the macro is called: everything
@@ -623,22 +630,28 @@ fn integration_test_impl(
 /// there (`{{ v.upstrem }}`), an attribute of `none`, a filter given the
 /// wrong type, an unknown filter, and all of a dynamic template. A render
 /// error returns from `template!` before the step that would write the text
-/// runs, so nothing is written; `--check` renders every template, so a dry
-/// run finds every template error without touching the machine. The error
-/// names the template (its file relative to the playbook crate, or `inline
-/// template at <file>:<line>`, or `dynamic template at <file>:<line>`) and
-/// the line, and for an error inside an included file, the include sites it
-/// was reached through.
+/// runs, so nothing is written. `--check` renders every template the dry
+/// run reaches, so it finds their errors without touching the machine; a
+/// template whose data is a would-change step's output is not reached,
+/// because reading that output ends its `ctx.block` under `--check`. The
+/// error names the template (its file relative to the playbook crate, or
+/// `inline template at <file>:<line>`, or `dynamic template at
+/// <file>:<line>`) and the line, the undefined expression (except inside a
+/// macro, where minijinja gives only the line), and for an error inside an
+/// included file, the include sites it was reached through.
 ///
 /// **Strict undefined**: a missing name or attribute is an error, never
-/// empty text. A template that wants an optional name says so: `{% if x is
-/// defined %}`, `{{ x | default("off") }}`. An `Option` that is `None` is
-/// not undefined but `none`: `{% if x %}` is false for it, and
-/// `{{ x if x is not none else "off" }}` replaces it.
+/// empty text. A literal or `include_str!` template must be passed every
+/// name it reads, so an optional value is an `Option`: `None` is `none`,
+/// `{% if x %}` is false for it, and `{{ x | default("off", true) }}`
+/// replaces it (`default("off")` alone keeps the `none`). `is defined` and
+/// `default(..)` are for names that may be absent: a spread's, an included
+/// file's, a dynamic template's.
 ///
 /// Values print as Jinja prints them, in Python's spelling: `true` as
-/// `True`, `None` as `None`, a list as `['a', 'b']`. A config file that
-/// wants `true` or JSON says `{{ x | lower }}` or `{{ x | tojson }}`.
+/// `True`, `None` as `None`, a list as `['a', 'b']`, an array as `('a',
+/// 'b')`. A config file that wants `true` or JSON says `{{ x | lower }}` or
+/// `{{ x | tojson }}`.
 ///
 /// # Whitespace and escaping
 ///
@@ -658,13 +671,17 @@ fn integration_test_impl(
 ///
 /// - the target must be a string literal, or for `include` a list of them
 ///   (`{% include ["a.j2", "b.j2"] %}`, the first that exists), or an inline
-///   `if` between literals. Anything else is a compile error;
+///   `if` between literals with an `else` (`"a.j2" if x else "b.j2"`).
+///   Anything else is a compile error;
 /// - a target resolves **relative to the file that contains the
 ///   statement**, at any depth; a literal's targets resolve relative to the
-///   playbook file. `..` works, and a symlinked template resolves its own
-///   targets from where the link points. No folder layout is imposed;
+///   playbook file. `..` works, an absolute path is read on the machine that
+///   compiles, and a symlinked template resolves its own targets from where
+///   the link points. No folder layout is imposed;
 /// - every file reached is embedded in the playbook binary, once, and cargo
-///   rebuilds the playbook when any of them changes;
+///   rebuilds the playbook when any of them changes. A file an `ignore
+///   missing` (or an include list) names but that does not exist is not
+///   watched: after creating it, touch the playbook so it rebuilds;
 /// - a target that does not exist is a compile error, unless the include
 ///   says `ignore missing`;
 /// - every target is embedded, including both branches of a conditional
@@ -672,17 +689,21 @@ fn integration_test_impl(
 /// - a template may include itself (a tree rendered by its data); an
 ///   infinite recursion fails the render at minijinja's recursion limit.
 ///
-/// What Jinja does with them, which minijinja follows:
+/// What they do, as minijinja implements Jinja:
 ///
 /// - In a child template that `extends`, only `{% block %}` contents are
 ///   output; text outside the blocks is dropped. `{{ super() }}` in a block
 ///   renders the parent's version of it.
 /// - An included file sees the variables in scope where it is included (a
-///   loop's variable, a `set`), and its own `{% set %}` does not leak back
-///   to the includer. Blocks defined in an included file override nothing.
-/// - An imported file's macros see the variables the importer was rendered
-///   with; minijinja accepts `with context` and `without context` and
-///   ignores both.
+///   loop's variable, a `set`). Blocks defined in an included file override
+///   nothing.
+/// - Unlike Jinja2, an included file's `{% set %}` replaces the includer's
+///   variable of the same name, a passed argument included, unless the
+///   include sits inside a `for` loop, whose scope keeps it. Give what an
+///   included file sets a name nothing else uses.
+/// - Unlike Jinja2, an imported file's macros see the variables the
+///   importer was rendered with: minijinja accepts `with context` and
+///   `without context` and ignores both.
 ///
 /// **A dynamic template reads no file.** Any `include`, `extends`, `import`
 /// or `from … import` in it fails the render with "includes are only
