@@ -658,7 +658,9 @@ fn integration_test_impl(
 /// "nmae")` leaves the order, `unique(attribute=..)`, `rejectattr`), a
 /// macro's keyword argument (`f(a=v.nope)` takes `a`'s default), a list
 /// printed whole (`{{ [v.nope] }}`, or `map(attribute=..)`'s result, prints
-/// `[undefined]`), and an undefined value deeper than a list's own items.
+/// `[undefined]`) or compared with the `in` and `==` operators (`"x" in
+/// xs | map(attribute="nmae")` is false; the tests `is in` and `is eq`
+/// refuse), and an undefined value deeper than a list's own items.
 /// A template that handles missing items says so, and renders:
 /// `select("defined")`, `reject("undefined")`, `map("default", ..)`.
 /// A literal or `include_str!` template must be passed every

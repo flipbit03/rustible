@@ -397,18 +397,30 @@ fn refuse_undefined(
     Ok(())
 }
 
-/// Whether a built-in's list arguments are looked into for undefined items:
-/// not by one that never puts an item into text (`length`, `count`, a test;
-/// `first` and `last` hand theirs on, and printing it fails), so that it
-/// stays constant time in a loop over large data; and not by one asked to
-/// handle the missing items (`select("defined")`, `reject("undefined")`, a
-/// bare `select` or `reject`, which test truth, and `map("default", ..)`).
+/// Whether a built-in's list arguments are looked into for undefined items.
+/// Not by one that only hands items on or counts them (`length`, `first`,
+/// `reverse`, `chain`, `default`'s fallback, …), so it stays constant time
+/// in a loop over large data and an item it hands on fails when printed;
+/// not by a test that asks what a value is (`sequence`, `string`, …); and
+/// not by `select("defined")`, `reject("undefined")` or `map("default", ..)`,
+/// which handle the missing items on purpose. A test that compares or looks
+/// for membership (`in`, `eq`, `lt`, …) and every other filter, `select` by
+/// truth included, does look: what it does with an undefined item is wrong.
 fn walks_items(kind: &str, name: &str, args: &[Value]) -> bool {
     let second = args.get(1).and_then(Value::as_str);
     match (kind, name) {
+        (
+            "test",
+            "in" | "eq" | "equalto" | "==" | "ne" | "!=" | "sameas" | "lt" | "lessthan" | "<"
+            | "le" | "<=" | "gt" | "greaterthan" | ">" | "ge" | ">=",
+        ) => true,
         ("test", _) => false,
-        ("filter", "length" | "count" | "first" | "last") => false,
-        ("filter", "select" | "reject") => !matches!(second, None | Some("defined" | "undefined")),
+        (
+            "filter",
+            "length" | "count" | "first" | "last" | "bool" | "reverse" | "chain" | "zip" | "batch"
+            | "slice" | "attr" | "default" | "d",
+        ) => false,
+        ("filter", "select" | "reject") => !matches!(second, Some("defined" | "undefined")),
         ("filter", "map") => !matches!(second, Some("default" | "d")),
         _ => true,
     }

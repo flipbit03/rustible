@@ -229,14 +229,28 @@ fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
     let users = rustible::json!([{ "email": "b@x" }, {}, {}]);
     let handled = "{{ users | map(attribute='email') | reject('undefined') | list }} \
                    {{ users | map(attribute='email') | select('defined') | list }} \
-                   {{ users | map(attribute='email') | select | list }} \
                    {{ users | map(attribute='email') | map('default', 'z') | join(',') }} \
+                   {{ users | map(attribute='email') | map('d', 'y') | join(',') }} \
                    {{ users | map(attribute='email') | length }}"
         .to_string();
     assert_eq!(
         template!(&handled, users = &users).unwrap(),
-        "['b@x'] ['b@x'] ['b@x'] b@x,z,z 3"
+        "['b@x'] ['b@x'] b@x,z,z b@x,y,y 3"
     );
+    // But a truth test or a comparison does not handle them: it gets them
+    // wrong, so it refuses them.
+    for text in [
+        "{{ users | map(attribute='emial') | select | join(',') }}",
+        "{% if 'b@x' is in(users | map(attribute='emial')) %}{% endif %}",
+        "{% if [users[0].emial] is eq(['b@x']) %}{% endif %}",
+    ] {
+        let dynamic = text.to_string();
+        let err = template!(&dynamic, users = &users).unwrap_err().chain();
+        assert!(
+            err.contains("a list holding an undefined item"),
+            "{text}: {err}"
+        );
+    }
 }
 
 #[test]
@@ -246,13 +260,16 @@ fn the_check_stays_linear_in_a_loop_over_large_data() {
         .collect();
     let started = std::time::Instant::now();
     let out = template!(
-        "{% for u in users %}{{ users | length }}{% if u == users | last %}!{% endif %}{% endfor %}",
+        "{% for u in users %}{{ users | length }}{{ users | count }}{{ users | bool }}\
+         {{ (users | first).a }}{{ (users | reverse | first).a }}{{ users is sequence }}\
+         {% if u == users | last %}!{% endif %}{% endfor %}",
         users = &users,
     )
     .unwrap();
-    assert!(out.ends_with("20000!"));
-    // `length` and `last` take no look at the items, so this is linear; a
-    // check that walked them on every call is quadratic, minutes here.
+    assert!(out.starts_with("2000020000True11True"), "{}", &out[..40]);
+    assert!(out.ends_with("2000020000True11True!"));
+    // These take no look at the items, so this is linear; a check that
+    // walked them on every call is quadratic, minutes here.
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "{:?}",
