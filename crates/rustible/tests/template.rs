@@ -203,7 +203,10 @@ fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
             "{{ v.items | map(attribute='b') | join(',') }}",
             "undefined value",
         ),
-        ("{{ [v.nope] | join(',') }}", "`v.nope` is undefined"),
+        (
+            "{{ [v.nope] | join(',') }}",
+            "filter `join` was given a list holding an undefined item",
+        ),
     ] {
         let dynamic = text.to_string();
         let err = template!(&dynamic, v = &v).unwrap_err().chain();
@@ -222,11 +225,23 @@ fn an_undefined_value_given_to_a_built_in_is_an_error_never_empty_text() {
         template!(&fine, v = &v).unwrap(),
         "d False True a,b 11 11 2"
     );
+    // A template that handles the missing items itself still renders.
+    let users = rustible::json!([{ "email": "b@x" }, {}, {}]);
+    let handled = "{{ users | map(attribute='email') | reject('undefined') | list }} \
+                   {{ users | map(attribute='email') | select('defined') | list }} \
+                   {{ users | map(attribute='email') | select | list }} \
+                   {{ users | map(attribute='email') | map('default', 'z') | join(',') }} \
+                   {{ users | map(attribute='email') | length }}"
+        .to_string();
+    assert_eq!(
+        template!(&handled, users = &users).unwrap(),
+        "['b@x'] ['b@x'] ['b@x'] b@x,z,z 3"
+    );
 }
 
 #[test]
 fn the_check_stays_linear_in_a_loop_over_large_data() {
-    let users: Vec<_> = (0..2000)
+    let users: Vec<_> = (0..20_000)
         .map(|i| rustible::json!({ "name": format!("u{i}"), "a": 1, "b": 2, "c": 3, "d": 4 }))
         .collect();
     let started = std::time::Instant::now();
@@ -235,9 +250,9 @@ fn the_check_stays_linear_in_a_loop_over_large_data() {
         users = &users,
     )
     .unwrap();
-    assert!(out.ends_with("2000!"));
-    // Quadratic in the number of users before the check stopped looking
-    // inside maps: seconds even in a release build.
+    assert!(out.ends_with("20000!"));
+    // `length` and `last` take no look at the items, so this is linear; a
+    // check that walked them on every call is quadratic, minutes here.
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "{:?}",

@@ -303,7 +303,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<Value, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined(&args, input_may_be_undefined)?;
+                refuse_undefined("filter", name, &args, input_may_be_undefined)?;
                 builtins().empty_state().apply_filter(name, &args)
             },
         );
@@ -315,7 +315,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<bool, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined(&args, false)?;
+                refuse_undefined("test", name, &args, false)?;
                 builtins().empty_state().perform_test(name, &args)
             },
         );
@@ -332,7 +332,7 @@ fn environment<'source>() -> Environment<'source> {
                   kwargs: Kwargs|
                   -> std::result::Result<Value, minijinja::Error> {
                 let args = with_kwargs(args, kwargs);
-                refuse_undefined(&args, false)?;
+                refuse_undefined("function", name, &args, false)?;
                 function.call(&mut builtins().empty_state(), &args)
             },
         );
@@ -359,16 +359,19 @@ fn builtins() -> &'static Environment<'static> {
 
 /// Fail when a built-in is given an undefined value: as the input (but
 /// `default`'s), as an argument or a keyword argument, or as an item of a
-/// list it is given (what `map(attribute=..)` makes of a missing attribute).
-/// minijinja's own strict mode lets one through here: a filter takes it as
-/// an argument left out. Only a list's own items are looked at, not deeper
-/// and not inside a map or an object (a `loop`, a `namespace`): the check
-/// runs on every call, inside loops too, so it stays linear in what it was
-/// given and never follows a value that contains itself.
+/// list it is given (what `map(attribute=..)` makes of a missing attribute),
+/// where [`walks_items`] says the items matter. minijinja's own strict mode
+/// lets one through here: a filter takes it as an argument left out. Only a
+/// list's own items are looked at, not deeper and not inside a map or an
+/// object (a `loop`, a `namespace`), so the check never follows a value
+/// that contains itself.
 fn refuse_undefined(
+    kind: &str,
+    name: &str,
     args: &[Value],
     input_may_be_undefined: bool,
 ) -> std::result::Result<(), minijinja::Error> {
+    let items = walks_items(kind, name, args);
     for (i, arg) in args.iter().enumerate() {
         if i == 0 && input_may_be_undefined {
             continue;
@@ -378,14 +381,37 @@ fn refuse_undefined(
                 undefined_fails(&arg.get_item(&key)?)?;
             }
         } else if arg.kind() == ValueKind::Seq {
-            for item in arg.try_iter()? {
-                undefined_fails(&item)?;
+            if items && arg.try_iter()?.any(|item| item.is_undefined()) {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::UndefinedError,
+                    format!(
+                        "{kind} `{name}` was given a list holding an undefined item (a \
+                         `map(attribute=..)` of an attribute some items lack?)"
+                    ),
+                ));
             }
         } else {
             undefined_fails(arg)?;
         }
     }
     Ok(())
+}
+
+/// Whether a built-in's list arguments are looked into for undefined items:
+/// not by one that never puts an item into text (`length`, `count`, a test;
+/// `first` and `last` hand theirs on, and printing it fails), so that it
+/// stays constant time in a loop over large data; and not by one asked to
+/// handle the missing items (`select("defined")`, `reject("undefined")`, a
+/// bare `select` or `reject`, which test truth, and `map("default", ..)`).
+fn walks_items(kind: &str, name: &str, args: &[Value]) -> bool {
+    let second = args.get(1).and_then(Value::as_str);
+    match (kind, name) {
+        ("test", _) => false,
+        ("filter", "length" | "count" | "first" | "last") => false,
+        ("filter", "select" | "reject") => !matches!(second, None | Some("defined" | "undefined")),
+        ("filter", "map") => !matches!(second, Some("default" | "d")),
+        _ => true,
+    }
 }
 
 /// The error strict mode raises for this undefined value, which names the
