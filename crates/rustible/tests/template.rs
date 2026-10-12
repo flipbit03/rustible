@@ -297,14 +297,19 @@ fn an_inline_literal_includes_relative_to_the_playbook_file() {
 
 #[test]
 fn an_error_in_an_included_file_names_that_file_its_line_and_the_include_sites() {
+    let line = line!() + 1;
     let err = template!(include_str!("templates/nest_err/one.j2"), who = "w")
         .unwrap_err()
         .chain();
+    // The call site last: one file may be rendered from several calls.
     assert_eq!(
         err,
-        "template `tests/templates/nest_err/two/three/three.j2` line 2: undefined value: \
-         `whom` is undefined (reached from template `tests/templates/nest_err/two/two.j2` \
-         line 2, from template `tests/templates/nest_err/one.j2` line 2)"
+        format!(
+            "template `tests/templates/nest_err/two/three/three.j2` line 2: undefined value: \
+             `whom` is undefined (reached from template `tests/templates/nest_err/two/two.j2` \
+             line 2, from template `tests/templates/nest_err/one.j2` line 2) (rendered at \
+             tests/template.rs:{line})"
+        )
     );
 }
 
@@ -411,10 +416,13 @@ fn an_error_inside_a_super_block_names_the_parent_s_file_and_line() {
     let err = template!(include_str!("templates/superr/child.j2"))
         .unwrap_err()
         .chain();
-    assert_eq!(
-        err,
-        "template `tests/templates/superr/base.j2` line 1: undefined value: `missing` is \
-         undefined (reached from template `tests/templates/superr/child.j2` line 1)"
+    assert!(
+        err.starts_with(
+            "template `tests/templates/superr/base.j2` line 1: undefined value: `missing` is \
+             undefined (reached from template `tests/templates/superr/child.j2` line 1) \
+             (rendered at tests/template.rs:"
+        ),
+        "{err}"
     );
 }
 
@@ -635,7 +643,18 @@ fn a_secret_rendered_through_a_template_or_an_include_is_masked_in_events() {
     // What lands on disk is the plaintext: masking is for what is reported.
     assert_eq!(fake.content("/etc/direct.conf").unwrap(), direct);
 
+    // Through `tojson`, whose escapes for HTML the masker would not know.
+    let html = Secret::new("pa'ss<wo>rd&xyz");
+    let json = template!("{\"password\": {{ p | tojson }}}\n", p = &html).unwrap();
+    assert_eq!(json, "{\"password\": \"pa'ss<wo>rd&xyz\"}\n");
+    ctx.step("json", file::Copy::from_str(&json).to("/etc/secret.json"))
+        .unwrap();
+
     let events = rustible::sdk::__private::serde_json::to_string(&sink.events()).unwrap();
     assert!(!events.contains("s3cr3t-t0ken-value"), "{events}");
+    assert!(
+        !events.contains("rd&xyz") && !events.contains("u0026xyz"),
+        "{events}"
+    );
     assert_eq!(events.matches("token=<secret>").count(), 2, "{events}");
 }

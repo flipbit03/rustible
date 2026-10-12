@@ -55,6 +55,10 @@ pub struct __Embedded {
     /// The top-level template's name: its file, relative to the playbook
     /// crate, or `inline template at <file>:<line>` for a literal.
     pub name: &'static str,
+    /// Where the call is, `<file>:<line>`, or empty when the compiler did
+    /// not say. A file template's errors add it, since one file may be
+    /// rendered from several calls with different data.
+    pub at: &'static str,
     /// Every template the top-level one can reach, itself included, as
     /// `(name, source)`. A file reached twice is here once.
     pub files: &'static [(&'static str, &'static str)],
@@ -191,7 +195,58 @@ fn environment<'source>() -> Environment<'source> {
     // minijinja gives the line only). It also copies the variables in scope
     // into the error's debug info, which `render_error` never shows.
     env.set_debug(true);
+    env.add_filter("tojson", tojson);
     env
+}
+
+/// minijinja's `tojson`, without its HTML escaping: it writes `<`, `>`,
+/// `&` and `'` as `\u003c`, `\u003e`, `\u0026` and `\u0027`, which a config
+/// file does not need and the run's masker does not know, so a secret
+/// holding one of them would go out unmasked. What is left is JSON as
+/// `serde_json` escapes it, the form the masker registers.
+fn tojson(
+    value: &Value,
+    indent: Option<Value>,
+    kwargs: minijinja::value::Kwargs,
+) -> std::result::Result<Value, minijinja::Error> {
+    let html_safe = minijinja::filters::tojson(value, indent, kwargs)?;
+    Ok(Value::from_safe_string(without_html_escapes(
+        html_safe.as_str().unwrap_or_default(),
+    )))
+}
+
+/// Undo the four `\u00XX` escapes `tojson` adds for HTML. Every backslash in
+/// JSON starts an escape, so stepping over each one whole is what keeps an
+/// escaped backslash followed by `u003c` (`\\u003c`) as it is.
+fn without_html_escapes(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    let mut rest = json;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let escape = &rest[at..];
+        let plain = match escape.get(..6) {
+            Some("\\u003c") => Some('<'),
+            Some("\\u003e") => Some('>'),
+            Some("\\u0026") => Some('&'),
+            Some("\\u0027") => Some('\''),
+            _ => None,
+        };
+        match plain {
+            Some(c) => {
+                out.push(c);
+                rest = &escape[6..];
+            }
+            None => {
+                // Any other escape is two characters, or six for `\uXXXX`,
+                // whose four hex digits hold no backslash: copy the two.
+                let len = escape.chars().take(2).map(char::len_utf8).sum();
+                out.push_str(&escape[..len]);
+                rest = &escape[len..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `trim_blocks` and `keep_trailing_newline`, minijinja's delimiters.
@@ -207,11 +262,19 @@ fn syntax() -> SyntaxConfig {
 /// `include_str!` source.
 #[doc(hidden)]
 pub fn __render_embedded(template: &'static __Embedded, vars: __Vars) -> Result<String> {
-    let context = vars.into_context(template.name)?;
-    let env = embedded_environment(template);
-    env.get_template(template.name)
-        .and_then(|t| t.render(context))
-        .map_err(|e| render_error(&e))
+    let rendered = vars.into_context(template.name).and_then(|context| {
+        embedded_environment(template)
+            .get_template(template.name)
+            .and_then(|t| t.render(context))
+            .map_err(|e| render_error(&e))
+    });
+    rendered.map_err(|e| {
+        if is_call_site(template.name) || template.at.is_empty() {
+            e
+        } else {
+            Error::msg(format!("{} (rendered at {})", e.chain(), template.at))
+        }
+    })
 }
 
 /// The environment for a compile-time template: [`environment`], with the
@@ -389,6 +452,30 @@ mod tests {
     }
 
     #[test]
+    fn without_html_escapes_undoes_only_tojson_s_html_escapes() {
+        assert_eq!(
+            without_html_escapes(r#""a\u003cb\u003e\u0026\u0027c""#),
+            r#""a<b>&'c""#
+        );
+        // An escaped backslash followed by the text `u003c` stays, as do
+        // the escapes JSON needs.
+        assert_eq!(
+            without_html_escapes(r#""\\u003c \" \n \u0001 ü""#),
+            r#""\\u003c \" \n \u0001 ü""#
+        );
+    }
+
+    #[test]
+    fn tojson_writes_json_as_serde_json_escapes_it() {
+        let out =
+            __render_dynamic("d", "{{ v | tojson }}", vars().named("v", "<a&'b\"\n>")).unwrap();
+        assert_eq!(out, serde_json::to_string("<a&'b\"\n>").unwrap());
+        let pretty =
+            __render_dynamic("d", "{{ v | tojson(indent=2) }}", vars().named("v", &[1])).unwrap();
+        assert_eq!(pretty, "[\n  1\n]");
+    }
+
+    #[test]
     fn first_load_ignores_raw_text_strings_and_names() {
         for text in [
             "{% raw %}{% include 'x' %}{% endraw %}",
@@ -438,6 +525,7 @@ mod tests {
 
     static UNRESOLVED: __Embedded = __Embedded {
         name: "top.j2",
+        at: "",
         files: &[
             ("top.j2", "[{% include 'x.j2' ignore missing %}]"),
             ("x.j2", "another file of the same bare name"),
@@ -452,6 +540,7 @@ mod tests {
 
     static RESOLVED: __Embedded = __Embedded {
         name: "top.j2",
+        at: "",
         files: &[
             ("top.j2", "[{% include 'x.j2' %}]\n"),
             ("dir/x.j2", "{{ who }}"),
@@ -473,6 +562,7 @@ mod tests {
 
     static FOREVER: __Embedded = __Embedded {
         name: "f.j2",
+        at: "",
         files: &[("f.j2", "x{% include 'f.j2' %}")],
         links: &[("f.j2", "f.j2", "f.j2")],
     };

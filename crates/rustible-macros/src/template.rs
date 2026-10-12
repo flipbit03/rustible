@@ -182,7 +182,8 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             let tree =
                 Tree::resolve(root, base.as_deref()).map_err(|m| Error::new_spanned(&lit, m))?;
             tree.check_names(spread.is_some(), &named, &source)?;
-            Ok(tree.expand(quote! { #lit }, vars))
+            let at = call_location(lit.span(), base.as_deref()).unwrap_or_default();
+            Ok(tree.expand(quote! { #lit }, vars, &at))
         }
         Source::File(path) => {
             let Some(here) = local_file(path.span()) else {
@@ -216,7 +217,8 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 Tree::resolve(root, base.as_deref()).map_err(|m| Error::new_spanned(&source, m))?;
             tree.check_names(spread.is_some(), &named, &source)?;
             let abs = canon.to_string_lossy().into_owned();
-            Ok(tree.expand(quote! { ::core::include_str!(#abs) }, vars))
+            let at = call_location(path.span(), base.as_deref()).unwrap_or_default();
+            Ok(tree.expand(quote! { ::core::include_str!(#abs) }, vars, &at))
         }
     }
 }
@@ -525,11 +527,12 @@ impl Tree {
             .collect();
 
         // Names left to the render rather than required of the call:
-        // - one the top-level template assigns anywhere (`set`, `for`,
-        //   `with`, a macro or an import): minijinja's analysis takes a name
-        //   assigned in one branch for undeclared in the next, and the
-        //   `{% set port = port | default(80) %}` idiom reads a name it also
-        //   assigns;
+        // - one the top-level template `set`s anywhere: minijinja's analysis
+        //   takes a name set in both branches of an `if` for undeclared after
+        //   it, and the `{% set port = port | default(80) %}` idiom reads a
+        //   name it also sets. Names a loop, a `with` or a macro binds are
+        //   scoped, and minijinja's analysis already tells their inside from
+        //   their outside, so they are not exempt;
         // - one a parent assigns (any file reached through `extends`,
         //   transitively): minijinja runs a child's block in the scope it is
         //   called from, so the block can use the parent's loop variable.
@@ -543,21 +546,31 @@ impl Tree {
                 }
             }
         }
-        let assigned: HashSet<&str> = reached
+        let inherited: HashSet<&str> = reached
             .iter()
+            .filter(|&&i| i != 0)
             .flat_map(|&i| self.files[i].walked.assigned.iter().map(String::as_str))
             .collect();
 
         if !has_spread {
-            // minijinja's analysis plus the condition of a load target
-            // (`{% include "a.j2" if flag else "b.j2" %}`), which it does not
-            // look at.
-            let missing: BTreeSet<&str> = root
+            // minijinja's analysis, less what the template sets; plus what
+            // that analysis does not see (a load target's condition, the
+            // value a slice is taken of), less anything the template binds,
+            // since only the walk saw it and the walk does not track scopes.
+            let from_analysis = root
                 .undeclared
                 .iter()
-                .chain(&root.walked.reads.unseen)
+                .filter(|n| !root.walked.set.contains(*n));
+            let from_walk = root
+                .walked
+                .reads
+                .unseen
+                .iter()
+                .filter(|n| !root.walked.assigned.contains(*n));
+            let missing: BTreeSet<&str> = from_analysis
+                .chain(from_walk)
                 .map(String::as_str)
-                .filter(|n| !passed.contains(n) && !globals.contains(*n) && !assigned.contains(n))
+                .filter(|n| !passed.contains(n) && !globals.contains(*n) && !inherited.contains(n))
                 .collect();
             if !missing.is_empty() {
                 let list: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
@@ -603,7 +616,7 @@ impl Tree {
 
     /// The expansion: every file embedded with `include_str!` (so cargo
     /// rebuilds when one changes), the links, and the render call.
-    fn expand(&self, root_source: TokenStream, vars: TokenStream) -> TokenStream {
+    fn expand(&self, root_source: TokenStream, vars: TokenStream, at: &str) -> TokenStream {
         let root_name = &self.files[0].name;
         let files = self.files.iter().enumerate().map(|(i, f)| {
             let name = &f.name;
@@ -629,6 +642,7 @@ impl Tree {
                 static __RUSTIBLE_TEMPLATE: ::rustible::sdk::template::__Embedded =
                     ::rustible::sdk::template::__Embedded {
                         name: #root_name,
+                        at: #at,
                         files: &[#(#files),*],
                         links: &[#(#links),*],
                     };
@@ -698,6 +712,8 @@ struct Walk {
     /// Names the template assigns: `set`, `for`, `with`, macro and import
     /// names.
     assigned: HashSet<String>,
+    /// The names a `set` (or a set block) assigns, a subset of `assigned`.
+    set: HashSet<String>,
     /// Every variable the template reads, anywhere.
     reads: Reads,
 }
@@ -744,11 +760,13 @@ fn walk(stmt: &Stmt, w: &mut Walk) -> WalkResult {
         }
         Stmt::Set(s) => {
             assign(&s.target, &mut w.assigned);
+            assign(&s.target, &mut w.set);
             vars(&s.expr, &mut w.reads);
             Ok(())
         }
         Stmt::SetBlock(s) => {
             assign(&s.target, &mut w.assigned);
+            assign(&s.target, &mut w.set);
             if let Some(f) = &s.filter {
                 vars(f, &mut w.reads);
             }
@@ -1334,6 +1352,93 @@ mod tests {
                 "{text} with {passed:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_name_bound_in_a_scope_does_not_hide_the_same_name_outside_it() {
+        for (text, name) in [
+            (
+                "{% macro row(user) %}<{{ user }}>{% endmacro %}{{ row(user) }}",
+                "user",
+            ),
+            (
+                "{% for host in hosts %}.{% endfor %} primary={{ host }}",
+                "host",
+            ),
+            (
+                "{% macro m() %}{{ caller(1) }}{% endmacro %}{% call(item) m() %}{{ item }}{% endcall %}{{ item }}",
+                "item",
+            ),
+            ("{% with x = 1 %}{{ x }}{% endwith %}{{ x }}", "x"),
+        ] {
+            let (_d, tree) = resolve(&[("t.j2", text)], "t.j2");
+            let tree = tree.unwrap();
+            let passed: Vec<&str> = if name == "host" {
+                vec!["hosts"]
+            } else {
+                vec![]
+            };
+            let err = check(&tree, false, &passed).unwrap_err();
+            assert!(err.contains(&format!("uses `{name}`")), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_name_read_in_any_position_is_used() {
+        // `x` is passed and read only in the one position each line shows,
+        // so a walk that missed the position would call it unused.
+        for text in [
+            "{{ x }}",
+            "{{ 1 if x is defined }}",
+            "{{ 'a' | default(x) }}",
+            "{{ 'a' | replace(old=x, new='b') }}",
+            "{{ {'k': x} }}",
+            "{{ {x: 1} }}",
+            "{{ [1][x] }}",
+            "{{ [1][x:] }}",
+            "{{ 1 < x }}",
+            "{{ -x }}",
+            "{{ x ~ 'a' }}",
+            "{{ x.attr }}",
+            "{{ range(x) }}",
+            "{{ dict(k=x) }}",
+            "{{ range(*x) }}",
+            "{{ dict(**x) }}",
+            "{{ (x, 1) }}",
+            "{% do range(x) %}",
+            "{% for i in [1] if x %}{% endfor %}",
+            "{% for i in x %}{% endfor %}",
+            "{% if x %}{% endif %}",
+            "{% with y = x %}{% endwith %}",
+            "{% set y = x %}",
+            "{% set y | replace('a', x) %}a{% endset %}",
+            "{% filter replace('a', x) %}a{% endfilter %}",
+            "{% autoescape x %}{% endautoescape %}",
+            "{% macro m(y=x) %}{% endmacro %}",
+            "{% macro m() %}{{ caller() }}{% endmacro %}{% call m(x) %}{% endcall %}",
+            "{% macro m() %}{% endmacro %}{% call(y=x) m() %}{% endcall %}",
+            "{% include 'a.j2' if x else 'a.j2' %}",
+        ] {
+            let (_d, tree) = resolve(&[("t.j2", text), ("a.j2", "")], "t.j2");
+            let tree = tree.unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(check(&tree, true, &["x"]), Ok(()), "{text}");
+        }
+    }
+
+    #[test]
+    fn names_a_load_condition_binds_in_scope_are_not_required() {
+        // `loop` and a loop variable, read only by an include's condition.
+        let (_d, tree) = resolve(
+            &[
+                (
+                    "t.j2",
+                    "{% for i in xs %}{% include 'a.j2' if loop.first and i else 'a.j2' %}{% endfor %}",
+                ),
+                ("a.j2", ""),
+            ],
+            "t.j2",
+        );
+        assert_eq!(check(&tree.unwrap(), false, &["xs"]), Ok(()));
     }
 
     #[test]

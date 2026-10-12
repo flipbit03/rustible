@@ -602,7 +602,9 @@ fn integration_test_impl(
 /// A `Secret` (`rustible::prelude::Secret`) passed in renders as its
 /// plaintext, and the run masks it in every event, diffs
 /// included, as it masks a secret anywhere. A filter that rewrites it
-/// (`upper`, `replace`) produces text the masker does not know.
+/// (`upper`, `replace`) produces text the masker does not know. `tojson`
+/// writes JSON as the masker knows it: Rustible's `tojson` leaves out the
+/// escapes minijinja's adds for HTML (`\u003c` for `<`, and `>`, `&`, `'`).
 ///
 /// # When a template is checked
 ///
@@ -613,9 +615,10 @@ fn integration_test_impl(
 ///   imports, at any depth;
 /// - that every name the top-level template reads is passed (unless there
 ///   is a spread, which may hold it), a name in an `include`'s inline `if`
-///   included. A name the template assigns itself (`set`, `for`, `with`, a
-///   macro, an import) is not required, so `{% set port = port |
-///   default(80) %}` works with `port` passed or not. Names in an included,
+///   included. A name the template `set`s itself is not required, so `{%
+///   set port = port | default(80) %}` works with `port` passed or not; a
+///   name a loop, a `with` or a macro binds counts only inside it. Names in
+///   an included,
 ///   extended or imported file are not checked against the arguments: they
 ///   can come from the scope at the include site (a `for` loop's variable,
 ///   a `set`, a macro's arguments), which only the render knows. A name a
@@ -639,7 +642,8 @@ fn integration_test_impl(
 /// <file>:<line>`) and the line, the undefined expression (except inside a
 /// macro, where minijinja gives only the line), and for an error inside an
 /// included file or a parent's block (`{{ super() }}`), the sites it was
-/// reached through.
+/// reached through. A file template's error ends with the call it was
+/// `rendered at`, since one file may be rendered from several calls.
 ///
 /// **Strict undefined**: a missing name or attribute is an error, never
 /// empty text. A literal or `include_str!` template must be passed every
