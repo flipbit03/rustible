@@ -13,15 +13,18 @@ target needs nothing installed: no Python, no agent, no runtime.
 use rustible::prelude::*;
 use rustible_std::{apt, file, systemd};
 
-const NGINX_CONF: &str = include_str!("../files/nginx.conf");
-
 #[rustible::playbook(hosts = "web", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     ctx.step("nginx installed", apt::Present::new(["nginx"]))?;
 
+    let conf = template!(
+        include_str!("../files/nginx.conf.j2"),
+        workers = ctx.facts().cpus,
+        server_names = &["example.com", "www.example.com"],
+    )?;
     let cfg = ctx.step(
         "nginx.conf is current",
-        file::Copy::from_str(NGINX_CONF)
+        file::Copy::from_str(&conf)
             .to("/etc/nginx/nginx.conf")
             .mode(0o644),
     )?;
@@ -40,7 +43,8 @@ fn main(ctx: &mut Ctx) -> Result<()> {
 
 Every operation returns a typed struct, and those values feed the steps after
 it: `cfg.changed` is a `bool`, so the reload is an `if`, not a handler. A
-misspelled field or a wrong type fails the build.
+misspelled field or a wrong type fails the build, and so does a template
+variable that `nginx.conf.j2` uses but the playbook does not pass.
 
 ## Why
 
@@ -49,7 +53,7 @@ readable runs — and changes what does not.
 
 | Ansible | Rustible |
 |---|---|
-| YAML tasks, Jinja templates | Rust functions, the compiler |
+| YAML tasks, Jinja templates | Rust functions, and Jinja2 templates whose names the compiler checks |
 | `when:` strings | `if` |
 | handlers and `notify` | `if step.changed { ... }` |
 | loops with `item` | just use `for` :-) |

@@ -1,11 +1,17 @@
 //! Proc macros for Rustible. Not used directly: the `rustible` facade
-//! re-exports them as `rustible::playbook`, `rustible::vars` and
-//! `rustible::integration_test`.
+//! re-exports them as `rustible::playbook`, `rustible::vars`,
+//! `rustible::template` and `rustible::integration_test`.
 //!
 //! Everything the expansions reference lives under `::rustible::sdk`, so a
 //! workspace only needs the `rustible` crate as a dependency.
 
 #![deny(missing_docs)]
+// `template!` reads template files at compile time, on the operator's
+// machine, as `include_str!` does. Vision 7.2's `sys` rule is about
+// operations running on a target; see clippy.toml.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+mod template;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -485,4 +491,250 @@ fn integration_test_impl(
             )
         }
     })
+}
+
+/// Renders a Jinja2 template to a `String`, on the target.
+///
+/// ```no_run
+/// # use rustible::prelude::*;
+/// # use rustible::std_ops::file;
+/// # fn f(ctx: &mut Ctx) -> Result<()> {
+/// let opts = rustible::template!(
+///     "JAVA_OPTS=-Xmx{{ heap }}{% for f in flags %} {{ f }}{% endfor %}",
+///     heap = "2G",
+///     flags = &["-XX:+UseG1GC"],
+/// )?;
+/// ctx.step(
+///     "java opts",
+///     file::Line::in_path("/etc/default/app").matching("^JAVA_OPTS=").set(&opts),
+/// )?;
+/// # Ok(())
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// A template is a value, not an operation: its `String` goes into any op
+/// (`file::Copy`, `file::Line`, `file::Block`, a command's stdin, an HTTP
+/// body), which does the diffing, the dry run, the mode and the owner as it
+/// does for any other text. Plain files are never templated:
+/// `file::Copy::from_str(include_str!("files/motd"))` copies `{{ }}` as it
+/// is. Only `template!` renders.
+///
+/// The language is Jinja2, as [minijinja](https://docs.rs/minijinja/3.0.0)
+/// implements it. Compute in Rust, render in the template: the playbook
+/// prepares the data, typed and testable, and the template lays it out. A
+/// template that grows logic is a sign the logic belongs in the playbook.
+///
+/// # The template
+///
+/// The first argument says where the text comes from:
+///
+/// - **A string literal**: `template!("Hello {{ name }}", name = "x")`.
+/// - **`include_str!("files/Caddyfile.j2")`**, a file, with the path
+///   relative to the file the call is in, as `include_str!` resolves it. The
+///   macro recognises `include_str!` and reads the file itself, so the path
+///   must be a single string literal.
+/// - **Any other expression**: a `&str` (or anything `AsRef<str>`) known only
+///   at run time, such as a var or a fetched file. This is a *dynamic*
+///   template.
+///
+/// A file that is rendered keeps its real name plus `.j2` (`Caddyfile.j2`,
+/// `script.sh.j2`), so a reader knows before opening it that `{{ }}` in it
+/// means something. That is a convention, not a rule: any name works.
+///
+/// # The variables
+///
+/// `name = <value>` passes one variable; the value is anything that
+/// implements `serde::Serialize`, borrowed, and the template sees what it
+/// serializes to: a struct is a map of its fields, in declaration order, a
+/// `Vec` or a slice is a list, an `Option` is the value or `none`. Any name
+/// can be passed, a Rust keyword too (`type = "x"`): no argument name is
+/// reserved.
+///
+/// `..<value>` spreads a map (a struct, a `HashMap`, a `json!` object) into
+/// the variables, for names known only at run time. A named argument wins
+/// over the spread's key of the same name, wherever it is written. There is
+/// at most one spread.
+///
+/// ```no_run
+/// # use rustible::prelude::*;
+/// # fn f() -> Result<()> {
+/// let settings = rustible::json!({ "listen": "0.0.0.0:80", "env": "dev" });
+/// let app = rustible::template!("{{ listen }} {{ env }}", ..&settings, env = "prod")?;
+/// assert_eq!(app, "0.0.0.0:80 prod");
+/// # Ok(())
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// Typed data derives `Serialize` through the re-export, which needs serde's
+/// `crate` attribute to find it (`#[rustible::vars]` does the same for
+/// `Deserialize`); a workspace that has `serde` as its own dependency can
+/// derive it directly instead. Ad hoc nested data needs no type:
+/// `rustible::json!` builds it.
+///
+/// ```no_run
+/// # use rustible::prelude::*;
+/// #[derive(rustible::serde::Serialize)]
+/// #[serde(crate = "rustible::serde")]
+/// struct Vhost {
+///     host: String,
+///     upstream: String,
+/// }
+///
+/// # fn f() -> Result<()> {
+/// let vhosts = vec![Vhost { host: "a.example.com".into(), upstream: "127.0.0.1:8080".into() }];
+/// let ops = [rustible::json!({ "name": "alice", "level": 4 })];
+/// let text = rustible::template!(
+///     "{% for v in vhosts %}{{ v.host }} -> {{ v.upstream }}\n{% endfor %}\
+///      {% for op in ops %}{{ op.name }} ({{ op.level }})\n{% endfor %}",
+///     vhosts = &vhosts,
+///     ops = &ops,
+/// )?;
+/// # Ok(())
+/// # }
+/// # fn main() {}
+/// ```
+///
+/// A [`Secret`](../rustible/sdk/secret/struct.Secret.html) passed in
+/// renders as its plaintext, and the run masks it in every event, diffs
+/// included, as it masks a secret anywhere. A filter that rewrites it
+/// (`upper`, `replace`) produces text the masker does not know.
+///
+/// # When a template is checked
+///
+/// **When the playbook compiles**, for a literal or an `include_str!`
+/// template:
+///
+/// - the syntax of the template and of every file it includes, extends or
+///   imports, at any depth;
+/// - that every name the top-level template uses is passed (unless there is
+///   a spread, which may hold it), and that every name passed is used by
+///   the top-level template or by a file it reaches. Names in an included,
+///   extended or imported file are not checked against the arguments: they
+///   can come from the scope at the include site (a `for` loop's variable,
+///   a `set`, a macro's arguments), which only the render knows. A name a
+///   parent template (`extends`) assigns is not required of the child
+///   either, since minijinja runs a block in the scope it is called from;
+/// - that every `include`, `extends` and `import` target exists.
+///
+/// **When it renders**, on the target, where the macro is called: everything
+/// else. A name used but missing in an included file, a field that is not
+/// there (`{{ v.upstrem }}`), an attribute of `none`, a filter given the
+/// wrong type, an unknown filter, and all of a dynamic template. A render
+/// error returns from `template!` before the step that would write the text
+/// runs, so nothing is written; `--check` renders every template, so a dry
+/// run finds every template error without touching the machine. The error
+/// names the template (its file relative to the playbook crate, or `inline
+/// template at <file>:<line>`, or `dynamic template at <file>:<line>`) and
+/// the line, and for an error inside an included file, the include sites it
+/// was reached through.
+///
+/// **Strict undefined**: a missing name or attribute is an error, never
+/// empty text. A template that wants an optional name says so: `{% if x is
+/// defined %}`, `{{ x | default("off") }}`. An `Option` that is `None` is
+/// not undefined but `none`: `{% if x %}` is false for it, and
+/// `{{ x if x is not none else "off" }}` replaces it.
+///
+/// Values print as Jinja prints them, in Python's spelling: `true` as
+/// `True`, `None` as `None`, a list as `['a', 'b']`. A config file that
+/// wants `true` or JSON says `{{ x | lower }}` or `{{ x | tojson }}`.
+///
+/// # Whitespace and escaping
+///
+/// `trim_blocks` is on, as in Ansible's `template` module: the newline after
+/// a `{% … %}` tag is removed, so a line holding only a tag leaves no blank
+/// line. A template keeps its trailing newlines, and so does an included
+/// file, so `{% include "vhost.j2" %}` on a line of its own renders exactly
+/// the file's lines; a fragment meant to sit mid-line is written without a
+/// final newline. `{%-` and `-%}` strip the whitespace before or after a
+/// tag. There is no autoescaping, whatever the file is called: these are
+/// config files.
+///
+/// # Includes, inheritance and imports
+///
+/// `{% include "x.j2" %}`, `{% extends "base.j2" %}`, `{% import "m.j2" as
+/// m %}` and `{% from "m.j2" import f %}` work in a compile-time template:
+///
+/// - the target must be a string literal, or for `include` a list of them
+///   (`{% include ["a.j2", "b.j2"] %}`, the first that exists), or an inline
+///   `if` between literals. Anything else is a compile error;
+/// - a target resolves **relative to the file that contains the
+///   statement**, at any depth; a literal's targets resolve relative to the
+///   playbook file. `..` works, and a symlinked template resolves its own
+///   targets from where the link points. No folder layout is imposed;
+/// - every file reached is embedded in the playbook binary, once, and cargo
+///   rebuilds the playbook when any of them changes;
+/// - a target that does not exist is a compile error, unless the include
+///   says `ignore missing`;
+/// - every target is embedded, including both branches of a conditional
+///   `extends` and a statement in a branch that never runs;
+/// - a template may include itself (a tree rendered by its data); an
+///   infinite recursion fails the render at minijinja's recursion limit.
+///
+/// What Jinja does with them, which minijinja follows:
+///
+/// - In a child template that `extends`, only `{% block %}` contents are
+///   output; text outside the blocks is dropped. `{{ super() }}` in a block
+///   renders the parent's version of it.
+/// - An included file sees the variables in scope where it is included (a
+///   loop's variable, a `set`), and its own `{% set %}` does not leak back
+///   to the includer. Blocks defined in an included file override nothing.
+/// - An imported file's macros see the variables the importer was rendered
+///   with; minijinja accepts `with context` and `without context` and
+///   ignores both.
+///
+/// **A dynamic template reads no file.** Any `include`, `extends`, `import`
+/// or `from … import` in it fails the render with "includes are only
+/// available for templates known at compile time", before anything is read
+/// and wherever the statement is (an untaken branch, `ignore missing`): a
+/// template whose text comes from data could otherwise read the target's
+/// files, as root, into the step. Read what it needs in Rust
+/// (`ctx.sys().read_to_string(..)`) and pass it in as a variable.
+///
+/// # Filters, tests and functions
+///
+/// Every built-in minijinja ships, and nothing else. Ansible's own filters
+/// (`to_nice_json`, `regex_replace`, `b64encode`, …) are not provided; a
+/// template that uses one fails with "unknown filter", and the logic usually
+/// belongs in the playbook anyway.
+///
+/// - **Filters**: `abs`, `attr`, `batch`, `bool`, `capitalize`, `chain`,
+///   `count`, `d`, `default`, `dictsort`, `e`, `escape`, `first`, `float`,
+///   `format`, `groupby`, `indent`, `int`, `items`, `join`, `last`,
+///   `length`, `lines`, `list`, `lower`, `map`, `max`, `min`, `pprint`,
+///   `reject`, `rejectattr`, `replace`, `reverse`, `round`, `safe`,
+///   `select`, `selectattr`, `slice`, `sort`, `split`, `string`, `sum`,
+///   `title`, `tojson`, `trim`, `unique`, `upper`, `urlencode`, `zip`.
+/// - **Tests**: `boolean`, `defined`, `divisibleby`, `endingwith`, `eq`
+///   (`equalto`, `==`), `escaped`, `even`, `false`, `filter`, `float`, `ge`
+///   (`>=`), `gt` (`greaterthan`, `>`), `in`, `int`, `integer`, `iterable`,
+///   `le` (`<=`), `lower`, `lt` (`lessthan`, `<`), `mapping`, `ne` (`!=`),
+///   `none`, `number`, `odd`, `safe`, `sameas`, `sequence`, `startingwith`,
+///   `string`, `test`, `true`, `undefined`, `upper`. The operator spellings
+///   are for `select` and `reject`: `xs | select(">", 2)`.
+/// - **Functions**: `range`, `dict`, `namespace`, `debug`.
+/// - **Tags**: `for` (with `loop`, `loop.previtem`, `loop.nextitem`, and
+///   `break` and `continue`), `if`, `set`, `with`, `filter`, `macro`,
+///   `call`, `do`, `autoescape`, `raw`, `block`, and the loads above.
+///
+/// minijinja's documentation describes each:
+/// <https://docs.rs/minijinja/3.0.0/minijinja/filters/index.html>,
+/// <https://docs.rs/minijinja/3.0.0/minijinja/tests/index.html>,
+/// <https://docs.rs/minijinja/3.0.0/minijinja/functions/index.html>, and
+/// the syntax at
+/// <https://docs.rs/minijinja/3.0.0/minijinja/syntax/index.html>.
+///
+/// # Reuse
+///
+/// A template is used where it is written, so the step shows the template,
+/// its variables and where the text goes. To reuse one, write a `fn` that
+/// returns `template!(..)`, and move it to `src/lib.rs` once a second
+/// playbook needs it.
+#[proc_macro]
+pub fn template(input: TokenStream) -> TokenStream {
+    match template::expand(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }

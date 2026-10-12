@@ -1,0 +1,25 @@
+error: `a` is passed to `template!` twice
+ --> tests/ui/fail_template_args.rs:3:51
+  |
+3 |     let _ = rustible::template!("{{ a }}", a = 1, a = 2);
+  |                                                   ^
+
+error: `template!` takes one `..` spread; merge the maps in Rust first
+ --> tests/ui/fail_template_args.rs:4:52
+  |
+4 |     let _ = rustible::template!("{{ a }}", ..&m, ..&m);
+  |                                                    ^^
+
+error: expected `name = <value>` or `..<spread>` after the template
+ --> tests/ui/fail_template_args.rs:5:45
+  |
+5 |     let _ = rustible::template!("{{ a }}", a: 1);
+  |                                             ^
+
+error: unexpected end of input, `template!` needs a template: a string literal, `include_str!("file.j2")`, or a `&str`
+ --> tests/ui/fail_template_args.rs:6:13
+  |
+6 |     let _ = rustible::template!();
+  |             ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `rustible::template` (in Nightly builds, run with -Z macro-backtrace for more info)

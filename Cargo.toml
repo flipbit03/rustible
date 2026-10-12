@@ -54,6 +54,15 @@ flate2 = "1"
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "xz"] }
 ruzstd = "0.9"
 zeroize = "1"
+# Templates (`rustible::template!`, `rustible_sdk::template`). Pinned to an
+# exact version: the macro walks minijinja's syntax tree through its
+# `unstable_machinery` API, which has no semver guarantee, and the parse at
+# compile time must agree with the render on the target. Re-validate the walk
+# (`rustible-macros/src/template.rs`) on every upgrade. The features are every
+# built-in filter, test and function minijinja ships (`json` is `tojson`,
+# `urlencode` is `urlencode`), the tags, and `debug`, which names the
+# undefined expression in an error. See `docs/plan/DECISIONS.md` [ISSUE-147].
+minijinja = { version = "=3.0.0", default-features = false, features = ["builtins", "debug", "macros", "multi_template", "adjacent_loop_items", "std_collections", "loop_controls", "json", "urlencode", "serde", "preserve_order", "unstable_machinery"] }
 base64 = "0.22"
 
 # Profile for binaries shipped to targets: small over fast-to-build.

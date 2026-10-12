@@ -1,0 +1,5 @@
+error: template `$DIR/tests/ui/templates/deep/b/c/three.j2` line 2: syntax error: unexpected end of block (reached from template `$DIR/tests/ui/templates/deep/b/two.j2` line 1, from template `$DIR/tests/ui/templates/deep/one.j2` line 1)
+ --> tests/ui/fail_template_syntax_deep.rs:2:33
+  |
+2 |     let _ = rustible::template!(include_str!("templates/deep/one.j2"));
+  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

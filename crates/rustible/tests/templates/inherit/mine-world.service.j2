@@ -1,0 +1,5 @@
+{% extends "base.service.j2" %}
+this text is outside every block and is dropped
+{% block service %}
+{{ super() }}ExecStart=/usr/bin/java -Xmx{{ heap }} -jar server.jar nogui
+{% endblock %}

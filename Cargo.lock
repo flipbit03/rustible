@@ -622,6 +622,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13345868cfa94eadafc067112ff29271380a820d5594d9ee6ba81a8d00ea5dc2"
+dependencies = [
+ "indexmap",
+ "percent-encoding",
+ "serde",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,6 +908,7 @@ dependencies = [
  "rustible-macros",
  "rustible-sdk",
  "rustible-std",
+ "tempfile",
 ]
 
 [[package]]
@@ -944,10 +956,12 @@ dependencies = [
 name = "rustible-macros"
 version = "0.0.0"
 dependencies = [
+ "minijinja",
  "proc-macro2",
  "quote",
  "rustible",
  "syn 2.0.119",
+ "tempfile",
  "trybuild",
 ]
 
@@ -957,6 +971,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "minijinja",
  "rustix",
  "schemars",
  "serde",

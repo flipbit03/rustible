@@ -1,0 +1,17 @@
+error: inline template at $DIR/tests/ui/fail_template_names.rs:3 uses `heap`, not passed to `template!`: add `heap = <value>`, or a `..` spread that holds it
+ --> tests/ui/fail_template_names.rs:3:33
+  |
+3 |     let _ = rustible::template!("-Xmx{{ heap }} {{ flags }}", flags = "");
+  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `unused` is passed to `template!` but not used by inline template at $DIR/tests/ui/fail_template_names.rs:5
+ --> tests/ui/fail_template_names.rs:5:51
+  |
+5 |     let _ = rustible::template!("{{ a }}", a = 1, unused = 2);
+  |                                                   ^^^^^^
+
+error: `unused` is passed to `template!` but not used by inline template at $DIR/tests/ui/fail_template_names.rs:8
+ --> tests/ui/fail_template_names.rs:8:50
+  |
+8 |     let _ = rustible::template!("{{ a }}", ..&m, unused = 2);
+  |                                                  ^^^^^^

@@ -159,9 +159,9 @@ document. `docs/plan/M8.md` is how this rule came to name zig.
 |---|---|
 | `rustible-cli` | the `rustible` binary: workspace, inventory, the run pipeline, rendering |
 | `rustible` | the facade a playbook imports (`use rustible::prelude::*`) |
-| `rustible-sdk` | `Op`, `Ctx`, `System`, `Backend`, facts, protocol, events, testing harness |
+| `rustible-sdk` | `Op`, `Ctx`, `System`, `Backend`, facts, protocol, events, template rendering, testing harness |
 | `rustible-std` | the standard operations |
-| `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]` |
+| `rustible-macros` | `#[playbook]`, `#[vars]`, `#[integration_test]`, `template!` |
 | `rustible-build` | playbook discovery for the generated `build.rs` |
 | `rustible-github` | the first collection, and the worked example of one |
 
