@@ -402,14 +402,18 @@ fn names_no_files(span: Span) -> bool {
 /// it holds a `template!(..)` with this call's tokens (`call`, as [`shape`]
 /// writes them), and may be when the literal stands in it outside any
 /// `template!(..)` (a call through an alias or a `macro_rules!`) or when it
-/// does not lex. More than one directory is a call the editor cannot place
-/// (the same call in two hosts' playbooks), left to [`same_failure`].
+/// does not lex. A file that only may be one never decides alone: with no
+/// file holding the call, which is also how a call the editor has not saved
+/// yet looks, there is no directory. More than one is a call the editor
+/// cannot place (the same call in two hosts' playbooks), left to
+/// [`same_failure`].
 fn caller_dirs(lit: &LitStr, call: &str, base: Option<&Path>) -> Vec<PathBuf> {
     let Some(base) = base else {
         return Vec::new();
     };
     let written = lit.token().to_string();
     let mut found = BTreeSet::new();
+    let mut holds_the_call = false;
     let mut pending = vec![base.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -427,13 +431,19 @@ fn caller_dirs(lit: &LitStr, call: &str, base: Option<&Path>) -> Vec<PathBuf> {
                 if !skipped {
                     pending.push(path);
                 }
-            } else if meta.is_file()
-                && name.ends_with(".rs")
-                && scanned(&path, &meta).may_hold(call, &written)
-            {
-                found.insert(dir.clone());
+            } else if meta.is_file() && name.ends_with(".rs") {
+                let scan = scanned(&path, &meta);
+                if scan.calls.contains(call) {
+                    holds_the_call = true;
+                    found.insert(dir.clone());
+                } else if scan.may_hold(call, &written) {
+                    found.insert(dir.clone());
+                }
             }
         }
+    }
+    if !holds_the_call {
+        return Vec::new();
     }
     found.into_iter().collect()
 }
@@ -441,8 +451,8 @@ fn caller_dirs(lit: &LitStr, call: &str, base: Option<&Path>) -> Vec<PathBuf> {
 /// What [`caller_dirs`] needs of one `.rs` file.
 #[derive(Default)]
 struct Scan {
-    /// The file's size and modification time when it was read.
-    stamp: Option<(u64, std::time::SystemTime)>,
+    /// The file as it was when read, by [`stamp`].
+    stamp: Option<Stamp>,
     /// The tokens of every `template!(..)` call in it, as [`shape`] writes them.
     calls: HashSet<String>,
     /// Every string literal, as written, outside those calls.
@@ -459,13 +469,30 @@ impl Scan {
     }
 }
 
-/// A file's [`Scan`], read again only when its size or modification time
-/// changes: an editor expands every call on every change, and the macro's
-/// process lives on between expansions.
+/// What tells a file's versions apart: its size and modification time, and
+/// on Unix its inode and change time, which a copy that keeps the
+/// modification time (`cp -p`, `rsync -a`) does not keep.
+type Stamp = (u64, std::time::SystemTime, u64, i64, i64);
+
+fn stamp(meta: &std::fs::Metadata) -> Option<Stamp> {
+    let modified = meta.modified().ok()?;
+    #[cfg(unix)]
+    let (inode, changed, changed_ns) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (inode, changed, changed_ns) = (0, 0, 0);
+    Some((meta.len(), modified, inode, changed, changed_ns))
+}
+
+/// A file's [`Scan`], read again only when its [`stamp`] changes: an editor
+/// expands every call on every change, and the macro's process lives on
+/// between expansions.
 fn scanned(path: &Path, meta: &std::fs::Metadata) -> std::sync::Arc<Scan> {
     use std::sync::{Arc, Mutex, OnceLock};
     static SCANS: OnceLock<Mutex<HashMap<PathBuf, Arc<Scan>>>> = OnceLock::new();
-    let stamp = meta.modified().ok().map(|m| (meta.len(), m));
+    let stamp = stamp(meta);
     let scans = SCANS.get_or_init(Default::default);
     if let Some(scan) = scans.lock().ok().and_then(|s| s.get(path).cloned())
         && stamp.is_some()
@@ -490,9 +517,14 @@ fn scanned(path: &Path, meta: &std::fs::Metadata) -> std::sync::Arc<Scan> {
     scan
 }
 
-/// Every `template!(..)` call in `tokens`, at any depth, into `scan.calls`,
-/// and every string literal outside them into `scan.loose`.
+/// Every `template!(..)` call in `tokens`, at any depth (one inside
+/// another's arguments too), into `scan.calls`, and every string literal
+/// outside them into `scan.loose`.
 fn collect(tokens: TokenStream, scan: &mut Scan) {
+    collect_in(tokens, scan, false);
+}
+
+fn collect_in(tokens: TokenStream, scan: &mut Scan, in_call: bool) {
     let tokens: Vec<TokenTree> = tokens.into_iter().collect();
     for (i, tree) in tokens.iter().enumerate() {
         match tree {
@@ -502,11 +534,10 @@ fn collect(tokens: TokenStream, scan: &mut Scan) {
                     && matches!(&tokens[i - 1], TokenTree::Punct(p) if p.as_char() == '!');
                 if invoked {
                     scan.calls.insert(shape(g.stream()));
-                } else {
-                    collect(g.stream(), scan);
                 }
+                collect_in(g.stream(), scan, in_call || invoked);
             }
-            TokenTree::Literal(l) => {
+            TokenTree::Literal(l) if !in_call => {
                 scan.loose.insert(l.to_string());
             }
             _ => {}
@@ -1699,6 +1730,49 @@ mod tests {
             r#"fn main() { tpl!(include_str!("files/a.j2"), port = 80, ..&m); }"#
         ));
         assert!(!holds(r#"fn main() { tpl!(include_str!("files/b.j2")); }"#));
+    }
+
+    #[test]
+    fn a_directory_only_where_some_file_holds_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for (file, text) in [
+            (
+                "a/x.rs",
+                r#"fn f() { template!(include_str!("files/x.j2"), port = 80); }"#,
+            ),
+            (
+                "b/y.rs",
+                r#"fn g() { let _ = include_str!("files/x.j2"); }"#,
+            ),
+            (
+                "c/z.rs",
+                r#"fn h() { template!("{{ a }}", a = template!(include_str!("files/n.j2"))); }"#,
+            ),
+        ] {
+            let path = base.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let lit: LitStr = syn::parse_str(r#""files/x.j2""#).unwrap();
+        let dirs = |call: &str| caller_dirs(&lit, &shape(call.parse().unwrap()), Some(&base));
+        // Held in `a`; `b` has the literal outside any call, so it may be too.
+        assert_eq!(
+            dirs(r#"include_str!("files/x.j2"), port = 80"#),
+            [base.join("a"), base.join("b")]
+        );
+        // Held nowhere, as a call not saved yet: `b` alone does not decide.
+        assert!(dirs(r#"include_str!("files/x.j2"), port = 81"#).is_empty());
+        // A call inside another call's arguments is found.
+        let nested: LitStr = syn::parse_str(r#""files/n.j2""#).unwrap();
+        assert_eq!(
+            caller_dirs(
+                &nested,
+                &shape(r#"include_str!("files/n.j2")"#.parse().unwrap()),
+                Some(&base)
+            ),
+            [base.join("c")]
+        );
     }
 
     // ---- names ----
