@@ -1,4 +1,4 @@
-error: `listen` is passed to `template!` but not used by inline template at $DIR/tests/ui/fail_template_files.rs:4 (the template is the text "templates/app.conf.j2", which has no `{{ }}`, `{% %}` or `{# #}` in it: to render a file, write `template!(include_str!("templates/app.conf.j2"), ..)`)
+error: `listen` is passed to `template!` but not used by inline template at $DIR/tests/ui/fail_template_files.rs:4 (the template is the text "templates/app.conf.j2", which has no `{{ }}`, `{% %}` or `{# #}` in it; if you meant a file, write `template!(include_str!("templates/app.conf.j2"), ..)`)
  --> tests/ui/fail_template_files.rs:4:58
   |
 4 |     let _ = rustible::template!("templates/app.conf.j2", listen = 1);

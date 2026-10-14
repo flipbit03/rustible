@@ -23,7 +23,8 @@ minijinja.workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# Template trees laid out on disk for `template`'s unit tests.
+# Template trees laid out on disk for `template`'s unit tests, and the
+# scratch workspace of `tests/rust_analyzer.rs`.
 tempfile.workspace = true
 # `testing` for the `#[integration_test]` cases, which the facade re-exports
 # only with it.

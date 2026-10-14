@@ -398,7 +398,10 @@ OS process. The CLI's tests in `crates/rustible-cli/tests/` spawn the built
 `rustible` binary and `rustible-macros`' trybuild UI tests run the compiler,
 and both are T1 because they need nothing beyond `cargo`. The T2 tests in
 `crates/rustible-std/tests/` are compiled by the same `cargo test` and skip
-themselves, without `RUSTIBLE_INTEGRATION=1`. What T1 cannot see:
+themselves, without `RUSTIBLE_INTEGRATION=1`. One T1 test needs a rustup
+component besides the compiler: `rustible-macros`' rust-analyzer test, which
+skips itself without `RUSTIBLE_RUST_ANALYZER=1` and runs in its own CI job
+(`make rust-analyzer`). What T1 cannot see:
 
 - **What a tool really does.** The `Fake` models what we believe `useradd`,
   `apt-get`, `systemctl` or `chown` does; that `chown` clears setuid showed

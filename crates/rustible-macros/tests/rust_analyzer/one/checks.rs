@@ -21,7 +21,7 @@ fn main(_ctx: &mut Ctx) -> Result<()> {
     )?;
 
     // A file's path written as the template: the literal is the text.
-    let _ = template!("files/app.conf.j2", port = 80)?; //~ to render a file, write `template!(include_str!("files/app.conf.j2"), ..)`
+    let _ = template!("files/app.conf.j2", port = 80)?; //~ if you meant a file, write `template!(include_str!("files/app.conf.j2"), ..)`
 
     // A failed call is one error: the code after it still type-checks.
     let text: String = template!(include_str!("files/missing.j2"))?; //~ template file not found

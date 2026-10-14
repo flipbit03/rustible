@@ -651,11 +651,12 @@ fn integration_test_impl(
 /// does not tell it which file the call is in (nor its line). The macro then
 /// looks for the same `template!(..)` call, token for token, in the crate's
 /// `.rs` files, and where exactly one directory has it, runs the
-/// compile-time checks above from there. Where several do (an identical
-/// call in two hosts' playbooks), it shows an error only if the call fails
-/// the same way from each; the build checks every one.
-/// The editor does not know the macro read the template file, so a change to
-/// only that file shows there once the `.rs` is edited again.
+/// compile-time checks above from there. Where it may be in several (an
+/// identical call in two hosts' playbooks, or the path written outside
+/// `template!` too, as through an alias), it shows an error only if the call
+/// fails the same way from each; the build checks every one. The editor
+/// does not know the macro read the template file, so after a change to
+/// only that file it shows the old result until the `.rs` is edited again.
 ///
 /// **Strict undefined**, minijinja's: a missing name or attribute that is
 /// printed, iterated, compared or tested for truth is an error, never empty

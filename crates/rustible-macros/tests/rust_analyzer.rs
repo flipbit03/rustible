@@ -7,8 +7,9 @@
 //! reaches. This copies `examples/workspace`, adds the playbooks of
 //! `tests/rust_analyzer/` as `playbooks/ra/`, and runs `cargo check` and
 //! `rust-analyzer diagnostics` on it. Every error marked `//~` must come from
-//! both, one marked `//~ build:` from the build alone, and no other error from
-//! either, in those playbooks or the example's own.
+//! both, one marked `//~ build:` from the build (rust-analyzer may report it
+//! only if it can place the call), and no other error from either, in those
+//! playbooks or the example's own.
 //!
 //! It needs rust-analyzer (`rustup component add rust-analyzer`, or a binary
 //! named by `RUST_ANALYZER`) and runs only with `RUSTIBLE_RUST_ANALYZER=1`,
@@ -32,7 +33,8 @@ struct Reported {
 }
 
 /// A `//~` mark: the line it is on, whether rust-analyzer must report the
-/// error too, and a part of the message.
+/// error too (it may report a `build:` one, but only that one), and a part
+/// of the message.
 #[derive(Debug)]
 struct Mark {
     file: String,
@@ -66,6 +68,8 @@ fn template_errors_in_rust_analyzer_match_the_build() {
 
     let mut failures = Vec::new();
     compare("cargo check", &build, &marks, |_| true, &mut failures);
+    // rust-analyzer may report a `build:` mark's error, should it come to
+    // name the call's file, but no other.
     compare(
         "rust-analyzer",
         &editor,
@@ -82,18 +86,17 @@ fn template_errors_in_rust_analyzer_match_the_build() {
     );
 }
 
-/// Every mark `applies` to has an error on its line containing its part,
-/// and every error is one of those: a second error on a marked line (a
+/// Every mark `required` holds has an error on its line containing its
+/// part, and every error is a mark's: a second error on a marked line (a
 /// failed expansion's own) counts as unexpected.
 fn compare(
     tool: &str,
     reported: &[Reported],
     marks: &[Mark],
-    applies: impl Fn(&Mark) -> bool,
+    required: impl Fn(&Mark) -> bool,
     failures: &mut Vec<String>,
 ) {
-    let expected: Vec<&Mark> = marks.iter().filter(|m| applies(m)).collect();
-    for m in &expected {
+    for m in marks.iter().filter(|m| required(m)) {
         let found = reported
             .iter()
             .any(|r| r.file == m.file && r.line == m.line && r.message.contains(&m.part));
@@ -105,7 +108,7 @@ fn compare(
         }
     }
     for r in reported {
-        let marked = expected
+        let marked = marks
             .iter()
             .any(|m| m.file == r.file && m.line == r.line && r.message.contains(&m.part));
         if !marked {
@@ -247,10 +250,13 @@ fn cargo_check(ws: &Path, target: &Path) -> Vec<Reported> {
 /// with the output.
 fn rust_analyzer(ws: &Path, target: &Path) -> Vec<Reported> {
     let binary = std::env::var("RUST_ANALYZER").unwrap_or_else(|_| "rust-analyzer".into());
+    // Without its bidirectional protocol, which would name the files, as an
+    // editor runs it by default: that is the path under test.
     let out = Command::new(&binary)
         .arg("diagnostics")
         .arg(ws)
         .env("CARGO_TARGET_DIR", target)
+        .env_remove("RUST_ANALYZER_USE_POSTCARD")
         .output()
         .unwrap_or_else(|e| panic!("cannot run `{binary}`: {e}"));
     let text = format!(
