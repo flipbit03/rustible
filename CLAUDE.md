@@ -210,6 +210,7 @@ against:
 | `Test (T1): unit & fake (Linux)` | T1: everything a plain `cargo test` runs, chiefly pure functions and ops against the `Fake` |
 | `Build: MSRV 1.95` | the floor stays 1.95 |
 | `Build: example workspace` | `examples/workspace`, which the cargo workspace never compiles |
+| `Test (T1): rust-analyzer (example workspace)` | what rust-analyzer shows for `template!`, which it expands without naming the call's file: the errors the build reports, and no others |
 | `Test (T1): unit & fake (macOS)` | T1 on macOS: the `#[cfg(target_os = "macos")]` tests, and the launch scripts under bash 3.2 and the BSD tools |
 | `Test (T3): macOS runner (local connection)` | T3 on the runner itself, over a local connection: `hello` once (facts), `mac` twice (escalated), and `macbrew` installing twice and then removing twice (as the login user) |
 | `Test (T2): Docker (Debian/Ubuntu/Alpine)` | T2 |
@@ -242,6 +243,7 @@ Before pushing, run what CI runs:
 ```sh
 make                # fmt, clippy, test, rustdoc, example workspace
 make integration    # the container tier, T2; needs docker
+make rust-analyzer  # template! as rust-analyzer shows it; needs rust-analyzer
 ```
 
 which is these, in the order that fails soonest:
@@ -254,6 +256,7 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --lib --all-features
 cargo build --manifest-path examples/workspace/Cargo.toml
 RUSTIBLE_INTEGRATION=1 cargo test -p rustible-std --tests   # needs docker
+RUSTIBLE_RUST_ANALYZER=1 cargo test -p rustible-macros --test rust_analyzer   # needs rust-analyzer
 ```
 
 `make vm-test` is absent from that list only because it needs vagrant and a

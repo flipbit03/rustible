@@ -5,18 +5,18 @@ error: inline template at $DIR/tests/ui/fail_template_loads.rs:3, line 1: the ta
   |                                 ^^^^^^^^^^^^^^^^^^^^
 
 error: template `$DIR/tests/ui/templates/missing_include.j2` line 1: `{% include %}`: no such file: `$DIR/tests/ui/templates/nowhere.j2` (a target resolves relative to the file that names it; add `ignore missing` to an `include` that may be absent)
- --> tests/ui/fail_template_loads.rs:5:33
+ --> tests/ui/fail_template_loads.rs:5:46
   |
 5 |     let _ = rustible::template!(include_str!("templates/missing_include.j2"));
-  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error: template `$DIR/tests/ui/templates/self_extends.j2` line 1: `{% extends %}` makes a template its own ancestor: $DIR/tests/ui/templates/self_extends.j2 -> $DIR/tests/ui/templates/self_extends.j2
- --> tests/ui/fail_template_loads.rs:7:33
+ --> tests/ui/fail_template_loads.rs:7:46
   |
 7 |     let _ = rustible::template!(include_str!("templates/self_extends.j2"));
-  |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: `template!` cannot read `$DIR/tests/ui/templates/not_there.j2`: No such file or directory (os error 2)
+error: template file not found: `$DIR/tests/ui/templates/not_there.j2` (an `include_str!` path is relative to the directory of the file the call is in, `$DIR/tests/ui`)
  --> tests/ui/fail_template_loads.rs:9:46
   |
 9 |     let _ = rustible::template!(include_str!("templates/not_there.j2"));

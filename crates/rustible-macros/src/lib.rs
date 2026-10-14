@@ -529,7 +529,9 @@ fn integration_test_impl(
 ///
 /// The first argument says where the text comes from:
 ///
-/// - **A string literal**: `template!("Hello {{ name }}", name = "x")`.
+/// - **A string literal**: `template!("Hello {{ name }}", name = "x")`. The
+///   literal is the template's text, never a file name:
+///   `template!("files/app.conf.j2")` renders `files/app.conf.j2`.
 /// - **`include_str!("files/Caddyfile.j2")`**, a file, with the path
 ///   relative to the file the call is in, as `include_str!` resolves it. The
 ///   macro recognises `include_str!` and reads the file itself, so the path
@@ -644,6 +646,16 @@ fn integration_test_impl(
 /// included file or a parent's block (`{{ super() }}`), the sites it was
 /// reached through. A file template's error ends with the call it was
 /// `rendered at`, since one file may be rendered from several calls.
+///
+/// **In an editor**: rust-analyzer expands the macro as well, but by default
+/// does not tell it which file the call is in (nor its line). The macro then
+/// looks for the same `template!(..)` call, token for token, in the crate's
+/// `.rs` files, and where exactly one directory has it, runs the
+/// compile-time checks above from there. Where several do (an identical
+/// call in two hosts' playbooks), it shows an error only if the call fails
+/// the same way from each; the build checks every one.
+/// The editor does not know the macro read the template file, so a change to
+/// only that file shows there once the `.rs` is edited again.
 ///
 /// **Strict undefined**, minijinja's: a missing name or attribute that is
 /// printed, iterated, compared or tested for truth is an error, never empty
@@ -772,6 +784,20 @@ fn integration_test_impl(
 pub fn template(input: TokenStream) -> TokenStream {
     match template::expand(input.into()) {
         Ok(ts) => ts.into(),
-        Err(e) => e.to_compile_error().into(),
+        // The error, and an expression of the type the call has, so that
+        // the code around the call still type-checks: one error per mistake
+        // rather than a cascade, in the compiler and in an IDE alike.
+        Err(e) => {
+            let error = e.to_compile_error();
+            quote::quote! {{
+                #error
+                ::rustible::sdk::template::__render_dynamic(
+                    "",
+                    "",
+                    ::rustible::sdk::template::__Vars::new(),
+                )
+            }}
+            .into()
+        }
     }
 }
