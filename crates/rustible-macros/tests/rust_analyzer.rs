@@ -209,7 +209,8 @@ fn relative(ws: &Path, path: &Path) -> String {
 fn cargo_check(ws: &Path, target: &Path) -> Vec<Reported> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let out = Command::new(cargo)
-        .args(["check", "--message-format", "short"])
+        // Plain text whatever the caller's CARGO_TERM_COLOR (CI sets it).
+        .args(["check", "--message-format", "short", "--color", "never"])
         .current_dir(ws)
         .env("CARGO_TARGET_DIR", target)
         .output()
