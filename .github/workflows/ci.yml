@@ -113,6 +113,35 @@ jobs:
       # generated build script and the playbook registry.
       - run: cargo build --manifest-path examples/workspace/Cargo.toml
 
+  # T1 through rust-analyzer, which expands `template!` without telling it
+  # which file the call is in, a path no rustc test reaches. The test copies
+  # `examples/workspace`, adds playbooks whose errors are marked, and holds
+  # what `rust-analyzer diagnostics` reports to what `cargo check` does.
+  rust-analyzer:
+    name: "Test (T1): rust-analyzer (example workspace)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-rust-analyzer-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-rust-analyzer-cargo-
+
+      - run: cargo test -p rustible-macros --test rust_analyzer
+        env:
+          RUSTIBLE_RUST_ANALYZER: "1"
+
   # T1 on macOS: the same plain `cargo test` as the Linux job, on a mac, so
   # the `#[cfg(target_os = "macos")]` tests run, and the launch scripts'
   # real /bin/sh tests meet bash 3.2 and the BSD tools.

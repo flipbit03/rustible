@@ -6,6 +6,7 @@ for testing against real systems, and this file is how to turn them on.
 ```sh
 make            # fmt, clippy, test, rustdoc, and the example workspace
 make integration    # the container tier, T2: needs docker
+make rust-analyzer  # template! as rust-analyzer shows it: needs rust-analyzer
 make vm-up          # a virtual machine
 make vm-test        # the machine tier, T3: needs vagrant
 ```
@@ -23,7 +24,9 @@ reason (`CLAUDE.md`, "Choosing a tier").
   the CLI's tests of its built binary and the macros' trybuild UI tests:
   "in-process" means no environment, not one OS process. The T2 tests in
   `crates/rustible-std/tests/` skip themselves there, without
-  `RUSTIBLE_INTEGRATION=1`. It sees nothing real: the `Fake` models what we
+  `RUSTIBLE_INTEGRATION=1`, and so does `rustible-macros`' rust-analyzer
+  test without `RUSTIBLE_RUST_ANALYZER=1` (`make rust-analyzer`, which needs
+  the rust-analyzer component). It sees nothing real: the `Fake` models what we
   believe a tool does, and there are no real permissions, ownership,
   processes, users or distributions, and no kernel, init, `sudo` or SSH.
 - **T2, containers** (`make integration`). Real distributions, real package

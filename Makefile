@@ -7,7 +7,7 @@ CARGO ?= cargo
 VAGRANT ?= vagrant
 VAGRANT_DIR := dev/vagrant
 
-.PHONY: default check fmt clippy test doc example integration \
+.PHONY: default check fmt clippy test doc example integration rust-analyzer \
         vm-up vm-up-x86 vm-up-arm vm-test vm-halt vm-destroy vm-status \
         vm-ssh vm-orphans
 
@@ -46,6 +46,12 @@ example:
 # The container tier, T2. Needs docker.
 integration:
 	RUSTIBLE_INTEGRATION=1 $(CARGO) test -p rustible-std --tests
+
+# `template!` as rust-analyzer shows it, against what the build reports, in a
+# copy of the example workspace. Needs the rust-analyzer component (`rustup
+# component add rust-analyzer`), or RUST_ANALYZER=<path to one>.
+rust-analyzer:
+	RUSTIBLE_RUST_ANALYZER=1 $(CARGO) test -p rustible-macros --test rust_analyzer
 
 ## ------------------------------------------- the machine tier, T3: Linux VMs
 

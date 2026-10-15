@@ -1177,7 +1177,9 @@ let ops_txt = template!(
   (`{{ v.upstrem }}`), and all of a dynamic template. The error names the
   file and line; `?` returns it before the step that would write runs.
   `--check` renders every template it reaches (not one fed from a
-  would-change step's output: §9).
+  would-change step's output: §9). rust-analyzer shows the compile-time
+  errors too, but after an edit to only a template file it shows the old
+  result until the playbook's `.rs` changes or rust-analyzer restarts.
 - **Strict undefined**: a missing name or field that is printed, looped
   over, compared or tested for truth (`{% if %}`) is an error, never empty
   text. ⚠️ Handed to a filter or an `is` test first, it passes silently:

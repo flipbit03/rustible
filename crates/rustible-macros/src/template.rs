@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use minijinja::machinery::ast::{Expr, Stmt};
 use minijinja::syntax::SyntaxConfig;
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -110,6 +110,7 @@ fn classify(expr: &syn::Expr) -> syn::Result<Source> {
 
 /// The macro's entry point.
 pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
+    let call = shape(input.clone());
     let Input { source, args } = syn::parse2(input)?;
 
     let mut spread = None;
@@ -159,68 +160,415 @@ pub(crate) fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 Some(at) => format!("dynamic template at {at}"),
                 None => "dynamic template".to_string(),
             };
-            Ok(quote! {
-                ::rustible::sdk::template::__render_dynamic(
-                    #name,
-                    ::core::convert::AsRef::<str>::as_ref(&(#expr)),
-                    #vars,
-                )
-            })
+            Ok(unchecked(
+                &name,
+                quote! { ::core::convert::AsRef::<str>::as_ref(&(#expr)) },
+                vars,
+            ))
         }
         Source::Inline(lit) => {
             let name = match call_location(lit.span(), base.as_deref()) {
                 Some(at) => format!("inline template at {at}"),
                 None => "inline template".to_string(),
             };
-            let dir = local_file(lit.span()).and_then(|f| f.parent().map(Path::to_path_buf));
+            let from = |dir: Option<PathBuf>| -> syn::Result<TokenStream> {
+                let root = Root {
+                    name: name.clone(),
+                    source: lit.value(),
+                    dir,
+                    path: None,
+                };
+                let tree = Tree::resolve(root, base.as_deref())
+                    .map_err(|m| Error::new_spanned(&lit, m))?;
+                if let Some(why) = tree.unresolved() {
+                    return Err(Error::new_spanned(&lit, why));
+                }
+                tree.check_names(spread.is_some(), &named, &lit)?;
+                let at = call_location(lit.span(), base.as_deref()).unwrap_or_default();
+                Ok(tree.expand(quote! { #lit }, vars.clone(), &at))
+            };
+            let here = local_file(lit.span()).and_then(|f| f.parent().map(Path::to_path_buf));
+            if here.is_some() || !names_no_files(lit.span()) {
+                return from(here);
+            }
+            // Where no file is named, the template is checked as it is, and
+            // only one that loads another needs the call's directory.
             let root = Root {
-                name,
+                name: name.clone(),
                 source: lit.value(),
-                dir,
+                dir: None,
                 path: None,
             };
             let tree =
                 Tree::resolve(root, base.as_deref()).map_err(|m| Error::new_spanned(&lit, m))?;
-            tree.check_names(spread.is_some(), &named, &source)?;
-            let at = call_location(lit.span(), base.as_deref()).unwrap_or_default();
-            Ok(tree.expand(quote! { #lit }, vars, &at))
+            if tree.unresolved.is_none() {
+                return from(None);
+            }
+            let dirs = caller_dirs(&lit, &call, base.as_deref());
+            match dirs.as_slice() {
+                [dir] => from(Some(dir.clone())),
+                several => {
+                    match same_failure(several, base.as_deref(), |d| from(Some(d.to_path_buf()))) {
+                        Some(e) => Err(e),
+                        None => Ok(unchecked(&name, quote! { #lit }, vars)),
+                    }
+                }
+            }
         }
         Source::File(path) => {
-            let Some(here) = local_file(path.span()) else {
-                return Err(Error::new_spanned(
-                    &path,
-                    "`template!` cannot tell which file this call is in, so it cannot resolve \
-                     the `include_str!` path relative to it",
-                ));
+            let dirs = match local_file(path.span()) {
+                Some(here) => vec![here.parent().map(Path::to_path_buf).unwrap_or_default()],
+                None if names_no_files(path.span()) => caller_dirs(&path, &call, base.as_deref()),
+                None => {
+                    return Err(Error::new_spanned(
+                        &path,
+                        "`template!` cannot tell which file this call is in, so it cannot \
+                         resolve the `include_str!` path relative to it",
+                    ));
+                }
             };
-            let dir = here.parent().map(Path::to_path_buf).unwrap_or_default();
-            let wanted = dir.join(path.value());
-            let canon = wanted.canonicalize().map_err(|e| {
-                Error::new_spanned(
-                    &path,
-                    format!("`template!` cannot read `{}`: {e}", wanted.display()),
-                )
-            })?;
-            let text = std::fs::read_to_string(&canon).map_err(|e| {
-                Error::new_spanned(
-                    &path,
-                    format!("`template!` cannot read `{}`: {e}", canon.display()),
-                )
-            })?;
-            let root = Root {
-                name: display(&canon, base.as_deref()),
-                source: text,
-                dir: canon.parent().map(Path::to_path_buf),
-                path: Some(canon.clone()),
+            let from = |dir: &Path| -> syn::Result<TokenStream> {
+                let unreadable = |e: std::io::Error| {
+                    Error::new_spanned(&path, unreadable(&path.value(), dir, &e, base.as_deref()))
+                };
+                let canon = dir.join(path.value()).canonicalize().map_err(unreadable)?;
+                let text = std::fs::read_to_string(&canon).map_err(unreadable)?;
+                let root = Root {
+                    name: display(&canon, base.as_deref()),
+                    source: text,
+                    dir: canon.parent().map(Path::to_path_buf),
+                    path: Some(canon.clone()),
+                };
+                let tree = Tree::resolve(root, base.as_deref())
+                    .map_err(|m| Error::new_spanned(&path, m))?;
+                tree.check_names(spread.is_some(), &named, &path)?;
+                let abs = canon.to_string_lossy().into_owned();
+                let at = call_location(path.span(), base.as_deref()).unwrap_or_default();
+                Ok(tree.expand(quote! { ::core::include_str!(#abs) }, vars.clone(), &at))
             };
-            let tree =
-                Tree::resolve(root, base.as_deref()).map_err(|m| Error::new_spanned(&source, m))?;
-            tree.check_names(spread.is_some(), &named, &source)?;
-            let abs = canon.to_string_lossy().into_owned();
-            let at = call_location(path.span(), base.as_deref()).unwrap_or_default();
-            Ok(tree.expand(quote! { ::core::include_str!(#abs) }, vars, &at))
+            match dirs.as_slice() {
+                [dir] => from(dir),
+                several => match same_failure(several, base.as_deref(), from) {
+                    Some(e) => Err(e),
+                    // The compiler resolves this `include_str!` itself, relative
+                    // to the call, as it would one written outside `template!`.
+                    None => Ok(unchecked(
+                        &path.value(),
+                        quote! { ::core::include_str!(#path) },
+                        vars,
+                    )),
+                },
+            }
         }
     }
+}
+
+/// For a call written the same way in several directories, which a host
+/// that names no files cannot tell apart: the error `check` gives from every
+/// one of them, alike but for the directory. Wherever the call is, that is
+/// its error. `None` when one passes, when they differ, or for no directory.
+fn same_failure(
+    dirs: &[PathBuf],
+    base: Option<&Path>,
+    check: impl Fn(&Path) -> syn::Result<TokenStream>,
+) -> Option<Error> {
+    let shown: Vec<String> = dirs.iter().map(|d| display(d, base)).collect();
+    let mut failures = Vec::new();
+    for (dir, shown_dir) in dirs.iter().zip(&shown) {
+        let error = check(dir).err()?;
+        let alike: Vec<String> = error
+            .clone()
+            .into_iter()
+            .map(|e| match shown_dir.is_empty() {
+                true => e.to_string(),
+                false => e.to_string().replace(shown_dir.as_str(), "\0"),
+            })
+            .collect();
+        failures.push((error, alike));
+    }
+    let (first, alike) = failures.first()?;
+    if failures.iter().any(|(_, other)| other != alike) {
+        return None;
+    }
+    let note = format!(
+        " [the same call is in `{}`, which the editor cannot tell apart; it fails in \
+         each, and the paths shown are `{}`'s]",
+        shown.join("`, `"),
+        shown[0]
+    );
+    first
+        .clone()
+        .into_iter()
+        .map(|e| Error::new(e.span(), format!("{e}{note}")))
+        .reduce(|mut all, e| {
+            all.combine(e);
+            all
+        })
+}
+
+/// The error for an `include_str!` path that cannot be read: the file it
+/// names, crate-relative, where the path resolves from, and for a missing
+/// file the missing directory or the likeliest file meant.
+fn unreadable(written: &str, dir: &Path, e: &std::io::Error, base: Option<&Path>) -> String {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let wanted = dir.join(written);
+    if e.kind() != std::io::ErrorKind::NotFound {
+        return format!("`template!` cannot read `{}`: {e}", display(&wanted, base));
+    }
+    let shown_dir = match display(&dir, base) {
+        d if d.is_empty() => ".".to_string(),
+        d => d,
+    };
+    let mut why = format!(
+        "template file not found: `{}` (an `include_str!` path is relative to the \
+         directory of the file the call is in, `{shown_dir}`)",
+        display(&wanted, base)
+    );
+    match wanted.parent() {
+        Some(parent) if !parent.is_dir() => {
+            why.push_str(&format!(
+                "; there is no directory `{}`",
+                display(parent, base)
+            ));
+        }
+        _ => {
+            if let Some(close) = closest(written, &wanted) {
+                why.push_str(&format!("; did you mean `{close}`?"));
+            }
+        }
+    }
+    why
+}
+
+/// A file beside the missing `wanted` whose name is a few edits from its
+/// name, written as `written` with that name in place of the last part.
+fn closest(written: &str, wanted: &Path) -> Option<String> {
+    let name = wanted.file_name()?.to_str()?;
+    let (distance, best) = std::fs::read_dir(wanted.parent()?)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|n| (edit_distance(name, &n), n))
+        .min()?;
+    (distance <= (name.chars().count() / 3).max(2)).then(|| match written.rfind('/') {
+        Some(i) => format!("{}{best}", &written[..=i]),
+        None => best,
+    })
+}
+
+/// Levenshtein distance, by `char`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let next = (diagonal + usize::from(ca != cb))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
+}
+
+/// A template rendered on the target without the compile-time checks:
+/// [`Source::Dynamic`], and a compile-time template where the macro cannot
+/// read what it reaches. `source` is an expression of type `&str`.
+fn unchecked(name: &str, source: TokenStream, vars: TokenStream) -> TokenStream {
+    quote! { ::rustible::sdk::template::__render_dynamic(#name, #source, #vars) }
+}
+
+/// Whether the macro is expanding in a host that names no source file at
+/// all: `file()` of the span is empty, which rustc never answers, so a call
+/// rustc does not name a local file for keeps the error. An IDE
+/// expands macros only to analyse the code, never to build what runs, so
+/// there a compile-time template is checked from the files [`caller_dirs`]
+/// finds, or falls back to [`unchecked`], instead of failing:
+/// rust-analyzer's proc-macro server names no files unless it is opted into
+/// its bidirectional protocol, and every `template!` call would show an
+/// error that `cargo build` never gives. The build still checks it.
+fn names_no_files(span: Span) -> bool {
+    span.unwrap().file().is_empty()
+}
+
+/// For a host that names no files: the directories the call may be in.
+/// Every `.rs` file of the crate is searched, but for the build directory
+/// (`target`) and hidden directories at the crate's root, without following
+/// symlinks, as `rustible-build` finds playbooks. A file is the call's when
+/// it holds a `template!(..)` with this call's tokens (`call`, as [`shape`]
+/// writes them), and may be when the literal stands in it outside any
+/// `template!(..)` (a call through an alias or a `macro_rules!`) or when it
+/// does not lex. A file that only may be one never decides alone: with no
+/// file holding the call, which is also how a call the editor has not saved
+/// yet looks, there is no directory. More than one is a call the editor
+/// cannot place (the same call in two hosts' playbooks), left to
+/// [`same_failure`].
+fn caller_dirs(lit: &LitStr, call: &str, base: Option<&Path>) -> Vec<PathBuf> {
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let written = lit.token().to_string();
+    let mut found = BTreeSet::new();
+    let mut holds_the_call = false;
+    let mut pending = vec![base.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if meta.is_dir() {
+                let skipped = dir == base && (name == "target" || name.starts_with('.'));
+                if !skipped {
+                    pending.push(path);
+                }
+            } else if meta.is_file() && name.ends_with(".rs") {
+                let scan = scanned(&path, &meta);
+                if scan.calls.contains(call) {
+                    holds_the_call = true;
+                    found.insert(dir.clone());
+                } else if scan.may_hold(call, &written) {
+                    found.insert(dir.clone());
+                }
+            }
+        }
+    }
+    if !holds_the_call {
+        return Vec::new();
+    }
+    found.into_iter().collect()
+}
+
+/// What [`caller_dirs`] needs of one `.rs` file.
+#[derive(Default)]
+struct Scan {
+    /// The file as it was when read, by [`stamp`].
+    stamp: Option<Stamp>,
+    /// The tokens of every `template!(..)` call in it, as [`shape`] writes them.
+    calls: HashSet<String>,
+    /// Every string literal, as written, outside those calls.
+    loose: HashSet<String>,
+    /// The text of a file that does not lex.
+    unlexed: Option<String>,
+}
+
+impl Scan {
+    fn may_hold(&self, call: &str, written: &str) -> bool {
+        self.calls.contains(call)
+            || self.loose.contains(written)
+            || self.unlexed.as_ref().is_some_and(|t| t.contains(written))
+    }
+}
+
+/// What tells a file's versions apart: its size and modification time, and
+/// on Unix its inode and change time, which a copy that keeps the
+/// modification time (`cp -p`, `rsync -a`) does not keep.
+type Stamp = (u64, std::time::SystemTime, u64, i64, i64);
+
+fn stamp(meta: &std::fs::Metadata) -> Option<Stamp> {
+    let modified = meta.modified().ok()?;
+    #[cfg(unix)]
+    let (inode, changed, changed_ns) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (inode, changed, changed_ns) = (0, 0, 0);
+    Some((meta.len(), modified, inode, changed, changed_ns))
+}
+
+/// A file's [`Scan`], read again only when its [`stamp`] changes: an editor
+/// expands every call on every change, and the macro's process lives on
+/// between expansions.
+fn scanned(path: &Path, meta: &std::fs::Metadata) -> std::sync::Arc<Scan> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static SCANS: OnceLock<Mutex<HashMap<PathBuf, Arc<Scan>>>> = OnceLock::new();
+    let stamp = stamp(meta);
+    let scans = SCANS.get_or_init(Default::default);
+    if let Some(scan) = scans.lock().ok().and_then(|s| s.get(path).cloned())
+        && stamp.is_some()
+        && scan.stamp == stamp
+    {
+        return scan;
+    }
+    let mut scan = Scan {
+        stamp,
+        ..Scan::default()
+    };
+    if let Ok(text) = std::fs::read_to_string(path) {
+        match text.parse::<TokenStream>() {
+            Ok(tokens) => collect(tokens, &mut scan),
+            Err(_) => scan.unlexed = Some(text),
+        }
+    }
+    let scan = Arc::new(scan);
+    if let Ok(mut scans) = scans.lock() {
+        scans.insert(path.to_path_buf(), scan.clone());
+    }
+    scan
+}
+
+/// Every `template!(..)` call in `tokens`, at any depth (one inside
+/// another's arguments too), into `scan.calls`, and every string literal
+/// outside them into `scan.loose`.
+fn collect(tokens: TokenStream, scan: &mut Scan) {
+    collect_in(tokens, scan, false);
+}
+
+fn collect_in(tokens: TokenStream, scan: &mut Scan, in_call: bool) {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, tree) in tokens.iter().enumerate() {
+        match tree {
+            TokenTree::Group(g) => {
+                let invoked = i >= 2
+                    && matches!(&tokens[i - 2], TokenTree::Ident(id) if id == "template")
+                    && matches!(&tokens[i - 1], TokenTree::Punct(p) if p.as_char() == '!');
+                if invoked {
+                    scan.calls.insert(shape(g.stream()));
+                }
+                collect_in(g.stream(), scan, in_call || invoked);
+            }
+            TokenTree::Literal(l) if !in_call => {
+                scan.loose.insert(l.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Tokens as text, one space after each: the same for a call the compiler
+/// hands the macro and for that call lexed from its file, whatever the
+/// spacing, line breaks or comments in it.
+fn shape(tokens: TokenStream) -> String {
+    let mut out = String::new();
+    for tree in tokens {
+        match tree {
+            TokenTree::Group(g) => {
+                let (open, close) = match g.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::None => ("", ""),
+                };
+                out.push_str(open);
+                out.push(' ');
+                out.push_str(&shape(g.stream()));
+                out.push_str(close);
+            }
+            other => out.push_str(&other.to_string()),
+        }
+        out.push(' ');
+    }
+    out
 }
 
 /// The playbook crate's directory, canonical: template names are shown
@@ -274,6 +622,10 @@ struct Tree {
     /// `(from, to, line)` for every `extends` target, by index into
     /// `files`, with the line of the statement.
     extends: Vec<(usize, usize, usize)>,
+    /// The first load that could not be followed because the compiler did
+    /// not say which file its template is in: `(file, line, statement)`.
+    /// The loads of such a template are left unresolved.
+    unresolved: Option<(usize, usize, &'static str)>,
 }
 
 struct File {
@@ -320,6 +672,7 @@ impl Tree {
             }],
             links: Vec::new(),
             extends: Vec::new(),
+            unresolved: None,
         };
         let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
         if let Some(p) = &tree.files[0].path {
@@ -348,15 +701,9 @@ impl Tree {
 
             for load in loads {
                 let Some(dir) = tree.files[index].dir.clone() else {
-                    return Err(tree.at(
-                        index,
-                        load.line,
-                        &format!(
-                            "`{{% {} %}}` needs to know which file this template is in, to \
-                             resolve its target relative to it, and the compiler does not say",
-                            load.statement
-                        ),
-                    ));
+                    tree.unresolved
+                        .get_or_insert((index, load.line, load.statement));
+                    continue;
                 };
                 let mut found = 0;
                 let mut missing = Vec::new();
@@ -411,7 +758,7 @@ impl Tree {
                 if fails {
                     let names: Vec<String> = missing
                         .iter()
-                        .map(|p| format!("`{}`", p.display()))
+                        .map(|p| format!("`{}`", display(p, base)))
                         .collect();
                     return Err(tree.at(
                         index,
@@ -487,6 +834,19 @@ impl Tree {
         Ok(())
     }
 
+    /// Why the tree is incomplete, if a load could not be followed.
+    fn unresolved(&self) -> Option<String> {
+        let (index, line, statement) = self.unresolved?;
+        Some(self.at(
+            index,
+            line,
+            &format!(
+                "`{{% {statement} %}}` needs to know which file this template is in, to \
+                 resolve its target relative to it, and the compiler does not say"
+            ),
+        ))
+    }
+
     /// A message about line `line` of template `index`, with the chain of
     /// includes that reached it.
     fn at(&self, index: usize, line: usize, why: &str) -> String {
@@ -529,7 +889,7 @@ impl Tree {
         &self,
         has_spread: bool,
         named: &[(String, &Ident, &syn::Expr)],
-        source: &syn::Expr,
+        source: &LitStr,
     ) -> syn::Result<()> {
         let passed: HashSet<&str> = named.iter().map(|(n, _, _)| n.as_str()).collect();
         let globals: HashSet<String> = environment()
@@ -585,14 +945,15 @@ impl Tree {
                 .collect();
             if !missing.is_empty() {
                 let list: Vec<String> = missing.iter().map(|n| format!("`{n}`")).collect();
-                let first = missing.iter().next().expect("not empty");
+                let add: Vec<String> = missing.iter().map(|n| format!("{n} = <value>")).collect();
                 return Err(Error::new_spanned(
                     source,
                     format!(
-                        "{} uses {}, not passed to `template!`: add `{first} = <value>`, \
-                         or a `..` spread that holds {}",
+                        "{} uses {}, not passed to `template!`: add `{}`, or a `..` spread \
+                         that holds {}",
                         shown(&root.name),
                         list.join(", "),
+                        add.join(", "),
                         if missing.len() == 1 { "it" } else { "them" }
                     ),
                 ));
@@ -606,23 +967,45 @@ impl Tree {
             .iter()
             .flat_map(|f| f.walked.reads.all.iter().map(String::as_str))
             .collect();
-        for (name, ident, _) in named {
-            if !used.contains(name.as_str()) {
-                let scope = if self.files.len() > 1 {
-                    " or by any template it includes, extends or imports"
-                } else {
-                    ""
-                };
-                return Err(Error::new_spanned(
+        let root = &self.files[0];
+        let scope = if self.files.len() > 1 {
+            " or by any template it includes, extends or imports"
+        } else {
+            ""
+        };
+        // A one-line literal with no Jinja in it at all may be a file's
+        // path, written without `include_str!`.
+        let hint = if root.path.is_none()
+            && !root.source.contains('\n')
+            && !["{{", "{%", "{#"].iter().any(|d| root.source.contains(d))
+        {
+            format!(
+                " (the template is the text {:?}, which has no `{{{{ }}}}`, `{{% %}}` or \
+                 `{{# #}}` in it; if you meant a file, write `template!(include_str!({:?}), ..)`)",
+                root.source, root.source
+            )
+        } else {
+            String::new()
+        };
+        let mut unused = named
+            .iter()
+            .filter(|(name, _, _)| !used.contains(name.as_str()))
+            .map(|(name, ident, _)| {
+                Error::new_spanned(
                     ident,
                     format!(
-                        "`{name}` is passed to `template!` but not used by {}{scope}",
-                        shown(&self.files[0].name)
+                        "`{name}` is passed to `template!` but not used by {}{scope}{hint}",
+                        shown(&root.name)
                     ),
-                ));
+                )
+            });
+        match unused.next() {
+            Some(mut first) => {
+                unused.for_each(|e| first.combine(e));
+                Err(first)
             }
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The expansion: every file embedded with `include_str!` (so cargo
@@ -1060,7 +1443,8 @@ mod tests {
         let value: syn::Expr = syn::parse_str("1").unwrap();
         let named: Vec<(String, &Ident, &syn::Expr)> =
             idents.iter().map(|i| (i.to_string(), i, &value)).collect();
-        tree.check_names(spread, &named, &value)
+        let source: LitStr = syn::parse_str("\"t.j2\"").unwrap();
+        tree.check_names(spread, &named, &source)
             .map_err(|e| e.to_string())
     }
 
@@ -1293,10 +1677,101 @@ mod tests {
             },
             None,
         );
-        let err = tree.err().unwrap();
+        let err = tree.unwrap().unresolved().unwrap();
         assert!(
             err.starts_with("inline template, line 1: `{% include %}` needs to know"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_literal_with_no_file_still_has_its_syntax_checked() {
+        let tree = Tree::resolve(
+            Root {
+                name: "inline template".into(),
+                source: "{% include \"x.j2\" %}{{ a ".into(),
+                dir: None,
+                path: None,
+            },
+            None,
+        );
+        let err = tree.err().unwrap();
+        assert!(
+            err.starts_with("inline template, line 1: syntax error: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_call_is_found_in_its_file_token_for_token() {
+        let call = shape(r#"include_str!("files/a.j2"), port = 80, ..&m"#.parse().unwrap());
+        let file = r#"
+            fn main() {
+                let x = vec![rustible::template!(
+                    include_str!( "files/a.j2" ), // the unit
+                    port = 80,
+                    ..&m
+                )];
+            }
+        "#;
+        let written = r#""files/a.j2""#;
+        let holds = |text: &str| {
+            let mut scan = Scan::default();
+            collect(text.parse().unwrap(), &mut scan);
+            scan.may_hold(&call, written)
+        };
+        assert!(holds(file));
+        // The same literal in another call is that call's, not this one's.
+        assert!(!holds(
+            r#"fn main() { template!(include_str!("files/a.j2"), port = 81, ..&m); }"#
+        ));
+        // Outside any `template!` (an alias, a `macro_rules!`), it may be.
+        assert!(holds(
+            r#"fn main() { tpl!(include_str!("files/a.j2"), port = 80, ..&m); }"#
+        ));
+        assert!(!holds(r#"fn main() { tpl!(include_str!("files/b.j2")); }"#));
+    }
+
+    #[test]
+    fn a_directory_only_where_some_file_holds_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for (file, text) in [
+            (
+                "a/x.rs",
+                r#"fn f() { template!(include_str!("files/x.j2"), port = 80); }"#,
+            ),
+            (
+                "b/y.rs",
+                r#"fn g() { let _ = include_str!("files/x.j2"); }"#,
+            ),
+            (
+                "c/z.rs",
+                r#"fn h() { template!("{{ a }}", a = template!(include_str!("files/n.j2"))); }"#,
+            ),
+        ] {
+            let path = base.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let lit: LitStr = syn::parse_str(r#""files/x.j2""#).unwrap();
+        let dirs = |call: &str| caller_dirs(&lit, &shape(call.parse().unwrap()), Some(&base));
+        // Held in `a`; `b` has the literal outside any call, so it may be too.
+        assert_eq!(
+            dirs(r#"include_str!("files/x.j2"), port = 80"#),
+            [base.join("a"), base.join("b")]
+        );
+        // Held nowhere, as a call not saved yet: `b` alone does not decide.
+        assert!(dirs(r#"include_str!("files/x.j2"), port = 81"#).is_empty());
+        // A call inside another call's arguments is found.
+        let nested: LitStr = syn::parse_str(r#""files/n.j2""#).unwrap();
+        assert_eq!(
+            caller_dirs(
+                &nested,
+                &shape(r#"include_str!("files/n.j2")"#.parse().unwrap()),
+                Some(&base)
+            ),
+            [base.join("c")]
         );
     }
 
@@ -1316,8 +1791,8 @@ mod tests {
         assert_eq!(check(&tree, false, &["a", "b", "xs"]), Ok(()));
         assert_eq!(
             check(&tree, false, &["a"]).unwrap_err(),
-            "template `t.j2` uses `b`, `xs`, not passed to `template!`: add `b = <value>`, or a \
-             `..` spread that holds them"
+            "template `t.j2` uses `b`, `xs`, not passed to `template!`: add `b = <value>, xs = \
+             <value>`, or a `..` spread that holds them"
         );
         assert_eq!(check(&tree, true, &["a"]), Ok(()));
     }
