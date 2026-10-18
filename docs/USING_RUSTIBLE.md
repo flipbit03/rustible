@@ -1110,9 +1110,9 @@ still installed.
 mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
 `systemd::*` refuse (there `/etc/passwd` lists only system accounts and there
 is no `/proc`); `file::*`, `shell`, `http`, `archive` and `brew` run.
-`ssh::authorized_keys::Present::for_user_name(..)` refuses a mac because it
-reads `/etc/passwd`; `for_account(home, uid, gid)` runs. A platform Rustible
-does not know is refused by every op.
+`ssh::authorized_keys` runs in every form; on a mac, `for_user_name(..)` finds
+the account through Open Directory (`id -P`) rather than `/etc/passwd`. A
+platform Rustible does not know is refused by every op.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:

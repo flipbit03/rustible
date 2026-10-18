@@ -117,6 +117,54 @@ pub fn passwd_by_uid(text: &str, uid: u32) -> Option<PasswdEntry> {
     parse_passwd(text).into_iter().find(|e| e.uid == uid)
 }
 
+/// Pure: the account `id -P <name>` printed on macOS, which is `getpwnam(3)`
+/// as one line of BSD `master.passwd`:
+/// `name:password:uid:gid:class:change:expire:gecos:home:shell`. Home and
+/// shell are taken from the end, so a `:` in the full name cannot shift
+/// them.
+///
+/// `getpwnam` answers for an alias with the account's own name, so a
+/// different name comes back as that account. One case is not `getpwnam`:
+/// `id` given a number it finds no account by tries it as a uid, so a
+/// numeric name that comes back as another account is `None`.
+pub(crate) fn parse_id_p(out: &str, name: &str) -> Result<Option<PasswdEntry>> {
+    let line = out.trim_end_matches('\n');
+    let f: Vec<&str> = line.split(':').collect();
+    let n = f.len();
+    let entry = (n >= 10 && !f[0].is_empty())
+        .then(|| {
+            Some(PasswdEntry {
+                name: f[0].to_string(),
+                uid: f[2].parse().ok()?,
+                gid: f[3].parse().ok()?,
+                comment: f[7..n - 2].join(":"),
+                home: PathBuf::from(f[n - 2]),
+                shell: PathBuf::from(f[n - 1]),
+            })
+        })
+        .flatten();
+    let Some(entry) = entry else {
+        bail!("`id -P {name}` printed a line that is not a passwd entry: {line}");
+    };
+    if entry.name != name && name.parse::<u32>().is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(entry))
+}
+
+/// The account called `name` on macOS, where `/etc/passwd` lists only system
+/// services and the accounts live in Open Directory: `getpwnam(3)`, through
+/// `id -P`, so a directory-bound account resolves as a local one does. That
+/// is the lookup `ansible.posix.authorized_key` makes (`pwd.getpwnam`,
+/// `authorized_key.py:343`). `id` exits non-zero only for an account it
+/// cannot find, which is `None`.
+pub(crate) fn lookup_user_macos(sys: &System, name: &str) -> Result<Option<PasswdEntry>> {
+    match sys.cmd("id").args(["-P", "--", name]).ok()? {
+        Some(out) => parse_id_p(&out.stdout_str(), name),
+        None => Ok(None),
+    }
+}
+
 /// Pure: an [`Account`] from a passwd entry and `/etc/group` text.
 pub fn account_of(entry: &PasswdEntry, group_text: &str) -> Account {
     Account {
@@ -1463,6 +1511,60 @@ mod tests {
                 groups: vec!["adm".into(), "sudo".into()],
             }
         );
+    }
+
+    /// What `id -P` printed on macOS 26.3 (arm64): an Open Directory account
+    /// that `/etc/passwd` does not list, and root, which it does.
+    #[test]
+    fn id_p_lines_parse_as_passwd_entries() {
+        let cadu = "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n";
+        assert_eq!(
+            parse_id_p(cadu, "cadu").unwrap(),
+            Some(PasswdEntry {
+                name: "cadu".into(),
+                uid: 501,
+                gid: 20,
+                comment: "Cadu".into(),
+                home: "/Users/cadu".into(),
+                shell: "/bin/zsh".into(),
+            })
+        );
+        let root = "root:*:0:0::0:0:System Administrator:/var/root:/bin/sh\n";
+        let root = parse_id_p(root, "root").unwrap().unwrap();
+        assert_eq!((root.uid, root.home), (0, "/var/root".into()));
+
+        // A `:` in the full name does not move home or shell.
+        let odd = "x:*:600:20::0:0:Smith: Bob:/Users/x:/bin/zsh";
+        let odd = parse_id_p(odd, "x").unwrap().unwrap();
+        assert_eq!(odd.comment, "Smith: Bob");
+        assert_eq!(odd.home, PathBuf::from("/Users/x"));
+        assert_eq!(odd.shell, PathBuf::from("/bin/zsh"));
+    }
+
+    /// `id 501` finds no account named `501` and answers for uid 501; that
+    /// is not an account named `501`. An alias is: `getpwnam` answers it
+    /// with the account's own name.
+    #[test]
+    fn id_p_uid_fallback_is_not_a_match_but_an_alias_is() {
+        let cadu = "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n";
+        assert_eq!(parse_id_p(cadu, "501").unwrap(), None);
+        assert_eq!(parse_id_p(cadu, "carlos").unwrap().unwrap().name, "cadu");
+    }
+
+    #[test]
+    fn id_p_output_that_is_not_an_entry_is_an_error() {
+        for out in [
+            "",
+            "\n",
+            "cadu:*:501:20:/Users/cadu:/bin/zsh",
+            "cadu:*:x:20::0:0::/Users/cadu:/bin/zsh",
+        ] {
+            let err = parse_id_p(out, "cadu").unwrap_err().chain();
+            assert!(
+                err.contains("`id -P cadu` printed a line that is not a passwd entry"),
+                "{err}"
+            );
+        }
     }
 
     // ---- plan_modify ----

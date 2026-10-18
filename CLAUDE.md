@@ -775,7 +775,7 @@ target.
 Every operation declares where it runs and refuses the rest by name. On a mac
 `/etc/passwd` lists only system accounts and there is no `/proc`, so `user`,
 `group`, `hostname`, `sysctl`, `apt` and `systemd` refuse it;
-`ssh::authorized_keys` refuses only its `/etc/passwd` lookup; the portable ops
+`ssh::authorized_keys` looks a user up with `id -P` instead; the portable ops
 carry an explicit `Linux | Macos` match; `brew` is the mac's package op.
 `docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement.
 

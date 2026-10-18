@@ -1,4 +1,7 @@
 //! Homebrew on a mac, the way `vagrant.rs` drives apt on a Debian guest.
+//! Every run also looks the login account up by name for
+//! `ssh::authorized_keys`, which a mac answers from Open Directory, and
+//! changes nothing there.
 //!
 //! Deliberately **not** escalated: Homebrew refuses to run as root, so this
 //! is the one playbook here whose ops need the login user. Run it twice; the
@@ -31,7 +34,12 @@ use std::path::{Component, Path, PathBuf};
 
 use rustible::prelude::*;
 use rustible::sdk::backend::FileKind;
+use rustible_std::ssh::authorized_keys;
 use rustible_std::{archive, brew, file, shell};
+
+/// A key nobody holds, which the lookup step revokes so it reads and changes
+/// nothing.
+const NO_ONE_S_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIrustibleNoOne rustible-never-installed";
 
 /// The version the copied keg is filed under. Any directory in a rack is a
 /// version to Homebrew; this one cannot be mistaken for a real release.
@@ -78,6 +86,25 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
         "{} is {:?} {} on {:?}, {} cpus, {} MB, pm {:?}, init {:?}",
         f.hostname, f.distro, f.distro_version, f.arch, f.cpus, f.memory_mb, f.package_managers, f.init
     ));
+
+    // The login account by name: it is in Open Directory and not in the
+    // mac's `/etc/passwd`, so this resolves only through `getpwnam` (#151).
+    // Revoking a key nobody has reads the file and writes nothing, so it is
+    // `ok` on every run, here or on a mac someone runs this on by hand.
+    let user = f.user.clone();
+    let revoked = ctx.step(
+        format!("authorized_keys of {user}, looked up by name"),
+        authorized_keys::Absent::for_user_name(&user).keys([NO_ONE_S_KEY]),
+    )?;
+    if let Some(home) = std::env::var_os("HOME") {
+        let want = Path::new(&home).join(".ssh/authorized_keys");
+        ensure!(
+            revoked.path == want,
+            "the lookup of `{user}` resolved {}, but this login's $HOME says {}",
+            revoked.path.display(),
+            want.display()
+        );
+    }
 
     if vars.present {
         let out = ctx.step(

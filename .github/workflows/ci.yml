@@ -222,7 +222,9 @@ jobs:
       # 50 MiB file as root, copies it and fetches it back through the sudo
       # helper (`ctx.as_root()`), in chunks, and extracts it from a plain
       # tarball (over 48 MiB) and a gzipped one the mac's `tar` made; each
-      # removal run removes it all.
+      # removal run removes it all. Every `macbrew` run also looks the login
+      # account up by name for `ssh::authorized_keys`, which on a mac goes
+      # through Open Directory, and checks it against `$HOME`.
       - name: Run playbooks against this mac
         run: |
           set -euo pipefail
@@ -240,15 +242,15 @@ jobs:
           run mac -v
           run mac | tee /dev/stderr | grep -Eq '^runner +4 +1 +0 +0 +0 +0 +0$'
           run macbrew -v
-          run macbrew | tee /dev/stderr | grep -Eq '^runner +10 +0 +0 +0 +0 +0 +0$'
+          run macbrew | tee /dev/stderr | grep -Eq '^runner +11 +0 +0 +0 +0 +0 +0$'
           # What `ctx.fetch` brought back through the sudo helper is the
           # 50 MiB macbrew.rs generated, and nothing was left beside it.
           fetched=examples/workspace/out/macbrew/runner
           (yes 'rustible streams this line' 2>/dev/null || true) | head -c 52428800 | cmp - "$fetched/large-copy"
           test "$(ls -A "$fetched")" = large-copy
           rm -rf examples/workspace/out/macbrew
-          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +0 +6 +0 +0 +0 +1 +0$'
-          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +3 +0 +0 +0 +0 +0 +0$'
+          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +1 +6 +0 +0 +0 +1 +0$'
+          run macbrew --var present=false | tee /dev/stderr | grep -Eq '^runner +4 +0 +0 +0 +0 +0 +0$'
 
   harness:
     name: "Test (T2): Docker (Debian/Ubuntu/Alpine)"
