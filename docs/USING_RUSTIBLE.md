@@ -1107,7 +1107,7 @@ name (`python3`): one brew did not link at `<prefix>/opt/<name>` makes
 still installed.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
-mac, `user::*` but `user::Existing`, `group::*`, `hostname::Is`,
+mac, `user::*` except `user::Existing`, `group::*`, `hostname::Is`,
 `sysctl::Present`, `apt::*` and `systemd::*` refuse (there `/etc/passwd` lists
 only system accounts and there is no `/proc`); `file::*`, `shell`, `http`,
 `archive` and `brew` run. `user::Existing` and `ssh::authorized_keys`'

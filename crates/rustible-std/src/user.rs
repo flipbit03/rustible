@@ -37,17 +37,21 @@ use crate::group::{
 /// `ssh::authorized_keys::Present::for_user` will take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
-    /// Login name, the first field of the account's `/etc/passwd` line.
+    /// Login name, the first field of the account's `/etc/passwd` line (on
+    /// macOS, the name Open Directory gives it, which for an alias is not
+    /// the name that was asked for).
     pub name: String,
     /// The uid `/etc/passwd` records, not the one that was asked for: when
     /// [`Present`] left the choice to `useradd`, this is what it allocated.
     pub uid: u32,
     /// Primary group id.
     pub gid: u32,
-    /// Home directory as `/etc/passwd` records it. The directory itself may
+    /// Home directory as `/etc/passwd` (on macOS, Open Directory) records it.
+    /// The directory itself may
     /// not exist; nothing here repairs a missing home after creation.
     pub home: PathBuf,
-    /// Login shell as `/etc/passwd` records it, the distro tool's default
+    /// Login shell as `/etc/passwd` (on macOS, Open Directory) records it,
+    /// the distro tool's default
     /// when [`Present`] was not given one.
     pub shell: PathBuf,
     /// Supplementary groups: every group in `/etc/group` whose member field
@@ -227,7 +231,13 @@ fn read_account_macos(sys: &System, name: &str) -> Result<Option<Account>> {
             "GroupMembership",
             &entry.name,
         ])
-        .run()?;
+        .run()
+        .with_context(|| {
+            format!(
+                "user::Existing found `{}` but `dscl` could not list the groups that list it",
+                entry.name
+            )
+        })?;
     Ok(Some(Account {
         name: entry.name,
         uid: entry.uid,
@@ -1311,7 +1321,8 @@ pub struct Existing {
 }
 
 impl Existing {
-    /// Read the account `name` out of `/etc/passwd` and `/etc/group`. There
+    /// Read the account `name` out of `/etc/passwd` and `/etc/group` (on
+    /// macOS, out of Open Directory). There
     /// is no "missing is fine" variant: a step that hands its [`Account`] to
     /// later steps has nothing to hand them if the user is not there, so a
     /// missing account fails the run.
@@ -1943,9 +1954,36 @@ mod tests {
         let mut facts = fake_sys(&fake).facts().clone();
         facts.os = Os::Other("freebsd".into());
         let s = fake_sys(&fake).with_facts(facts);
-        let err = Present::new("cadu").check(&s).unwrap_err().chain();
-        assert!(err.contains("freebsd"), "{err}");
-        assert!(err.contains("only knows to be true on Linux"), "{err}");
+        for err in [
+            Present::new("cadu").check(&s).unwrap_err().chain(),
+            Existing::named("cadu").check(&s).unwrap_err().chain(),
+        ] {
+            assert!(err.contains("freebsd"), "{err}");
+            assert!(err.contains("only knows to be true on Linux"), "{err}");
+        }
+        assert!(fake.argvs().is_empty());
+    }
+
+    /// `dscl` failing is an error naming the account and the step, never an
+    /// account with no groups.
+    #[test]
+    fn existing_on_a_mac_fails_when_dscl_does() {
+        let fake = Arc::new(
+            base()
+                .with_cmd(
+                    "/usr/bin/id",
+                    None,
+                    0,
+                    "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n",
+                )
+                .with_cmd("/usr/bin/dscl", None, 1, ""),
+        );
+        let s = macos(fake_sys(&fake));
+        let err = Existing::named("cadu").check(&s).unwrap_err().chain();
+        assert!(
+            err.contains("user::Existing found `cadu` but `dscl` could not list the groups"),
+            "{err}"
+        );
     }
 
     fn not_root(sys: System) -> System {

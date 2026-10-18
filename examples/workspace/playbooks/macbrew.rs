@@ -94,15 +94,13 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     // this on by hand.
     let login = f.user.clone();
     let account = ctx.step(format!("{login}, looked up"), user::Existing::named(&login))?;
-    if !ctx.check_mode() {
-        ctx.log(format!(
-            "{login} is uid {} gid {}, home {}, in {:?}",
-            account.uid,
-            account.gid,
-            account.home.display(),
-            account.groups
-        ));
-    }
+    ctx.log(format!(
+        "{login} is uid {} gid {}, home {}, in {:?}",
+        account.uid,
+        account.gid,
+        account.home.display(),
+        account.groups
+    ));
     let revoked = ctx.step(
         format!("authorized_keys of {login}, looked up by name"),
         authorized_keys::Absent::for_user_name(&login).keys([NO_ONE_S_KEY]),
