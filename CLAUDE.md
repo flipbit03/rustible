@@ -775,10 +775,10 @@ target.
 Every operation declares where it runs and refuses the rest by name. On a mac
 `/etc/passwd` lists only system accounts and there is no `/proc`, so `user`
 (except `user::Existing`), `group`, `hostname`, `sysctl`, `apt` and `systemd`
-refuse it; `user::Existing` and `ssh::authorized_keys` look a user up in Open
-Directory instead (`id -P`, and `dscl` for `user::Existing`'s groups); the
-portable ops
-carry an explicit `Linux | Macos` match; `brew` is the mac's package op.
+refuse it; `user::Existing` and `ssh::authorized_keys`' `for_user_name` look
+the account up in Open Directory instead (`id -P`, and `dscl` for
+`user::Existing`'s groups); the portable ops carry an explicit `Linux | Macos`
+match; `brew` is the mac's package op.
 `docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement.
 
 Operations run on the target, including lookups (vision 5.1), so

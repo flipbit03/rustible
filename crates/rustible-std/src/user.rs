@@ -4,11 +4,12 @@
 //! without changing anything (vision 13.1), and [`Membership`] adds a user
 //! to one group (vision 6.6).
 //!
-//! Every op reads `/etc/passwd` and `/etc/group` through `sys` and changes
-//! them only through the distro's own tools, chosen from `facts.distro`
-//! (vision 7.4): shadow-utils `useradd`/`usermod`/`userdel` everywhere
-//! except Alpine, whose BusyBox `adduser`/`deluser`/`addgroup`/`delgroup`
-//! take different flags and cannot modify an existing account's attributes.
+//! Every op reads `/etc/passwd` and `/etc/group` through `sys` (but
+//! [`Existing`] on macOS; see below) and changes them only through the
+//! distro's own tools, chosen from `facts.distro` (vision 7.4): shadow-utils
+//! `useradd`/`usermod`/`userdel` everywhere except Alpine, whose BusyBox
+//! `adduser`/`deluser`/`addgroup`/`delgroup` take different flags and cannot
+//! modify an existing account's attributes.
 //! Nothing here creates a group (vision 6.7): a `.groups([..])` or `.gid(..)`
 //! naming a missing group fails at `check`; use `group::Present` first. Under
 //! `--check`, for an account that does not exist yet, it does not fail: an
@@ -41,18 +42,18 @@ pub struct Account {
     /// macOS, the name Open Directory gives it, which for an alias is not
     /// the name that was asked for).
     pub name: String,
-    /// The uid `/etc/passwd` records, not the one that was asked for: when
+    /// The uid `/etc/passwd` (on macOS, Open Directory) records, not the one
+    /// that was asked for: when
     /// [`Present`] left the choice to `useradd`, this is what it allocated.
     pub uid: u32,
     /// Primary group id.
     pub gid: u32,
     /// Home directory as `/etc/passwd` (on macOS, Open Directory) records it.
-    /// The directory itself may
-    /// not exist; nothing here repairs a missing home after creation.
+    /// The directory itself may not exist; nothing here repairs a missing home
+    /// after creation.
     pub home: PathBuf,
-    /// Login shell as `/etc/passwd` (on macOS, Open Directory) records it,
-    /// the distro tool's default
-    /// when [`Present`] was not given one.
+    /// Login shell as `/etc/passwd` (on macOS, Open Directory) records it, the
+    /// distro tool's default when [`Present`] was not given one.
     pub shell: PathBuf,
     /// Supplementary groups: every group in `/etc/group` whose member field
     /// lists the user (on macOS, every group whose `GroupMembership` does),
@@ -205,7 +206,7 @@ pub(crate) fn lookup_user_macos(sys: &System, name: &str) -> Result<Option<Passw
 }
 
 /// BSD `id` on macOS, which is in the sealed system volume on every mac.
-pub(crate) const MACOS_ID: &str = "/usr/bin/id";
+const MACOS_ID: &str = "/usr/bin/id";
 
 /// `dscl` on macOS, beside it.
 const MACOS_DSCL: &str = "/usr/bin/dscl";
@@ -1322,10 +1323,9 @@ pub struct Existing {
 
 impl Existing {
     /// Read the account `name` out of `/etc/passwd` and `/etc/group` (on
-    /// macOS, out of Open Directory). There
-    /// is no "missing is fine" variant: a step that hands its [`Account`] to
-    /// later steps has nothing to hand them if the user is not there, so a
-    /// missing account fails the run.
+    /// macOS, out of Open Directory). There is no "missing is fine" variant: a
+    /// step that hands its [`Account`] to later steps has nothing to hand them
+    /// if the user is not there, so a missing account fails the run.
     pub fn named(name: impl Into<String>) -> Self {
         Existing { name: name.into() }
     }

@@ -24,10 +24,9 @@ use crate::user_keys::UserKeys;
 /// (`changed` when a key was appended). The second step is
 /// `ssh::authorized_keys::Present::for_user_name`, so its rules apply:
 /// `sys_user` must exist (in `/etc/passwd` on Linux, in Open Directory on
-/// macOS), and `~/.ssh` is created (0700,
-/// owned by the account) if it is not there — the home directory above it is
-/// not, so create the account with `user::Present::new(..).create_home(true)`
-/// first. Returns the block, whose value is the install step's `Applied`:
+/// macOS), and `~/.ssh` is created (0700, owned by the account) if it is
+/// not there — the home directory above it is not, so on Linux create the
+/// account with `user::Present::new(..).create_home(true)` first. Returns the block, whose value is the install step's `Applied`:
 /// `r.changed`, `r.added` and `r.path` read through it.
 ///
 /// **Under `--check`** the fetch sends no request (vision 12), so it reports

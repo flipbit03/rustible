@@ -1111,10 +1111,9 @@ mac, `user::*` except `user::Existing`, `group::*`, `hostname::Is`,
 `sysctl::Present`, `apt::*` and `systemd::*` refuse (there `/etc/passwd` lists
 only system accounts and there is no `/proc`); `file::*`, `shell`, `http`,
 `archive` and `brew` run. `user::Existing` and `ssh::authorized_keys`'
-`for_user_name(..)` find the account through Open Directory there, so
-`user::Existing` then `for_user(&account)` works on a mac too; an account's
-`groups` are the groups whose `GroupMembership` lists it. A platform Rustible
-does not know is refused by every op.
+`for_user_name(..)` look the account up in Open Directory there; an account's
+`groups` are the groups whose `GroupMembership` lists it, fewer than `id -Gn`
+prints. A platform Rustible does not know is refused by every op.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:

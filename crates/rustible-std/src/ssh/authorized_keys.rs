@@ -439,7 +439,10 @@ impl Target {
                     }
                     // Open Directory, through `getpwnam`: the file there
                     // lists only system services.
+                    // A name `id` would read as a flag or, with a sign or
+                    // a space, as a uid never reaches it.
                     Os::Macos => {
+                        crate::group::validate_name("user", name)?;
                         let Some(entry) = crate::user::lookup_user_macos(sys, name)? else {
                             bail!(
                                 "user `{name}` does not exist: `id -P` found no account called \
@@ -1692,6 +1695,24 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// `id -P -- -2` answers as `nobody` and `id -P -- " 501"` as uid 501's
+    /// account (measured on macOS 26.3): names like these are refused
+    /// before `id` runs.
+    #[test]
+    fn a_mac_name_id_would_read_as_a_uid_or_a_flag_never_reaches_it() {
+        let fake = Arc::new(Fake::new().with_cmd("/usr/bin/id", None, 0, ID_P_CADU));
+        let s = macos(fake_sys(&fake));
+        for name in ["-2", " 501", "-P"] {
+            let err = Present::for_user_name(name)
+                .keys([K1])
+                .check(&s)
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("is not valid"), "{name}: {err}");
+        }
+        assert!(fake.argvs().is_empty());
     }
 
     /// Anything but Linux and macOS is refused by name, pointing at the form

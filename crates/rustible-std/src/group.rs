@@ -134,10 +134,9 @@ impl Tools {
 /// Open Directory, and `/etc/passwd` there lists only `root`, `daemon`,
 /// `nobody` and the `_service` users. Reading them would report a real
 /// account as absent, so every op in `user` and `group` asks this first,
-/// except on a mac `user::Existing`, which reads Open Directory there, as
+/// except `user::Existing` on a mac, which reads Open Directory there as
 /// `ssh::authorized_keys`' name lookup does (`user::lookup_user_macos`).
-/// Measured on macOS 26.3; see
-/// `docs/plan/reports/MACOS-TARGET-SPIKE.md`.
+/// Measured on macOS 26.3; see `docs/plan/reports/MACOS-TARGET-SPIKE.md`.
 pub(crate) fn require_passwd_db(sys: &System, op: &str) -> Result<()> {
     match sys.facts().os {
         Os::Linux => Ok(()),
