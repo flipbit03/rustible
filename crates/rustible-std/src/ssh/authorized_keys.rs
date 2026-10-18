@@ -341,7 +341,8 @@ pub struct KeysReport {
     pub created_dir: Option<PathBuf>,
 }
 
-/// Whose file: a user looked up in `/etc/passwd`, or an explicit path.
+/// Whose file: a user looked up by name (`/etc/passwd` on Linux, `getpwnam`
+/// on macOS), or an explicit path.
 #[derive(Debug, Clone)]
 enum Target {
     /// `~user/.ssh/authorized_keys`. The op owns the file *and* the `.ssh`
@@ -392,7 +393,7 @@ fn ensure_absolute_home(home: &Path) -> Result<()> {
 }
 
 impl Target {
-    /// A user that is not in `/etc/passwd` is refused in both modes, under
+    /// A user the lookup does not find is refused in both modes, under
     /// `--check` too: `ansible.posix.authorized_key` does the same ("Either
     /// user must exist or you must provide full path to key file in check
     /// mode"), and Rustible follows it here (`[CHECK-MODE] 2026-09-24` in
@@ -417,35 +418,47 @@ impl Target {
                 })
             }
             Target::User(name) => {
-                // The only variant of this op that is not portable, and the
-                // reason the refusal lives here rather than on `Present` and
-                // `Absent`: `Target::File` and `Target::Account` are plain
-                // file work and run on macOS today. Naming the working
-                // alternative matters, because the caller has one.
-                match sys.facts().os {
-                    Os::Linux => {}
-                    Os::Macos => bail!(
-                        "ssh::authorized_keys cannot look `{name}` up in /etc/passwd on macOS, \
-                         where that file lists only system services and the accounts live in \
-                         Open Directory. Pass the account directly with \
-                         `for_account(home, uid, gid)`, which works here"
-                    ),
+                // The only variant of this op that depends on the platform,
+                // and the reason the refusal lives here rather than on
+                // `Present` and `Absent`: `Target::File` and
+                // `Target::Account` are plain file work and run anywhere.
+                let entry = match sys.facts().os {
+                    // /etc/passwd only (vision 7.4 and 13 plan the user ops
+                    // around it); NSS-only accounts (LDAP, SSSD, homed) are a
+                    // known limit, recorded in DECISIONS.md.
+                    Os::Linux => {
+                        let passwd = sys.read_to_string("/etc/passwd")?;
+                        let Some(entry) = crate::user::lookup_user(&passwd, name)? else {
+                            bail!(
+                                "user `{name}` does not exist in /etc/passwd; \
+                                 ssh::authorized_keys does not create users, use user::Present \
+                                 first"
+                            );
+                        };
+                        entry
+                    }
+                    // Open Directory, through `getpwnam`: the file there
+                    // lists only system services.
+                    // A name `id` would read as a flag or, with a sign or
+                    // a space, as a uid never reaches it.
+                    Os::Macos => {
+                        crate::group::validate_name("user", name)?;
+                        let Some(entry) = crate::user::lookup_user_macos(sys, name)? else {
+                            bail!(
+                                "user `{name}` does not exist: `id -P` found no account called \
+                                 `{name}` in Open Directory; ssh::authorized_keys does not \
+                                 create users, so create the account first, or pass its home, \
+                                 uid and gid with `for_account(home, uid, gid)`"
+                            );
+                        };
+                        entry
+                    }
                     ref other => bail!(
-                        "ssh::authorized_keys looks users up in /etc/passwd, which rustible \
-                         only trusts on Linux; this host is {}. Pass the account directly \
-                         with `for_account(home, uid, gid)`",
+                        "ssh::authorized_keys knows how to look users up only on Linux and \
+                         macOS; this host is {}. Pass the account directly with \
+                         `for_account(home, uid, gid)`",
                         other.name()
                     ),
-                }
-                // /etc/passwd only (vision 7.4 and 13 plan the user ops around
-                // it); NSS-only accounts (LDAP, SSSD, homed) are a known limit,
-                // recorded in DECISIONS.md.
-                let passwd = sys.read_to_string("/etc/passwd")?;
-                let Some(entry) = crate::user::lookup_user(&passwd, name)? else {
-                    bail!(
-                        "user `{name}` does not exist in /etc/passwd; \
-                         ssh::authorized_keys does not create users, use user::Present first"
-                    );
                 };
                 let (uid, gid, home) = (entry.uid, entry.gid, entry.home);
                 ensure_absolute_home(&home)?;
@@ -732,7 +745,7 @@ fn write_context(path: &Path, attrs: Option<WriteAttrs>) -> String {
 /// of [`Absent`], and of [`Present`] whenever it has work to do.
 ///
 /// `apply` acts on these paths and no others: the account is resolved once,
-/// by `check`, so a second read of `/etc/passwd` cannot send the keys
+/// by `check`, so a second lookup of the account cannot send the keys
 /// somewhere `check` never inspected.
 #[derive(Debug)]
 pub struct KeysWrite {
@@ -859,7 +872,8 @@ impl Intent for KeysIntent {
 /// # Ok(()) }
 /// ```
 ///
-/// The user-name form reads `/etc/passwd` for home, uid, and gid; the
+/// The user-name form looks the account up for home, uid, and gid
+/// (`/etc/passwd` on Linux, `getpwnam` through `id -P` on macOS); the
 /// `for_user(&account)` and `for_account(home, uid, gid)` forms take them
 /// directly (from `user::Present` or `user::Existing`) with no lookup.
 ///
@@ -1588,20 +1602,134 @@ mod tests {
         sys.with_facts(facts)
     }
 
-    /// The refusal is on the *variant*, not the op: only the name lookup
-    /// reads `/etc/passwd`, and a mac's copy of that file describes only
-    /// system services. The message has to name the form that does work,
-    /// because the caller has one.
+    /// What `id -P cadu` printed on macOS 26.3.
+    const ID_P_CADU: &str = "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n";
+
+    /// A mac's `/etc/passwd`, which lists system services and none of the
+    /// accounts people log in with.
+    const MAC_PASSWD: &str = "root:*:0:0:System Administrator:/var/root:/bin/sh\n\
+                              _www:*:70:70:World Wide Web Server:/Library/WebServer:/usr/bin/false\n\
+                              ghost:*:600:20:Not in Open Directory:/Users/ghost:/bin/zsh\n";
+
+    /// On a mac the name is looked up the way sshd will look it up at login,
+    /// through `getpwnam` (`id -P`), and never in `/etc/passwd`, whose copy
+    /// there does not list the account at all.
     #[test]
-    fn the_name_lookup_refuses_a_mac_and_names_for_account() {
-        let fake = fake_with_user();
+    fn the_name_lookup_on_a_mac_asks_getpwnam() {
+        let fake = Arc::new(
+            Fake::new()
+                .with_file("/etc/passwd", MAC_PASSWD)
+                .with_dir("/Users/cadu")
+                .with_cmd("/usr/bin/id", Some(&["-P", "--", "cadu"]), 0, ID_P_CADU),
+        );
         let s = macos(fake_sys(&fake));
+        let op = Present::for_user_name("cadu").keys([K1]);
+
+        let Plan::Change(c) = op.check(&s).unwrap() else {
+            panic!("expected change")
+        };
+        op.apply(&s, c).unwrap();
+        assert!(fake.argvs().contains(&vec![
+            "/usr/bin/id".to_string(),
+            "-P".into(),
+            "--".into(),
+            "cadu".into()
+        ]));
+        let dir = fake.file("/Users/cadu/.ssh").unwrap();
+        assert_eq!((dir.mode, dir.uid, dir.gid), (0o700, 501, 20));
+        let file = fake.file("/Users/cadu/.ssh/authorized_keys").unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 501, 20));
+        assert!(String::from_utf8_lossy(&file.bytes).contains(K1));
+        assert!(matches!(op.check(&s).unwrap(), Plan::Satisfied(_)));
+    }
+
+    /// An account `id` cannot find is refused by both ops in both modes on a
+    /// mac too, as on Linux, and the message says where it looked.
+    #[test]
+    fn a_mac_account_getpwnam_cannot_find_is_refused_in_both_modes() {
+        let fake = Arc::new(Fake::new().with_file("/etc/passwd", MAC_PASSWD).with_cmd(
+            "/usr/bin/id",
+            None,
+            1,
+            "",
+        ));
+        for dry in [false, true] {
+            let s = macos(fake_sys(&fake)).with_check_mode(dry);
+            for err in [
+                Present::for_user_name("ghost")
+                    .keys([K1])
+                    .check(&s)
+                    .unwrap_err(),
+                Absent::for_user_name("ghost")
+                    .keys([K1])
+                    .check(&s)
+                    .unwrap_err(),
+            ] {
+                let err = err.chain();
+                assert!(
+                    err.contains(
+                        "user `ghost` does not exist: `id -P` found no account called `ghost`"
+                    ),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    /// `id` given a number no account is called tries it as a uid; that is
+    /// another account, and the message says so rather than "not found".
+    #[test]
+    fn a_numeric_name_id_answers_as_a_uid_is_refused_naming_the_account() {
+        let fake =
+            Arc::new(Fake::new().with_cmd("/usr/bin/id", Some(&["-P", "--", "501"]), 0, ID_P_CADU));
+        let s = macos(fake_sys(&fake));
+        let err = Present::for_user_name("501")
+            .keys([K1])
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "`501` is not an account name: no account is called that, and `id` answered \
+                 for uid 501 instead, which is `cadu`"
+            ),
+            "{err}"
+        );
+    }
+
+    /// `id -P -- -2` answers as `nobody` and `id -P -- " 501"` as uid 501's
+    /// account (measured on macOS 26.3): names like these are refused
+    /// before `id` runs.
+    #[test]
+    fn a_mac_name_id_would_read_as_a_uid_or_a_flag_never_reaches_it() {
+        let fake = Arc::new(Fake::new().with_cmd("/usr/bin/id", None, 0, ID_P_CADU));
+        let s = macos(fake_sys(&fake));
+        for name in ["-2", " 501", "-P"] {
+            let err = Present::for_user_name(name)
+                .keys([K1])
+                .check(&s)
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("is not valid"), "{name}: {err}");
+        }
+        assert!(fake.argvs().is_empty());
+    }
+
+    /// Anything but Linux and macOS is refused by name, pointing at the form
+    /// that needs no lookup.
+    #[test]
+    fn the_name_lookup_refuses_an_unknown_platform_and_names_for_account() {
+        let fake = fake_with_user();
+        let s = fake_sys(&fake);
+        let mut facts = s.facts().clone();
+        facts.os = Os::Other("freebsd".into());
+        let s = s.with_facts(facts);
         let err = Present::for_user_name("cadu")
             .keys([K1])
             .check(&s)
             .unwrap_err()
             .chain();
-        assert!(err.contains("Open Directory"), "{err}");
+        assert!(err.contains("this host is freebsd"), "{err}");
         assert!(err.contains("for_account(home, uid, gid)"), "{err}");
     }
 

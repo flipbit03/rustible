@@ -23,10 +23,10 @@ use crate::user_keys::UserKeys;
 /// <gh_login>` (a lookup: `ok` in a real run) and `Install for <sys_user>`
 /// (`changed` when a key was appended). The second step is
 /// `ssh::authorized_keys::Present::for_user_name`, so its rules apply:
-/// `sys_user` must exist in `/etc/passwd`, and `~/.ssh` is created (0700,
-/// owned by the account) if it is not there — the home directory above it is
-/// not, so create the account with `user::Present::new(..).create_home(true)`
-/// first. Returns the block, whose value is the install step's `Applied`:
+/// `sys_user` must exist (in `/etc/passwd` on Linux, in Open Directory on
+/// macOS), and `~/.ssh` is created (0700, owned by the account) if it is
+/// not there — the home directory above it is not, so on Linux create the
+/// account with `user::Present::new(..).create_home(true)` first. Returns the block, whose value is the install step's `Applied`:
 /// `r.changed`, `r.added` and `r.path` read through it.
 ///
 /// **Under `--check`** the fetch sends no request (vision 12), so it reports
@@ -296,6 +296,39 @@ mod tests {
             vec![Status::Ok, Status::Ok]
         );
         assert_eq!(canned.asked().len(), 2, "one fetch per run");
+    }
+
+    /// Issue #151: the helper on a mac, where the account is not in
+    /// `/etc/passwd` and the user-name lookup goes through `id -P`. No change
+    /// to this crate made it work; the test keeps it working.
+    #[test]
+    fn installs_on_a_mac_whose_account_is_in_open_directory() {
+        let canned = Canned::answering(URL, Ok(Response::ok(body())));
+        let fake = Arc::new(
+            Fake::new()
+                .with_file(
+                    "/etc/passwd",
+                    "root:*:0:0:System Administrator:/var/root:/bin/sh\n",
+                )
+                .with_dir("/Users/cadu")
+                .with_cmd(
+                    "/usr/bin/id",
+                    Some(&["-P", "--", "cadu"]),
+                    0,
+                    "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n",
+                ),
+        );
+        let sink = Arc::new(Collect::default());
+        let sys = System::fake(fake.clone(), sink.clone());
+        let mut mac = sys.facts().clone();
+        mac.os = rustible_sdk::facts::Os::Macos;
+        let mut ctx = rustible_sdk::testing::ctx(sys.with_facts(mac));
+
+        let r = keys_to_user_via(&mut ctx, canned).unwrap();
+        assert!(r.changed);
+        assert_eq!(r.path.to_str().unwrap(), "/Users/cadu/.ssh/authorized_keys");
+        let file = fake.file("/Users/cadu/.ssh/authorized_keys").unwrap();
+        assert_eq!((file.mode, file.uid, file.gid), (0o600, 501, 20));
     }
 
     fn keys_to_user_via(ctx: &mut Ctx, fetch: Arc<Canned>) -> Result<Block<Applied<KeysReport>>> {
