@@ -773,9 +773,10 @@ Linux (any libc) and macOS, both architectures. Any controller builds for any
 target.
 
 Every operation declares where it runs and refuses the rest by name. On a mac
-`/etc/passwd` lists only system accounts and there is no `/proc`, so `user`,
-`group`, `hostname`, `sysctl`, `apt` and `systemd` refuse it;
-`ssh::authorized_keys` looks a user up with `id -P` instead; the portable ops
+`/etc/passwd` lists only system accounts and there is no `/proc`, so `user`
+(but `user::Existing`), `group`, `hostname`, `sysctl`, `apt` and `systemd`
+refuse it; `user::Existing` and `ssh::authorized_keys` look a user up in Open
+Directory instead (`id -P`, `dscl`); the portable ops
 carry an explicit `Linux | Macos` match; `brew` is the mac's package op.
 `docs/plan/reports/MACOS-TARGET-SPIKE.md` is the measurement.
 

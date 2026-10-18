@@ -313,7 +313,7 @@ mod tests {
                 )
                 .with_dir("/Users/cadu")
                 .with_cmd(
-                    "id",
+                    "/usr/bin/id",
                     Some(&["-P", "--", "cadu"]),
                     0,
                     "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n",

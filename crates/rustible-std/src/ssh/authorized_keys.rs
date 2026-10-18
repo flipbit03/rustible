@@ -442,9 +442,10 @@ impl Target {
                     Os::Macos => {
                         let Some(entry) = crate::user::lookup_user_macos(sys, name)? else {
                             bail!(
-                                "user `{name}` does not exist: `id -P {name}` found no such \
-                                 account in Open Directory; ssh::authorized_keys does not \
-                                 create users"
+                                "user `{name}` does not exist: `id -P` found no account called \
+                                 `{name}` in Open Directory; ssh::authorized_keys does not \
+                                 create users, so create the account first, or pass its home, \
+                                 uid and gid with `for_account(home, uid, gid)`"
                             );
                         };
                         entry
@@ -1604,7 +1605,8 @@ mod tests {
     /// A mac's `/etc/passwd`, which lists system services and none of the
     /// accounts people log in with.
     const MAC_PASSWD: &str = "root:*:0:0:System Administrator:/var/root:/bin/sh\n\
-                              _www:*:70:70:World Wide Web Server:/Library/WebServer:/usr/bin/false\n";
+                              _www:*:70:70:World Wide Web Server:/Library/WebServer:/usr/bin/false\n\
+                              ghost:*:600:20:Not in Open Directory:/Users/ghost:/bin/zsh\n";
 
     /// On a mac the name is looked up the way sshd will look it up at login,
     /// through `getpwnam` (`id -P`), and never in `/etc/passwd`, whose copy
@@ -1615,7 +1617,7 @@ mod tests {
             Fake::new()
                 .with_file("/etc/passwd", MAC_PASSWD)
                 .with_dir("/Users/cadu")
-                .with_cmd("id", Some(&["-P", "--", "cadu"]), 0, ID_P_CADU),
+                .with_cmd("/usr/bin/id", Some(&["-P", "--", "cadu"]), 0, ID_P_CADU),
         );
         let s = macos(fake_sys(&fake));
         let op = Present::for_user_name("cadu").keys([K1]);
@@ -1625,7 +1627,7 @@ mod tests {
         };
         op.apply(&s, c).unwrap();
         assert!(fake.argvs().contains(&vec![
-            "id".to_string(),
+            "/usr/bin/id".to_string(),
             "-P".into(),
             "--".into(),
             "cadu".into()
@@ -1642,11 +1644,12 @@ mod tests {
     /// mac too, as on Linux, and the message says where it looked.
     #[test]
     fn a_mac_account_getpwnam_cannot_find_is_refused_in_both_modes() {
-        let fake = Arc::new(
-            Fake::new()
-                .with_file("/etc/passwd", MAC_PASSWD)
-                .with_cmd("id", None, 1, ""),
-        );
+        let fake = Arc::new(Fake::new().with_file("/etc/passwd", MAC_PASSWD).with_cmd(
+            "/usr/bin/id",
+            None,
+            1,
+            "",
+        ));
         for dry in [false, true] {
             let s = macos(fake_sys(&fake)).with_check_mode(dry);
             for err in [
@@ -1662,12 +1665,33 @@ mod tests {
                 let err = err.chain();
                 assert!(
                     err.contains(
-                        "user `ghost` does not exist: `id -P ghost` found no such account"
+                        "user `ghost` does not exist: `id -P` found no account called `ghost`"
                     ),
                     "{err}"
                 );
             }
         }
+    }
+
+    /// `id` given a number no account is called tries it as a uid; that is
+    /// another account, and the message says so rather than "not found".
+    #[test]
+    fn a_numeric_name_id_answers_as_a_uid_is_refused_naming_the_account() {
+        let fake =
+            Arc::new(Fake::new().with_cmd("/usr/bin/id", Some(&["-P", "--", "501"]), 0, ID_P_CADU));
+        let s = macos(fake_sys(&fake));
+        let err = Present::for_user_name("501")
+            .keys([K1])
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(
+            err.contains(
+                "`501` is not an account name: no account is called that, and `id` answered \
+                 for uid 501 instead, which is `cadu`"
+            ),
+            "{err}"
+        );
     }
 
     /// Anything but Linux and macOS is refused by name, pointing at the form

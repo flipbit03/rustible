@@ -1,7 +1,7 @@
 //! Homebrew on a mac, the way `vagrant.rs` drives apt on a Debian guest.
-//! Every run also looks the login account up by name for
-//! `ssh::authorized_keys`, which a mac answers from Open Directory, and
-//! changes nothing there.
+//! Every run also looks the login account up by name, with `user::Existing`
+//! and for `ssh::authorized_keys`, which a mac answers from Open Directory,
+//! and changes nothing there.
 //!
 //! Deliberately **not** escalated: Homebrew refuses to run as root, so this
 //! is the one playbook here whose ops need the login user. Run it twice; the
@@ -17,7 +17,7 @@
 //! The removal first gives the formula a second version, a copy of its keg,
 //! which `brew::Absent` must take too, and pins it, which `brew::Absent` must
 //! refuse until it is unpinned. A removal run with both installed reports
-//! five `changed` and one `recovered`; the one after it, `ok`.
+//! six `changed` and one `recovered`; the one after it, `ok`.
 //!
 //! Each install run also moves a 50 MiB file through `ctx.as_root()`, which
 //! from this unescalated playbook is the sudo helper: it is generated as
@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use rustible::prelude::*;
 use rustible::sdk::backend::FileKind;
 use rustible_std::ssh::authorized_keys;
-use rustible_std::{archive, brew, file, shell};
+use rustible_std::{archive, brew, file, shell, user};
 
 /// A key nobody holds, which the lookup step revokes so it reads and changes
 /// nothing.
@@ -88,21 +88,33 @@ fn main(ctx: &mut Ctx, vars: Vars) -> Result<()> {
     ));
 
     // The login account by name: it is in Open Directory and not in the
-    // mac's `/etc/passwd`, so this resolves only through `getpwnam` (#151).
-    // Revoking a key nobody has reads the file and writes nothing, so it is
-    // `ok` on every run, here or on a mac someone runs this on by hand.
-    let user = f.user.clone();
+    // mac's `/etc/passwd`, so these resolve only through `getpwnam` (#151).
+    // Both read and change nothing (revoking a key nobody has writes
+    // nothing), so they are `ok` on every run, here or on a mac someone runs
+    // this on by hand.
+    let login = f.user.clone();
+    let account = ctx.step(format!("{login}, looked up"), user::Existing::named(&login))?;
+    if !ctx.check_mode() {
+        ctx.log(format!(
+            "{login} is uid {} gid {}, home {}, in {:?}",
+            account.uid,
+            account.gid,
+            account.home.display(),
+            account.groups
+        ));
+    }
     let revoked = ctx.step(
-        format!("authorized_keys of {user}, looked up by name"),
-        authorized_keys::Absent::for_user_name(&user).keys([NO_ONE_S_KEY]),
+        format!("authorized_keys of {login}, looked up by name"),
+        authorized_keys::Absent::for_user_name(&login).keys([NO_ONE_S_KEY]),
     )?;
     if let Some(home) = std::env::var_os("HOME") {
-        let want = Path::new(&home).join(".ssh/authorized_keys");
+        let home = Path::new(&home);
         ensure!(
-            revoked.path == want,
-            "the lookup of `{user}` resolved {}, but this login's $HOME says {}",
+            account.home == home && revoked.path == home.join(".ssh/authorized_keys"),
+            "the lookups of `{login}` resolved {} and {}, but this login's $HOME is {}",
+            account.home.display(),
             revoked.path.display(),
-            want.display()
+            home.display()
         );
     }
 

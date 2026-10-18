@@ -18,6 +18,9 @@
 //! refused in both modes. Both halves are what Ansible's `user` does (vision
 //! 12 for the first; `[CHECK-MODE] 2026-09-24` in `docs/plan/DECISIONS.md`
 //! for the second).
+//!
+//! Every op here refuses macOS, whose accounts live in Open Directory, except
+//! [`Existing`], which only reads and asks Open Directory there.
 
 use std::path::PathBuf;
 
@@ -48,8 +51,9 @@ pub struct Account {
     /// when [`Present`] was not given one.
     pub shell: PathBuf,
     /// Supplementary groups: every group in `/etc/group` whose member field
-    /// lists the user, sorted by name. The primary group appears only if it
-    /// also lists the user.
+    /// lists the user (on macOS, every group whose `GroupMembership` does),
+    /// sorted by name. The primary group appears only if it also lists the
+    /// user.
     pub groups: Vec<String>,
 }
 
@@ -121,13 +125,14 @@ pub fn passwd_by_uid(text: &str, uid: u32) -> Option<PasswdEntry> {
 /// as one line of BSD `master.passwd`:
 /// `name:password:uid:gid:class:change:expire:gecos:home:shell`. Home and
 /// shell are taken from the end, so a `:` in the full name cannot shift
-/// them.
+/// them. `id` prints ids signed, so `nobody`'s uid is `-2`; it is read back
+/// as the `u32` the kernel holds (4294967294).
 ///
 /// `getpwnam` answers for an alias with the account's own name, so a
 /// different name comes back as that account. One case is not `getpwnam`:
-/// `id` given a number it finds no account by tries it as a uid, so a
-/// numeric name that comes back as another account is `None`.
-pub(crate) fn parse_id_p(out: &str, name: &str) -> Result<Option<PasswdEntry>> {
+/// `id` given a number it finds no account by tries it as a uid, and that
+/// is refused rather than taken for the account the uid belongs to.
+pub(crate) fn parse_id_p(out: &str, name: &str) -> Result<PasswdEntry> {
     let line = out.trim_end_matches('\n');
     let f: Vec<&str> = line.split(':').collect();
     let n = f.len();
@@ -135,8 +140,8 @@ pub(crate) fn parse_id_p(out: &str, name: &str) -> Result<Option<PasswdEntry>> {
         .then(|| {
             Some(PasswdEntry {
                 name: f[0].to_string(),
-                uid: f[2].parse().ok()?,
-                gid: f[3].parse().ok()?,
+                uid: signed_id(f[2])?,
+                gid: signed_id(f[3])?,
                 comment: f[7..n - 2].join(":"),
                 home: PathBuf::from(f[n - 2]),
                 shell: PathBuf::from(f[n - 1]),
@@ -147,22 +152,90 @@ pub(crate) fn parse_id_p(out: &str, name: &str) -> Result<Option<PasswdEntry>> {
         bail!("`id -P {name}` printed a line that is not a passwd entry: {line}");
     };
     if entry.name != name && name.parse::<u32>().is_ok() {
-        return Ok(None);
+        bail!(
+            "`{name}` is not an account name: no account is called that, and `id` answered \
+             for uid {name} instead, which is `{}`; name the account",
+            entry.name
+        );
     }
-    Ok(Some(entry))
+    Ok(entry)
+}
+
+/// A uid or gid as BSD `id` prints it: decimal, and negative above `i32::MAX`.
+fn signed_id(s: &str) -> Option<u32> {
+    match s.parse::<i64>().ok()? {
+        v @ 0..=0xFFFF_FFFF => Some(v as u32),
+        v @ -0x8000_0000..0 => Some(v as i32 as u32),
+        _ => None,
+    }
+}
+
+/// Pure: the groups `dscl -search /Groups GroupMembership <name>` printed:
+/// one `<group>\t\tGroupMembership = (` line per group, its members indented
+/// below it, then `)`. Sorted by name, as [`groups_of`] returns them.
+pub(crate) fn parse_dscl_group_search(out: &str) -> Vec<String> {
+    let mut groups: Vec<String> = out
+        .lines()
+        .filter(|l| l.contains("GroupMembership") && !l.starts_with([' ', '\t', ')']))
+        .filter_map(|l| l.split('\t').next())
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+        .collect();
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 /// The account called `name` on macOS, where `/etc/passwd` lists only system
 /// services and the accounts live in Open Directory: `getpwnam(3)`, through
 /// `id -P`, so a directory-bound account resolves as a local one does. That
-/// is the lookup `ansible.posix.authorized_key` makes (`pwd.getpwnam`,
-/// `authorized_key.py:343`). `id` exits non-zero only for an account it
-/// cannot find, which is `None`.
+/// is the lookup `ansible.posix.authorized_key` makes (`pwd.getpwnam`). BSD
+/// `id` exits non-zero only for an account it cannot find, which is `None`;
+/// it is named by its path because a GNU `id` earlier on `PATH` (Homebrew's
+/// coreutils) has no `-P` and would fail for every account.
 pub(crate) fn lookup_user_macos(sys: &System, name: &str) -> Result<Option<PasswdEntry>> {
-    match sys.cmd("id").args(["-P", "--", name]).ok()? {
-        Some(out) => parse_id_p(&out.stdout_str(), name),
+    match sys.cmd(MACOS_ID).args(["-P", "--", name]).ok()? {
+        Some(out) => parse_id_p(&out.stdout_str(), name).map(Some),
         None => Ok(None),
     }
+}
+
+/// BSD `id` on macOS, which is in the sealed system volume on every mac.
+pub(crate) const MACOS_ID: &str = "/usr/bin/id";
+
+/// `dscl` on macOS, beside it.
+const MACOS_DSCL: &str = "/usr/bin/dscl";
+
+/// [`read_account`] for macOS: the account from [`lookup_user_macos`], and
+/// its groups are every group whose `GroupMembership` lists it, the
+/// counterpart of `/etc/group`'s member field, which is what Ansible's
+/// `user` module reads on Darwin (`DarwinUser._list_user_groups`). Groups
+/// it belongs to only through nesting, or implicitly (`everyone`), are not
+/// listed, as on Linux. Searched through `/Search`, the search policy
+/// `getpwnam` used to find the account, and by the account's own name, so
+/// an alias is given the groups of the account it names.
+fn read_account_macos(sys: &System, name: &str) -> Result<Option<Account>> {
+    let Some(entry) = lookup_user_macos(sys, name)? else {
+        return Ok(None);
+    };
+    let out = sys
+        .cmd(MACOS_DSCL)
+        .args([
+            "/Search",
+            "-search",
+            "/Groups",
+            "GroupMembership",
+            &entry.name,
+        ])
+        .run()?;
+    Ok(Some(Account {
+        name: entry.name,
+        uid: entry.uid,
+        gid: entry.gid,
+        home: entry.home,
+        shell: entry.shell,
+        groups: parse_dscl_group_search(&out.stdout_str()),
+    }))
 }
 
 /// Pure: an [`Account`] from a passwd entry and `/etc/group` text.
@@ -1228,7 +1301,10 @@ impl Op for Absent {
 /// # Ok(()) }
 /// ```
 ///
-/// Needs no root: it only reads `/etc/passwd` and `/etc/group`.
+/// Needs no root: it only reads `/etc/passwd` and `/etc/group`. On macOS,
+/// the one platform besides Linux it runs on, it reads Open Directory
+/// instead: the account through `getpwnam` (`id -P`), and as its `groups`
+/// every group whose `GroupMembership` lists it (`dscl`).
 #[derive(Debug, Clone)]
 pub struct Existing {
     name: String,
@@ -1249,6 +1325,20 @@ impl Op for Existing {
     type Intent = std::convert::Infallible;
 
     fn check(&self, sys: &System) -> Result<Plan<Self>> {
+        // The one op in this module that runs on a mac: it only reads, and
+        // Open Directory answers a lookup the way `/etc/passwd` does.
+        if sys.facts().os == Os::Macos {
+            validate_name("user", &self.name)?;
+            return match read_account_macos(sys, &self.name)? {
+                Some(account) => Ok(Plan::Satisfied(account)),
+                None => bail!(
+                    "user `{name}` does not exist: `id -P` found no account called `{name}` \
+                     in Open Directory; user::Existing only looks up, so create the account \
+                     first",
+                    name = self.name
+                ),
+            };
+        }
         require_passwd_db(sys, "user::Existing")?;
         validate_name("user", &self.name)?;
         match read_account(sys, &self.name)? {
@@ -1514,41 +1604,61 @@ mod tests {
     }
 
     /// What `id -P` printed on macOS 26.3 (arm64): an Open Directory account
-    /// that `/etc/passwd` does not list, and root, which it does.
+    /// that `/etc/passwd` does not list, root, which it does, and `nobody`,
+    /// whose ids `id` prints signed.
     #[test]
     fn id_p_lines_parse_as_passwd_entries() {
         let cadu = "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n";
         assert_eq!(
             parse_id_p(cadu, "cadu").unwrap(),
-            Some(PasswdEntry {
+            PasswdEntry {
                 name: "cadu".into(),
                 uid: 501,
                 gid: 20,
                 comment: "Cadu".into(),
                 home: "/Users/cadu".into(),
                 shell: "/bin/zsh".into(),
-            })
+            }
         );
         let root = "root:*:0:0::0:0:System Administrator:/var/root:/bin/sh\n";
-        let root = parse_id_p(root, "root").unwrap().unwrap();
+        let root = parse_id_p(root, "root").unwrap();
         assert_eq!((root.uid, root.home), (0, "/var/root".into()));
+
+        let nobody = "nobody:*:-2:-2::0:0:Unprivileged User:/var/empty:/usr/bin/false\n";
+        let nobody = parse_id_p(nobody, "nobody").unwrap();
+        assert_eq!((nobody.uid, nobody.gid), (4294967294, 4294967294));
 
         // A `:` in the full name does not move home or shell.
         let odd = "x:*:600:20::0:0:Smith: Bob:/Users/x:/bin/zsh";
-        let odd = parse_id_p(odd, "x").unwrap().unwrap();
+        let odd = parse_id_p(odd, "x").unwrap();
         assert_eq!(odd.comment, "Smith: Bob");
         assert_eq!(odd.home, PathBuf::from("/Users/x"));
         assert_eq!(odd.shell, PathBuf::from("/bin/zsh"));
     }
 
-    /// `id 501` finds no account named `501` and answers for uid 501; that
-    /// is not an account named `501`. An alias is: `getpwnam` answers it
-    /// with the account's own name.
     #[test]
-    fn id_p_uid_fallback_is_not_a_match_but_an_alias_is() {
+    fn signed_ids_read_back_as_the_kernel_holds_them() {
+        assert_eq!(signed_id("0"), Some(0));
+        assert_eq!(signed_id("4294967295"), Some(u32::MAX));
+        assert_eq!(signed_id("-1"), Some(u32::MAX));
+        assert_eq!(signed_id("-2147483648"), Some(0x8000_0000));
+        for bad in ["4294967296", "-2147483649", "", "x", "1.5"] {
+            assert_eq!(signed_id(bad), None, "{bad}");
+        }
+    }
+
+    /// `id 501` finds no account named `501` and answers for uid 501; that
+    /// is not an account named `501`, and the message names the account it
+    /// is. An alias is: `getpwnam` answers it with the account's own name.
+    #[test]
+    fn id_p_uid_fallback_is_refused_but_an_alias_is_the_account() {
         let cadu = "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n";
-        assert_eq!(parse_id_p(cadu, "501").unwrap(), None);
-        assert_eq!(parse_id_p(cadu, "carlos").unwrap().unwrap().name, "cadu");
+        let err = parse_id_p(cadu, "501").unwrap_err().chain();
+        assert!(
+            err.contains("`id` answered for uid 501 instead, which is `cadu`"),
+            "{err}"
+        );
+        assert_eq!(parse_id_p(cadu, "carlos").unwrap().name, "cadu");
     }
 
     #[test]
@@ -1565,6 +1675,22 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// What `dscl /Search -search /Groups GroupMembership cadu` printed on
+    /// macOS 26.3: tab-separated headers, members indented below.
+    const DSCL_CADU: &str = "_appserverusr\t\tGroupMembership = (\n    cadu\n)\n\
+                             admin\t\tGroupMembership = (\n    root,\n    cadu\n)\n\
+                             _appserveradm\t\tGroupMembership = (\n    cadu\n)\n";
+
+    #[test]
+    fn dscl_group_search_lists_the_groups_sorted() {
+        assert_eq!(
+            parse_dscl_group_search(DSCL_CADU),
+            ["_appserveradm", "_appserverusr", "admin"]
+        );
+        // An account no group lists: `dscl` prints nothing and exits 0.
+        assert!(parse_dscl_group_search("").is_empty());
     }
 
     // ---- plan_modify ----
@@ -1711,7 +1837,8 @@ mod tests {
     }
 
     /// A mac. `/etc/passwd` exists there and describes only system
-    /// services, so every op in this module has to refuse before reading it.
+    /// services, so every op in this module but `Existing` has to refuse
+    /// before reading it.
     fn macos(sys: System) -> System {
         let mut facts = sys.facts().clone();
         facts.os = Os::Macos;
@@ -1722,8 +1849,9 @@ mod tests {
 
     /// Measured on macOS 26.3 before this gate existed: `user::Absent`
     /// reported `ok` for the logged-in account and `user::Existing` reported
-    /// that it did not exist. Every one of the four refuses now, and the
-    /// message says where the accounts actually live.
+    /// that it did not exist. The three that manage accounts refuse now, and
+    /// the message says where the accounts actually live; `Existing` asks
+    /// Open Directory (below).
     #[test]
     fn every_user_op_refuses_a_mac_naming_open_directory() {
         let fake = Arc::new(base());
@@ -1732,21 +1860,79 @@ mod tests {
         let errs = [
             Present::new("cadu").check(&s).unwrap_err().chain(),
             Absent::new("cadu").check(&s).unwrap_err().chain(),
-            Existing::named("cadu").check(&s).unwrap_err().chain(),
             Membership::of_name("cadu")
                 .in_group_named("staff")
                 .check(&s)
                 .unwrap_err()
                 .chain(),
         ];
-        for (op, err) in ["Present", "Absent", "Existing", "Membership"]
-            .iter()
-            .zip(&errs)
-        {
+        for (op, err) in ["Present", "Absent", "Membership"].iter().zip(&errs) {
             assert!(err.contains(&format!("user::{op}")), "{op}: {err}");
             assert!(err.contains("Open Directory"), "{op}: {err}");
             assert!(err.contains("/etc/passwd"), "{op}: {err}");
         }
+    }
+
+    /// `Existing` on a mac reads Open Directory, not the mac's `/etc/passwd`
+    /// and `/etc/group` (which `base()` plants with a different `cadu`): the
+    /// account through `id -P`, its groups through `dscl`, searched by the
+    /// name `id` returned, so an alias gets its account's groups.
+    #[test]
+    fn existing_on_a_mac_reads_open_directory() {
+        let fake = Arc::new(
+            base()
+                .with_cmd(
+                    "/usr/bin/id",
+                    Some(&["-P", "--", "carlos"]),
+                    0,
+                    "cadu:********:501:20::0:0:Cadu:/Users/cadu:/bin/zsh\n",
+                )
+                .with_cmd(
+                    "/usr/bin/dscl",
+                    Some(&["/Search", "-search", "/Groups", "GroupMembership", "cadu"]),
+                    0,
+                    DSCL_CADU,
+                ),
+        );
+        let s = macos(fake_sys(&fake));
+        let Plan::Satisfied(account) = Existing::named("carlos").check(&s).unwrap();
+        assert_eq!(
+            account,
+            Account {
+                name: "cadu".into(),
+                uid: 501,
+                gid: 20,
+                home: "/Users/cadu".into(),
+                shell: "/bin/zsh".into(),
+                groups: vec![
+                    "_appserveradm".into(),
+                    "_appserverusr".into(),
+                    "admin".into()
+                ],
+            }
+        );
+    }
+
+    /// An account Open Directory does not have is refused, in both modes,
+    /// and the message does not send a mac to `user::Present`, which
+    /// refuses it.
+    #[test]
+    fn existing_on_a_mac_refuses_a_missing_account() {
+        let fake = Arc::new(base().with_cmd("/usr/bin/id", None, 1, ""));
+        for dry in [false, true] {
+            let s = macos(fake_sys(&fake)).with_check_mode(dry);
+            let err = Existing::named("cadu").check(&s).unwrap_err().chain();
+            assert!(
+                err.contains("user `cadu` does not exist: `id -P` found no account called `cadu`"),
+                "{err}"
+            );
+            assert!(!err.contains("user::Present"), "{err}");
+        }
+        assert!(fake.argvs().iter().all(|a| a[0] == "/usr/bin/id"));
+        // And a name the tools would read as a flag never reaches them.
+        let s = macos(fake_sys(&fake));
+        assert!(Existing::named("-x").check(&s).is_err());
+        assert_eq!(fake.argvs().len(), 2);
     }
 
     /// A platform rustible has never heard of is refused too, and told which

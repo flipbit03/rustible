@@ -1107,12 +1107,14 @@ name (`python3`): one brew did not link at `<prefix>/opt/<name>` makes
 still installed.
 
 **Every operation declares where it runs and refuses the rest by name.** On a
-mac, `user::*`, `group::*`, `hostname::Is`, `sysctl::Present`, `apt::*` and
-`systemd::*` refuse (there `/etc/passwd` lists only system accounts and there
-is no `/proc`); `file::*`, `shell`, `http`, `archive` and `brew` run.
-`ssh::authorized_keys` runs in every form; on a mac, `for_user_name(..)` finds
-the account through Open Directory (`id -P`) rather than `/etc/passwd`. A
-platform Rustible does not know is refused by every op.
+mac, `user::*` but `user::Existing`, `group::*`, `hostname::Is`,
+`sysctl::Present`, `apt::*` and `systemd::*` refuse (there `/etc/passwd` lists
+only system accounts and there is no `/proc`); `file::*`, `shell`, `http`,
+`archive` and `brew` run. `user::Existing` and `ssh::authorized_keys`'
+`for_user_name(..)` find the account through Open Directory there, so
+`user::Existing` then `for_user(&account)` works on a mac too; an account's
+`groups` are the groups whose `GroupMembership` lists it. A platform Rustible
+does not know is refused by every op.
 
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:
