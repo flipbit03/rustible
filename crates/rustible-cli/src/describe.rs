@@ -213,8 +213,11 @@ impl Cargo {
             b.cargo.common.target = triples.to_vec();
         }
         // Compiler messages come back as JSON on stdout, for `print_messages`
-        // to show; cargo's own lines and progress bar stay on stderr.
-        let format = if diagnostics_in_color() {
+        // to show; cargo's own lines and progress bar stay on stderr. Their
+        // colour and the progress bar are decided as cargo decides them.
+        let config = cargo_config2::Config::load().context("loading cargo config")?;
+        let style = stderr_style(&TermInputs::read(&config));
+        let format = if style.color {
             "json-diagnostic-rendered-ansi"
         } else {
             "json"
@@ -227,7 +230,7 @@ impl Cargo {
         let mut std_cmd = b
             .build_command()
             .context("preparing the zig-backed cargo build")?;
-        wire_host_linker(&self.host, &mut std_cmd)?;
+        wire_host_linker(&self.host, &config, &mut std_cmd)?;
         let mut cmd = tokio::process::Command::from(std_cmd);
         match selected {
             Some(name) => {
@@ -239,53 +242,164 @@ impl Cargo {
         }
         cmd.stdout(std::process::Stdio::piped());
         let mut child = cmd.spawn().context("running cargo build")?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        print_messages(stdout, apple).await?;
+        let stdout = tokio::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        let erase = style.erase_progress_bar();
+        let printed = print_messages(stdout, &mut std::io::stderr(), apple, erase).await;
+        // Wait for cargo even when reading its output failed, so the build's
+        // own result is not lost behind the read error.
         let status = child.wait().await.context("running cargo build")?;
+        let exit = status.code().unwrap_or(-1);
+        printed.with_context(|| format!("cargo build (exit {exit})"))?;
         if !status.success() {
-            bail!("cargo build failed (exit {})", status.code().unwrap_or(-1));
+            bail!("cargo build failed (exit {exit})");
         }
         Ok(())
     }
 }
 
-/// Whether the compiler messages `Cargo::build` prints carry colour: as
-/// cargo decides for its own lines, `CARGO_TERM_COLOR` first, else whether
-/// stderr is a terminal.
-fn diagnostics_in_color() -> bool {
-    use std::io::IsTerminal;
-    match std::env::var("CARGO_TERM_COLOR").as_deref() {
-        Ok("always") => true,
-        Ok("never") => false,
-        _ => std::io::stderr().is_terminal(),
+/// How cargo draws on the stderr it shares with the compiler messages
+/// `Cargo::build` prints, so that the two match.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StderrStyle {
+    /// cargo colours its lines, so rustc's messages are rendered with ANSI
+    /// colour too, as cargo would have asked rustc for.
+    color: bool,
+    /// cargo draws a progress bar.
+    progress_bar: bool,
+}
+
+impl StderrStyle {
+    /// Whether to erase cargo's progress bar before a message, as cargo's
+    /// `Shell::err_erase_line` does: with `\x1b[K`, and only when it prints
+    /// in colour. cargo leaves the cursor at the start of the bar's line
+    /// (it draws `"{bar}\r"`), so no `\r` is needed; without one, a cargo
+    /// line caught half-written is not wiped either (DECISIONS D3).
+    fn erase_progress_bar(self) -> bool {
+        self.progress_bar && self.color
+    }
+}
+
+/// What cargo reads to decide its `StderrStyle`.
+#[derive(Debug, Clone, Default)]
+struct TermInputs {
+    /// `term.color`, `CARGO_TERM_COLOR` applied (cargo-config2 does that).
+    color: Option<cargo_config2::Color>,
+    /// `term.quiet`.
+    quiet: bool,
+    /// `term.progress.when`, `CARGO_TERM_PROGRESS_WHEN` applied.
+    progress_when: Option<cargo_config2::When>,
+    /// `term.progress.width` is set.
+    progress_width: bool,
+    /// stderr is a terminal.
+    tty: bool,
+    /// `NO_COLOR` is set and not empty.
+    no_color: bool,
+    /// `CLICOLOR_FORCE` is set and not empty.
+    clicolor_force: bool,
+    /// `CLICOLOR`, when set: anything but `0` is true.
+    clicolor: Option<bool>,
+    /// `TERM`.
+    term: Option<String>,
+    /// `CI` is set.
+    ci: bool,
+    /// `TF_BUILD` is set (Azure Pipelines), which cargo counts as CI too.
+    tf_build: bool,
+}
+
+impl TermInputs {
+    fn read(config: &cargo_config2::Config) -> TermInputs {
+        use std::io::IsTerminal;
+        let var = |name| std::env::var_os(name);
+        let non_empty = |name| var(name).is_some_and(|v| !v.is_empty());
+        TermInputs {
+            color: config.term.color,
+            quiet: config.term.quiet.unwrap_or(false),
+            progress_when: config.term.progress.when,
+            progress_width: config.term.progress.width.is_some(),
+            tty: std::io::stderr().is_terminal(),
+            no_color: non_empty("NO_COLOR"),
+            clicolor_force: non_empty("CLICOLOR_FORCE"),
+            clicolor: var("CLICOLOR").map(|v| v != "0"),
+            term: var("TERM").map(|v| v.to_string_lossy().into_owned()),
+            ci: var("CI").is_some(),
+            tf_build: var("TF_BUILD").is_some(),
+        }
+    }
+}
+
+/// cargo's own decisions, from `t`. Colour: `term.color`, and for `auto`
+/// anstream's choice for stderr (`anstream::auto::choice`, which is what
+/// cargo's `Shell` uses): `NO_COLOR`, then `CLICOLOR_FORCE`, then
+/// `CLICOLOR=0`, then a terminal whose `TERM` is set and not `dumb` (or
+/// `CLICOLOR` set, or CI). Progress bar: `term.progress.when`, and for
+/// `auto` none when quiet, under `TERM=dumb` or on CI (cargo's
+/// `Shell::progress_supported`); either way only with a width to draw it
+/// in, a terminal's or `term.progress.width` (`Progress::new_priv`).
+fn stderr_style(t: &TermInputs) -> StderrStyle {
+    use cargo_config2::{Color, When};
+    let dumb = t.term.as_deref() == Some("dumb");
+    let color = match t.color.unwrap_or_default() {
+        Color::Always => true,
+        Color::Never => false,
+        Color::Auto => {
+            !t.no_color
+                && (t.clicolor_force
+                    || (t.clicolor != Some(false)
+                        && t.tty
+                        && ((t.term.is_some() && !dumb) || t.clicolor == Some(true) || t.ci)))
+        }
+    };
+    let width = t.tty || t.progress_width;
+    let progress_bar = match t.progress_when.unwrap_or_default() {
+        When::Always => width,
+        When::Never => false,
+        When::Auto => !t.quiet && !dumb && !t.ci && !t.tf_build && width,
+    };
+    StderrStyle {
+        color,
+        progress_bar,
     }
 }
 
 /// Show the compiler messages from cargo's `--message-format=json` stdout on
-/// our stderr, as each line arrives so they stay in step with cargo's own
-/// lines. stdout stays clean for `--json`.
-async fn print_messages(stdout: tokio::process::ChildStdout, apple: bool) -> Result<()> {
-    use std::io::{IsTerminal, Write};
+/// `out` (stderr; stdout stays clean for `--json`) as each line arrives.
+/// cargo writes its own lines to stderr directly, so the two are close but
+/// not strictly ordered: a message replayed from a cached build can land
+/// after cargo's `Finished`, and rarely inside one of cargo's lines (see
+/// DECISIONS `[ISSUE-155]` D3). `erase_bar` is
+/// `StderrStyle::erase_progress_bar`.
+async fn print_messages(
+    mut stdout: impl tokio::io::AsyncBufRead + Unpin,
+    out: &mut impl std::io::Write,
+    apple: bool,
+    erase_bar: bool,
+) -> Result<()> {
     use tokio::io::AsyncBufReadExt;
 
-    // cargo draws its progress bar only on a terminal.
-    let progress_bar = std::io::stderr().is_terminal();
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await.context("reading cargo's output")? {
-        let text = match cargo_line(&line, apple) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Bytes, not `lines()`: a build script's non-UTF-8 output must not
+        // end the build's output.
+        if stdout
+            .read_until(b'\n', &mut buf)
+            .await
+            .context("reading cargo's output")?
+            == 0
+        {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\n', '\r']);
+        let text = match cargo_line(line, apple) {
             CargoLine::Show(rendered) => rendered,
             CargoLine::Other => format!("{line}\n"),
             CargoLine::Quiet => continue,
         };
-        let mut err = std::io::stderr().lock();
-        // Clear cargo's progress bar first, as cargo does before a message;
-        // it draws the bar again on its next tick.
-        if progress_bar {
-            let _ = err.write_all(b"\r\x1b[K");
-        }
-        let _ = err.write_all(text.as_bytes());
+        let erase = if erase_bar { "\x1b[K" } else { "" };
+        // One write, so the erase and the message are not split.
+        let _ = out.write_all(format!("{erase}{text}").as_bytes());
     }
-    Ok(())
 }
 
 /// One line of cargo's `--message-format=json` stdout, decided.
@@ -368,9 +482,12 @@ fn is_sdk_lookup_warning(m: &CompilerMessage) -> bool {
 /// The fix is the same for both cases: a zig wrapper for the host triple
 /// in `CARGO_TARGET_<HOST>_LINKER`, which stable cargo applies to host
 /// artifacts, and the override removed so that it can.
-fn wire_host_linker(host_triple: &str, cmd: &mut std::process::Command) -> Result<()> {
-    let config = cargo_config2::Config::load().context("loading cargo config for zig")?;
-    let host = cargo_zigbuild::zig::prepare_zig_linker(host_triple, &config)
+fn wire_host_linker(
+    host_triple: &str,
+    config: &cargo_config2::Config,
+    cmd: &mut std::process::Command,
+) -> Result<()> {
+    let host = cargo_zigbuild::zig::prepare_zig_linker(host_triple, config)
         .with_context(|| format!("preparing zig as the linker for host {host_triple}"))?;
     let env_host = host_triple.replace('-', "_");
     cmd.env(
@@ -811,5 +928,280 @@ mod tests {
         for line in ["", "hello from somewhere", r#"{"not":"cargo"}"#] {
             assert_eq!(cargo_line(line, true), CargoLine::Other, "{line}");
         }
+    }
+
+    // ---- how cargo draws on stderr ----
+
+    /// A terminal like most: `TERM` set, no colour variables, not CI.
+    fn terminal() -> TermInputs {
+        TermInputs {
+            tty: true,
+            term: Some("xterm-256color".into()),
+            ..TermInputs::default()
+        }
+    }
+
+    fn style(color: bool, progress_bar: bool) -> StderrStyle {
+        StderrStyle {
+            color,
+            progress_bar,
+        }
+    }
+
+    #[test]
+    fn a_plain_terminal_gets_colour_and_a_progress_bar() {
+        assert_eq!(stderr_style(&terminal()), style(true, true));
+    }
+
+    #[test]
+    fn not_a_terminal_gets_neither() {
+        let t = TermInputs {
+            tty: false,
+            ..terminal()
+        };
+        assert_eq!(stderr_style(&t), style(false, false));
+    }
+
+    #[test]
+    fn what_turns_colour_off_on_a_terminal() {
+        use cargo_config2::Color;
+        for (why, t) in [
+            (
+                "NO_COLOR",
+                TermInputs {
+                    no_color: true,
+                    ..terminal()
+                },
+            ),
+            (
+                "TERM=dumb",
+                TermInputs {
+                    term: Some("dumb".into()),
+                    ..terminal()
+                },
+            ),
+            (
+                "no TERM",
+                TermInputs {
+                    term: None,
+                    ..terminal()
+                },
+            ),
+            (
+                "CLICOLOR=0",
+                TermInputs {
+                    clicolor: Some(false),
+                    ..terminal()
+                },
+            ),
+            (
+                "term.color = never",
+                TermInputs {
+                    color: Some(Color::Never),
+                    ..terminal()
+                },
+            ),
+            // NO_COLOR beats CLICOLOR_FORCE, as in anstream.
+            (
+                "NO_COLOR and CLICOLOR_FORCE",
+                TermInputs {
+                    no_color: true,
+                    clicolor_force: true,
+                    ..terminal()
+                },
+            ),
+        ] {
+            assert!(!stderr_style(&t).color, "{why}");
+        }
+    }
+
+    #[test]
+    fn what_turns_colour_on_without_a_plain_terminal() {
+        use cargo_config2::Color;
+        let pipe = TermInputs {
+            tty: false,
+            ..terminal()
+        };
+        for (why, t) in [
+            (
+                "term.color = always",
+                TermInputs {
+                    color: Some(Color::Always),
+                    ..pipe.clone()
+                },
+            ),
+            // `term.color = always` wins over NO_COLOR, as it does in cargo.
+            (
+                "term.color = always and NO_COLOR",
+                TermInputs {
+                    color: Some(Color::Always),
+                    no_color: true,
+                    ..pipe.clone()
+                },
+            ),
+            (
+                "CLICOLOR_FORCE",
+                TermInputs {
+                    clicolor_force: true,
+                    ..pipe.clone()
+                },
+            ),
+            (
+                "CI on a terminal with no TERM",
+                TermInputs {
+                    term: None,
+                    ci: true,
+                    ..terminal()
+                },
+            ),
+            (
+                "CLICOLOR=1 under TERM=dumb",
+                TermInputs {
+                    term: Some("dumb".into()),
+                    clicolor: Some(true),
+                    ..terminal()
+                },
+            ),
+        ] {
+            assert!(stderr_style(&t).color, "{why}");
+        }
+    }
+
+    #[test]
+    fn what_stops_the_progress_bar_on_a_terminal() {
+        use cargo_config2::When;
+        for (why, t) in [
+            (
+                "TERM=dumb",
+                TermInputs {
+                    term: Some("dumb".into()),
+                    ..terminal()
+                },
+            ),
+            (
+                "CI",
+                TermInputs {
+                    ci: true,
+                    ..terminal()
+                },
+            ),
+            (
+                "TF_BUILD",
+                TermInputs {
+                    tf_build: true,
+                    ..terminal()
+                },
+            ),
+            (
+                "term.quiet",
+                TermInputs {
+                    quiet: true,
+                    ..terminal()
+                },
+            ),
+            (
+                "term.progress.when = never",
+                TermInputs {
+                    progress_when: Some(When::Never),
+                    ..terminal()
+                },
+            ),
+        ] {
+            assert!(!stderr_style(&t).progress_bar, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_forced_progress_bar_needs_somewhere_to_draw() {
+        use cargo_config2::When;
+        let always = TermInputs {
+            progress_when: Some(When::Always),
+            ..terminal()
+        };
+        // Forced, it ignores CI and TERM=dumb.
+        let t = TermInputs {
+            ci: true,
+            term: Some("dumb".into()),
+            ..always.clone()
+        };
+        assert!(stderr_style(&t).progress_bar);
+        // Off a terminal it needs term.progress.width.
+        let pipe = TermInputs {
+            tty: false,
+            ..always
+        };
+        assert!(!stderr_style(&pipe).progress_bar);
+        let t = TermInputs {
+            progress_width: true,
+            ..pipe
+        };
+        assert!(stderr_style(&t).progress_bar);
+    }
+
+    // ---- printing what cargo said ----
+
+    /// `print_messages` over `input`, returning what it wrote.
+    fn printed(input: &[u8], apple: bool, erase_bar: bool) -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut out = Vec::new();
+        rt.block_on(print_messages(input, &mut out, apple, erase_bar))
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn messages_and_stray_lines_go_to_the_writer_and_bookkeeping_does_not() {
+        let input = [
+            compiler_message(
+                "warning",
+                "unused variable: `x`",
+                Value::Null,
+                "warning: x\n",
+            ),
+            compiler_message("warning", NO_XCRUN, Value::Null, "warning: xcrun\n"),
+            r#"{"reason":"build-finished","success":true}"#.into(),
+            "not json".into(),
+        ]
+        .join("\n");
+        assert_eq!(
+            String::from_utf8(printed(input.as_bytes(), true, false)).unwrap(),
+            "warning: x\nnot json\n"
+        );
+    }
+
+    #[test]
+    fn the_progress_bar_is_erased_before_each_message_only_when_asked() {
+        let input = compiler_message("warning", "w", Value::Null, "warning: w\n");
+        assert_eq!(
+            printed(input.as_bytes(), false, true),
+            b"\x1b[Kwarning: w\n"
+        );
+        assert_eq!(printed(input.as_bytes(), false, false), b"warning: w\n");
+    }
+
+    #[test]
+    fn the_bar_is_erased_as_cargo_erases_it_only_in_colour() {
+        assert!(style(true, true).erase_progress_bar());
+        // NO_COLOR on a terminal: cargo still draws the bar, but its
+        // `err_erase_line` writes nothing without colour.
+        let t = TermInputs {
+            no_color: true,
+            ..terminal()
+        };
+        assert_eq!(stderr_style(&t), style(false, true));
+        assert!(!stderr_style(&t).erase_progress_bar());
+        assert!(!style(true, false).erase_progress_bar());
+    }
+
+    #[test]
+    fn output_that_is_not_utf8_does_not_end_the_reading() {
+        let mut input = b"bad \xff byte\r\n".to_vec();
+        input.extend(compiler_message("warning", "w", Value::Null, "warning: w\n").as_bytes());
+        assert_eq!(
+            String::from_utf8(printed(&input, false, false)).unwrap(),
+            "bad \u{fffd} byte\nwarning: w\n"
+        );
     }
 }
