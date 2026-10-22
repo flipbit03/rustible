@@ -51,6 +51,13 @@ pub struct Account {
     /// Home directory as `/etc/passwd` (on macOS, Open Directory) records it.
     /// The directory itself may not exist; nothing here repairs a missing home
     /// after creation.
+    ///
+    /// Taken verbatim, so whether it ends in `/` is up to that record (usually
+    /// not). Build paths with [`Path::join`](std::path::Path::join), which adds
+    /// exactly one separator either way: `home.join(".config/app")`. Pasting it
+    /// into a string (`format!("{}/x", home.display())`, `{{ home }}/x` in a
+    /// template) can give `//` when the record has the slash; harmless on
+    /// Linux and macOS.
     pub home: PathBuf,
     /// Login shell as `/etc/passwd` (on macOS, Open Directory) records it, the
     /// distro tool's default when [`Present`] was not given one.
@@ -74,7 +81,8 @@ pub struct PasswdEntry {
     pub gid: u32,
     /// The GECOS field, Ansible's `comment`.
     pub comment: String,
-    /// Field 6, verbatim. Whether the directory exists is not checked here.
+    /// Field 6, verbatim (a trailing `/` stays if the line has one; see
+    /// [`Account::home`]). Whether the directory exists is not checked here.
     pub home: PathBuf,
     /// Field 7, verbatim; empty when the line ends on its colon.
     pub shell: PathBuf,
