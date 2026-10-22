@@ -212,6 +212,16 @@ impl Cargo {
             b.cargo.common.profile = Some("dist".into());
             b.cargo.common.target = triples.to_vec();
         }
+        // Compiler messages come back as JSON on stdout, for `print_messages`
+        // to show; cargo's own lines and progress bar stay on stderr.
+        let format = if diagnostics_in_color() {
+            "json-diagnostic-rendered-ansi"
+        } else {
+            "json"
+        };
+        b.cargo.common.message_format = vec![format.into()];
+        // The describe build's host target counts: a mac controller is Apple.
+        let apple = b.cargo.common.target.iter().any(|t| t.contains("-apple-"));
         // This is where zig is located and the wrappers written; a machine
         // with no zig fails here, by name, before cargo runs.
         let mut std_cmd = b
@@ -227,12 +237,118 @@ impl Cargo {
                 cmd.env_remove("RUSTIBLE_PLAYBOOK");
             }
         }
-        let status = cmd.status().await.context("running cargo build")?;
+        cmd.stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().context("running cargo build")?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        print_messages(stdout, apple).await?;
+        let status = child.wait().await.context("running cargo build")?;
         if !status.success() {
             bail!("cargo build failed (exit {})", status.code().unwrap_or(-1));
         }
         Ok(())
     }
+}
+
+/// Whether the compiler messages `Cargo::build` prints carry colour: as
+/// cargo decides for its own lines, `CARGO_TERM_COLOR` first, else whether
+/// stderr is a terminal.
+fn diagnostics_in_color() -> bool {
+    use std::io::IsTerminal;
+    match std::env::var("CARGO_TERM_COLOR").as_deref() {
+        Ok("always") => true,
+        Ok("never") => false,
+        _ => std::io::stderr().is_terminal(),
+    }
+}
+
+/// Show the compiler messages from cargo's `--message-format=json` stdout on
+/// our stderr, as each line arrives so they stay in step with cargo's own
+/// lines. stdout stays clean for `--json`.
+async fn print_messages(stdout: tokio::process::ChildStdout, apple: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    use tokio::io::AsyncBufReadExt;
+
+    // cargo draws its progress bar only on a terminal.
+    let progress_bar = std::io::stderr().is_terminal();
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    while let Some(line) = lines.next_line().await.context("reading cargo's output")? {
+        let text = match cargo_line(&line, apple) {
+            CargoLine::Show(rendered) => rendered,
+            CargoLine::Other => format!("{line}\n"),
+            CargoLine::Quiet => continue,
+        };
+        let mut err = std::io::stderr().lock();
+        // Clear cargo's progress bar first, as cargo does before a message;
+        // it draws the bar again on its next tick.
+        if progress_bar {
+            let _ = err.write_all(b"\r\x1b[K");
+        }
+        let _ = err.write_all(text.as_bytes());
+    }
+    Ok(())
+}
+
+/// One line of cargo's `--message-format=json` stdout, decided.
+#[derive(Debug, PartialEq)]
+enum CargoLine {
+    /// A compiler message, as rustc rendered it for a terminal.
+    Show(String),
+    /// Cargo bookkeeping (artifacts, build scripts, the end of the build),
+    /// or the SDK lookup warning `is_sdk_lookup_warning` drops.
+    Quiet,
+    /// Not cargo's JSON at all: shown as it came.
+    Other,
+}
+
+#[derive(Deserialize)]
+struct CargoMessage {
+    reason: String,
+    message: Option<CompilerMessage>,
+}
+
+#[derive(Deserialize)]
+struct CompilerMessage {
+    level: String,
+    message: String,
+    code: Option<Value>,
+    rendered: Option<String>,
+}
+
+/// What to do with one line of cargo's JSON stdout. `apple` says the build
+/// has an Apple target, the only kind rustc looks for an SDK for.
+fn cargo_line(line: &str, apple: bool) -> CargoLine {
+    let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else {
+        return CargoLine::Other;
+    };
+    match msg.message {
+        Some(m) if msg.reason == "compiler-message" => {
+            if apple && is_sdk_lookup_warning(&m) {
+                CargoLine::Quiet
+            } else {
+                CargoLine::Show(
+                    m.rendered
+                        .unwrap_or_else(|| format!("{}: {}\n", m.level, m.message)),
+                )
+            }
+        }
+        _ => CargoLine::Quiet,
+    }
+}
+
+/// rustc's warning that it could not find an Apple SDK (`XcrunError` in
+/// `rustc_codegen_ssa`): there is no `xcrun` (any non-mac), or `xcrun`
+/// failed (a mac without the command line tools). zig links against its own
+/// libSystem and never reads the SDK, so under Rustible it is always noise,
+/// and it is not a lint, so nothing else can silence it (issue #155).
+/// rustc's lookup of an SDK it did find (`output of xcrun ...`) is not this.
+fn is_sdk_lookup_warning(m: &CompilerMessage) -> bool {
+    let text = &m.message;
+    m.level == "warning"
+        && m.code.as_ref().is_none_or(Value::is_null)
+        && (text.starts_with("invoking `\"xcrun\" ")
+            || text.starts_with("failed running `\"xcrun\" "))
+        && text.contains(" \"--show-sdk-path\"` to find ")
+        && text.contains(".sdk")
 }
 
 /// Point the *host* linker at zig too, so build scripts and proc-macros
@@ -575,5 +691,125 @@ mod tests {
             heading.is_some(),
             "no `### ` heading in the guide for #{anchor}"
         );
+    }
+
+    // ---- cargo's JSON messages ----
+
+    /// A `compiler-message` line as cargo prints it, trimmed to the fields
+    /// `cargo_line` reads plus the ones around them.
+    fn compiler_message(level: &str, message: &str, code: Value, rendered: &str) -> String {
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///ws#0.1.0",
+            "manifest_path": "/ws/Cargo.toml",
+            "target": { "kind": ["bin"], "name": "infra" },
+            "message": {
+                "$message_type": "diagnostic",
+                "level": level,
+                "message": message,
+                "code": code,
+                "spans": [],
+                "children": [],
+                "rendered": rendered,
+            },
+        })
+        .to_string()
+    }
+
+    /// rustc 1.99's message when there is no `xcrun` at all (a Linux
+    /// controller), byte for byte.
+    const NO_XCRUN: &str = "invoking `\"xcrun\" \"--sdk\" \"macosx\" \"--show-sdk-path\"` to find \
+                            MacOSX.sdk failed: No such file or directory (os error 2)";
+    /// And when `xcrun` is there but fails (a mac without the command line
+    /// tools).
+    const XCRUN_FAILED: &str =
+        "failed running `\"xcrun\" \"--sdk\" \"macosx\" \"--show-sdk-path\"` to find MacOSX.sdk";
+
+    #[test]
+    fn the_sdk_lookup_warning_is_dropped_for_an_apple_build() {
+        for text in [NO_XCRUN, XCRUN_FAILED] {
+            let line =
+                compiler_message("warning", text, Value::Null, &format!("warning: {text}\n"));
+            assert_eq!(cargo_line(&line, true), CargoLine::Quiet, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_sdk_lookup_warning_shows_when_no_target_is_apple() {
+        let line = compiler_message("warning", NO_XCRUN, Value::Null, "warning: xcrun\n");
+        assert_eq!(
+            cargo_line(&line, false),
+            CargoLine::Show("warning: xcrun\n".into())
+        );
+    }
+
+    #[test]
+    fn everything_else_rustc_says_is_shown_as_rendered() {
+        let unused = compiler_message(
+            "warning",
+            "unused variable: `x`",
+            serde_json::json!({ "code": "unused_variables", "explanation": null }),
+            "\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n",
+        );
+        assert_eq!(
+            cargo_line(&unused, true),
+            CargoLine::Show("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n".into())
+        );
+        // An error mentioning xcrun is still an error, and is shown.
+        let error = compiler_message("error", NO_XCRUN, Value::Null, "error: xcrun\n");
+        assert_eq!(
+            cargo_line(&error, true),
+            CargoLine::Show("error: xcrun\n".into())
+        );
+        // rustc passing on what a working `xcrun` printed is not a failed
+        // lookup.
+        let found = compiler_message(
+            "warning",
+            "output of `xcrun` while finding MacOSX.sdk",
+            Value::Null,
+            "warning: output of `xcrun`\n",
+        );
+        assert_eq!(
+            cargo_line(&found, true),
+            CargoLine::Show("warning: output of `xcrun`\n".into())
+        );
+        // A lint whose text happens to match still has a code, and shows.
+        let lint = compiler_message(
+            "warning",
+            NO_XCRUN,
+            serde_json::json!({ "code": "some_lint", "explanation": null }),
+            "warning: lint\n",
+        );
+        assert_eq!(
+            cargo_line(&lint, true),
+            CargoLine::Show("warning: lint\n".into())
+        );
+    }
+
+    #[test]
+    fn a_message_without_rendered_text_is_shown_from_its_parts() {
+        let line = serde_json::json!({
+            "reason": "compiler-message",
+            "message": { "level": "error", "message": "boom", "code": null, "rendered": null },
+        })
+        .to_string();
+        assert_eq!(
+            cargo_line(&line, true),
+            CargoLine::Show("error: boom\n".into())
+        );
+    }
+
+    #[test]
+    fn cargo_bookkeeping_is_quiet_and_anything_else_is_passed_on() {
+        for line in [
+            r#"{"reason":"compiler-artifact","package_id":"x","target":{},"filenames":[]}"#,
+            r#"{"reason":"build-script-executed","package_id":"x","out_dir":"/o"}"#,
+            r#"{"reason":"build-finished","success":false}"#,
+        ] {
+            assert_eq!(cargo_line(line, true), CargoLine::Quiet, "{line}");
+        }
+        for line in ["", "hello from somewhere", r#"{"not":"cargo"}"#] {
+            assert_eq!(cargo_line(line, true), CargoLine::Other, "{line}");
+        }
     }
 }
