@@ -1115,6 +1115,21 @@ only system accounts and there is no `/proc`); `file::*`, `shell`, `http`,
 `groups` are the groups whose `GroupMembership` lists it, fewer than `id -Gn`
 prints. A platform Rustible does not know is refused by every op.
 
+⚠️ **Take an account's home from Rustible; never write `/home/<name>`.** A
+mac keeps homes under `/Users`, and any account's home can be elsewhere.
+`user::Existing::named(n)`, or the `Account` that `user::Present` returns,
+carries it as `.home`, a `PathBuf`: join onto it, and pass it to a template
+as is.
+
+```rust
+let home = ctx.step("syncthing account", user::Existing::named("syncthing"))?.into_output()?.home;
+let conf = template!(include_str!("../files/app.conf.j2"), home = &home)?; // data = {{ home }}/data
+ctx.step("app.conf", file::Copy::from_str(&conf).to(home.join(".config/app/app.conf")))?;
+```
+
+`user::Existing` only reads, so its output is there under `--check` too; a
+`user::Present` that would create the account has none (§9).
+
 **`ctx.as_root()` returns a `Ctx` by value**, and `step` takes `&mut self`.
 Chain on the temporary, or bind it `mut`:
 
@@ -1244,7 +1259,7 @@ The structs need serde in your workspace: `cargo add serde --features derive`.
 
 ```rust
 use rustible::prelude::*;
-use rustible_std::http;
+use rustible_std::{http, user};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -1266,12 +1281,12 @@ struct RestartRequired {
 }
 
 const API: &str = "http://127.0.0.1:8384/rest";
-const CONFIG: &str = "/home/syncthing/.local/state/syncthing/config.xml";
 
 #[rustible::playbook(hosts = "nas", escalate = true)]
 fn main(ctx: &mut Ctx) -> Result<()> {
     // The API key, read on the target into a Secret: never printed.
-    let config = ctx.sys().read_to_string(CONFIG)?;
+    let home = ctx.step("syncthing account", user::Existing::named("syncthing"))?.into_output()?.home;
+    let config = ctx.sys().read_to_string(home.join(".local/state/syncthing/config.xml"))?;
     let key = config
         .split("<apikey>")
         .nth(1)
