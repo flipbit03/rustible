@@ -12,6 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::apple_sdk;
 use crate::toolchain;
 use crate::workspace::Workspace;
 
@@ -218,6 +219,17 @@ impl Cargo {
             .build_command()
             .context("preparing the zig-backed cargo build")?;
         wire_host_linker(&self.host, &mut std_cmd)?;
+        // On the cargo command only: cargo-zigbuild has already read this
+        // process's environment, and must not take the stand-in for an SDK.
+        if b.cargo
+            .common
+            .target
+            .iter()
+            .any(|t| t.contains("apple-darwin"))
+            && let Some(dir) = apple_sdk::sdkroot_for_build()
+        {
+            std_cmd.env("SDKROOT", dir);
+        }
         let mut cmd = tokio::process::Command::from(std_cmd);
         match selected {
             Some(name) => {
