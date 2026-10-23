@@ -11,6 +11,7 @@
 // machine, so vision 7.2's `sys` rule does not apply to it.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod apple_sdk;
 mod create;
 mod describe;
 mod init;
@@ -208,6 +209,14 @@ fn needs_zig(cli: &Cli) -> bool {
 }
 
 fn main() {
+    // `Cargo::build` names an empty directory as `SDKROOT` so that rustc
+    // stops asking `xcrun` for an Apple SDK. When rustc or cc-rs runs this
+    // binary as the compiler, linker or archiver, zig must not take it for a
+    // real one (`apple_sdk`).
+    if apple_sdk::is_stand_in(std::env::var_os("SDKROOT").as_deref()) {
+        // SAFETY: the first thing `main` does, before any thread exists.
+        unsafe { std::env::remove_var("SDKROOT") };
+    }
     if let Some(result) = dispatch_as_tool() {
         if let Err(e) = result {
             eprintln!("error: {e:#}");
