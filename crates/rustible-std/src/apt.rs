@@ -9,12 +9,15 @@
 //! only the refresh [`Latest`] asks for with `.update_cache()`, with the
 //! `mkdir -p` and `touch` that record it (see below).
 //!
-//! **Held packages.** A package on hold (`apt-mark hold`) that a step would
-//! change, by installing, upgrading, removing or purging it, fails `check`,
-//! under `--check` too, naming `apt-mark unhold`: apt-get refuses the change
-//! itself, `--simulate` included. A held package the step leaves alone
-//! passes, so a held package that is installed is `ok` for [`Present`], and
-//! for [`Latest`] when it is at the candidate.
+//! **Held packages.** A step that would install, upgrade or remove a held
+//! package (`apt-mark hold`) it names, and so change its version, fails
+//! `check`, under `--check` too, naming `apt-mark unhold`: apt-get refuses
+//! the change itself, `--simulate` included. A held package whose version
+//! stays passes, so a held package that is installed is `ok` for
+//! [`Present`], and for [`Latest`] when it is at the candidate, and purging
+//! one's leftover configuration files goes through. A held package the step
+//! does not name but would change (a dependency apt removes or upgrades
+//! with it) is apt-get's to refuse, in `apply`.
 //!
 //! **Cache refresh.** [`Present`] and [`Latest`] take `.update_cache(max_age)`:
 //! `apt-get update` runs when the lists are older than `max_age` or of unknown
@@ -119,7 +122,7 @@ pub enum DpkgStatus {
     /// remain.
     ConfigFiles(String),
     /// Any other state (half-installed, unpacked, ...), a flag other than
-    /// `ok` (`reinst-required`), or a status that is not three words, with
+    /// `ok` (`reinstreq`), or a status that is not three words, with
     /// the raw text.
     Other(String),
 }
@@ -139,8 +142,8 @@ pub fn parse_dpkg_status(text: &str) -> DpkgStatus {
 }
 
 /// Whether one `${Status}\t${Version}` line wants the package held
-/// (`apt-mark hold`), which apt-get refuses to install, upgrade, remove or
-/// purge without `--allow-change-held-packages`.
+/// (`apt-mark hold`), whose version apt-get refuses to change without
+/// `--allow-change-held-packages`.
 pub fn parse_dpkg_held(text: &str) -> bool {
     split_dpkg_line(text).0.split_whitespace().next() == Some("hold")
 }
@@ -190,6 +193,21 @@ struct Dpkg {
     held: bool,
 }
 
+impl Dpkg {
+    /// Held, with no version installed (nothing on disk, or only the
+    /// configuration files), so that installing it sets one: apt-get refuses
+    /// that. apt refuses a held package only when its version would change,
+    /// so purging the configuration files of one, or finishing the
+    /// half-done install of one, goes through.
+    fn held_without_a_version(&self) -> bool {
+        self.held
+            && matches!(
+                self.status,
+                DpkgStatus::Unknown | DpkgStatus::ConfigFiles(_)
+            )
+    }
+}
+
 /// Query dpkg for one package.
 fn dpkg_status(sys: &System, name: &str) -> Result<Dpkg> {
     let out = sys
@@ -220,7 +238,8 @@ fn installed_version(sys: &System, name: &str) -> Result<Option<String>> {
 }
 
 /// The refusal for a step that would `action` (install, upgrade, remove,
-/// purge) a held package, which apt-get refuses too, `--simulate` included.
+/// purge) a held package and so change its version, which apt-get refuses
+/// too, `--simulate` included.
 fn held_error(op: &str, name: &str, action: &str) -> Error {
     Error::msg(format!(
         "package `{name}` is held (`apt-mark hold`), and apt-get will not {action} a held \
@@ -537,7 +556,9 @@ impl Op for Present {
                     name: name.clone(),
                     version,
                 }),
-                _ if dpkg.held => return Err(held_error("Present", name, "install")),
+                _ if dpkg.held_without_a_version() => {
+                    return Err(held_error("Present", name, "install"));
+                }
                 _ => missing.push(name.clone()),
             }
         }
@@ -581,8 +602,8 @@ impl Op for Present {
 
 /// Ensure packages are not installed. `apt: state=absent`.
 ///
-/// A package whose status is `deinstall ok config-files` (removed, config
-/// files kept) counts as present only with `.purge(true)`, so a plain
+/// A package whose state is `config-files` (removed, config files kept)
+/// counts as present only with `.purge(true)`, so a plain
 /// `Absent` after a plain remove is `ok`, and a purging one is `changed`.
 /// `.autoremove(true)` runs `apt-get autoremove -y` after a removal (with
 /// `--purge` when purging); it does not run when nothing was removed.
@@ -638,8 +659,8 @@ struct Removal {
     name: String,
     /// The version dpkg had, which the report names: apt-get takes it.
     version: String,
-    /// Only the configuration files were left (`deinstall ok
-    /// config-files`), which a purge removes.
+    /// Only the configuration files were left (state `config-files`), which
+    /// a purge removes.
     config_files: bool,
 }
 
@@ -674,6 +695,10 @@ impl Op for Absent {
         for name in &self.names {
             let dpkg = dpkg_status(sys, name)?;
             let present = match dpkg.status {
+                DpkgStatus::Installed(_) if dpkg.held => {
+                    let action = if self.purge { "purge" } else { "remove" };
+                    return Err(held_error("Absent", name, action));
+                }
                 DpkgStatus::Installed(v) => Some((v, false)),
                 DpkgStatus::ConfigFiles(v) if self.purge => Some((v, true)),
                 DpkgStatus::ConfigFiles(_) | DpkgStatus::Unknown => None,
@@ -682,10 +707,6 @@ impl Op for Absent {
                      fix it by hand (dpkg --configure -a) before apt::Absent"
                 ),
             };
-            if present.is_some() && dpkg.held {
-                let action = if self.purge { "purge" } else { "remove" };
-                return Err(held_error("Absent", name, action));
-            }
             match present {
                 Some((version, config_files)) => packages.push(Removal {
                     name: name.clone(),
@@ -891,6 +912,13 @@ impl Op for Latest {
         if let Some(stale) = self.refresh_cache(sys)?
             && !self.names.is_empty()
         {
+            // dpkg alone says a held package with no version needs
+            // installing, which the real run refuses whatever the candidate.
+            for name in &self.names {
+                if dpkg_status(sys, name)?.held_without_a_version() {
+                    return Err(held_error("Latest", name, "install"));
+                }
+            }
             return Ok(Plan::Change(Upgrade(Decision::Unrefreshed {
                 names: self.names.clone(),
                 stale,
@@ -900,6 +928,7 @@ impl Op for Latest {
         let mut packages = vec![];
         for name in &self.names {
             let dpkg = dpkg_status(sys, name)?;
+            let held_without_a_version = dpkg.held_without_a_version();
             let installed = match dpkg.status {
                 DpkgStatus::Installed(v) => Some(v),
                 _ => None,
@@ -916,7 +945,9 @@ impl Op for Latest {
                     version: candidate,
                 }),
                 Some(_) if dpkg.held => return Err(held_error("Latest", name, "upgrade")),
-                None if dpkg.held => return Err(held_error("Latest", name, "install")),
+                None if held_without_a_version => {
+                    return Err(held_error("Latest", name, "install"));
+                }
                 None => packages.push((name.clone(), Bump::Install { candidate })),
                 Some(v) => packages.push((
                     name.clone(),
@@ -1165,12 +1196,12 @@ mod tests {
         );
         // A flag other than `ok` is a half-state whatever the state word.
         assert_eq!(
-            parse_dpkg_status("install reinst-required installed\t2.0\n"),
-            DpkgStatus::Other("install reinst-required installed".into())
+            parse_dpkg_status("install reinstreq installed\t2.0\n"),
+            DpkgStatus::Other("install reinstreq installed".into())
         );
         assert_eq!(
-            parse_dpkg_status("install reinst-required half-installed\t2.0\n"),
-            DpkgStatus::Other("install reinst-required half-installed".into())
+            parse_dpkg_status("install reinstreq half-installed\t2.0\n"),
+            DpkgStatus::Other("install reinstreq half-installed".into())
         );
         for state in [
             "half-installed",
@@ -1406,21 +1437,32 @@ mod tests {
 
     #[test]
     fn present_refuses_to_install_a_held_package_in_both_modes() {
-        let fake = Arc::new(
-            dpkg(Fake::new(), "sl", 0, "hold ok not-installed\t\n")
-                .with_cmd("apt-get", None, 0, ""),
-        );
-        for s in [sys(&fake), sys(&fake).with_check_mode(true)] {
-            let err = Present::new(["sl"]).check(&s).unwrap_err().chain();
-            assert!(err.contains("package `sl` is held"), "{err}");
-            assert!(err.contains("will not install"), "{err}");
-            assert!(err.contains("apt-mark unhold sl"), "{err}");
+        for line in [
+            "hold ok not-installed\t\n",
+            "hold ok config-files\t5.02-1\n",
+        ] {
+            let fake = Arc::new(dpkg(Fake::new(), "sl", 0, line).with_cmd("apt-get", None, 0, ""));
+            for s in [sys(&fake), sys(&fake).with_check_mode(true)] {
+                let err = Present::new(["sl"]).check(&s).unwrap_err().chain();
+                assert!(err.contains("package `sl` is held"), "{line}: {err}");
+                assert!(err.contains("will not install"), "{line}: {err}");
+                assert!(err.contains("apt-mark unhold sl"), "{line}: {err}");
+            }
+            assert!(
+                fake.argvs().iter().all(|a| a[0] == "dpkg-query"),
+                "{:?}",
+                fake.argvs()
+            );
         }
-        assert!(
-            fake.argvs().iter().all(|a| a[0] == "dpkg-query"),
-            "{:?}",
-            fake.argvs()
-        );
+    }
+
+    /// A held package dpkg left half-done keeps its version: apt-get
+    /// finishes it, so the hold is not refused.
+    #[test]
+    fn present_lets_apt_finish_a_held_half_configured_package() {
+        let line = "hold ok half-configured\t5.02-1\n";
+        let fake = Arc::new(dpkg(Fake::new(), "sl", 0, line));
+        assert!(Present::new(["sl"]).check(&sys(&fake)).unwrap().is_change());
     }
 
     // ---- Present: update_cache(Duration) ----
@@ -1933,15 +1975,15 @@ W: Some index files failed to download. They have been ignored, or old ones used
     }
 
     #[test]
-    fn absent_refuses_a_reinst_required_package() {
-        let line = "install reinst-required installed\t2.4.62-1\n";
+    fn absent_refuses_a_reinstreq_package() {
+        let line = "install reinstreq installed\t2.4.62-1\n";
         let fake = Arc::new(dpkg(Fake::new(), "apache2", 0, line));
         let err = Absent::new(["apache2"])
             .check(&sys(&fake))
             .unwrap_err()
             .chain();
         assert!(
-            err.contains("dpkg state `install reinst-required installed`"),
+            err.contains("dpkg state `install reinstreq installed`"),
             "{err}"
         );
     }
@@ -1982,17 +2024,29 @@ W: Some index files failed to download. They have been ignored, or old ones used
             };
             assert_eq!(r.not_present, vec!["sl"]);
         }
-        let fake = Arc::new(dpkg(Fake::new(), "sl", 0, "hold ok config-files\t5.02-1\n"));
+        // apt-get purges a held package's leftover configuration files: no
+        // version changes.
+        let fake = Arc::new(dpkg(
+            Fake::new(),
+            "nano",
+            0,
+            "hold ok config-files\t7.2-1\n",
+        ));
         assert!(matches!(
-            Absent::new(["sl"]).check(&sys(&fake)).unwrap(),
+            Absent::new(["nano"]).check(&sys(&fake)).unwrap(),
             Plan::Satisfied(_)
         ));
-        let err = Absent::new(["sl"])
+        let Plan::Change(c) = Absent::new(["nano"])
             .purge(true)
             .check(&sys(&fake))
-            .unwrap_err()
-            .chain();
-        assert!(err.contains("will not purge"), "{err}");
+            .unwrap()
+        else {
+            panic!("a held package's config files are purged")
+        };
+        assert_eq!(
+            c.diff().render(),
+            "apt packages:\n  nano: config-files -> purged\n"
+        );
     }
 
     #[test]
@@ -2180,6 +2234,34 @@ W: Some index files failed to download. They have been ignored, or old ones used
             let argvs = fake.argvs();
             assert!(argvs.iter().all(|a| a[0] != "apt-get"), "{argvs:?}");
         }
+    }
+
+    /// Under `--check` with stale lists the candidates are unknown, but dpkg
+    /// alone says a held package with no version needs installing.
+    #[test]
+    fn latest_refuses_a_held_package_to_install_under_check_with_stale_lists() {
+        let fake = dpkg(Fake::new(), "curl", 0, "hold ok not-installed\t\n");
+        let fake = Arc::new(stamp_tools(fake.with_cmd("apt-get", None, 0, "")));
+        let s = sys(&fake).with_check_mode(true);
+        let err = Latest::new(["curl"])
+            .update_cache(Duration::ZERO)
+            .check(&s)
+            .unwrap_err()
+            .chain();
+        assert!(err.contains("package `curl` is held"), "{err}");
+        assert!(err.contains("will not install"), "{err}");
+        let argvs = fake.argvs();
+        assert!(
+            argvs.iter().all(|a| a[0] == "dpkg-query"),
+            "no refresh, and no candidate read: {argvs:?}"
+        );
+    }
+
+    #[test]
+    fn latest_lets_apt_finish_a_held_half_configured_package() {
+        let fake = dpkg(Fake::new(), "sl", 0, "hold ok half-configured\t5.02-1\n");
+        let fake = Arc::new(policy_of(fake, "sl", "5.02-1", "5.02-1"));
+        assert!(Latest::new(["sl"]).check(&sys(&fake)).unwrap().is_change());
     }
 
     #[test]
@@ -2392,7 +2474,10 @@ W: Some index files failed to download. They have been ignored, or old ones used
             "{rendered}"
         );
         let argvs = fake.argvs();
-        assert!(argvs.iter().all(|a| a[0] == "stat"), "{argvs:?}");
+        assert!(
+            argvs.iter().all(|a| a[0] == "stat" || a[0] == "dpkg-query"),
+            "{argvs:?}"
+        );
 
         let fake = Arc::new(openssl_outdated_curl_missing().with_cmd("stat", None, 1, ""));
         let s = sys(&fake).with_check_mode(true);
@@ -2407,7 +2492,10 @@ W: Some index files failed to download. They have been ignored, or old ones used
             c.diff().render()
         );
         let argvs = fake.argvs();
-        assert!(argvs.iter().all(|a| a[0] == "stat"), "{argvs:?}");
+        assert!(
+            argvs.iter().all(|a| a[0] == "stat" || a[0] == "dpkg-query"),
+            "{argvs:?}"
+        );
     }
 
     /// Lists within the max age need no refresh in a real run either, so the
@@ -2476,12 +2564,13 @@ W: Some index files failed to download. They have been ignored, or old ones used
         let Plan::Change(c) = op.check(&sys(&fake).with_check_mode(true)).unwrap() else {
             panic!("expected change")
         };
+        let checked = fake.argvs().len();
         let err = op.apply(&sys(&fake), c).unwrap_err().chain();
         assert!(
             err.contains("cannot apply a plan made under --check"),
             "{err}"
         );
-        assert!(fake.argvs().is_empty(), "{:?}", fake.argvs());
+        assert_eq!(fake.argvs().len(), checked, "{:?}", fake.argvs());
     }
 
     /// The refusals about the machine stand under `--check` too, and come

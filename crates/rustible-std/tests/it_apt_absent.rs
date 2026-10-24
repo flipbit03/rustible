@@ -76,8 +76,9 @@ fn absent_ok_for_a_package_dpkg_keeps_only_a_record_of(ctx: &mut Ctx) -> Result<
     Ok(())
 }
 
-/// A held package is installed for `Present` and `Latest`, and `Absent`
-/// refuses to remove it, under check mode too, because apt-get would.
+/// A held package is installed for `Present` and `Latest`, and a step that
+/// would change its version is refused, under check mode too, because
+/// apt-get would refuse it.
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
 fn held_package_is_present_and_absent_refuses_it(ctx: &mut Ctx) -> Result<()> {
     ctx.step(
@@ -112,6 +113,35 @@ fn held_package_is_present_and_absent_refuses_it(ctx: &mut Ctx) -> Result<()> {
     ctx.sys().cmd("apt-mark").args(["unhold", "sl"]).run()?;
     changed_then_ok(ctx, "sl absent once unheld", || {
         apt::Absent::new(["sl"]).purge(true)
+    })?;
+
+    // Installing a held package sets its version, which apt-get refuses,
+    // whether nothing of it is on disk or only its configuration files.
+    // Purging those files changes no version, so that goes through.
+    ctx.step("install nano", apt::Present::new(["nano"]))?;
+    ctx.step("remove nano", apt::Absent::new(["nano"]))?;
+    for name in ["cowsay", "nano"] {
+        ctx.sys().cmd("apt-mark").args(["hold", name]).run()?;
+        let mut dry = testing::dry(ctx);
+        for (mode, c) in [("real", &mut *ctx), ("dry", &mut dry)] {
+            let err = c
+                .step("install while held", apt::Present::new([name]))
+                .unwrap_err()
+                .chain();
+            assert!(
+                err.contains(&format!("package `{name}` is held")),
+                "{mode}: {err}"
+            );
+        }
+    }
+    let status = ctx
+        .sys()
+        .cmd("dpkg-query")
+        .args(["-W", "-f=${Status}\n", "nano"])
+        .run()?;
+    assert_eq!(status.stdout_str(), "hold ok config-files\n");
+    changed_then_ok(ctx, "purge nano's config files while held", || {
+        apt::Absent::new(["nano"]).purge(true)
     })?;
     Ok(())
 }
