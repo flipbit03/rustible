@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use rustible::prelude::*;
-use rustible::sdk::testing::changed_then_ok;
+use rustible::sdk::testing::{self, changed_then_ok};
 use rustible_std::apt;
 
 #[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
@@ -50,5 +50,68 @@ fn absent_changed_then_ok(ctx: &mut Ctx) -> Result<()> {
         "{}",
         status.stdout_str()
     );
+    Ok(())
+}
+
+/// #157. dpkg keeps a `not-installed` record for a package another installed
+/// package names, and `dpkg-query` answers for it with exit 0. libc6's
+/// `Breaks:` names `nscd` on both images, so a stock image has the record
+/// with nothing set up.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn absent_ok_for_a_package_dpkg_keeps_only_a_record_of(ctx: &mut Ctx) -> Result<()> {
+    let record = ctx
+        .sys()
+        .cmd("dpkg-query")
+        .args(["-W", "-f=${Status}\n", "nscd"])
+        .allow_failure()
+        .run()?;
+    assert!(record.success(), "dpkg-query has a record of nscd");
+    assert_eq!(record.stdout_str(), "unknown ok not-installed\n");
+
+    for purge in [false, true] {
+        let r = ctx.step("nscd absent", apt::Absent::new(["nscd"]).purge(purge))?;
+        assert!(!r.changed, "purge {purge}");
+        assert_eq!(r.not_present, vec!["nscd"]);
+    }
+    Ok(())
+}
+
+/// A held package is installed for `Present` and `Latest`, and `Absent`
+/// refuses to remove it, under check mode too, because apt-get would.
+#[rustible::integration_test(images = ["debian:12", "ubuntu:24.04"])]
+fn held_package_is_present_and_absent_refuses_it(ctx: &mut Ctx) -> Result<()> {
+    ctx.step(
+        "install sl",
+        apt::Present::new(["sl"]).update_cache(Duration::ZERO),
+    )?;
+    ctx.sys().cmd("apt-mark").args(["hold", "sl"]).run()?;
+
+    let present = ctx.step("sl present while held", apt::Present::new(["sl"]))?;
+    assert!(!present.changed);
+    assert_eq!(present.already_present[0].name, "sl");
+    let latest = ctx.step("sl latest while held", apt::Latest::new(["sl"]))?;
+    assert!(!latest.changed);
+
+    let mut dry = testing::dry(ctx);
+    for purge in [false, true] {
+        for (mode, c) in [("real", &mut *ctx), ("dry", &mut dry)] {
+            let err = c
+                .step(
+                    "sl absent while held",
+                    apt::Absent::new(["sl"]).purge(purge),
+                )
+                .unwrap_err()
+                .chain();
+            assert!(err.contains("package `sl` is held"), "{mode}: {err}");
+            assert!(err.contains("apt-mark unhold sl"), "{mode}: {err}");
+        }
+    }
+    assert!(ctx.sys().exists("/usr/games/sl")?);
+
+    // Unheld, the same step goes through.
+    ctx.sys().cmd("apt-mark").args(["unhold", "sl"]).run()?;
+    changed_then_ok(ctx, "sl absent once unheld", || {
+        apt::Absent::new(["sl"]).purge(true)
+    })?;
     Ok(())
 }
