@@ -1094,6 +1094,9 @@ so guard — with `has_pm`, since a host can have several:
 ensure!(f.has_pm(&Pm::Apt), "{} has {:?}", f.hostname, f.package_managers);
 ```
 
+An apt step that would install, upgrade or remove a held package it names
+(`apt-mark hold`) fails, under `--check` too: `apt-mark unhold` it first.
+
 **`brew` refuses root** (Homebrew does), so a playbook with `escalate = true`
 cannot use `brew::Present`/`Absent` directly: run it unescalated or use
 `ctx.as_user(..)`. Like `apt`, it takes a list: `brew::Present::new(["x"])`.
