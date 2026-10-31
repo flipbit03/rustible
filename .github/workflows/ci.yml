@@ -404,8 +404,16 @@ jobs:
           key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - name: Install vagrant, libvirt and qemu
+        id: packages
         run: |
           set -euo pipefail
+          # This runner is thrown away when the job ends, so dpkg need not
+          # sync every file it unpacks to disk, and nothing will ever boot the
+          # initramfs that the packages below would otherwise regenerate.
+          echo force-unsafe-io | sudo tee /etc/dpkg/dpkg.cfg.d/force-unsafe-io > /dev/null
+          if [ -f /etc/initramfs-tools/update-initramfs.conf ]; then
+            sudo sed -i 's/^update_initramfs=.*/update_initramfs=no/' /etc/initramfs-tools/update-initramfs.conf
+          fi
           # Ubuntu dropped the vagrant package after HashiCorp's licence
           # change, so it comes from HashiCorp's own apt repo. A developer on
           # Ubuntu 24.04 has to do the same; docs/DEVELOPING.md says so.
@@ -422,8 +430,28 @@ jobs:
             ${{ matrix.qemu }} qemu-utils \
             dnsmasq-base ebtables iptables \
             ruby-dev libvirt-dev gcc make pkg-config
-          # vagrant-libvirt is a Vagrant plugin, not an apt package.
-          vagrant plugin install vagrant-libvirt
+          # The plugin's cache key: what its native extension was built
+          # against, and the newest release, which is what an install takes.
+          # An unreachable rubygems.org only names a key that misses.
+          latest=$(curl -fsS https://rubygems.org/api/v1/versions/vagrant-libvirt/latest.json \
+            | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p') || latest=unknown
+          echo "plugin-key=ci-vagrant-libvirt-$ImageOS-$(dpkg-query -W -f='${Version}' vagrant)-$(dpkg-query -W -f='${Version}' libvirt-dev)-$latest" >> "$GITHUB_OUTPUT"
+
+      # vagrant-libvirt is a Vagrant plugin, not an apt package, and
+      # installing it builds native extensions; a cached install is the same
+      # files, restored.
+      - name: Cache the vagrant-libvirt plugin
+        id: plugin
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.vagrant.d/gems
+            ~/.vagrant.d/plugins.json
+          key: ${{ steps.packages.outputs.plugin-key }}
+
+      - name: Install the vagrant-libvirt plugin
+        if: steps.plugin.outputs.cache-hit != 'true'
+        run: vagrant plugin install vagrant-libvirt
 
       - name: Open /dev/kvm and the libvirt socket
         run: |
