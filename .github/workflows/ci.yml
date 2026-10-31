@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request supersedes the run still going for the last
+# one: cancel it, so its jobs stop holding the free plan's concurrent-job
+# slots (macOS above all) that the new run is queueing for. A push to main is
+# grouped by its own commit, so nothing on main is ever cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
