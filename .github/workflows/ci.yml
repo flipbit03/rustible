@@ -8,9 +8,23 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request supersedes the run still going for the last
+# one: cancel it, so its jobs stop holding the free plan's concurrent-job
+# slots (macOS above all) that the new run is queueing for. A push to main is
+# grouped by its own commit, so nothing on main is ever cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Debug and test builds keep file and line for backtraces and drop the
+  # rest of the debuginfo, which nothing in CI reads: they compile and link
+  # faster, and the target directories the caches carry are about half the
+  # size. Every cargo a job starts inherits it, the nested ones that tests
+  # and `rustible` run included.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # Lint and tests are separate jobs because they answer different questions:
@@ -23,10 +37,16 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      # Every cargo cache below is keyed by the compiler as well as the
+      # lockfile. A cache is saved only when its key misses, so a key of the
+      # lockfile alone outlives the next stable release: every job then
+      # restores a target directory the new rustc cannot use, rebuilds all of
+      # it, and saves nothing, until Cargo.lock happens to change.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -34,8 +54,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-lint-cargo-
+          key: ci-lint-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-lint-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo fmt --all --check
 
@@ -69,6 +89,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
@@ -78,8 +99,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-check-cargo-
+          key: ci-check-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-check-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test --workspace
 
@@ -95,7 +116,18 @@ jobs:
       # and silently drops the node after it. Let-chains in the CLI need 1.88,
       # so that is the floor this would fall back to.
       - name: Install Rust 1.95
+        id: toolchain
         uses: dtolnay/rust-toolchain@1.95
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-msrv-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-msrv-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo check --workspace --all-targets
 
@@ -106,7 +138,19 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Its own target directory: the example is a workspace of its own.
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            examples/workspace/target
+          key: ci-example-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-example-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       # `examples/workspace` is excluded from the workspace on purpose: it is a
       # user's workspace, wired to these crates by path, and it exercises the
@@ -124,6 +168,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-analyzer
@@ -135,8 +180,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-rust-analyzer-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-rust-analyzer-cargo-
+          key: ci-rust-analyzer-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-rust-analyzer-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test -p rustible-macros --test rust_analyzer
         env:
@@ -154,6 +199,7 @@ jobs:
       # Nothing but Rust is installed here; the runner's own clang serves
       # `cargo test`, as a developer's would. `cargo test` never fetches zig.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
@@ -163,8 +209,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-macos-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-macos-unit-cargo-
+          key: ci-macos-unit-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-unit-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test --workspace
 
@@ -185,8 +231,12 @@ jobs:
       # step below is what keeps that from being a 50 MB download per run.
       # The runner's own clang serves the CLI build, as a developer's would.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # examples/workspace/target as well: the playbook builds `rustible`
+      # makes, for the host and for the target, which are most of the job's
+      # compiling.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -194,8 +244,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-macos-runner-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-macos-runner-cargo-
+            examples/workspace/target
+          key: ci-macos-runner-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-runner-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Cache the zig rustible fetches
         uses: actions/cache@v5
@@ -260,6 +311,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -271,8 +323,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-harness-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-harness-cargo-
+          key: ci-harness-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-harness-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       # The harness builds each test as a static musl binary and runs it inside
       # the images the test names; without RUSTIBLE_INTEGRATION=1 these tests
@@ -332,10 +384,14 @@ jobs:
       # docker image to build in; `make vm-test` below is an ordinary
       # `rustible playbook run`.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # examples/workspace/target as well: the playbook builds `rustible`
+      # makes, for the host and for the target, which are most of the job's
+      # compiling.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -343,8 +399,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-machine-${{ matrix.machine }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-machine-${{ matrix.machine }}-cargo-
+            examples/workspace/target
+          key: ci-machine-${{ matrix.machine }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-machine-${{ matrix.machine }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Cache the zig rustible fetches
         uses: actions/cache@v5
@@ -353,8 +410,16 @@ jobs:
           key: ci-linux-zig-${{ hashFiles('crates/rustible-cli/src/zig.rs') }}
 
       - name: Install vagrant, libvirt and qemu
+        id: packages
         run: |
           set -euo pipefail
+          # This runner is thrown away when the job ends, so dpkg need not
+          # sync every file it unpacks to disk, and nothing will ever boot the
+          # initramfs that the packages below would otherwise regenerate.
+          echo force-unsafe-io | sudo tee /etc/dpkg/dpkg.cfg.d/force-unsafe-io > /dev/null
+          if [ -f /etc/initramfs-tools/update-initramfs.conf ]; then
+            sudo sed -i 's/^update_initramfs=.*/update_initramfs=no/' /etc/initramfs-tools/update-initramfs.conf
+          fi
           # Ubuntu dropped the vagrant package after HashiCorp's licence
           # change, so it comes from HashiCorp's own apt repo. A developer on
           # Ubuntu 24.04 has to do the same; docs/DEVELOPING.md says so.
@@ -371,8 +436,28 @@ jobs:
             ${{ matrix.qemu }} qemu-utils \
             dnsmasq-base ebtables iptables \
             ruby-dev libvirt-dev gcc make pkg-config
-          # vagrant-libvirt is a Vagrant plugin, not an apt package.
-          vagrant plugin install vagrant-libvirt
+          # The plugin's cache key: what its native extension was built
+          # against, and the newest release, which is what an install takes.
+          # An unreachable rubygems.org only names a key that misses.
+          latest=$(curl -fsS --max-time 30 https://rubygems.org/api/v1/versions/vagrant-libvirt/latest.json \
+            | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p') || latest=unknown
+          echo "plugin-key=ci-vagrant-libvirt-$ImageOS-$(dpkg-query -W -f='${Version}' vagrant)-$(dpkg-query -W -f='${Version}' libvirt-dev)-$latest" >> "$GITHUB_OUTPUT"
+
+      # vagrant-libvirt is a Vagrant plugin, not an apt package, and
+      # installing it builds native extensions; a cached install is the same
+      # files, restored.
+      - name: Cache the vagrant-libvirt plugin
+        id: plugin
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.vagrant.d/gems
+            ~/.vagrant.d/plugins.json
+          key: ${{ steps.packages.outputs.plugin-key }}
+
+      - name: Install the vagrant-libvirt plugin
+        if: steps.plugin.outputs.cache-hit != 'true'
+        run: vagrant plugin install vagrant-libvirt
 
       - name: Open /dev/kvm and the libvirt socket
         run: |
@@ -420,13 +505,25 @@ jobs:
           virsh -c qemu:///system pool-info default | grep -q '^State: *running' \
             || { echo "libvirt's default storage pool is not running" >&2; exit 1; }
 
-      - name: Bring the machine up
+      # The boot and the controller's builds need nothing from each other, so
+      # they overlap: the guest boots in the background while the example
+      # workspace and the CLI build, and the step fails if either does. The
+      # boot's output is printed once it is done, so it does not interleave
+      # with cargo's.
+      - name: Bring the machine up, building while it boots
         env:
           RUSTIBLE_VM_BOX: ${{ matrix.box }}
         run: |
           set -euo pipefail
-          cd dev/vagrant
-          vagrant up ${{ matrix.machine }}
+          log="$RUNNER_TEMP/vagrant-up.log"
+          (cd dev/vagrant && exec vagrant up ${{ matrix.machine }}) > "$log" 2>&1 &
+          up=$!
+          make example
+          cargo build --release -p rustible-cli
+          status=0
+          wait "$up" || status=$?
+          cat "$log"
+          exit "$status"
 
       - name: The guest is the architecture this job claims
         run: |
@@ -452,9 +549,11 @@ jobs:
       # unless every second run changes nothing and every run recovers exactly the
       # failures its playbook catches (vagrant_login: 1). The second run is the test.
       # Then vagrant_login_escalate once, which must be refused at launch naming its
-      # ssh_user.
+      # ssh_user. FRESH=1: the guest above was just created, so vm-test does not
+      # destroy and boot it a second time, and keeps every assertion, the
+      # first run's included.
       - name: make vm-test
-        run: make vm-test
+        run: make vm-test FRESH=1
 
       - name: Machine state on failure
         if: failure()

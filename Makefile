@@ -89,7 +89,8 @@ vm-up-arm:
 # of vagrant must fetch back, byte for byte, the 50 MiB file it copied through
 # the escalation helper. Then vagrant_login_escalate, once, whose launch must
 # be refused. Pass HOSTS=vagrant-arm to limit it, QUICK=1 to skip the
-# recreate while iterating.
+# recreate while iterating, FRESH=1 when the guests were just brought up (CI
+# does, to build while they boot): no recreate, every assertion kept.
 vm-test: example
 	$(CARGO) build --release -p rustible-cli
 	$(VAGRANT_DIR)/vm-test.sh $(HOSTS)

@@ -743,7 +743,9 @@ Three things that will bite you:
   the suite having exercised only the satisfied path. It also asserts the
   *first* run changed something, so a recreate that did not take fails loudly
   instead of passing vacuously. `make vm-test QUICK=1` skips the recreate for
-  iteration and says on stderr that what it ran is not the full test.
+  iteration and says on stderr that what it ran is not the full test. CI
+  passes `FRESH=1` instead, having just brought the guest up itself: no
+  recreate, every assertion kept.
 
 **A test that pins a deadlock or a hang needs a time bound**, or a regression
 hangs instead of failing and wedges CI until the workflow timeout.

@@ -268,6 +268,11 @@ against the guests as they stand. It prints on stderr that what it ran is not
 the full test, and it drops the first-run assertion, since a converged guest
 is the expected case there. Drop `QUICK=1` before trusting a green.
 
+`make vm-test FRESH=1` is for a caller that has just brought the guests up
+itself, which is what CI does so that it can build while the guest boots: it
+skips the recreate as `QUICK=1` does, but keeps every assertion, the first-run
+one included.
+
 ## Troubleshooting
 
 **On Linux it is one architecture at a time.** vagrant-libvirt 0.12.2 names

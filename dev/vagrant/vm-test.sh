@@ -67,6 +67,14 @@ fi
 
 quick=${QUICK:-0}
 
+# FRESH=1 is for a caller that has just created the guests itself, as CI does
+# with its own `vagrant up` so that it can build while the guest boots.
+# Recreating them again would be a second boot that proves nothing new; under
+# emulation it is minutes. Unlike QUICK=1, every assertion stays, the
+# first-run one included, so a guest that was not fresh after all still fails
+# loudly rather than passing on the satisfied path.
+fresh=${FRESH:-0}
+
 # Which Vagrant machines to recreate. The inventory names a host
 # `vagrant-x86`; the Vagrant machine behind it is `x86`, so the prefix comes
 # off. With no host arguments, recreate whatever is currently running, and
@@ -112,6 +120,8 @@ if [ "$quick" = 1 ]; then
     before trusting a green.
 
 MSG
+elif [ "$fresh" = 1 ]; then
+    echo "==> FRESH=1: the guests were just created; not recreating them"
 else
     recreate "$@"
 fi
@@ -345,6 +355,14 @@ both runs report \`ok\` and the second-run assertion hold vacuously, which is
 exactly the false green this check exists to stop. Either the recreate did
 not take, or the playbook has a step that is satisfied on a fresh guest.
 MSG
+        if [ "$fresh" = 1 ]; then
+            cat >&2 <<'MSG'
+
+Under FRESH=1 there was no recreate here: whoever passed it said the guests
+had just been created. If they had not, run without FRESH=1, which
+recreates them.
+MSG
+        fi
         exit 1
     fi
     if ! printf '%s\n' "$first" | assert_recovered "$want"; then
