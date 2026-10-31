@@ -19,6 +19,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Debug and test builds keep file and line for backtraces and drop the
+  # rest of the debuginfo, which nothing in CI reads: they compile and link
+  # faster, and the target directories the caches carry are about half the
+  # size. Every cargo a job starts inherits it, the nested ones that tests
+  # and `rustible` run included.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # Lint and tests are separate jobs because they answer different questions:
