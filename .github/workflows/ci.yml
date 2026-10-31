@@ -439,7 +439,7 @@ jobs:
           # The plugin's cache key: what its native extension was built
           # against, and the newest release, which is what an install takes.
           # An unreachable rubygems.org only names a key that misses.
-          latest=$(curl -fsS https://rubygems.org/api/v1/versions/vagrant-libvirt/latest.json \
+          latest=$(curl -fsS --max-time 30 https://rubygems.org/api/v1/versions/vagrant-libvirt/latest.json \
             | sed -n 's/.*"version": *"\([^"]*\)".*/\1/p') || latest=unknown
           echo "plugin-key=ci-vagrant-libvirt-$ImageOS-$(dpkg-query -W -f='${Version}' vagrant)-$(dpkg-query -W -f='${Version}' libvirt-dev)-$latest" >> "$GITHUB_OUTPUT"
 
