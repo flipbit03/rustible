@@ -355,6 +355,14 @@ both runs report \`ok\` and the second-run assertion hold vacuously, which is
 exactly the false green this check exists to stop. Either the recreate did
 not take, or the playbook has a step that is satisfied on a fresh guest.
 MSG
+        if [ "$fresh" = 1 ]; then
+            cat >&2 <<'MSG'
+
+Under FRESH=1 there was no recreate here: whoever passed it said the guests
+had just been created. If they had not, run without FRESH=1, which
+recreates them.
+MSG
+        fi
         exit 1
     fi
     if ! printf '%s\n' "$first" | assert_recovered "$want"; then
