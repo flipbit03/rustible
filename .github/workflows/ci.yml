@@ -31,10 +31,16 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      # Every cargo cache below is keyed by the compiler as well as the
+      # lockfile. A cache is saved only when its key misses, so a key of the
+      # lockfile alone outlives the next stable release: every job then
+      # restores a target directory the new rustc cannot use, rebuilds all of
+      # it, and saves nothing, until Cargo.lock happens to change.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -42,8 +48,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-lint-cargo-
+          key: ci-lint-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-lint-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo fmt --all --check
 
@@ -77,6 +83,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
@@ -86,8 +93,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-check-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-check-cargo-
+          key: ci-check-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-check-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test --workspace
 
@@ -103,7 +110,18 @@ jobs:
       # and silently drops the node after it. Let-chains in the CLI need 1.88,
       # so that is the floor this would fall back to.
       - name: Install Rust 1.95
+        id: toolchain
         uses: dtolnay/rust-toolchain@1.95
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-msrv-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-msrv-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo check --workspace --all-targets
 
@@ -114,7 +132,19 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Its own target directory: the example is a workspace of its own.
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            examples/workspace/target
+          key: ci-example-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-example-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       # `examples/workspace` is excluded from the workspace on purpose: it is a
       # user's workspace, wired to these crates by path, and it exercises the
@@ -132,6 +162,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rust-analyzer
@@ -143,8 +174,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-rust-analyzer-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-rust-analyzer-cargo-
+          key: ci-rust-analyzer-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-rust-analyzer-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test -p rustible-macros --test rust_analyzer
         env:
@@ -162,6 +193,7 @@ jobs:
       # Nothing but Rust is installed here; the runner's own clang serves
       # `cargo test`, as a developer's would. `cargo test` never fetches zig.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
@@ -171,8 +203,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-macos-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-macos-unit-cargo-
+          key: ci-macos-unit-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-unit-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - run: cargo test --workspace
 
@@ -193,8 +225,12 @@ jobs:
       # step below is what keeps that from being a 50 MB download per run.
       # The runner's own clang serves the CLI build, as a developer's would.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # examples/workspace/target as well: the playbook builds `rustible`
+      # makes, for the host and for the target, which are most of the job's
+      # compiling.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -202,8 +238,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-macos-runner-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-macos-runner-cargo-
+            examples/workspace/target
+          key: ci-macos-runner-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-macos-runner-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Cache the zig rustible fetches
         uses: actions/cache@v5
@@ -268,6 +305,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -279,8 +317,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-harness-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-harness-cargo-
+          key: ci-harness-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-harness-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       # The harness builds each test as a static musl binary and runs it inside
       # the images the test names; without RUSTIBLE_INTEGRATION=1 these tests
@@ -340,10 +378,14 @@ jobs:
       # docker image to build in; `make vm-test` below is an ordinary
       # `rustible playbook run`.
       - name: Install Rust toolchain
+        id: toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # examples/workspace/target as well: the playbook builds `rustible`
+      # makes, for the host and for the target, which are most of the job's
+      # compiling.
       - name: Cache cargo registry & build
         uses: actions/cache@v5
         with:
@@ -351,8 +393,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ci-machine-${{ matrix.machine }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ci-machine-${{ matrix.machine }}-cargo-
+            examples/workspace/target
+          key: ci-machine-${{ matrix.machine }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-machine-${{ matrix.machine }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Cache the zig rustible fetches
         uses: actions/cache@v5
