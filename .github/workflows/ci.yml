@@ -471,13 +471,25 @@ jobs:
           virsh -c qemu:///system pool-info default | grep -q '^State: *running' \
             || { echo "libvirt's default storage pool is not running" >&2; exit 1; }
 
-      - name: Bring the machine up
+      # The boot and the controller's builds need nothing from each other, so
+      # they overlap: the guest boots in the background while the example
+      # workspace and the CLI build, and the step fails if either does. The
+      # boot's output is printed once it is done, so it does not interleave
+      # with cargo's.
+      - name: Bring the machine up, building while it boots
         env:
           RUSTIBLE_VM_BOX: ${{ matrix.box }}
         run: |
           set -euo pipefail
-          cd dev/vagrant
-          vagrant up ${{ matrix.machine }}
+          log="$RUNNER_TEMP/vagrant-up.log"
+          (cd dev/vagrant && exec vagrant up ${{ matrix.machine }}) > "$log" 2>&1 &
+          up=$!
+          make example
+          cargo build --release -p rustible-cli
+          status=0
+          wait "$up" || status=$?
+          cat "$log"
+          exit "$status"
 
       - name: The guest is the architecture this job claims
         run: |
@@ -503,9 +515,11 @@ jobs:
       # unless every second run changes nothing and every run recovers exactly the
       # failures its playbook catches (vagrant_login: 1). The second run is the test.
       # Then vagrant_login_escalate once, which must be refused at launch naming its
-      # ssh_user.
+      # ssh_user. FRESH=1: the guest above was just created, so vm-test does not
+      # destroy and boot it a second time, and keeps every assertion, the
+      # first run's included.
       - name: make vm-test
-        run: make vm-test
+        run: make vm-test FRESH=1
 
       - name: Machine state on failure
         if: failure()
