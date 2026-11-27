@@ -865,7 +865,7 @@ mod tests {
         let sink = Arc::new(Collect::default());
         // `pakage` is undeclared, which is the runtime's own warning.
         let host_vars = serde_json::json!({ "package": "mc", "ports": [22], "pakage": "mc" });
-        execute(
+        let _ = execute(
             &named,
             HostInfo::local(),
             host_vars,
@@ -942,7 +942,7 @@ mod tests {
         };
 
         let sink = Arc::new(Collect::default());
-        execute(
+        let _ = execute(
             &named,
             HostInfo::local(),
             Value::Null,

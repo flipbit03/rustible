@@ -684,6 +684,11 @@ if root_fs == "btrfs" { /* ... */ }
 prefer an operation to *change* something, because `sys` writes have no diff
 and no idempotence.
 
+⚠️ **Under `--check`, your own code must not send a request to a network
+service, even on `127.0.0.1`**: not with `curl`, `wget` or the service's own
+CLI through `ctx.sys()`, an HTTP crate, or `http::Request::send()`. Read it
+with an `http::Request` step inside a `ctx.block` (§13, "Calling an HTTP API").
+
 ⚠️ **`facts.is_root` is about the process, not the identity a step will run
 as.** It is `getuid() == 0`. Under `escalate = true` the whole binary runs
 behind `sudo`, so it is true — but under `ctx.as_root()` in an otherwise
@@ -1540,7 +1545,8 @@ Under `--check`:
 - **A step under `ctx.as_user(name)` waits for an account that does not
   exist yet:** `would change`, ``waits for account `name` ``. A direct
   `ctx.as_user(name).sys()` call still fails.
-- **Nothing outside the target is contacted.** A step whose answer is remote,
+- **Nothing outside the target is contacted, nor a network service on it**,
+  and your own code is bound too (§10). A step whose answer is remote,
   such as `http::Request` (any method) or `rustible_github::UserKeys`,
   reports `would change` with no output.
   `apt::Latest::update_cache(..)` does not refresh under `--check`: if the

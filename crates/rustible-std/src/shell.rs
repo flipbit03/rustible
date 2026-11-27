@@ -4,7 +4,7 @@
 //! | Ansible | Rustible |
 //! |---|---|
 //! | `command: /usr/bin/make install` | `shell::Command::new("/usr/bin/make").arg("install")` |
-//! | `shell: cat a \| grep b` | `shell::Command::sh("cat a | grep b")` |
+//! | `shell: cat a \| grep b` | `shell::Command::sh("cat a \| grep b")` |
 //! | `args: chdir: /src` | `.cwd("/src")` |
 //! | `args: creates: /opt/x/done` | `.creates("/opt/x/done")` |
 //! | `args: removes: /opt/x/lock` | `.removes("/opt/x/lock")` |
