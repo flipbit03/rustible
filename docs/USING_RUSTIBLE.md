@@ -684,6 +684,11 @@ if root_fs == "btrfs" { /* ... */ }
 prefer an operation to *change* something, because `sys` writes have no diff
 and no idempotence.
 
+⚠️ Under `--check` nothing outside the target is contacted (§15), and that
+binds your code too: never reach the network through `ctx.sys()` (`curl`,
+`wget`, an API client) to read an API, even one on `127.0.0.1`. Read it with
+an `http::Request` step, and let the dry run stop seeing there.
+
 ⚠️ **`facts.is_root` is about the process, not the identity a step will run
 as.** It is `getuid() == 0`. Under `escalate = true` the whole binary runs
 behind `sudo`, so it is true — but under `ctx.as_root()` in an otherwise
